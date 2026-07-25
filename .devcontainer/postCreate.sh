@@ -13,23 +13,28 @@ set -euo pipefail
 # newer one landing here is expected, not pinned.
 sudo npm install -g @anthropic-ai/claude-code@latest opencode-ai@latest 2>&1 | tail -1 || true
 
+# The repo's own dependencies: `npm test`, `npx tsc --noEmit` and `npm start` need
+# tsx/typescript from devDependencies, and nothing installed them before. Non-fatal
+# like the line above — the tooling report at the end says so instead.
+if [ -f package-lock.json ]; then
+  npm ci 2>&1 | tail -1 || echo "npm ci FAILED — run it before npm test"
+else
+  npm install 2>&1 | tail -1 || echo "npm install FAILED — run it before npm test"
+fi
+
 # The bind sources are created host-user-owned by prepare-host-state.sh, which
 # lines up with `node` (uid 1000) on the hosts this targets. chown defensively for
 # the hosts where it does not — Docker creates a missing bind source root-owned.
 sudo chown node:node "$HOME/.claude" "$HOME/.local/share/opencode" "$HOME/.config/gh" 2>/dev/null || true
-# Keep the surviving shell (the verify/lint scripts) executable — the bash wrapper
-# layer was retired at M12; the product is the TypeScript/MCP server (npm).
+# Keep the verify/lint scripts executable. They are all tracked 755, so this is a
+# no-op safety net rather than a source of mode-only diffs in the worktree.
 chmod +x modelguild/verify-guild-*.sh modelguild/tests/*.sh 2>/dev/null || true
 
-# Adopt the host's timezone (issue #26). The image is UTC, which makes `date`, log
-# lines and evidence-log timestamps read in a timezone the developer does not live
-# in — and quietly misdates anything an agent writes. prepare-host-timezone.sh
-# probed the host and left the zone name here.
+# Adopt the host timezone prepare-host-timezone.sh detected; the image is UTC.
 tz_file="$(pwd)/.devcontainer/.host-timezone"
 if [ -f "$tz_file" ]; then
   tz="$(tr -d '[:space:]' < "$tz_file")"
-  # Re-validate in here rather than trusting the file: it sits in the workspace, and
-  # the value is about to be resolved as a path under /usr/share/zoneinfo.
+  # Re-validate: the file sits in the workspace and this resolves as a path.
   if printf '%s' "$tz" | grep -Eq '^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+)*$' && [ -f "/usr/share/zoneinfo/$tz" ]; then
     sudo ln -snf "/usr/share/zoneinfo/$tz" /etc/localtime
     printf '%s\n' "$tz" | sudo tee /etc/timezone >/dev/null
@@ -67,11 +72,50 @@ if [ ! -L "$HOME/.claude.json" ]; then
 fi
 
 echo "== ModelGuild dev container =="
-printf 'node:     %s\n' "$(node --version 2>/dev/null || echo MISSING)"
-printf 'claude:   %s\n' "$(claude --version 2>/dev/null || echo MISSING)"
-printf 'opencode: %s\n' "$(opencode --version 2>/dev/null || echo MISSING)"
-# Prints the host zone when prepare-host-timezone.sh found one, UTC when it did not.
-printf 'time:     %s\n' "$(date)"
+
+# Report every tool the documented workflows invoke, so a gap shows up here rather
+# than at the first `npm test`. Non-fatal, matching the installs above.
+missing=""
+report_tool() { # <label> <binary> [version-args...]
+  local label="$1" bin="$2" out
+  shift 2
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    printf '%-11s %s\n' "$label:" "MISSING"
+    missing="$missing $bin"
+    return
+  fi
+  # No version args for tools whose --version prints a banner.
+  if [ "$#" -eq 0 ]; then printf '%-11s %s\n' "$label:" "present"; return; fi
+  out="$("$bin" "$@" 2>/dev/null | head -1)" || out=""
+  printf '%-11s %s\n' "$label:" "${out:-present}"
+}
+
+report_tool node      node     --version
+report_tool npm       npm      --version
+report_tool claude    claude   --version
+report_tool opencode  opencode --version
+report_tool git       git      --version
+report_tool gh        gh       --version
+report_tool jq        jq       --version
+report_tool ripgrep   rg       --version
+report_tool shellcheck shellcheck   # banner, not a version
+report_tool sudo      sudo     --version
+
+if [ -d node_modules ]; then
+  printf '%-11s %s\n' "deps:" "node_modules present"
+else
+  printf '%-11s %s\n' "deps:" "MISSING — run 'npm ci'"
+  missing="$missing node_modules"
+fi
+
+printf '%-11s %s\n' "time:" "$(date)"
+
+if [ -n "$missing" ]; then
+  echo
+  echo "!! missing tooling:$missing"
+  echo "   This container did NOT land in a working state. Re-run this script, or"
+  echo "   rebuild the container. See AGENTS.md -> 'Dev container & auth'."
+fi
 
 echo
 echo "-- auth status --"
@@ -90,11 +134,16 @@ if gh auth status >/dev/null 2>&1; then
 else
   echo "gh:       NOT logged in — run 'gh auth login' inside this container"
 fi
-# Commit signing uses the 1Password SSH agent forwarded in by VS Code (SSH_AUTH_SOCK).
-if [ -n "${SSH_AUTH_SOCK:-}" ] && ssh-add -l 2>/dev/null | grep -qi 'signing'; then
-  echo "signing:  1Password signing key available via forwarded agent"
+# Nothing here sets a git identity; some editors copy the host ~/.gitconfig in.
+if git config user.email >/dev/null 2>&1; then
+  echo "git:      identity set"
 else
-  echo "signing:  no forwarded signing key — commits may prompt on host or need -c commit.gpgsign=false"
+  echo "git:      NO identity — set user.name / user.email before committing"
+fi
+if [ -n "${SSH_AUTH_SOCK:-}" ] && ssh-add -l >/dev/null 2>&1; then
+  echo "ssh agent: forwarded, has keys"
+else
+  echo "ssh agent: none forwarded — anything needing a key (signing, remotes) won't work"
 fi
 
 echo

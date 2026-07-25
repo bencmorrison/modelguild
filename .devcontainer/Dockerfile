@@ -21,6 +21,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 RUN mkdir -p /home/node/.local/share/opencode \
              /home/node/.local/state \
              /home/node/.config/opencode \
+             /home/node/.config/gh \
              /home/node/.cache \
              /home/node/.claude \
     && chown -R node:node /home/node/.local /home/node/.config /home/node/.cache /home/node/.claude
