@@ -38,6 +38,8 @@ The container (`.devcontainer/`) has **Claude Code and opencode both preinstalle
 
 The `postCreate` step reports login status each time. Because state lives in `~/.modelguild/` on the host, you only log in again if you delete that directory. `.devcontainer/prepare-host-state.sh` creates it (mode 700) before the container is built — Docker would otherwise create a missing bind source `root`-owned, which the `node` user can't write. Override the location with `MODELGUILD_HOST_STATE`, and update the `mounts` in `devcontainer.json` to match if you do.
 
+The container runs on **your host's timezone**, not UTC: `.devcontainer/prepare-host-timezone.sh` probes it before creation (`$MODELGUILD_TZ`, then `$TZ`, then the `/etc/localtime` symlink, then `/etc/timezone`) and `postCreate.sh` applies it. Set `MODELGUILD_TZ=Area/City` to override, or expect UTC on a host where none of those exist (Windows via Git Bash).
+
 Before creation, `.devcontainer/prepare-host-config.sh` snapshots only selected host Claude config (`CLAUDE.md`, `settings.json`, `statusline-command.sh`, `commands/`, and `agents/`) into git-ignored `.devcontainer/.host-config`. Confined internal symlinks are dereferenced; external or dangling symlinks and non-regular entries are rejected throughout selected trees before the previous snapshot is cleared. The container does not mount the whole host config or dotfiles tree. Run `.devcontainer/test-prepare-host-config.sh` after changing this boundary.
 
 ## Before you open a PR
@@ -50,6 +52,7 @@ npm test                                     # the TS suite (13 suites; spawning
 bash modelguild/tests/check-frontmatter.sh       # command/agent frontmatter structure
 bash modelguild/tests/check-docs.sh --self-test  # command names + MCP-grant lint (+ its self-test)
 bash .devcontainer/test-prepare-host-config.sh # host symlink confinement
+bash .devcontainer/test-prepare-host-timezone.sh # host timezone detection + junk rejection
 bash modelguild/tests/check-agent-permissions.sh --self-test # agent permission-allowlist invariants (+ self-test)
 bash modelguild/tests/check-shebangs.sh --self-test          # shebang conformance (+ self-test)
 bash modelguild/tests/check-shellcheck.sh                    # ShellCheck over the surviving shell scripts

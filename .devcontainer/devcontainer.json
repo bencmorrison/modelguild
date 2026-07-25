@@ -13,7 +13,9 @@
   "name": "ModelGuild",
   "build": { "dockerfile": "Dockerfile" },
   "remoteUser": "node",
-  "initializeCommand": "bash .devcontainer/prepare-host-config.sh && bash .devcontainer/prepare-host-state.sh",
+  // Host-side prep, in order: stage selected Claude config, create the bind-mount
+  // sources, probe the host timezone. All three run on the HOST before build.
+  "initializeCommand": "bash .devcontainer/prepare-host-config.sh && bash .devcontainer/prepare-host-state.sh && bash .devcontainer/prepare-host-timezone.sh",
 
   "features": {
     // GitHub CLI (gh) for repo / PR / Actions work. Installed as a Feature so it

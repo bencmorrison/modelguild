@@ -21,6 +21,23 @@ sudo chown node:node "$HOME/.claude" "$HOME/.local/share/opencode" "$HOME/.confi
 # layer was retired at M12; the product is the TypeScript/MCP server (npm).
 chmod +x modelguild/verify-guild-*.sh modelguild/tests/*.sh 2>/dev/null || true
 
+# Adopt the host's timezone (issue #26). The image is UTC, which makes `date`, log
+# lines and evidence-log timestamps read in a timezone the developer does not live
+# in — and quietly misdates anything an agent writes. prepare-host-timezone.sh
+# probed the host and left the zone name here.
+tz_file="$(pwd)/.devcontainer/.host-timezone"
+if [ -f "$tz_file" ]; then
+  tz="$(tr -d '[:space:]' < "$tz_file")"
+  # Re-validate in here rather than trusting the file: it sits in the workspace, and
+  # the value is about to be resolved as a path under /usr/share/zoneinfo.
+  if printf '%s' "$tz" | grep -Eq '^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+)*$' && [ -f "/usr/share/zoneinfo/$tz" ]; then
+    sudo ln -snf "/usr/share/zoneinfo/$tz" /etc/localtime
+    printf '%s\n' "$tz" | sudo tee /etc/timezone >/dev/null
+  else
+    echo "timezone: refusing unusable value from .host-timezone; staying UTC" >&2
+  fi
+fi
+
 # Link the selected host Claude config snapshot into the active ~/.claude.
 # settings.json is copied only on a fresh volume because host hooks/statusLine/
 # paths may need container-specific changes.
@@ -53,6 +70,8 @@ echo "== ModelGuild dev container =="
 printf 'node:     %s\n' "$(node --version 2>/dev/null || echo MISSING)"
 printf 'claude:   %s\n' "$(claude --version 2>/dev/null || echo MISSING)"
 printf 'opencode: %s\n' "$(opencode --version 2>/dev/null || echo MISSING)"
+# Prints the host zone when prepare-host-timezone.sh found one, UTC when it did not.
+printf 'time:     %s\n' "$(date)"
 
 echo
 echo "-- auth status --"

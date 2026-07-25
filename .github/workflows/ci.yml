@@ -82,6 +82,11 @@ jobs:
       - name: Host-config symlink confinement
         run: bash .devcontainer/test-prepare-host-config.sh
 
+      - name: Host timezone detection
+        # The detected zone is resolved as a path under /usr/share/zoneinfo in the
+        # container, so the "junk is refused" cases are load-bearing, not cosmetic.
+        run: bash .devcontainer/test-prepare-host-timezone.sh
+
       - name: Agent permission invariants (source-level allowlist lint)
         # Opencode-free: guards the realistic regression (a human weakens an agent
         # def — re-adds "*": allow, drops the deny floor, flips mode). It does NOT
@@ -171,6 +176,12 @@ jobs:
         # Genuinely macOS-relevant: prepare-host-config.sh runs on the HOST, so a
         # Mac user runs this code path for real.
         run: bash .devcontainer/test-prepare-host-config.sh
+
+      - name: Host timezone detection
+        # Same reason, plus macOS is the platform whose zoneinfo lives somewhere
+        # else entirely (/var/db/timezone/zoneinfo), and whose older `readlink`
+        # has no -f.
+        run: bash .devcontainer/test-prepare-host-timezone.sh
 
       - name: Agent permission invariants (+ self-test)
         # High value here: its effective-permission resolver is awk, and this is
