@@ -11,15 +11,17 @@ Thanks for helping out. This is a small, security-sensitive tool — a local MCP
 
 ## Setup
 
-Use the dev container (`.devcontainer/`) — it has Claude Code and opencode preinstalled. Log in once inside it (`claude` → `/login`, and `opencode auth login`); state persists in named volumes. See the README for details. No API keys are stored anywhere in this repo.
+Use the dev container (`.devcontainer/`) — it has Claude Code and opencode preinstalled. Log in once inside it (`claude` → `/login`, and `opencode auth login`); state persists in `~/.modelguild/` on your host. See the README for details. No API keys are stored anywhere in this repo.
 
 ## Dev container (for working *on* ModelGuild)
 
 **To *use* ModelGuild you don't need this** — the Setup above (opencode authenticated in your own environment) is all it takes. The dev container is for **developing ModelGuild itself**: it brings the whole development environment — Claude Code, opencode, and the test tooling — into one reproducible box so contributors get an identical setup. If you're just running the slash commands in your own repo, skip this section.
 
-The container (`.devcontainer/`) has **Claude Code and opencode both preinstalled**. You log in **once inside the container**; login state persists across rebuilds in named volumes (`modelguild-claude`, `modelguild-opencode`). No API keys or host credentials are baked into the image.
+The container (`.devcontainer/`) has **Claude Code and opencode both preinstalled**. You log in **once inside the container**; login state persists across rebuilds in host directories bind-mounted from `~/.modelguild/{claude,opencode,gh}`. No API keys or host credentials are baked into the image.
 
-> Why in-container login and not host-credential mounts? On macOS, the host credential files are mode `600` and appear `root`-owned through Docker's mount layer, so the non-root `node` user the agents run as can't read them. In-container login sidesteps that and lets the agents refresh their own tokens.
+> Why in-container login and not host-credential mounts? On macOS, the host credential files are mode `600` and appear `root`-owned through Docker's mount layer, so the non-root `node` user the agents run as can't read them. In-container login sidesteps that and lets the agents refresh their own tokens. Bind-mounting `~/.modelguild/` is not a reversal of that: the container **writes its own** credentials into an initially-empty directory it owns, rather than reading a pre-existing host secret.
+
+> These were named Docker volumes until 2026-07-25. A named volume survives `Rebuild Container` but not `docker volume prune`, `docker system prune --volumes`, or Docker Desktop's "Clean / Purge data" — losing it takes every Claude Code session transcript and every OAuth token with it. A host directory survives those and can be backed up.
 
 1. Open the folder in the container:
    - **VS Code**: "Dev Containers: Reopen in Container", or
@@ -34,7 +36,7 @@ The container (`.devcontainer/`) has **Claude Code and opencode both preinstalle
    opencode models
    ```
 
-The `postCreate` step reports login status each time. Because state lives in the named volumes, you only log in again if you delete those volumes.
+The `postCreate` step reports login status each time. Because state lives in `~/.modelguild/` on the host, you only log in again if you delete that directory. `.devcontainer/prepare-host-state.sh` creates it (mode 700) before the container is built — Docker would otherwise create a missing bind source `root`-owned, which the `node` user can't write. Override the location with `MODELGUILD_HOST_STATE`, and update the `mounts` in `devcontainer.json` to match if you do.
 
 Before creation, `.devcontainer/prepare-host-config.sh` snapshots only selected host Claude config (`CLAUDE.md`, `settings.json`, `statusline-command.sh`, `commands/`, and `agents/`) into git-ignored `.devcontainer/.host-config`. Confined internal symlinks are dereferenced; external or dangling symlinks and non-regular entries are rejected throughout selected trees before the previous snapshot is cleared. The container does not mount the whole host config or dotfiles tree. Run `.devcontainer/test-prepare-host-config.sh` after changing this boundary.
 

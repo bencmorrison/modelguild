@@ -13,8 +13,9 @@ set -euo pipefail
 # newer one landing here is expected, not pinned.
 sudo npm install -g @anthropic-ai/claude-code@latest opencode-ai@latest 2>&1 | tail -1 || true
 
-# Named volumes are normally seeded node-owned from the image dirs, but chown
-# defensively in case a volume initialized root-owned.
+# The bind sources are created host-user-owned by prepare-host-state.sh, which
+# lines up with `node` (uid 1000) on the hosts this targets. chown defensively for
+# the hosts where it does not — Docker creates a missing bind source root-owned.
 sudo chown node:node "$HOME/.claude" "$HOME/.local/share/opencode" "$HOME/.config/gh" 2>/dev/null || true
 # Keep the surviving shell (the verify/lint scripts) executable — the bash wrapper
 # layer was retired at M12; the product is the TypeScript/MCP server (npm).
@@ -38,9 +39,9 @@ if [ -d "$host_claude" ]; then
 fi
 
 # Persist ~/.claude.json (Claude Code account/onboarding state). It lives in HOME,
-# OUTSIDE the ~/.claude volume, so a rebuild wipes it and forces a re-login even
-# though the tokens (~/.claude/.credentials.json) persist. Keep the real file in the
-# volume and symlink it back so login survives rebuilds.
+# OUTSIDE the mounted ~/.claude, so a rebuild wipes it and forces a re-login even
+# though the tokens (~/.claude/.credentials.json) persist. Keep the real file inside
+# the mount and symlink it back so login survives rebuilds.
 persist="$HOME/.claude/home-dot-claude.json"
 if [ ! -L "$HOME/.claude.json" ]; then
   [ -f "$HOME/.claude.json" ] && [ ! -f "$persist" ] && mv "$HOME/.claude.json" "$persist"
@@ -78,5 +79,5 @@ else
 fi
 
 echo
-echo "Log in once (persists across rebuilds via named volumes), then try:"
+echo "Log in once (persists in ~/.modelguild on the host, across rebuilds AND prunes), then try:"
 echo "  /guild:consult <question>   |   /guild:panel <question>   |   /guild:delegate <task>   |   /guild:collaborate <problem>"
