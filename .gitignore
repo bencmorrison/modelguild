@@ -48,5 +48,9 @@ modelguild/logs/
 # container starts; never commit personal config copied here.
 .devcontainer/.host-config/
 
+# The host's IANA timezone, probed before the container starts (issue #26). Local
+# to whoever created the container, so it is not committed.
+.devcontainer/.host-timezone
+
 # Logs / temp
 *.log

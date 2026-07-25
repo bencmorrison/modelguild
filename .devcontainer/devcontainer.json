@@ -2,30 +2,39 @@
   // ModelGuild dev container — Claude Code + opencode both run in here.
   //
   // Auth model: you log in ONCE inside the container. Login state is kept in the
-  // named volumes below, so it survives rebuilds and the agents can refresh their
-  // own OAuth tokens (no host credential mounts — those don't work for a non-root
-  // container user on macOS, where secrets are mode 600 / root-owned via the mount).
+  // host directories bind-mounted below, so it survives rebuilds AND volume
+  // pruning, and the agents can refresh their own OAuth tokens. The container
+  // WRITES those credentials itself — it does not mount host ones (mounting an
+  // existing host secret was tried and abandoned: on macOS a mode-600/root-owned
+  // file is unreadable by the non-root `node` user through the mount).
   //
   //   claude                 -> then /login  (device-code OAuth in your browser)
   //   opencode auth login    -> pick OpenAI / Copilot / Gemini
   "name": "ModelGuild",
   "build": { "dockerfile": "Dockerfile" },
   "remoteUser": "node",
-  "initializeCommand": "bash .devcontainer/prepare-host-config.sh",
+  // Host-side prep, in order: stage selected Claude config, create the bind-mount
+  // sources, probe the host timezone. All three run on the HOST before build.
+  "initializeCommand": "bash .devcontainer/prepare-host-config.sh && bash .devcontainer/prepare-host-state.sh && bash .devcontainer/prepare-host-timezone.sh",
 
   "features": {
     // GitHub CLI (gh) for repo / PR / Actions work. Installed as a Feature so it
-    // persists across rebuilds; its auth lives in the modelguild-gh volume below.
+    // persists across rebuilds; its auth lives in the host state dir below.
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
 
   "mounts": [
-    // Persistent login/state volumes. Seeded node-owned from the image dirs on
-    // first use (see the mkdir+chown in the Dockerfile), so the node user can write.
-    "source=modelguild-claude,target=/home/node/.claude,type=volume",
-    "source=modelguild-opencode,target=/home/node/.local/share/opencode,type=volume",
+    // Persistent login/state, bind-mounted from the HOST (all three were named
+    // volumes until 2026-07-25). A named volume survives a rebuild but not `docker
+    // volume prune` / Docker Desktop "Clean / Purge data" — and that silently took
+    // every session transcript and OAuth token with it. A host dir survives those
+    // and is backup-able. `initializeCommand` (prepare-host-state.sh) creates the
+    // sources host-user-owned first: Docker would otherwise create them ROOT-owned
+    // and the non-root `node` user could not write them.
+    "source=${localEnv:HOME}/.modelguild/claude,target=/home/node/.claude,type=bind",
+    "source=${localEnv:HOME}/.modelguild/opencode,target=/home/node/.local/share/opencode,type=bind",
     // gh CLI auth (device-code login persists here across rebuilds).
-    "source=modelguild-gh,target=/home/node/.config/gh,type=volume"
+    "source=${localEnv:HOME}/.modelguild/gh,target=/home/node/.config/gh,type=bind"
 
     // Host Claude config is not mounted. initializeCommand copies only selected
     // config paths into git-ignored .devcontainer/.host-config; postCreate imports

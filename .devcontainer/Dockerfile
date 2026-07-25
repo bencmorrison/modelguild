@@ -16,10 +16,12 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pre-create the home dirs the agents write their persistent state into, owned by
-# `node`, so the named volumes are writable when first initialized.
+# `node`. Three of them are bind-mount targets (see devcontainer.json); the rest
+# are plain image dirs the agents need writable.
 RUN mkdir -p /home/node/.local/share/opencode \
              /home/node/.local/state \
              /home/node/.config/opencode \
+             /home/node/.config/gh \
              /home/node/.cache \
              /home/node/.claude \
     && chown -R node:node /home/node/.local /home/node/.config /home/node/.cache /home/node/.claude
