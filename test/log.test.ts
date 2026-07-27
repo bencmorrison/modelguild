@@ -2,7 +2,7 @@
  * Evidence-layer tests (CONTRACT.md area D, C22–C35) — OFFLINE.
  *
  * No model is called. The suite drives `src/log.ts` (the reference implementation; the
- * bash `collab/log.sh` it was cross-verified against retired at M12). Canonicalization is
+ * bash `log.sh` it was cross-verified against retired at M12). Canonicalization is
  * still pinned byte-for-byte against `jq` (a system tool, not a ModelGuild script), and
  * cross-process concurrency is proven with genuinely-racing TS writer child processes
  * (`test/log-writer-child.ts`) contending the shared `mkdir` lock.
@@ -410,7 +410,7 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
-  // 12. C30 — a subagent-voice-only run verifies (all-Anthropic collab); a
+  // 12. C30 — a subagent-voice-only run verifies (all-Anthropic exchange); a
   //     claude-final-only run does NOT.
   // -------------------------------------------------------------------------
   {
@@ -418,7 +418,7 @@ export async function run(): Promise<number> {
     const env = envFor(dir, { GUILD_RUN_ID: "sv" });
     const log = new EvidenceLog({ env });
     await log.subagentVoice({ model: "claude-opus-4-8", response: "lone subagent reply" });
-    c.check(log.verify("sv").ok, "C30: a subagent-voice-only run verifies (all-Anthropic collab is not empty)");
+    c.check(log.verify("sv").ok, "C30: a subagent-voice-only run verifies (all-Anthropic exchange is not empty)");
 
     const dir2 = tmp();
     const env2 = envFor(dir2, { GUILD_RUN_ID: "cf" });
@@ -585,10 +585,10 @@ export async function run(): Promise<number> {
   // -------------------------------------------------------------------------
   {
     const dir = tmp();
-    const collabDir = tmp();
-    writeFileSync(path.join(collabDir, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=3\n");
+    const guildDir = tmp();
+    writeFileSync(path.join(guildDir, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=3\n");
     const mk = (extra: Record<string, string> = {}) =>
-      new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir, ...extra }), collabDir });
+      new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir, ...extra }), guildDir });
 
     const dflt = new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir }) }).retention();
     c.check(dflt.days === 14 && dflt.source === "default" && dflt.valid,
@@ -667,8 +667,8 @@ export async function run(): Promise<number> {
   // -------------------------------------------------------------------------
   {
     const base = tmp();
-    const collabDir = path.join(base, "modelguild");
-    mkdirSync(collabDir, { recursive: true });
+    const guildDir = path.join(base, "modelguild");
+    mkdirSync(guildDir, { recursive: true });
     const projA = path.join(tmp(), "projA");
     const projB = path.join(tmp(), "projB");
     mkdirSync(projA, { recursive: true });
@@ -676,8 +676,8 @@ export async function run(): Promise<number> {
     gitInit(projA);
     gitInit(projB);
     const partEnv = envForNoLogDir({ GUILD_LOG_PARTITION: "1" });
-    const logA = new EvidenceLog({ env: partEnv, cwd: projA, collabDir });
-    const logB = new EvidenceLog({ env: partEnv, cwd: projB, collabDir });
+    const logA = new EvidenceLog({ env: partEnv, cwd: projA, guildDir });
+    const logB = new EvidenceLog({ env: partEnv, cwd: projB, guildDir });
     const old = new Date(Date.now() - 60 * 86_400_000);
     const stale = (root: string): string => {
       const p = path.join(root, "20200101T000000Z-aaaaaaaa");
@@ -690,7 +690,7 @@ export async function run(): Promise<number> {
     const staleA = stale(logA.logDir());
     const staleB = stale(logB.logDir());
 
-    const rPart = enforceRetentionOnStart({ env: partEnv, cwd: projA, collabDir });
+    const rPart = enforceRetentionOnStart({ env: partEnv, cwd: projA, guildDir });
     c.check(!!rPart && rPart.dir === logA.logDir(), "#23 C33: the hook scans the CURRENT project's partition");
     c.check(!existsSync(staleA), "#23 C33: the current partition's stale run is removed");
     c.check(existsSync(staleB), "#23 C33: another project's partition is out of scope and untouched");
@@ -817,8 +817,8 @@ export async function run(): Promise<number> {
     const layers = [projectRoot, globalRoot]; // most-specific first, as layeredRoots() returns
     const layered = new EvidenceLog({
       env: envForNoLogDir(),
-      collabDir: projectRoot,
-      collabDirs: layers,
+      guildDir: projectRoot,
+      guildDirs: layers,
     });
     c.check(layered.retention().days === 1 && layered.retention().source === "conf",
       "#23×#19: a GLOBAL-only retention setting binds in a project that never restates it");
@@ -827,8 +827,8 @@ export async function run(): Promise<number> {
 
     const r = enforceRetentionOnStart({
       env: envForNoLogDir(),
-      collabDir: projectRoot,
-      collabDirs: layers,
+      guildDir: projectRoot,
+      guildDirs: layers,
     });
     c.check(!!r && r.dir === path.join(projectRoot, "logs") && r.removed.length === 1,
       "#23×#19: the start hook prunes the PRIMARY root's logs, using the global window");
@@ -840,16 +840,16 @@ export async function run(): Promise<number> {
     writeFileSync(path.join(projectRoot, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=90\n");
     const overridden = new EvidenceLog({
       env: envForNoLogDir(),
-      collabDir: projectRoot,
-      collabDirs: layers,
+      guildDir: projectRoot,
+      guildDirs: layers,
     });
     c.check(overridden.retention().days === 90,
       "#23×#19: a project retention setting overrides the global baseline");
     // …and env still beats both (C35 order survives layering).
     const envWins = new EvidenceLog({
       env: envForNoLogDir({ GUILD_LOG_RETENTION_DAYS: "5" }),
-      collabDir: projectRoot,
-      collabDirs: layers,
+      guildDir: projectRoot,
+      guildDirs: layers,
     });
     c.check(envWins.retention().days === 5 && envWins.retention().source === "env",
       "#23×#19: env still beats every conf layer (C35)");
@@ -875,9 +875,9 @@ export async function run(): Promise<number> {
   // -------------------------------------------------------------------------
   {
     const base = tmp();
-    const collabDir = path.join(base, "collab");
-    mkdirSync(collabDir, { recursive: true });
-    const baseLogs = path.join(collabDir, "logs");
+    const guildDir = path.join(base, "modelguild");
+    mkdirSync(guildDir, { recursive: true });
+    const baseLogs = path.join(guildDir, "logs");
     // Two same-basename project roots under different parents.
     const sharedA = path.join(tmp(), "proj");
     const sharedB = path.join(tmp(), "proj");
@@ -885,7 +885,7 @@ export async function run(): Promise<number> {
     mkdirSync(sharedB, { recursive: true });
     gitInit(sharedA); gitInit(sharedB);
     const mk = (cwd: string) =>
-      new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_PARTITION: "1" }), cwd, collabDir });
+      new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_PARTITION: "1" }), cwd, guildDir });
     const rA = mk(sharedA).newRun("/guild:consult");
     const dirA = mk(sharedA).dir(rA);
     const rB = mk(sharedB).newRun("/guild:consult");
@@ -901,12 +901,12 @@ export async function run(): Promise<number> {
       "C33: same-basename projects get DISTINCT keys via the path-hash suffix",
     );
     // OFF ⇒ flat under base.
-    const off = new EvidenceLog({ env: envForNoLogDir(), cwd: sharedA, collabDir });
+    const off = new EvidenceLog({ env: envForNoLogDir(), cwd: sharedA, guildDir });
     const rOff = off.newRun("/guild:consult");
     c.check(off.dir(rOff) === path.join(baseLogs, rOff), "C33: partitioning OFF ⇒ run lands directly in base logs dir");
     // explicit GUILD_LOG_DIR beats PARTITION=1.
     const explicit = tmp();
-    const ex = new EvidenceLog({ env: envFor(explicit, { GUILD_LOG_PARTITION: "1" }), cwd: sharedA, collabDir });
+    const ex = new EvidenceLog({ env: envFor(explicit, { GUILD_LOG_PARTITION: "1" }), cwd: sharedA, guildDir });
     const rE = ex.newRun("/guild:consult");
     c.check(ex.dir(rE) === path.join(explicit, rE), "C33: explicit GUILD_LOG_DIR disables partitioning");
   }
@@ -929,17 +929,17 @@ export async function run(): Promise<number> {
 
     // Live: a config file sets GUILD_LOG_PROMPTS=off; a started entry records no prompt.
     const base = tmp();
-    const collabDir = path.join(base, "collab");
-    mkdirSync(collabDir, { recursive: true });
-    writeFileSync(path.join(collabDir, "modelguild.conf.local"), "GUILD_LOG_PROMPTS=off\n");
-    const logDir = path.join(collabDir, "logs");
-    const log = new EvidenceLog({ env: { ...cleanEnv(), GUILD_LOG_DIR: logDir, GUILD_RUN_ID: "r" } as NodeJS.ProcessEnv, collabDir });
+    const guildDir = path.join(base, "modelguild");
+    mkdirSync(guildDir, { recursive: true });
+    writeFileSync(path.join(guildDir, "modelguild.conf.local"), "GUILD_LOG_PROMPTS=off\n");
+    const logDir = path.join(guildDir, "logs");
+    const log = new EvidenceLog({ env: { ...cleanEnv(), GUILD_LOG_DIR: logDir, GUILD_RUN_ID: "r" } as NodeJS.ProcessEnv, guildDir });
     await log.expect({ callId: "p", model: "m/x", agent: "guild-read" });
     const st = await log.started({ callId: "p", model: "m/x", agent: "guild-read", prompt: "SENTINEL-abc123" });
     const started = parsed(path.join(logDir, "r", "calls.jsonl")).find((e) => e.status === "started")!;
     c.check(started.prompt === null && started.prompt_hash === null, "C35: GUILD_LOG_PROMPTS honored from modelguild.conf.local");
     // env overrides the file.
-    const log2 = new EvidenceLog({ env: { ...cleanEnv(), GUILD_LOG_DIR: logDir, GUILD_RUN_ID: "r2", GUILD_LOG_PROMPTS: "full" } as NodeJS.ProcessEnv, collabDir });
+    const log2 = new EvidenceLog({ env: { ...cleanEnv(), GUILD_LOG_DIR: logDir, GUILD_RUN_ID: "r2", GUILD_LOG_PROMPTS: "full" } as NodeJS.ProcessEnv, guildDir });
     await log2.expect({ callId: "p", model: "m/x", agent: "guild-read" });
     await log2.started({ callId: "p", model: "m/x", agent: "guild-read", prompt: "SENTINEL-abc123" });
     void st;

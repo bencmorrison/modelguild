@@ -1,8 +1,8 @@
 /**
  * Config & model resolution port (CONTRACT.md area B, C8–C14).
  *
- * Oracle: `collab/ask.sh` (`conf_get`, default-model precedence, the leading-`-`
- * refusal) and `collab/panel-models.sh` (panel-set resolution + diversity warnings).
+ * Oracle: `ask.sh` (`conf_get`, default-model precedence, the leading-`-`
+ * refusal) and `panel-models.sh` (panel-set resolution + diversity warnings).
  *
  * `conf_get` is deliberately REUSED from `src/log.ts` (`confGet`) rather than
  * re-implemented: C11 requires the parser be byte-identical everywhere it appears, and
@@ -23,7 +23,7 @@ import { MESSAGE_HTTP_MS } from "./client.js";
 export { confGet };
 
 /* ---------------------------------------------------------------------------
- * Collab-root resolution — LAYERED (issue #19).
+ * Guild-root resolution — LAYERED (issue #19).
  *
  * The bash scripts resolved their config/policy/log siblings via `dirname "$0"` — one
  * directory, whichever install was running. The TS server first reproduced that as a
@@ -54,7 +54,7 @@ export { confGet };
  * exist on disk. (`$GUILD_POLICY`/`$GUILD_CONF` behave the same way for the same reason:
  * an explicit FILE is the whole answer, not a top layer.)
  *
- * `resolveCollabRoot()` remains the PRIMARY root — `layeredRoots()[0]`, i.e. the
+ * `resolveGuildRoot()` remains the PRIMARY root — `layeredRoots()[0]`, i.e. the
  * most-specific layer, falling back to the home root when nothing exists yet. It is what
  * WRITES use (the evidence log's `logs/` dir) and what `doctor`/`guild_status` report as
  * "the root in effect". Reads use the layers.
@@ -69,7 +69,7 @@ export { confGet };
  * --------------------------------------------------------------------------- */
 export type RootSource = "env" | "project" | "home";
 
-export interface CollabRoot {
+export interface GuildRoot {
   root: string;
   source: RootSource;
 }
@@ -85,10 +85,10 @@ export function layeredRoots(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
-): CollabRoot[] {
+): GuildRoot[] {
   const override = env.GUILD_ROOT;
   if (override && override.length > 0) return [{ root: override, source: "env" }];
-  const out: CollabRoot[] = [];
+  const out: GuildRoot[] = [];
   const project = path.join(cwd, "modelguild");
   if (existsSync(project)) out.push({ root: project, source: "project" });
   const globalRoot = path.join(home, ".claude", "modelguild");
@@ -103,11 +103,11 @@ export function layeredRoots(
  * here, and this is the root `doctor`/`guild_status` name as "in effect". Identical to the
  * pre-layering single-root chain by construction (`layeredRoots()[0]`).
  */
-export function resolveCollabRoot(
+export function resolveGuildRoot(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
-): CollabRoot {
+): GuildRoot {
   return layeredRoots(env, cwd, home)[0];
 }
 
@@ -121,8 +121,8 @@ export function candidateRoots(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
-): CollabRoot[] {
-  const out: CollabRoot[] = [];
+): GuildRoot[] {
+  const out: GuildRoot[] = [];
   const override = env.GUILD_ROOT;
   if (override && override.length > 0) out.push({ root: override, source: "env" });
   const project = path.join(cwd, "modelguild");
@@ -224,12 +224,12 @@ export function hardenedDefPresentIn(
  * Parsed, NEVER sourced.
  * --------------------------------------------------------------------------- */
 export function resolveConfFile(
-  collabDir: string,
+  guildDir: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
   const override = env.GUILD_CONF;
   if (override && override.length > 0) return override;
-  const local = path.join(collabDir, "modelguild.conf.local");
+  const local = path.join(guildDir, "modelguild.conf.local");
   return existsSync(local) ? local : undefined;
 }
 
@@ -237,10 +237,10 @@ export function resolveConfFile(
  * (bash `conf_get` short-circuits on a missing file and awk on an unreadable one, both
  * yielding "no value"; an empty string produces exactly that from `confGet`.) */
 export function readConfContents(
-  collabDir: string,
+  guildDir: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const file = resolveConfFile(collabDir, env);
+  const file = resolveConfFile(guildDir, env);
   if (!file) return "";
   try { return readFileSync(file, "utf8"); } catch { return ""; }
 }
@@ -252,13 +252,13 @@ export function readConfContents(
  * `modelguild.conf.local` that exists, in the roots' order.
  */
 export function resolveConfFiles(
-  collabDirs: string[],
+  guildDirs: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const override = env.GUILD_CONF;
   if (override && override.length > 0) return [override];
   const out: string[] = [];
-  for (const dir of collabDirs) {
+  for (const dir of guildDirs) {
     const local = path.join(dir, "modelguild.conf.local");
     if (existsSync(local) && !out.includes(local)) out.push(local);
   }
@@ -279,10 +279,10 @@ export function resolveConfFiles(
  * one layer can never fuse with the first line of the next.
  */
 export function readLayeredConfContents(
-  collabDirs: string[],
+  guildDirs: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const files = resolveConfFiles(collabDirs, env);
+  const files = resolveConfFiles(guildDirs, env);
   const parts: string[] = [];
   // Least-specific first: reverse the most-specific-first file list.
   for (const file of [...files].reverse()) {

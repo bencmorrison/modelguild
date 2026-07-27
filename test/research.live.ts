@@ -32,13 +32,13 @@ async function main(): Promise<number> {
   const c = new Checker();
   console.log("== research.live (M7) ==");
 
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m7-research-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m7-research-"));
   const agentDir = path.join(scratch, ".opencode", "agent");
   const logDir = path.join(scratch, "logs");
   // HERMETICITY (issue #24): point XDG_CONFIG_HOME at an empty temp dir so the GLOBAL
   // opencode agent dir (`${XDG_CONFIG_HOME:-~/.config}/opencode/agent/`) resolves empty —
   // otherwise a box with a global install satisfies the def-missing refusal check globally.
-  const emptyXdg = await mkdtemp(path.join(tmpdir(), "collab-m7-research-xdg-"));
+  const emptyXdg = await mkdtemp(path.join(tmpdir(), "guild-m7-research-xdg-"));
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
   const env: NodeJS.ProcessEnv = {
     ...process.env,

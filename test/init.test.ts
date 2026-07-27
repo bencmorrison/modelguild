@@ -1,5 +1,5 @@
 /**
- * `modelguild init` test, in the spirit of collab/tests/test-install.sh:
+ * `modelguild init` test, in the spirit of the retired bash `tests/test-install.sh`:
  * install into throwaway temp dirs and assert the file / .mcp.json / ownership behaviour,
  * idempotency, the merge-not-clobber guarantee, hash-verified uninstall, and that the
  * bash wrappers are NOT installed. Offline, no model call. packageRoot is the repo root

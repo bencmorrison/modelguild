@@ -1,7 +1,7 @@
 /**
  * Model policy port (CONTRACT.md area A, C1–C7).
  *
- * The oracle is `collab/ask.sh` — its `_has_rules`, `policy_tier`, and the policy
+ * The oracle is `ask.sh` — its `_has_rules`, `policy_tier`, and the policy
  * resolution/enforcement block. This module reproduces those semantics EXACTLY, so a
  * TS caller (the M5+ MCP tools, `doctor`) reaches the same deny/ask/allow verdict the
  * bash wrapper does for every model id. Where this file and the bash disagree, the
@@ -40,7 +40,7 @@ export interface PolicyDecision {
 export interface PolicyLayer {
   file: string;
   source: PolicySource;
-  /** Which collab root contributed it — `undefined` for a `$GUILD_POLICY` override. */
+  /** Which guild root contributed it — `undefined` for a `$GUILD_POLICY` override. */
   root?: string;
   /** Whether the file is present on disk (a reported-but-absent layer contributes nothing). */
   exists: boolean;
@@ -274,7 +274,7 @@ export function tierFromContents(
  *
  * `$GUILD_POLICY` is a single-FILE override: exactly one layer, nothing beneath it (same
  * reasoning as `$GUILD_ROOT` in config.ts — an explicit file is the whole answer, not a top
- * layer). Otherwise, for each collab root in order (project layer, then the global
+ * layer). Otherwise, for each guild root in order (project layer, then the global
  * baseline):
  *   - `models.policy.local` — included ONLY IF it carries ≥1 complete rule (C1/C2's
  *     `_has_rules` gate, KEPT: an empty or comment-only `.local`, or a bare `deny` with no
@@ -290,7 +290,7 @@ export function tierFromContents(
  * not shadow the committed policy" both survive unchanged.
  */
 export function resolvePolicyLayers(
-  collabDirs: string[],
+  guildDirs: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): PolicyLayer[] {
   const override = env.GUILD_POLICY;
@@ -300,17 +300,17 @@ export function resolvePolicyLayers(
     return [{ file: override, source: "env", exists }];
   }
   const out: PolicyLayer[] = [];
-  for (const collabDir of collabDirs) {
-    const local = path.join(collabDir, "models.policy.local");
+  for (const guildDir of guildDirs) {
+    const local = path.join(guildDir, "models.policy.local");
     let localContents: string | undefined;
     try { localContents = readFileSync(local, "utf8"); } catch { localContents = undefined; }
     if (localContents !== undefined && hasRules(localContents)) {
-      out.push({ file: local, source: "local", root: collabDir, exists: true });
+      out.push({ file: local, source: "local", root: guildDir, exists: true });
     }
-    const committed = path.join(collabDir, "models.policy");
+    const committed = path.join(guildDir, "models.policy");
     let cExists = false;
     try { cExists = statSync(committed).isFile(); } catch { cExists = false; }
-    out.push({ file: committed, source: "committed", root: collabDir, exists: cExists });
+    out.push({ file: committed, source: "committed", root: guildDir, exists: cExists });
   }
   return out;
 }
@@ -323,15 +323,15 @@ export function resolvePolicyLayers(
  * `resolvePolicyLayers` so the two can never drift.
  */
 export function resolvePolicyFile(
-  collabDir: string,
+  guildDir: string,
   env: NodeJS.ProcessEnv = process.env,
 ): { file: string; source: PolicySource } {
-  const [head] = resolvePolicyLayers([collabDir], env);
+  const [head] = resolvePolicyLayers([guildDir], env);
   return { file: head.file, source: head.source };
 }
 
 /**
- * SINGLE-ROOT policy verdict (C1–C7) — one collab root's layers only:
+ * SINGLE-ROOT policy verdict (C1–C7) — one guild root's layers only:
  *   - no such regular file            → allow (policy only ever restricts)
  *   - exists but unreadable           → deny, loud reason (fail-closed, C5)
  *   - malformed active line           → deny, loud reason (fail-closed, C6)
@@ -343,9 +343,9 @@ export function resolvePolicyFile(
  */
 export function policyTier(
   model: string,
-  opts: { collabDir: string; env?: NodeJS.ProcessEnv },
+  opts: { guildDir: string; env?: NodeJS.ProcessEnv },
 ): PolicyDecision {
-  return policyTierAcross(model, { collabDirs: [opts.collabDir], env: opts.env });
+  return policyTierAcross(model, { guildDirs: [opts.guildDir], env: opts.env });
 }
 
 /**
@@ -373,10 +373,10 @@ export function policyTier(
  */
 export function policyTierAcross(
   model: string,
-  opts: { collabDirs: string[]; env?: NodeJS.ProcessEnv },
+  opts: { guildDirs: string[]; env?: NodeJS.ProcessEnv },
 ): PolicyDecision {
   const env = opts.env ?? process.env;
-  const layers = resolvePolicyLayers(opts.collabDirs, env);
+  const layers = resolvePolicyLayers(opts.guildDirs, env);
   // Reported file/source when NOTHING matched: the most-specific layer that exists, else
   // the most-specific candidate — so the diagnostic always names a real resolution slot.
   const head = layers.find((l) => l.exists) ?? layers[0];

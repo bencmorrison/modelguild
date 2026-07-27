@@ -46,9 +46,9 @@ function defDirWithResearch(): string {
   return dir;
 }
 
-/** A collab root carrying a deny/ask test policy. */
-function makeCollabRoot(): string {
-  const root = tmp("m7r-collab-");
+/** A guild root carrying a deny/ask test policy. */
+function makeGuildRoot(): string {
+  const root = tmp("m7r-guild-");
   writeFileSync(
     path.join(root, "models.policy.local"),
     "# M7 research test policy\ndeny openai/denied-model\nask openai/ask-model\n",
@@ -71,7 +71,7 @@ export async function run(): Promise<number> {
   //    logged, NO model call — the deliberate deviation from bash C16 (task-directed).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m7r-logs-");
     const emptyDefDir = tmp("m7r-emptyagent-"); // no guild-research.md inside
     // HERMETICITY: resolveAgentDefDirs also looks in the GLOBAL opencode dir
@@ -114,7 +114,7 @@ export async function run(): Promise<number> {
   // 2. gate parity — DENY: def present, model denied → policy-deny (exit-3), nothing logged.
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m7r-logs-");
     const env = envWith({
       GUILD_ROOT: root,
@@ -144,7 +144,7 @@ export async function run(): Promise<number> {
   // 3. gate parity — ASK unconfirmed → policy-ask (exit-4); confirmed:true proceeds.
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m7r-logs-");
     const env = envWith({
       GUILD_ROOT: root,
@@ -179,7 +179,7 @@ export async function run(): Promise<number> {
   // -------------------------------------------------------------------------
   {
     const ANSWER = 'Per the source: X.\n"quoted"\tcafé ☕\n';
-    const root = tmp("m7r-collab-"); // no policy file ⇒ default-allow
+    const root = tmp("m7r-guild-"); // no policy file ⇒ default-allow
     const logDir = tmp("m7r-logs-");
     const env = envWith({
       GUILD_ROOT: root,

@@ -6,7 +6,7 @@
  * (test/fake-opencode-server.ts) behind a `ServeProvider`, exactly like the M2 client
  * tests. The evidence layer writes to a temp GUILD_LOG_DIR, and the flagship case
  * verifies a TOOL-PRODUCED run with the TS `verify()` (the reference verifier; the bash
- * `collab/log.sh verify` it was cross-checked against retired at M12).
+ * `log.sh verify` it was cross-checked against retired at M12).
  */
 
 import {
@@ -23,7 +23,7 @@ import path from "node:path";
 import {
   consult,
   consultToToolResult,
-  collabDoctorSeed,
+  guildDoctorSeed,
   type ConsultResult,
 } from "../src/consult.js";
 import { EvidenceLog } from "../src/log.js";
@@ -47,9 +47,9 @@ function tmp(prefix = "m5-"): string {
   return d;
 }
 
-/** A collab root carrying a deny/ask test policy; returns its path. */
-function makeCollabRoot(): string {
-  const root = tmp("m5-collab-");
+/** A guild root carrying a deny/ask test policy; returns its path. */
+function makeGuildRoot(): string {
+  const root = tmp("m5-guild-");
   writeFileSync(
     path.join(root, "models.policy.local"),
     "# M5 test policy\ndeny openai/denied-model\nask openai/ask-model\n",
@@ -100,7 +100,7 @@ export async function run(): Promise<number> {
   //    fail-closed refusal.
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const emptyDefDir = tmp("m5-emptyagent-"); // no guild-read.md inside
     // HERMETICITY (issue #24): resolveAgentDefDirs also looks in the GLOBAL opencode dir
@@ -141,7 +141,7 @@ export async function run(): Promise<number> {
   // Def-missing STILL refuses on a sessionId continuation (the def governs the agent
   // regardless of session reuse) — a continuation must not slip past the guard.
   {
-    const root = tmp("m5-collab-");
+    const root = tmp("m5-guild-");
     const logDir = tmp("m5-logs-");
     const emptyDefDir = tmp("m5-emptyagent-");
     const emptyXdg = tmp("m5-emptyxdg-");
@@ -169,7 +169,7 @@ export async function run(): Promise<number> {
   // 1. Policy DENY → structured error (exit-3 analogue); NOTHING logged (C7/C24).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "should never be reached" });
@@ -198,7 +198,7 @@ export async function run(): Promise<number> {
   //    confirmed:true (C41 two-layer defense).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "unreached" });
@@ -231,7 +231,7 @@ export async function run(): Promise<number> {
   // 3. ASK + confirmed:true → proceeds (the user-approval analogue of GUILD_CONFIRMED).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "approved answer" });
@@ -263,7 +263,7 @@ export async function run(): Promise<number> {
   //    This is the receipts guarantee — every real call leaves a verifiable record.
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "the second opinion", syncText: "SYNC-MUST-NOT-LEAK" });
@@ -309,7 +309,7 @@ export async function run(): Promise<number> {
   // 5. Byte-exact answer round-trip THROUGH THE TOOL BOUNDARY (MCP serialization).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: AWKWARD });
@@ -342,7 +342,7 @@ export async function run(): Promise<number> {
   // 6. Empty-but-present answer stays COMPLETE (raw_response "", hash = sha256("")).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "" });
@@ -371,7 +371,7 @@ export async function run(): Promise<number> {
   //    failed makes verify() fail LOUDLY (code 7), as designed (C25/C40).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "x", failMessage: true });
@@ -407,7 +407,7 @@ export async function run(): Promise<number> {
   // 8. runId threading: two calls, one run, DISTINCT call_ids, cardinality verifies.
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "answer" });
@@ -452,14 +452,14 @@ export async function run(): Promise<number> {
     const globalRoot = path.join(home, ".claude", "modelguild");
     const env = envWith({}); // no GUILD_ROOT
 
-    const seed = collabDoctorSeed(env, cwd, home);
-    c.check(seed.collabRoot.source === "project", "layers: the project root is PRIMARY (writes/logs)");
-    c.check(seed.collabRoot.conflict === null,
+    const seed = guildDoctorSeed(env, cwd, home);
+    c.check(seed.guildRoot.source === "project", "layers: the project root is PRIMARY (writes/logs)");
+    c.check(seed.guildRoot.conflict === null,
       "layers: project + global on disk is NOT a conflict any more — it is the layering");
     c.check(
-      seed.collabRoot.layers.length === 2 &&
-        seed.collabRoot.layers[0].root === projectRoot &&
-        seed.collabRoot.layers[1].root === globalRoot,
+      seed.guildRoot.layers.length === 2 &&
+        seed.guildRoot.layers[0].root === projectRoot &&
+        seed.guildRoot.layers[1].root === globalRoot,
       "layers: the seed reports BOTH read layers, most-specific first",
     );
     c.check(
@@ -474,19 +474,19 @@ export async function run(): Promise<number> {
 
     // $GUILD_ROOT is a SINGLE-ROOT override: exactly one layer, and — because a real global
     // root exists on disk that is NOT layered under it — the note fires.
-    const single = collabDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), cwd, home);
-    c.check(single.collabRoot.layers.length === 1 && single.collabRoot.layers[0].root === projectRoot,
+    const single = guildDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), cwd, home);
+    c.check(single.guildRoot.layers.length === 1 && single.guildRoot.layers[0].root === projectRoot,
       "layers: $GUILD_ROOT yields exactly one layer (single-root override)");
     c.check(
-      typeof single.collabRoot.conflict === "string" &&
-        single.collabRoot.conflict.includes(globalRoot) &&
-        /NOT layered/i.test(single.collabRoot.conflict),
+      typeof single.guildRoot.conflict === "string" &&
+        single.guildRoot.conflict.includes(globalRoot) &&
+        /NOT layered/i.test(single.guildRoot.conflict),
       "layers: $GUILD_ROOT names the roots on disk it is leaving UNLAYERED",
     );
 
     // $GUILD_ROOT with nothing else on disk → nothing is being dropped, so no note.
-    const clean = collabDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), tmp("m5-noproj-"), tmp("m5-nohome-"));
-    c.check(clean.collabRoot.conflict === null,
+    const clean = guildDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), tmp("m5-noproj-"), tmp("m5-nohome-"));
+    c.check(clean.guildRoot.conflict === null,
       "layers: $GUILD_ROOT with no other root on disk reports no note (nothing dropped)");
   }
 
@@ -495,7 +495,7 @@ export async function run(): Promise<number> {
   //     Refused before any log write, exactly like a policy refusal (C12/C24).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "unreached" });
@@ -521,7 +521,7 @@ export async function run(): Promise<number> {
   //     logged (logging disabled means every log hook short-circuits, C31 posture).
   // -------------------------------------------------------------------------
   {
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG: "off", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "x", failMessage: true });
@@ -551,7 +551,7 @@ export async function run(): Promise<number> {
   //     as model-id even when a `deny -*` rule would also match it.
   // -------------------------------------------------------------------------
   {
-    const root = tmp("m5-collab-");
+    const root = tmp("m5-guild-");
     // `deny -*` would ALSO deny the dash-leading id — but model-id is checked first.
     writeFileSync(path.join(root, "models.policy.local"), "# double-refusal\ndeny -*\n");
     const logDir = tmp("m5-logs-");
@@ -580,7 +580,7 @@ export async function run(): Promise<number> {
   // one threaded run verifies under verify with session ids present.
   // -------------------------------------------------------------------------
   {
-    const root = tmp("m5-collab-"); // no policy ⇒ default-allow
+    const root = tmp("m5-guild-"); // no policy ⇒ default-allow
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "turn answer" });
@@ -634,7 +634,7 @@ export async function run(): Promise<number> {
   // capture is legitimate, an unpaired entry is not).
   // -------------------------------------------------------------------------
   {
-    const root = tmp("m5-collab-"); // default-allow
+    const root = tmp("m5-guild-"); // default-allow
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "FULL-ACCESS ANSWER", servedAgent: "build" });
@@ -672,7 +672,7 @@ export async function run(): Promise<number> {
 
   // MATCH: served agent equals requested → normal success (the check is not a false trip).
   {
-    const root = tmp("m5-collab-");
+    const root = tmp("m5-guild-");
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "read-only answer", servedAgent: "guild-read" });
@@ -697,7 +697,7 @@ export async function run(): Promise<number> {
   {
     // (a) A small per-call timeoutMs WINS over a large env GUILD_MESSAGE_TIMEOUT_MS:
     //     the call aborts despite env allowing it — proving the param reached the turn.
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_MESSAGE_TIMEOUT_MS: "60000", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "late answer", messageDelayMs: 300 });
@@ -716,7 +716,7 @@ export async function run(): Promise<number> {
   {
     // (b) Absent a per-call param, the env GUILD_MESSAGE_TIMEOUT_MS is what binds: a small
     //     env value aborts the same delayed response — proving the resolver fallback path.
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_MESSAGE_TIMEOUT_MS: "100", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "late answer", messageDelayMs: 300 });
@@ -733,7 +733,7 @@ export async function run(): Promise<number> {
   {
     // (c) A large per-call timeoutMs lets the same delayed response THROUGH — the positive
     //     control for (a), proving the abort in (a) was the timeout, not something else.
-    const root = makeCollabRoot();
+    const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_MESSAGE_TIMEOUT_MS: "40", GUILD_AGENT_DIR: defDirWithRead() });
     const fake = await startFakeOpencode({ historyText: "late answer", messageDelayMs: 200 });

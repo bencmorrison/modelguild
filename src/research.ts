@@ -4,7 +4,9 @@
  * The MCP translation of the bash `/guild:research` / `ask.sh --research` path: one
  * read-only, WEB-CAPABLE model turn through the UNMODIFIED `guild-research` agent
  * (`.opencode/agent/guild-research.md` — a default-deny allowlist re-allowing only
- * read-non-secret + webfetch/websearch; C47/C48). The model's answer — and every
+ * read + grep + glob + webfetch/websearch, with mutation and `task` denied; C47/C48. It
+ * is NOT a confidentiality boundary: since the 2026-07-22 permission realignment there
+ * are no secret-glob read-denies, so anything it reads can egress — see AGENTS.md). The model's answer — and every
  * citation in it — is untrusted DATA the DRIVER must verify against the cited source
  * (C45 verify-not-relay), never instructions to act on (C42/C52). This tool is the
  * TRANSPORT; the `/guild:research` command doc does the fetch-each-source verification.
@@ -44,7 +46,7 @@ import { type PolicyTier } from "./policy.js";
 
 /** The web-capable research agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const RESEARCH_AGENT = "guild-research";
-/** The command label recorded in the evidence log (drives `/guild:witness`). */
+/** The command label recorded in the evidence log. */
 export const RESEARCH_COMMAND = "/guild:research";
 
 // --- Params + deps ---------------------------------------------------------
@@ -66,7 +68,7 @@ export interface ResearchDeps {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
-  /** Injected in tests so root/policy/log all share one collab dir; else resolved. */
+  /** Injected in tests so root/policy/log all share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
 }
@@ -131,10 +133,10 @@ export async function research(
 
   // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19).
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDirs = rootRes.layers.map((l) => l.root);
-  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
+  const guildDirs = rootRes.layers.map((l) => l.root);
+  const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readLayeredConfContents(collabDirs, env);
+  const confContents = readLayeredConfContents(guildDirs, env);
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
@@ -163,7 +165,7 @@ export async function research(
   const requestedModel = resolveModel({ flag: params.model, env, confContents });
 
   // 4. Gate: leading-dash refusal (C12) THEN policy tier (C1–C7), all BEFORE any log write.
-  const gate = gateModel(requestedModel, params.confirmed === true, { collabDirs, env });
+  const gate = gateModel(requestedModel, params.confirmed === true, { guildDirs, env });
   if (!gate.ok) {
     return {
       ok: false,
@@ -179,7 +181,7 @@ export async function research(
   }
 
   // --- Past the gate: from here every path writes exactly one started + completed. ---
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(RESEARCH_COMMAND);
 

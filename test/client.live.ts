@@ -29,7 +29,7 @@ async function main(): Promise<number> {
   const c = new Checker();
   console.log("== client.live ==");
 
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m2-live-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m2-live-"));
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
   let servePid: number | undefined;
 

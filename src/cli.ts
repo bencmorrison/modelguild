@@ -241,7 +241,7 @@ function printRegisterInstructions(targetDir: string, launch: ServerLaunch, glob
 }
 
 /** A light, token-free doctor: no model call. Confirms the MCP-era payload is present
- * and coherent. This is the deep check — the bash `collab/doctor.sh` was retired at M12. */
+ * and coherent. This is the deep check — the bash `doctor.sh` was retired at M12. */
 export async function runDoctor(
   argv: string[],
   inject?: { homeDir?: string; xdgConfigHome?: string },
@@ -306,7 +306,7 @@ export async function runDoctor(
   //     `~/.claude/commands/guild/`.
   //   - agent defs: opencode resolves BOTH project `.opencode/agent/` and global
   //     `<xdg>/opencode/agent/` (this is exactly what `resolveAgentDefDirs` models).
-  //   - policy: `resolveCollabRoot` falls back project `modelguild/` → home `~/.claude/modelguild/`.
+  //   - policy: `resolveGuildRoot` falls back project `modelguild/` → home `~/.claude/modelguild/`.
   // So DEFAULT doctor must count a piece present if it is found in EITHER location — otherwise a
   // perfectly-working GLOBAL install (`init --global`) falsely fails 0/8, 0/3, no policy. `--global`
   // stays an explicit "verify ONLY my global install" and checks the global location alone.
@@ -538,9 +538,9 @@ export async function runLogsClean(
   const env = inject?.env ?? process.env;
   const home = inject?.homeDir;
   // LAYERED resolution (issue #19), split exactly the way the tools split it: the window
-  // is READ across every layer (`collabDirs`), so a global `GUILD_LOG_RETENTION_DAYS`
+  // is READ across every layer (`guildDirs`), so a global `GUILD_LOG_RETENTION_DAYS`
   // binds in a project that never restates it — but the logs being cleaned live under the
-  // PRIMARY root alone (`collabDir` = layers[0]), because that is the only root writes
+  // PRIMARY root alone (`guildDir` = layers[0]), because that is the only root writes
   // ever land in. Cleaning a layer nobody writes to would be cleaning someone else's
   // logs from this project's command.
   const roots = home ? layeredRoots(env, targetDir, home) : layeredRoots(env, targetDir);
@@ -548,8 +548,8 @@ export async function runLogsClean(
   const log = new EvidenceLog({
     env,
     cwd: targetDir,
-    collabDir: root,
-    collabDirs: roots.map((r) => r.root),
+    guildDir: root,
+    guildDirs: roots.map((r) => r.root),
   });
 
   // Resolve the window BEFORE touching the filesystem, so a refusal costs nothing.

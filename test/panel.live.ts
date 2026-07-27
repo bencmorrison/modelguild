@@ -32,7 +32,7 @@ async function main(): Promise<number> {
   const c = new Checker();
   console.log("== panel.live (M6) ==");
 
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m6-live-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m6-live-"));
   const logDir = path.join(scratch, "logs");
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
   const env: NodeJS.ProcessEnv = {

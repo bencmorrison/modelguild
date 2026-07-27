@@ -6,7 +6,7 @@
  * (test/fake-opencode-server.ts) behind a `ServeProvider`. The evidence layer writes to
  * a temp GUILD_LOG_DIR, and the flagship case verifies a TOOL-PRODUCED CONCURRENT run
  * (3 members, 9 lifecycle entries) with the TS `verify()` (the reference verifier; the
- * bash `collab/log.sh verify` it was cross-checked against retired at M12).
+ * bash `log.sh verify` it was cross-checked against retired at M12).
  */
 
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
@@ -32,9 +32,9 @@ function tmp(prefix = "m6-"): string {
   return d;
 }
 
-/** A collab root with the given policy body; returns its path. */
+/** A guild root with the given policy body; returns its path. */
 function rootWithPolicy(policy: string): string {
-  const root = tmp("m6-collab-");
+  const root = tmp("m6-guild-");
   writeFileSync(path.join(root, "models.policy.local"), policy);
   return root;
 }

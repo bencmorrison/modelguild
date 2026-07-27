@@ -58,7 +58,7 @@ import { snapshotWorktree, captureDelegateDiff, scaffoldDigest } from "./snapsho
 
 /** The write-capable, hardened agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const DELEGATE_AGENT = "guild-build";
-/** The command label recorded in the evidence log (drives `/guild:witness`). */
+/** The command label recorded in the evidence log. */
 export const DELEGATE_COMMAND = "/guild:delegate";
 
 // --- Params + deps ---------------------------------------------------------
@@ -80,7 +80,7 @@ export interface DelegateDeps {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
-  /** Injected in tests so root/policy/log all share one collab dir; else resolved. */
+  /** Injected in tests so root/policy/log all share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
   /**
@@ -183,10 +183,10 @@ export async function delegate(
 
   // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19).
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDirs = rootRes.layers.map((l) => l.root);
-  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
+  const guildDirs = rootRes.layers.map((l) => l.root);
+  const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readLayeredConfContents(collabDirs, env);
+  const confContents = readLayeredConfContents(guildDirs, env);
 
   // 2. NO-FALLBACK def gate (deviation from bash C16). A missing guild-build def REFUSES
   //    loudly — never silently degrades to the UNRESTRICTED `build`. Refused before any log
@@ -215,7 +215,7 @@ export async function delegate(
   const requestedModel = resolveModel({ flag: params.model, env, confContents });
 
   // 4. Gate: leading-dash refusal (C12) THEN policy tier (C1–C7), all BEFORE any log write.
-  const gate = gateModel(requestedModel, params.confirmed === true, { collabDirs, env });
+  const gate = gateModel(requestedModel, params.confirmed === true, { guildDirs, env });
   if (!gate.ok) {
     return {
       ok: false,
@@ -231,7 +231,7 @@ export async function delegate(
   }
 
   // --- Past the gate: from here every path writes exactly one started + completed. ---
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(DELEGATE_COMMAND);
   const repoDir = resolveRepoDir(deps, env, cwd);

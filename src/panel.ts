@@ -30,8 +30,8 @@
  * call approves EVERY ask-tier member of THIS call — the human is asked once about "this
  * panel", not once per model. That is a deliberately wider scope than guild_consult's
  * single-model confirm; it is recorded per-member in the evidence entries (tier/confirmed)
- * so /guild:witness can still audit, after the fact, that an ask-tier member ran under a
- * claimed approval. Same non-witness-grade bound as consult: a driver that sets confirmed
+ * so a reader of the log can still audit, after the fact, that an ask-tier member ran under
+ * a claimed approval. Same non-witness-grade bound as consult: a driver that sets confirmed
  * without asking is caught by audit, not prevented.
  *
  * ONE RUN FOR THE WHOLE PANEL (C23/C43): a single runId groups the workflow. It is minted
@@ -61,7 +61,7 @@ import { type PolicyTier } from "./policy.js";
 
 /** The read-only agent every panel member uses, unmodified (C15/C47/C48). */
 export const PANEL_AGENT = "guild-read";
-/** The command label recorded in the evidence log (drives `/guild:witness`). */
+/** The command label recorded in the evidence log. */
 export const PANEL_COMMAND = "/guild:panel";
 
 // --- Params + deps ---------------------------------------------------------
@@ -98,7 +98,7 @@ export interface PanelDeps {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
-  /** Injected in tests so root/policy/log share one collab dir; else resolved. */
+  /** Injected in tests so root/policy/log share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
 }
@@ -175,10 +175,10 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
 
   // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19).
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDirs = rootRes.layers.map((l) => l.root);
-  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
+  const guildDirs = rootRes.layers.map((l) => l.root);
+  const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readLayeredConfContents(collabDirs, env);
+  const confContents = readLayeredConfContents(guildDirs, env);
 
   // 2. NO-FALLBACK def gate for the WHOLE panel (deviation from bash C16, mirroring
   //    guild_research/guild_delegate). Every member runs through the SAME hardened guild-read
@@ -225,7 +225,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
 
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
   const runId = params.runId && params.runId.length > 0 ? params.runId : log.newRun(PANEL_COMMAND);
   const confirmed = params.confirmed === true;
   const keepSessions = params.keepSessions === true;
@@ -238,7 +238,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //    refusal or failure never touches another's result (order preserved by Promise.all).
   const results = await Promise.all(
     panelRes.models.map(async (model): Promise<PanelMemberResult> => {
-      const gate = gateModel(model, confirmed, { collabDirs, env });
+      const gate = gateModel(model, confirmed, { guildDirs, env });
       if (!gate.ok) {
         // A pre-log refusal: no call_id, nothing written for this member (gap parity).
         return {

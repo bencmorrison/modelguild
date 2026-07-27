@@ -20,7 +20,7 @@
  *   - the delegate-diff entry passes verify; a corrupted patch fails it (C39 neg)
  *   - NO-FALLBACK def gate, gate deny/ask, agent-mismatch, partially-failed-call capture
  *
- * The TS verifier is the reference (the bash `collab/log.sh verify` + `ask.sh --edit`
+ * The TS verifier is the reference (the bash `log.sh verify` + `ask.sh --edit`
  * parity fixture these were cross-checked against retired at M12).
  */
 
@@ -129,7 +129,7 @@ export async function run(): Promise<number> {
   {
     const repo = initRepo({ "a.txt": "A\n" });
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "created new.txt" });
     try {
       const r = await delegate(
@@ -158,7 +158,7 @@ export async function run(): Promise<number> {
   {
     const repo = initRepo({ "a.txt": "A0\n", "b.txt": "B0\n" });
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "mixed edits" });
     try {
       const r = await delegate(
@@ -195,7 +195,7 @@ export async function run(): Promise<number> {
     // The caller's own uncommitted edit BEFORE delegating (live work in progress).
     writeFileSync(path.join(repo, "x.txt"), "XDIRTY\n");
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "edited y" });
     try {
       const r = await delegate(
@@ -223,7 +223,7 @@ export async function run(): Promise<number> {
     // A pre-existing ignored file, present BEFORE the turn and left unchanged by the model.
     writeFileSync(path.join(repo, "ig.log"), "IG0\n");
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "edited a" });
     try {
       const r = await delegate(
@@ -248,7 +248,7 @@ export async function run(): Promise<number> {
     const repo = initRepo({ "r.txt": "R0\n" });
     writeFileSync(path.join(repo, "r.txt"), "R_DIRTY\n"); // caller's uncommitted state
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "clobbered r" });
     try {
       const r = await delegate(
@@ -276,7 +276,7 @@ export async function run(): Promise<number> {
     const repo = initRepo({ ".gitignore": "*.log\n", "a.txt": "A0\n" });
     writeFileSync(path.join(repo, "ig.log"), "IG0\n"); // present before
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "touched ignored" });
     try {
       const r = await delegate(
@@ -310,7 +310,7 @@ export async function run(): Promise<number> {
   {
     const repo = initRepo({ "a.txt": "A0\n" });
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "edit" });
     try {
       const r = await delegate(
@@ -345,7 +345,7 @@ export async function run(): Promise<number> {
     // empty temp dir: non-empty, so it wins over the ~/.config fallback, making the global dir
     // resolve to an empty location. Now BOTH dirs are genuinely def-free (issue #24).
     const emptyXdg = tmp("m8-emptyxdg-"); // <emptyXdg>/opencode/agent does not exist
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: emptyDefDir, XDG_CONFIG_HOME: emptyXdg });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: emptyDefDir, XDG_CONFIG_HOME: emptyXdg });
     const fake = await startFakeOpencode({ historyText: "unreached" });
     try {
       let mutated = false;
@@ -373,7 +373,7 @@ export async function run(): Promise<number> {
   // 10. gate parity — DENY (exit-3) and ASK (exit-4 → confirmed proceeds).
   // -------------------------------------------------------------------------
   {
-    const root = tmp("m8-collab-");
+    const root = tmp("m8-guild-");
     writeFileSync(path.join(root, "models.policy.local"), "deny openai/denied\nask openai/ask-me\n");
     const repo = initRepo({ "a.txt": "A\n" });
     const logDir = tmp("m8-logs-");
@@ -414,7 +414,7 @@ export async function run(): Promise<number> {
     //     but the mutation already happened → capture is surfaced.
     const repoA = initRepo({ "a.txt": "A0\n" });
     const logA = tmp("m8-logs-");
-    const envA = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logA, GUILD_AGENT_DIR: defDirWithBuild() });
+    const envA = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logA, GUILD_AGENT_DIR: defDirWithBuild() });
     const fakeA = await startFakeOpencode({ historyText: "x", servedAgent: "build" });
     try {
       const r = await delegate(
@@ -433,7 +433,7 @@ export async function run(): Promise<number> {
     // (b) call-failed (fake 500) after the mutation → capture surfaced, delegate-diff logged.
     const repoB = initRepo({ "a.txt": "A0\n" });
     const logB = tmp("m8-logs-");
-    const envB = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logB, GUILD_AGENT_DIR: defDirWithBuild() });
+    const envB = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logB, GUILD_AGENT_DIR: defDirWithBuild() });
     const fakeB = await startFakeOpencode({ historyText: "x", failMessage: true });
     try {
       const r = await delegate(
@@ -467,7 +467,7 @@ export async function run(): Promise<number> {
   {
     const repo = initRepo({ "a.txt": "A\n" });
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "nothing to change" });
     try {
       const r = await delegate(
@@ -502,7 +502,7 @@ export async function run(): Promise<number> {
       ".opencode/node_modules/dep.js": "old\n", // ignored serve scaffolding (present before)
     });
     const logDir = tmp("m8-logs-");
-    const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
     const fake = await startFakeOpencode({ historyText: "tampered a def + touched scaffolding" });
     try {
       const r = await delegate(
@@ -554,7 +554,7 @@ export async function run(): Promise<number> {
     {
       const repo = seed();
       const logDir = tmp("m8-logs-");
-      const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
       const fake = await startFakeOpencode({ historyText: "touched a plugin" });
       try {
         const r = await delegate(
@@ -593,7 +593,7 @@ export async function run(): Promise<number> {
     {
       const repo = seed();
       const logDir = tmp("m8-logs-");
-      const env = envWith({ GUILD_ROOT: tmp("m8-collab-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
       const fake = await startFakeOpencode({ historyText: "left plugins alone" });
       try {
         const r = await delegate(

@@ -18,7 +18,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { OpencodeLifecycle, type ServeHandle } from "./lifecycle.js";
-import { consult, consultToToolResult, collabDoctorSeed, type CollabDoctorSeed } from "./consult.js";
+import { consult, consultToToolResult, guildDoctorSeed, type GuildDoctorSeed } from "./consult.js";
 import { panel, panelToToolResult } from "./panel.js";
 import { research, researchToToolResult } from "./research.js";
 import { delegate, delegateToToolResult } from "./delegate.js";
@@ -66,15 +66,15 @@ const lifecycle = new OpencodeLifecycle();
 // ---------------------------------------------------------------------------
 // guild_status — diagnostics + the M4 doctor-seed checks.
 // ---------------------------------------------------------------------------
-interface CollabStatus extends CollabDoctorSeed {
+interface GuildStatus extends GuildDoctorSeed {
   opencodeVersion: string | null;
   port: number;
   pid: number;
   agentCount: number;
 }
 
-async function collabStatus(): Promise<CollabStatus> {
-  const seed = collabDoctorSeed();
+async function guildStatus(): Promise<GuildStatus> {
+  const seed = guildDoctorSeed();
   const serveInfo = await lifecycle.withServe(async (h: ServeHandle) => {
     // Version + liveness from the health endpoint (GET /doc is used for readiness;
     // /global/health additionally carries the opencode binary version).
@@ -115,7 +115,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: STATUS_TOOL,
       description:
         "Diagnostic: ensure the opencode serve child is running and report its version, " +
-        "port, pid, and agent count, PLUS the doctor-seed checks (the primary collab root " +
+        "port, pid, and agent count, PLUS the doctor-seed checks (the primary guild root " +
         "and the ordered config/policy LAYERS in effect — project over global baseline — " +
         "the model-policy layer chain with each file's presence, whether an explicit " +
         "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir). " +
@@ -351,7 +351,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (name === STATUS_TOOL) {
-    const status = await collabStatus();
+    const status = await guildStatus();
     return { content: [{ type: "text", text: JSON.stringify(status) }] };
   }
 
@@ -497,11 +497,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // `GUILD_LOG=off` skips it entirely (see `enforceRetentionOnStart`).
 //
 // LAYERED (issue #19), split the same way every tool splits it: the window is READ across
-// all root layers (`collabDirs`), so a global `GUILD_LOG_RETENTION_DAYS` binds in a project
-// that never restates it — but only the PRIMARY root's `logs/` is pruned (`collabDir` =
+// all root layers (`guildDirs`), so a global `GUILD_LOG_RETENTION_DAYS` binds in a project
+// that never restates it — but only the PRIMARY root's `logs/` is pruned (`guildDir` =
 // layers[0]). That is deliberate, not an oversight: logs are only ever WRITTEN to the
 // primary root, so the other layers hold no runs of ours, and a project's server start has
-// no business deleting a directory it does not write to. `resolveCollabRoot()` would give
+// no business deleting a directory it does not write to. `resolveGuildRoot()` would give
 // the same primary root — `layeredRoots()` is used so both halves come from one call.
 //
 // NON-FATAL: it returns a result rather than throwing, and reports on stderr ONLY —
@@ -509,8 +509,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 {
   const roots = layeredRoots();
   const pruned = enforceRetentionOnStart({
-    collabDir: roots[0].root,
-    collabDirs: roots.map((r) => r.root),
+    guildDir: roots[0].root,
+    guildDirs: roots.map((r) => r.root),
   });
   if (pruned && pruned.removed.length > 0) {
     process.stderr.write(
