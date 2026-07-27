@@ -193,17 +193,27 @@ jobs:
   node:
     name: node (TS/MCP — typecheck + offline suites)
     runs-on: ubuntu-latest
-    # `npm test` (test/run.ts) runs all 13 test/*.test.ts suites, and three of
+    # `npm test` (test/run.ts) runs every test/*.test.ts suite, and three of
     # them — lifecycle, orphan, mcp-client — spawn the REAL `opencode serve`
     # binary to prove process lifecycle (M1: shutdown-on-stdin-close,
     # the orphan flagship, no-process-leak). This CI is credential-free and
     # opencode-free by decision (see header) and never installs or authenticates
     # opencode, so those three cannot run honestly here — and they have NO graceful
     # skip when the binary is absent (verified: `spawn opencode ENOENT` crashes the
-    # process rather than reporting skipped). So this job runs the ten OFFLINE
-    # suites individually (each supports standalone `tsx test/<name>.test.ts`) and
+    # process rather than reporting skipped). So this job runs the OFFLINE suites
+    # individually BY NAME (each supports standalone `tsx test/<name>.test.ts`) and
     # states which three are excluded and why, so a green run here always means
-    # those ten suites actually executed — never a skipped-everything pass.
+    # those suites actually executed — never a skipped-everything pass. The loop's
+    # name list below is the source of truth; deliberately no count is stated
+    # anywhere in prose, because a count drifts the moment a suite is added.
+    #
+    # `doctor` was MISSING from this list (it ran only under a local `npm test`, so its
+    # coverage — including the issue-#22 upgrade-drift checks — was never enforced here).
+    # It is offline and belongs. NOTE its one environment dependency: doctor hard-fails the
+    # MCP-registration check when the `claude` CLI IS on PATH and answers "not registered"
+    # (real product behaviour). This runner has no `claude`, so that check degrades to the
+    # documented warning and the suite is green; on a dev box that HAS `claude`, expect the
+    # registration-dependent checks to fail locally.
     steps:
       - uses: actions/checkout@v4
 
@@ -219,14 +229,14 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      - name: Offline test suites (10 of 13)
+      - name: Offline test suites
         run: |
-          echo "Running 10/13 test/*.test.ts suites offline."
+          echo "Running the offline test/*.test.ts suites individually."
           echo "SKIPPED (need the real opencode binary; this CI never installs it):"
           echo "  lifecycle, orphan, mcp-client — see job comment; run them locally."
           echo
           rc=0
-          for suite in client log policy config consult panel research delegate models init; do
+          for suite in client log policy config consult panel research delegate models init doctor; do
             echo "=== test/${suite}.test.ts ==="
             npx tsx "test/${suite}.test.ts" || rc=1
             echo

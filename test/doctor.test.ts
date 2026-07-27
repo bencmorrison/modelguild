@@ -1,5 +1,5 @@
 /**
- * `modelguild doctor` test (fix/doctor-detects-global).
+ * `modelguild doctor` test (fix/doctor-detects-global; upgrade drift, issue #22).
  *
  * Regression guard for the bug where DEFAULT (non-`--global`) doctor only checked the PROJECT
  * payload locations, so a working GLOBAL install (`init --global`) falsely reported 0/8 docs,
@@ -9,9 +9,17 @@
  * with injected temp dirs and NEVER touch the real `~/.claude` / `~/.config`. Offline: the
  * MCP-registration and opencode-binary checks are warnings (not failures) when the tools are
  * absent, so the pass/fail is driven only by the docs/agents/policy payload checks under test.
+ *
+ * ENVIRONMENT DEPENDENCY, stated because it bites locally: that "warning, not failure" holds
+ * only while the `claude` CLI is ABSENT. When `claude` IS on PATH and answers "modelguild is not
+ * registered", doctor hard-fails that check (correctly) and every absolute `code === 0`
+ * assertion here fails — a dev-container fact, not a regression. CI has no `claude`, so the
+ * suite is green there. The issue-#22 drift checks below deliberately assert against a BASELINE
+ * doctor run in the same environment rather than a literal 0, so they hold either way.
  */
 
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Checker, repoRoot } from "./harness.js";
@@ -131,6 +139,87 @@ export async function run(): Promise<number> {
       "(g) both roots' policy files are listed as layers",
     );
   }
+
+  // ---- issue #22: UPGRADE DRIFT — cases (k)-(n) ---------------------------------
+  // Lettered from (k): (g) is #19's layered-chain case above, which landed on main first.
+  // BASELINE first: a pristine install in THIS environment. The drift assertions below compare
+  // against it rather than against a literal 0, because doctor's MCP-registration check depends
+  // on whether the `claude` CLI is on PATH and what it answers — an environment fact this suite
+  // does not control. What must hold is that drift does not CHANGE the verdict.
+  const projClean = tempDir();
+  init({ targetDir: projClean, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const base = await captureDoctor(["--dir", projClean], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+  c.check(base.out.includes("no upgrade drift"), "(k) a pristine install reports no upgrade drift");
+  c.check(!base.out.includes("STALE"), "(k) a pristine install reports nothing stale");
+
+  /** The lines that mention drift, so we can assert they are `!` warnings and never `✗`. */
+  const driftLines = (out: string): string[] =>
+    out.split("\n").filter((l) => /STALE|upgrade drift|CANNOT tell/.test(l));
+
+  // ---- (l) UPGRADE DRIFT is reported, and is a WARNING not a failure ----
+  // A user who edited a command doc keeps it forever (init never clobbers) — so after a release
+  // moves that file on, they are silently on a stale copy. Doctor must say so. Simulate the
+  // three-hash state: on-disk = the user's edit, record = a release neither side ships now.
+  const projDrift = tempDir();
+  init({ targetDir: projDrift, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const DEST = ".claude/commands/guild/consult.md";
+  writeFileSync(path.join(projDrift, DEST), "MY EDIT OF AN OLD RELEASE\n");
+  const dRecPath = path.join(projDrift, "modelguild/.modelguild-install.json");
+  const dRec = JSON.parse(readFileSync(dRecPath, "utf8"));
+  dRec.files[DEST] = createHash("sha256").update("AN OLDER RELEASE\n").digest("hex");
+  writeFileSync(dRecPath, JSON.stringify(dRec, null, 2) + "\n");
+  const lDrift = await captureDoctor(["--dir", projDrift], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+  c.check(lDrift.out.includes("STALE"), "(l) doctor reports the drifted file as STALE");
+  c.check(lDrift.out.includes(DEST), "(l) doctor names the drifted file");
+  c.check(lDrift.out.includes("diff "), "(l) doctor prints a diff hint for the drifted file");
+  c.check(
+    lDrift.out.includes(path.join(repoRoot, DEST)) && lDrift.out.includes(path.join(projDrift, DEST)),
+    "(l) the diff hint names BOTH the shipped bytes and the user's copy, absolute",
+  );
+  c.check(
+    lDrift.code === base.code,
+    `(l) drift does not change doctor's verdict — a warning, not a failure (${lDrift.code} vs baseline ${base.code})`,
+  );
+  c.check(
+    driftLines(lDrift.out).every((l) => !l.includes("✗")),
+    "(l) the drift report is a ! warning line, never a ✗ (a customized install is not broken)",
+  );
+
+  // ---- (m) no install record: doctor says it CANNOT judge, rather than guessing ----
+  const projNoRec = tempDir();
+  init({ targetDir: projNoRec, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  writeFileSync(path.join(projNoRec, DEST), "SOMETHING ELSE ENTIRELY\n");
+  const lostRecord = path.join(projNoRec, "modelguild/.modelguild-install.json");
+  rmSync(lostRecord);
+  const mNoRec = await captureDoctor(["--dir", projNoRec], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+  c.check(mNoRec.out.includes("CANNOT"), "(m) doctor states it cannot judge drift without an ownership record");
+  c.check(mNoRec.out.includes(lostRecord), "(m) doctor names the missing install record by path");
+  c.check(!mNoRec.out.includes("STALE"), "(m) doctor does NOT call an unrecorded difference stale (no guessing)");
+  c.check(
+    mNoRec.code === base.code,
+    `(m) an unjudgeable file does not change the verdict either (${mNoRec.code} vs baseline ${base.code})`,
+  );
+  c.check(
+    driftLines(mNoRec.out).every((l) => !l.includes("✗")),
+    "(m) the cannot-judge report is a ! warning line, never a ✗",
+  );
+
+  // ---- (n) plain doctor over a GLOBAL install judges drift by the GLOBAL record ----
+  // The project has no record at all; if doctor read the wrong one this would report nothing
+  // (or claim it cannot judge).
+  const gDest = path.join(gHome, ".claude/commands/guild/consult.md");
+  writeFileSync(gDest, "MY GLOBAL EDIT OF AN OLD RELEASE\n");
+  const gRecPath = path.join(gHome, ".claude/modelguild/.modelguild-install.json");
+  const gRec = JSON.parse(readFileSync(gRecPath, "utf8"));
+  gRec.files[DEST] = createHash("sha256").update("AN OLDER RELEASE\n").digest("hex");
+  writeFileSync(gRecPath, JSON.stringify(gRec, null, 2) + "\n");
+  const nGlobal = await captureDoctor(["--dir", emptyProject], inject);
+  c.check(nGlobal.out.includes("STALE"), "(n) plain doctor detects drift in a global-only install");
+  c.check(nGlobal.out.includes(gDest), "(n) drift names the file in the global commands dir");
+  c.check(
+    driftLines(nGlobal.out).every((l) => !l.includes("✗")),
+    "(n) global drift is a ! warning line too, never a ✗",
+  );
 
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

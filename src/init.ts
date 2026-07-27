@@ -25,6 +25,14 @@
  * hash-verified files. The record file is deliberately named distinctly from bash's
  * `.install-manifest`/`.install-hashes`, so the two installers never read each other's
  * records. Idempotent.
+ *
+ * UPGRADE DRIFT (issue #22) is the cost of that never-clobber guarantee: the skip is silent
+ * about *why* it matters, so a user who edited a command doc keeps running a copy of a
+ * release that has since moved on — with no signal. `isDrifted` names that state exactly
+ * (three distinct hashes: recorded ≠ current ≠ shipped, and shipped ≠ recorded) and both
+ * `init` and `doctor` REPORT it. Reporting only: the file is still never touched, and drift
+ * is a warning, not a failure — an edit is a supported, deliberate act, so a customized
+ * install must not turn `doctor` red.
  */
 
 import { createHash } from "node:crypto";
@@ -171,6 +179,21 @@ interface InstallPlan {
   gitignoreDir?: string; // project mode only
 }
 
+/**
+ * Absolute path of the ownership record for a mode. It goes through `payloadDest` with the
+ * record's own project-relative path, so the project/global mapping can never drift from the
+ * payload's (`modelguild/…` → project `modelguild/` or global `<home>/.claude/modelguild/`).
+ * Exported for `doctor`, which must read the record of the mode a file was found in.
+ */
+export function recordPathFor(opts: {
+  global?: boolean;
+  targetDir: string;
+  global_dirs?: GlobalDirs;
+}): string {
+  const { base, rel } = payloadDest(RECORD_REL, opts);
+  return path.join(base, rel);
+}
+
 function planFor(opts: InitOptions): InstallPlan {
   if (opts.global) {
     const g = resolveGlobalDirs(opts);
@@ -180,7 +203,10 @@ function planFor(opts: InitOptions): InstallPlan {
         const { base, rel: r } = payloadDest(rel, destOpts);
         return safeJoin(base, r);
       },
-      recordPath: safeJoin(g.homeDir, path.join(".claude", "modelguild", ".modelguild-install.json")),
+      recordPath: (() => {
+        const { base, rel } = payloadDest(RECORD_REL, destOpts);
+        return safeJoin(base, rel);
+      })(),
       pruneDirs: [
         path.join(g.homeDir, ".claude", "commands", "guild"),
         path.join(g.homeDir, ".claude", "commands"),
@@ -261,6 +287,10 @@ export interface InitResult {
   removed: string[];
   /** Command docs a user already had at our path that are NOT ours (shadowing). */
   shadowed: string[];
+  /** UPGRADE DRIFT (issue #22): files init wrote, the user then edited, whose shipped bytes have
+   * CHANGED since the version that edit was based on — so this upgrade skipped them and the
+   * user's copy is now behind the release. Reported, never touched. */
+  drifted: DriftEntry[];
   warnings: string[];
   /** `.mcp.json` outcome. `kept` (uninstall only): a `modelguild` key was present but left in
    * place because the ownership record does not prove init wrote it, or the current entry no
@@ -366,6 +396,102 @@ function mcpEntryHash(entry: unknown): string {
 
 function ensureDir(p: string): void {
   mkdirSync(p, { recursive: true });
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade drift (issue #22)
+//
+// The never-clobber rule means an upgrade SKIPS a file the user edited. That is correct and
+// stays — but silently leaves the user on a stale copy when the release has moved on. Drift is
+// the state where THREE hashes are all distinct:
+//   recorded — what init last wrote (proof the file is ours, and which version the edit was
+//              based on);
+//   current  — what is on disk now (≠ recorded ⇒ the user edited it);
+//   shipped  — what this package ships now (≠ recorded ⇒ the release moved on since that edit).
+// Only then is the user's copy BEHIND the release. Two adjacent states are deliberately NOT
+// drift: an edit against the still-current release (recorded === shipped — nothing to catch up
+// to), and a file with no record at all (never ours — a user's own file at our path, the
+// `shadowed` case; calling that "stale" would be a guess).
+// ---------------------------------------------------------------------------
+
+/** One file whose installed copy is behind (or unjudgeable against) the shipped payload. */
+export interface DriftEntry {
+  /** Project-relative payload dest — the stable record key in BOTH modes. */
+  dest: string;
+  /** Absolute path of the user's copy on disk. */
+  installedPath: string;
+  /** Absolute path of the bytes this package ships (for the `diff` hint). */
+  shippedPath: string;
+}
+
+/** True when the installed copy is ours, edited, AND behind the shipped payload. See the
+ * section comment for why each of the three exclusions is deliberate. */
+export function isDrifted(
+  recorded: string | undefined,
+  current: string,
+  shipped: string,
+): boolean {
+  if (!recorded) return false; // never ours ⇒ not stale, just someone else's file
+  if (current === recorded) return false; // unedited ⇒ the upgrade path handles it
+  if (current === shipped) return false; // already equals the release ⇒ nothing behind
+  return shipped !== recorded; // the release moved on since the edit was based on it
+}
+
+/** One file to test, as resolved by the caller: `doctor` picks the location the file was
+ * actually found in (project or global) and the record for THAT mode. */
+export interface DriftScanEntry {
+  dest: string;
+  installedPath: string;
+  recordPath: string;
+}
+
+export interface DriftScanResult {
+  /** Ours-but-stale (see `isDrifted`). */
+  drifted: DriftEntry[];
+  /** Differs from the shipped bytes but NO ownership record covers it — an intentional edit
+   * and a stale leftover are indistinguishable here. Reported as unjudgeable, never guessed. */
+  unknown: DriftEntry[];
+  /** Record files that were consulted and do not exist (absolute, de-duplicated) — the honest
+   * reason `unknown` entries could not be judged. */
+  missingRecords: string[];
+}
+
+/**
+ * Standalone drift scan for `doctor` (which has no install run in hand). Files identical to the
+ * shipped bytes are skipped before any record is read, so a pristine install consults nothing.
+ */
+export function scanDrift(packageRoot: string, entries: DriftScanEntry[]): DriftScanResult {
+  const srcFor = new Map(payloadFiles().map((p) => [p.dest, p.src]));
+  const recordCache = new Map<string, Records>();
+  const missingRecords = new Set<string>();
+  const drifted: DriftEntry[] = [];
+  const unknown: DriftEntry[] = [];
+  for (const e of entries) {
+    const src = srcFor.get(e.dest);
+    if (!src) continue; // not a payload file — nothing shipped to compare against
+    const shippedPath = path.join(packageRoot, src);
+    let current: string;
+    let shipped: string;
+    try {
+      if (!existsSync(shippedPath) || !existsSync(e.installedPath)) continue;
+      if (!lstatSync(e.installedPath).isFile()) continue;
+      current = sha256(readFileSync(e.installedPath));
+      shipped = sha256(readFileSync(shippedPath));
+    } catch {
+      continue; // unreadable → say nothing rather than guess
+    }
+    if (current === shipped) continue; // up to date
+    if (!recordCache.has(e.recordPath)) {
+      if (!existsSync(e.recordPath)) missingRecords.add(e.recordPath);
+      recordCache.set(e.recordPath, readRecords(e.recordPath));
+    }
+    const recorded = recordCache.get(e.recordPath)?.[e.dest];
+    const entry: DriftEntry = { dest: e.dest, installedPath: e.installedPath, shippedPath };
+    if (!recorded) unknown.push(entry);
+    else if (isDrifted(recorded, current, shipped)) drifted.push(entry);
+    // recorded && !drifted ⇒ ours, edited, but the release has not moved: a plain local edit.
+  }
+  return { drifted, unknown, missingRecords: [...missingRecords] };
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +647,7 @@ export function init(opts: InitOptions): InitResult {
     skipped: [],
     removed: [],
     shadowed: [],
+    drifted: [],
     warnings: [],
     mcpAction: "unchanged",
   };
@@ -582,11 +709,24 @@ export function init(opts: InitOptions): InitResult {
       const current = sha256(readFileSync(destAbs));
       const owned = records[dest] === current || current === payloadHash;
       if (!owned) {
-        // A file the user already had (or edited). Never clobber it.
+        // A file the user already had (or edited). Never clobber it — but SAY when the skip
+        // leaves them behind the release (issue #22), which the old bare warning did not.
         result.skipped.push(dest);
-        result.warnings.push(
-          `skipping ${dest} — a file you already have is there; left untouched.`,
-        );
+        const recorded = records[dest];
+        if (isDrifted(recorded, current, payloadHash)) {
+          result.drifted.push({ dest, installedPath: destAbs, shippedPath: srcAbs });
+          result.warnings.push(
+            `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +
+              `NEWER version: your copy is stale (see the drift note).`,
+          );
+        } else {
+          result.warnings.push(
+            recorded
+              ? `skipping ${dest} — you edited it since init wrote it; left untouched ` +
+                `(your edit is against the version this release still ships — not stale).`
+              : `skipping ${dest} — a file you already have is there; left untouched.`,
+          );
+        }
         if (COMMAND_DEST_RELS.has(dest)) result.shadowed.push(dest);
         if (records[dest]) newRecords[dest] = records[dest];
         continue;
