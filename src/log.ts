@@ -113,6 +113,63 @@ export interface VerifyResult {
   message: string;
 }
 
+/** The resolved `GUILD_LOG_RETENTION_DAYS` setting (C35 order: env > conf > default).
+ *
+ * `days` is the EFFECTIVE window: `0` means "pruning disabled" and is what an explicit
+ * `0`, a negative number, AND an unparseable value all resolve to. The last case is a
+ * DELIBERATE tightening over the pre-#23 code, which ran `parseInt` and so read
+ * `GUILD_LOG_RETENTION_DAYS=fourteen` as NaN (prune: no-op) but `new-run` re-defaulted
+ * it to 14 and deleted — two different answers to one typo, the deleting one silent.
+ * Fail-safe wins: a value we cannot read is never a licence to delete. `valid:false`
+ * carries the reason so `logs clean` can say so instead of guessing. */
+export interface RetentionSetting {
+  /** Effective retention window in days; 0 ⇒ disabled (nothing is pruned). */
+  days: number;
+  /** The configured string exactly as read (or the default when nothing was set). */
+  raw: string;
+  source: "env" | "conf" | "default";
+  /** False when `raw` is not a whole number of days (a typo, not a policy). */
+  valid: boolean;
+}
+
+/** One run directory removed (or, under `dryRun`, that WOULD be removed). */
+export interface PrunedRun {
+  runId: string;
+  /** Age in whole days of the run's NEWEST content (see `prune`'s age rule). */
+  ageDays: number;
+  /** Total bytes of the run dir's contents (regular files only). */
+  bytes: number;
+}
+
+/** Result of `prune` — data, never an exception (the C31 posture, extended to the
+ * maintenance path exactly as `verify` extends it to the audit path). */
+export interface PruneResult {
+  /** The resolved logs root that was scanned — GUILD_LOG_DIR + partitioning applied.
+   * Pruning NEVER looks outside this one directory, and never below its children. */
+  dir: string;
+  /** The window actually applied, in days. 0 ⇒ nothing was scanned. */
+  days: number;
+  /** Run-id-shaped directories examined. */
+  scanned: number;
+  /** Runs removed (or, under `dryRun`, that would be). */
+  removed: PrunedRun[];
+  /** Runs left alone because their newest content is inside the window. */
+  kept: number;
+  /** Runs skipped because they could not be read (unreadable/raced away). */
+  skipped: number;
+  /** Total bytes reclaimed (or that would be). */
+  freedBytes: number;
+  dryRun: boolean;
+  /** Set when nothing was scanned or the scan aborted:
+   *  `disabled` (retention 0/negative/unparseable), `no-log-dir` (nothing to clean),
+   *  `error` (an IO failure — reported, never thrown). */
+  reason?: "disabled" | "no-log-dir" | "error";
+  /** Present with `reason:"error"`. */
+  error?: string;
+  /** Present when `retention()` reported `valid:false` and no explicit window was passed. */
+  invalidSetting?: RetentionSetting;
+}
+
 // ---------------------------------------------------------------------------
 // Environment / config resolution (env override > modelguild.conf.local > default),
 // mirroring log.sh's cfg()/conf_get() exactly (C35).
@@ -209,11 +266,25 @@ export class EvidenceLog {
 
   /** cfg(KEY, default) — env (non-empty) > conf file > default. */
   #cfg(key: string, def: string): string {
+    return this.#cfgWithSource(key, def).value;
+  }
+
+  /** cfg() plus WHICH TIER answered — same resolution, one extra fact. `logs clean`
+   * needs it to tell a user "14 days (default)" from "14 days (from your conf)"; the
+   * value itself is computed identically so the two can never disagree.
+   *
+   * TIER, NOT LAYER. Since #19 the conf tier is every root layer's `modelguild.conf.local`
+   * concatenated (project last, so it wins) and read as ONE document — so `"conf"` honestly
+   * means "some conf layer set this" and does not claim to say which. Naming the layer would
+   * mean re-scanning the files separately, i.e. a second resolver free to disagree with the
+   * first about what actually binds; `doctor` already prints the layer chain for the operator
+   * who needs to know where a value came from. */
+  #cfgWithSource(key: string, def: string): { value: string; source: "env" | "conf" | "default" } {
     const e = this.#env[key];
-    if (e !== undefined && e !== "") return e;
+    if (e !== undefined && e !== "") return { value: e, source: "env" };
     const c = confGet(this.#confRead(), key);
-    if (c !== "") return c;
-    return def;
+    if (c !== "") return { value: c, source: "conf" };
+    return { value: def, source: "default" };
   }
 
   #disabled(): boolean {
@@ -384,6 +455,21 @@ export class EvidenceLog {
     return this.#logDir();
   }
 
+  /** The resolved retention setting (C35 order), including its source and whether the
+   * configured value was readable at all. Read-only; no side effects. The single
+   * resolver for BOTH prune paths (`new-run`, `logs clean`, server start) so they can
+   * never disagree about the window — the pre-#23 code resolved it twice, differently. */
+  retention(): RetentionSetting {
+    const { value: raw, source } = this.#cfgWithSource(
+      "GUILD_LOG_RETENTION_DAYS",
+      String(DEFAULT_RETENTION_DAYS),
+    );
+    const trimmed = raw.trim();
+    const valid = /^[+-]?\d+$/.test(trimmed);
+    const n = valid ? parseInt(trimmed, 10) : NaN;
+    return { days: valid && n > 0 ? n : 0, raw, source, valid };
+  }
+
   /** The most recent run's id (via the `latest` symlink). Returns undefined if none. */
   latest(): string | undefined {
     const l = path.join(this.#logDir(), "latest");
@@ -418,8 +504,9 @@ export class EvidenceLog {
       } catch {
         /* meta is best-effort */
       }
-      const days = parseInt(this.#cfg("GUILD_LOG_RETENTION_DAYS", "14"), 10);
-      this.prune(Number.isFinite(days) ? days : 14);
+      // Retention (C32). No argument ⇒ prune() resolves the window itself via
+      // retention(), the SAME resolver `logs clean` and the server-start hook use.
+      this.prune();
       return rid;
     } catch (err) {
       warn("new-run", err);
@@ -908,37 +995,188 @@ export class EvidenceLog {
     };
   }
 
-  /** Delete run dirs older than `days` (default from config, 14). 0/invalid disables.
-   * Only touches directories whose name looks like a minted run id (C32). Never throws. */
-  prune(days?: number): void {
+  /**
+   * Delete run dirs older than `days` (default: the resolved `retention()` window).
+   * 0 / negative / unparseable disables. Returns a `PruneResult`; never throws (C31).
+   *
+   * SCOPE — three fences, all load-bearing, none of them decoration:
+   *   1. Only the ONE resolved logs root (`#logDir()`, i.e. `GUILD_LOG_DIR` +
+   *      partitioning) is read, and only its DIRECT children. Nothing above it, and no
+   *      recursive descent looking for runs.
+   *   2. A child must match the minted run-id shape (log.sh's `-name '[0-9]*Z-*'`), so a
+   *      user's own directory parked in the logs root survives (C32).
+   *   3. A child must be a real directory by `lstat` — a SYMLINK is never followed and
+   *      never removed. (`statSync` follows links: a run-id-shaped symlink into $HOME
+   *      would have passed `isDirectory()`. `rmSync` would only have unlinked the link,
+   *      not its target, so this was not a live bug — but the check costs nothing and
+   *      the shape of the mistake is the one that matters here.)
+   *
+   * AGE RULE — the NEWEST mtime anywhere inside the run dir (the dir itself included),
+   * not the dir's own mtime. Both were considered; newest-content wins because the run
+   * dir's own mtime tracks entry creation/removal in its top level, not writes THROUGH
+   * it: `calls.jsonl` is appended for the life of a run without ever restamping its
+   * parent. That a `.lock` dir is made and removed beside it on every append does
+   * currently bump the parent — but that is an incidental artifact of the lock protocol,
+   * not something the retention rule should quietly depend on. Reading the content
+   * directly is a couple of `lstat`s on a handful of small files, and it cannot be
+   * invalidated by a change to how the lock works.
+   */
+  prune(days?: number, opts: { dryRun?: boolean } = {}): PruneResult {
+    const dryRun = opts.dryRun === true;
+    const res: PruneResult = {
+      dir: "",
+      days: 0,
+      scanned: 0,
+      removed: [],
+      kept: 0,
+      skipped: 0,
+      freedBytes: 0,
+      dryRun,
+    };
     try {
-      const d =
-        days ?? parseInt(this.#cfg("GUILD_LOG_RETENTION_DAYS", "14"), 10);
-      if (!Number.isFinite(d) || d <= 0) return;
-      const dir = this.#logDir();
-      if (!existsSync(dir)) return;
-      const cutoff = Date.now() - d * 86_400_000;
-      for (const name of readdirSync(dir)) {
-        // Match log.sh's `-name '[0-9]*Z-*'`: starts with a digit, contains `Z-`.
-        if (!/^[0-9].*Z-/.test(name)) continue;
-        const full = path.join(dir, name);
+      let window: number;
+      if (days === undefined) {
+        const setting = this.retention();
+        window = setting.days;
+        if (!setting.valid) res.invalidSetting = setting;
+      } else {
+        window = Number.isFinite(days) && days > 0 ? days : 0;
+      }
+      res.days = window;
+      res.dir = this.#logDir();
+      if (window <= 0) {
+        res.reason = "disabled";
+        return res;
+      }
+      if (!existsSync(res.dir)) {
+        res.reason = "no-log-dir";
+        return res;
+      }
+      const now = Date.now();
+      const cutoff = now - window * 86_400_000;
+      for (const name of readdirSync(res.dir)) {
+        if (!RUN_DIR_RE.test(name)) continue; // fence 2
+        const full = path.join(res.dir, name);
         try {
-          const st = statSync(full);
+          const st = lstatSync(full); // fence 3: lstat, so a symlink is not a directory
           if (!st.isDirectory()) continue;
-          if (st.mtimeMs < cutoff) rmSync(full, { recursive: true, force: true });
+          res.scanned++;
+          const scan = scanRunDir(full, st.mtimeMs);
+          if (scan.newestMs >= cutoff) {
+            res.kept++;
+            continue;
+          }
+          if (!dryRun) rmSync(full, { recursive: true, force: true });
+          res.removed.push({
+            runId: name,
+            ageDays: Math.floor((now - scan.newestMs) / 86_400_000),
+            bytes: scan.bytes,
+          });
+          res.freedBytes += scan.bytes;
         } catch {
-          /* skip unreadable */
+          res.skipped++; // unreadable or raced away — never fatal
         }
       }
+      if (!dryRun && res.removed.length > 0) this.#dropDanglingLatest();
+      return res;
     } catch (err) {
       warn("prune", err);
+      res.reason = "error";
+      res.error = String(err);
+      return res;
     }
+  }
+
+  /** After a prune, drop a `latest` symlink whose target no longer exists — otherwise
+   * `latest()` keeps naming a run that `dir()`/`path()` then resolve to nothing. */
+  #dropDanglingLatest(): void {
+    try {
+      const l = path.join(this.#logDir(), "latest");
+      if (!isSymlink(l)) return;
+      if (!existsSync(l)) unlinkSync(l); // existsSync FOLLOWS the link ⇒ false when dangling
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * Enforce log retention once, at MCP-server start (issue #23).
+ *
+ * NON-FATAL BY CONSTRUCTION: `prune` already returns data instead of throwing, and this
+ * wrapper catches anything the construction itself could raise. A broken logs dir must
+ * never stop the server from serving.
+ *
+ * SKIPPED when `GUILD_LOG=off`. A user who turned logging off to FREEZE what is on disk
+ * should not have the server delete it on the next start; disk hygiene for a log nobody
+ * is writing is not urgent enough to override that. `logs clean` still cleans in that
+ * state, because there the user asked for it in so many words.
+ */
+export function enforceRetentionOnStart(opts: EvidenceLogOptions = {}): PruneResult | null {
+  try {
+    const log = new EvidenceLog(opts);
+    if (!log.enabled()) return null;
+    return log.prune();
+  } catch (err) {
+    warn("retention-on-start", err);
+    return null;
   }
 }
 
 // ---------------------------------------------------------------------------
 // module-level helpers
 // ---------------------------------------------------------------------------
+
+/** The shipped retention window, in days (C32). Documented in README.md, SECURITY.md,
+ * CONTRACT.md C32 and `modelguild.conf.example` — change all five together. */
+export const DEFAULT_RETENTION_DAYS = 14;
+
+/** A minted run-id directory: starts with a digit and contains `Z-` (log.sh's
+ * `-name '[0-9]*Z-*'`). The prune fence that spares a user's own dirs. */
+const RUN_DIR_RE = /^[0-9].*Z-/;
+
+/** Depth cap for the run-dir walk. A run dir is flat plus `reports/`; anything deeper is
+ * not ours, and an unbounded walk on a surprise tree (or a link loop) is not something a
+ * maintenance path should be able to hang on. */
+const SCAN_MAX_DEPTH = 8;
+
+/**
+ * The newest mtime (ms) and total regular-file bytes inside `dir`, `dir` itself included.
+ * `lstat` throughout, and directory symlinks are counted but NOT descended, so the walk
+ * cannot leave the run dir or loop.
+ *
+ * A read error on an entry is skipped rather than thrown: a run we can only partly read
+ * still yields a lower-bound-newest mtime, and erring toward "newer" means erring toward
+ * KEEPING the run — the safe direction for a function whose caller deletes things.
+ */
+function scanRunDir(dir: string, seedMs: number, depth = 0): { newestMs: number; bytes: number } {
+  let newestMs = seedMs;
+  let bytes = 0;
+  if (depth >= SCAN_MAX_DEPTH) return { newestMs, bytes };
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return { newestMs, bytes };
+  }
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name);
+    try {
+      const st = lstatSync(full);
+      if (st.mtimeMs > newestMs) newestMs = st.mtimeMs;
+      if (st.isDirectory()) {
+        const sub = scanRunDir(full, st.mtimeMs, depth + 1);
+        if (sub.newestMs > newestMs) newestMs = sub.newestMs;
+        bytes += sub.bytes;
+      } else if (st.isFile()) {
+        bytes += st.size;
+      }
+    } catch {
+      /* skip unreadable entry */
+    }
+  }
+  return { newestMs, bytes };
+}
 
 /** `date -u +%Y-%m-%dT%H:%M:%SZ` then `tr -d ':-'` ⇒ `YYYYMMDDTHHMMSSZ`. */
 function nowStamp(): string {

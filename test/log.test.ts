@@ -17,14 +17,17 @@ import {
   existsSync,
   rmSync,
   utimesSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   EvidenceLog,
   confGet,
+  enforceRetentionOnStart,
   type PromptMode,
 } from "../src/log.js";
+import { runLogsClean } from "../src/cli.js";
 import { canonicalStringify, buildEntryLine } from "../src/canonical.js";
 import { Checker, repoRoot, tsxBin, sleep } from "./harness.js";
 
@@ -479,9 +482,377 @@ export async function run(): Promise<number> {
     const old = new Date(Date.now() - 60 * 86_400_000);
     utimesSync(oldRun, old, old);
     utimesSync(notARun, old, old);
-    log.prune(14);
+    const r14 = log.prune(14);
     c.check(!existsSync(oldRun), "C32: prune removes a 60-day-old run dir");
     c.check(existsSync(notARun), "C32: prune leaves a non-run-shaped dir untouched");
+    c.check(
+      r14.days === 14 && r14.scanned === 1 && r14.removed.length === 1 &&
+        r14.removed[0].runId === "20200101T000000Z-deadbeef" && r14.removed[0].ageDays >= 59,
+      "C32: prune returns a structured result naming the run it removed and its age",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 14a. Issue #23 — the AGE RULE is newest content, not the run dir's own mtime.
+  //      The regression this exists for: a long-lived run still being appended to,
+  //      whose parent dir mtime does not move, silently deleted mid-run.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const log = new EvidenceLog({ env: envFor(dir) });
+    const old = new Date(Date.now() - 60 * 86_400_000);
+
+    // (i) dir mtime old, but a FRESH file inside ⇒ KEPT.
+    const liveRun = path.join(dir, "20200101T000000Z-11111111");
+    mkdirSync(path.join(liveRun, "reports"), { recursive: true });
+    writeFileSync(path.join(liveRun, "calls.jsonl"), "{}\n");
+    utimesSync(path.join(liveRun, "reports"), old, old);
+    utimesSync(liveRun, old, old); // the dir is backdated; the file inside is NOT
+    // (ii) everything old ⇒ REMOVED.
+    const deadRun = path.join(dir, "20200101T000000Z-22222222");
+    mkdirSync(path.join(deadRun, "reports"), { recursive: true });
+    writeFileSync(path.join(deadRun, "calls.jsonl"), "{}\n");
+    utimesSync(path.join(deadRun, "calls.jsonl"), old, old);
+    utimesSync(path.join(deadRun, "reports"), old, old);
+    utimesSync(deadRun, old, old);
+    // (iii) fresh content one level DOWN (reports/) also keeps the run.
+    const nestedRun = path.join(dir, "20200101T000000Z-33333333");
+    mkdirSync(path.join(nestedRun, "reports"), { recursive: true });
+    writeFileSync(path.join(nestedRun, "reports", "note.md"), "x");
+    utimesSync(nestedRun, old, old);
+
+    const rAge = log.prune(14);
+    c.check(existsSync(liveRun), "#23 age: a backdated dir with a FRESH file inside is KEPT");
+    c.check(!existsSync(deadRun), "#23 age: a run whose newest content is old is removed");
+    c.check(existsSync(nestedRun), "#23 age: fresh content inside reports/ keeps the run");
+    c.check(rAge.kept === 2 && rAge.removed.length === 1, "#23 age: the result counts kept vs removed");
+    c.check(rAge.freedBytes >= 3, "#23: freedBytes reports the reclaimed size of the removed run");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14b. Issue #23 — prune SCOPE fences: symlinks, non-dirs, nothing outside the root.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const outside = tmp(); // a sibling tree that must never be touched
+    const victim = path.join(outside, "precious");
+    mkdirSync(victim, { recursive: true });
+    writeFileSync(path.join(victim, "keep.txt"), "do not delete");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(path.join(victim, "keep.txt"), old, old);
+    utimesSync(victim, old, old);
+    // A run-id-shaped SYMLINK in the logs dir pointing at that tree.
+    const link = path.join(dir, "20200101T000000Z-4444beef");
+    symlinkSync(victim, link);
+    // A run-id-shaped FILE (not a dir) — also not a run.
+    const stray = path.join(dir, "20200101T000000Z-5555beef.txt");
+    writeFileSync(stray, "x");
+    utimesSync(stray, old, old);
+
+    const rScope = new EvidenceLog({ env: envFor(dir) }).prune(14);
+    c.check(existsSync(link), "#23 scope: a run-id-shaped SYMLINK is not followed and not removed");
+    c.check(existsSync(path.join(victim, "keep.txt")), "#23 scope: the symlink's target tree is untouched");
+    c.check(existsSync(stray), "#23 scope: a run-id-shaped FILE is not removed");
+    c.check(rScope.scanned === 0 && rScope.removed.length === 0, "#23 scope: neither is counted as a run");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14c. Issue #23 — dry run reports without deleting; `latest` stops dangling.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const log = new EvidenceLog({ env: envFor(dir) });
+    const oldRun = path.join(dir, "20200101T000000Z-66666666");
+    mkdirSync(oldRun, { recursive: true });
+    writeFileSync(path.join(oldRun, "calls.jsonl"), "{}\n");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(path.join(oldRun, "calls.jsonl"), old, old);
+    utimesSync(oldRun, old, old);
+    symlinkSync("20200101T000000Z-66666666", path.join(dir, "latest"));
+
+    const dry = log.prune(14, { dryRun: true });
+    c.check(dry.dryRun && dry.removed.length === 1, "#23 dry-run: reports the run it would remove");
+    c.check(existsSync(oldRun), "#23 dry-run: deletes NOTHING");
+    c.check(log.latest() === "20200101T000000Z-66666666", "#23 dry-run: leaves `latest` alone");
+
+    const wet = log.prune(14);
+    c.check(!existsSync(oldRun) && wet.removed.length === 1, "#23: the same call without dryRun removes it");
+    c.check(log.latest() === undefined, "#23: a `latest` left dangling by a prune is dropped");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14d. Issue #23 — retention() resolution (C35 order) and the fail-safe on a typo.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const collabDir = tmp();
+    writeFileSync(path.join(collabDir, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=3\n");
+    const mk = (extra: Record<string, string> = {}) =>
+      new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir, ...extra }), collabDir });
+
+    const dflt = new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir }) }).retention();
+    c.check(dflt.days === 14 && dflt.source === "default" && dflt.valid,
+      "#23 retention: the default window is 14 days");
+    const conf = mk().retention();
+    c.check(conf.days === 3 && conf.source === "conf", "#23 retention: modelguild.conf.local beats the default");
+    const envWins = mk({ GUILD_LOG_RETENTION_DAYS: "7" }).retention();
+    c.check(envWins.days === 7 && envWins.source === "env", "#23 retention: env beats the conf file (C35)");
+    const zero = mk({ GUILD_LOG_RETENTION_DAYS: "0" }).retention();
+    c.check(zero.days === 0 && zero.valid, "#23 retention: an explicit 0 is VALID and means disabled");
+    const typo = mk({ GUILD_LOG_RETENTION_DAYS: "fourteen" }).retention();
+    c.check(typo.days === 0 && !typo.valid, "#23 retention: an unparseable value is invalid ⇒ disabled, not 14");
+
+    // A typo must NOT delete — the fail-safe direction.
+    const oldRun = path.join(dir, "20200101T000000Z-77777777");
+    mkdirSync(oldRun, { recursive: true });
+    const old = new Date(Date.now() - 600 * 86_400_000);
+    utimesSync(oldRun, old, old);
+    const rBad = mk({ GUILD_LOG_RETENTION_DAYS: "fourteen" }).prune();
+    c.check(existsSync(oldRun) && rBad.reason === "disabled" && !!rBad.invalidSetting,
+      "#23 retention: prune() on an unparseable window deletes nothing and says why");
+    const rZero = mk({ GUILD_LOG_RETENTION_DAYS: "0" }).prune();
+    c.check(existsSync(oldRun) && rZero.reason === "disabled", "C32: 0 disables pruning");
+    const rNeg = new EvidenceLog({ env: envForNoLogDir({ GUILD_LOG_DIR: dir }) }).prune(-1);
+    c.check(existsSync(oldRun) && rNeg.reason === "disabled", "#23: a negative explicit window disables, never inverts");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14e. Issue #23 — enforceRetentionOnStart: the server-start hook.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const mkOld = (name: string): string => {
+      const p = path.join(dir, name);
+      mkdirSync(p, { recursive: true });
+      writeFileSync(path.join(p, "calls.jsonl"), "{}\n");
+      const old = new Date(Date.now() - 60 * 86_400_000);
+      utimesSync(path.join(p, "calls.jsonl"), old, old);
+      utimesSync(p, old, old);
+      return p;
+    };
+
+    // (i) logging OFF ⇒ the hook is a NO-OP. A user who froze the log keeps it.
+    const frozen = mkOld("20200101T000000Z-88888888");
+    const offRes = enforceRetentionOnStart({
+      env: envForNoLogDir({ GUILD_LOG_DIR: dir, GUILD_LOG: "off" }),
+    });
+    c.check(offRes === null && existsSync(frozen),
+      "#23 on-start: GUILD_LOG=off ⇒ the hook returns null and deletes nothing");
+
+    // (ii) logging on ⇒ the configured window is applied.
+    const onRes = enforceRetentionOnStart({ env: envForNoLogDir({ GUILD_LOG_DIR: dir }) });
+    c.check(!!onRes && onRes.removed.length === 1 && !existsSync(frozen),
+      "#23 on-start: with logging on, a run past the window is removed");
+    c.check(!!onRes && onRes.days === 14,
+      "#23 on-start: uses the SAME resolved window as every other prune path");
+
+    // (iii) retention disabled ⇒ no-op, not a surprise delete.
+    const kept = mkOld("20200101T000000Z-99999999");
+    const disabled = enforceRetentionOnStart({
+      env: envForNoLogDir({ GUILD_LOG_DIR: dir, GUILD_LOG_RETENTION_DAYS: "0" }),
+    });
+    c.check(!!disabled && disabled.reason === "disabled" && existsSync(kept),
+      "#23 on-start: GUILD_LOG_RETENTION_DAYS=0 ⇒ nothing is removed");
+
+    // (iv) a logs dir that does not exist is reported, never thrown.
+    const missing = enforceRetentionOnStart({
+      env: envForNoLogDir({ GUILD_LOG_DIR: path.join(dir, "nope", "nowhere") }),
+    });
+    c.check(!!missing && missing.reason === "no-log-dir", "#23 on-start: a missing logs dir is non-fatal");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14f. Issue #23 — C33 partitioning is honored: the hook prunes only the CURRENT
+  //      project's partition, never a neighbouring project's.
+  // -------------------------------------------------------------------------
+  {
+    const base = tmp();
+    const collabDir = path.join(base, "modelguild");
+    mkdirSync(collabDir, { recursive: true });
+    const projA = path.join(tmp(), "projA");
+    const projB = path.join(tmp(), "projB");
+    mkdirSync(projA, { recursive: true });
+    mkdirSync(projB, { recursive: true });
+    gitInit(projA);
+    gitInit(projB);
+    const partEnv = envForNoLogDir({ GUILD_LOG_PARTITION: "1" });
+    const logA = new EvidenceLog({ env: partEnv, cwd: projA, collabDir });
+    const logB = new EvidenceLog({ env: partEnv, cwd: projB, collabDir });
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const stale = (root: string): string => {
+      const p = path.join(root, "20200101T000000Z-aaaaaaaa");
+      mkdirSync(p, { recursive: true });
+      utimesSync(p, old, old);
+      return p;
+    };
+    mkdirSync(logA.logDir(), { recursive: true });
+    mkdirSync(logB.logDir(), { recursive: true });
+    const staleA = stale(logA.logDir());
+    const staleB = stale(logB.logDir());
+
+    const rPart = enforceRetentionOnStart({ env: partEnv, cwd: projA, collabDir });
+    c.check(!!rPart && rPart.dir === logA.logDir(), "#23 C33: the hook scans the CURRENT project's partition");
+    c.check(!existsSync(staleA), "#23 C33: the current partition's stale run is removed");
+    c.check(existsSync(staleB), "#23 C33: another project's partition is out of scope and untouched");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14g. Issue #23 — the `modelguild logs clean` CLI surface.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const project = tmp();
+    const seed = (name: string, ageDays: number): string => {
+      const p = path.join(dir, name);
+      mkdirSync(p, { recursive: true });
+      writeFileSync(path.join(p, "calls.jsonl"), "{}\n");
+      const t = new Date(Date.now() - ageDays * 86_400_000);
+      utimesSync(path.join(p, "calls.jsonl"), t, t);
+      utimesSync(p, t, t);
+      return p;
+    };
+    const baseEnv = (extra: Record<string, string> = {}) =>
+      envForNoLogDir({ GUILD_LOG_DIR: dir, ...extra });
+
+    const oldRun = seed("20200101T000000Z-bbbbbbbb", 60);
+    const freshRun = seed("20200101T000000Z-cccccccc", 1);
+
+    // --dry-run: exit 0, names the run, deletes nothing.
+    const dry = await captureCli(["--dry-run", "--dir", project], baseEnv());
+    c.check(dry.code === 0 && existsSync(oldRun), "#23 CLI: --dry-run exits 0 and deletes nothing");
+    c.check(dry.out.includes("would remove") && dry.out.includes("20200101T000000Z-bbbbbbbb"),
+      "#23 CLI: --dry-run names the run it would remove");
+    c.check(dry.out.includes("14 day(s) (default)"), "#23 CLI: reports the window and where it came from");
+
+    // Real run: removes the stale one, keeps the fresh one.
+    const wet = await captureCli(["--dir", project], baseEnv());
+    c.check(wet.code === 0 && !existsSync(oldRun) && existsSync(freshRun),
+      "#23 CLI: clean removes only the run past the window");
+    c.check(wet.out.includes("removed") && wet.out.includes("kept"), "#23 CLI: prints what it removed and kept");
+
+    // --days overrides the configured window.
+    const frac = await captureCli(["--days", "0.5", "--dir", project], baseEnv());
+    c.check(frac.code === 2, "#23 CLI: --days rejects a non-integer");
+    const d1 = await captureCli(["--days", "1", "--dir", project], baseEnv());
+    c.check(d1.code === 0 && d1.out.includes("(--days)"), "#23 CLI: --days N overrides the configured window");
+
+    // Refusals — the never-delete-everything rule.
+    const zero = await captureCli(["--days", "0", "--dir", project], baseEnv());
+    c.check(zero.code === 2 && /DISABLES retention/.test(zero.out),
+      "#23 CLI: --days 0 is REFUSED (it would delete the whole log)");
+    const offWindow = await captureCli(["--dir", project], baseEnv({ GUILD_LOG_RETENTION_DAYS: "0" }));
+    c.check(offWindow.code === 2 && /retention is disabled/.test(offWindow.out),
+      "#23 CLI: a disabled retention window is refused, not defaulted");
+    const typo = await captureCli(["--dir", project], baseEnv({ GUILD_LOG_RETENTION_DAYS: "two weeks" }));
+    c.check(typo.code === 2 && /not a whole number of days/.test(typo.out),
+      "#23 CLI: an unreadable retention setting is refused with the reason");
+    const bogus = await captureCli(["--nope"], baseEnv());
+    c.check(bogus.code === 2 && /unknown argument/.test(bogus.out), "#23 CLI: an unknown flag exits 2");
+
+    // A logs dir that does not exist yet: reported, exit 0 (nothing is wrong).
+    const empty = await captureCli(["--dir", project], baseEnv({ GUILD_LOG_DIR: path.join(dir, "not-created") }));
+    c.check(empty.code === 0 && /does not exist yet/.test(empty.out),
+      "#23 CLI: a missing logs dir is reported, not an error");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14h. Issue #23 — the WIRING: a real `src/server.ts` process prunes on start.
+  //      14e proves the hook; only this proves server.ts actually calls it. Offline:
+  //      the prune happens before `connect`, and no opencode child is ever spawned —
+  //      the process exits on the stdin EOF we hand it.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const oldRun = path.join(dir, "20200101T000000Z-eeeeeeee");
+    mkdirSync(oldRun, { recursive: true });
+    writeFileSync(path.join(oldRun, "calls.jsonl"), "{}\n");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(path.join(oldRun, "calls.jsonl"), old, old);
+    utimesSync(oldRun, old, old);
+    const freshRun = path.join(dir, "20200101T000000Z-ffffffff");
+    mkdirSync(freshRun, { recursive: true });
+
+    const child = spawn(tsxBin, [path.join(repoRoot, "src", "server.ts")], {
+      env: envForNoLogDir({ GUILD_LOG_DIR: dir }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdin.end(); // EOF ⇒ the documented teardown trigger
+    const status = await new Promise<number>((resolve) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); resolve(-1); }, 30_000);
+      child.on("close", (code) => { clearTimeout(t); resolve(code ?? -1); });
+    });
+
+    c.check(status === 0, `#23 wiring: src/server.ts starts and exits cleanly on stdin EOF (exit ${status})`);
+    c.check(!existsSync(oldRun), "#23 wiring: a REAL server start pruned the run past the window");
+    c.check(existsSync(freshRun), "#23 wiring: the fresh run survived the server start");
+    c.check(/log retention — removed 1 run\(s\)/.test(stderr),
+      "#23 wiring: the server reports the prune on STDERR (stdout is the MCP channel)");
+  }
+
+  // -------------------------------------------------------------------------
+  // 14i. Issues #23 × #19 — retention under LAYERED roots: the window is READ across
+  //      every layer, but only the PRIMARY root's logs/ is pruned. The failure this
+  //      guards is a project's server start deleting runs out of the GLOBAL root,
+  //      which is not a root it ever writes to.
+  // -------------------------------------------------------------------------
+  {
+    const globalRoot = tmp();
+    const projectRoot = tmp();
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const seedRun = (root: string): string => {
+      const p = path.join(root, "logs", "20200101T000000Z-dddddddd");
+      mkdirSync(p, { recursive: true });
+      writeFileSync(path.join(p, "calls.jsonl"), "{}\n");
+      utimesSync(path.join(p, "calls.jsonl"), old, old);
+      utimesSync(p, old, old);
+      return p;
+    };
+    const globalStale = seedRun(globalRoot);
+    const projectStale = seedRun(projectRoot);
+
+    // Only the GLOBAL layer sets the knob; the project layer is silent about it.
+    writeFileSync(path.join(globalRoot, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=1\n");
+    const layers = [projectRoot, globalRoot]; // most-specific first, as layeredRoots() returns
+    const layered = new EvidenceLog({
+      env: envForNoLogDir(),
+      collabDir: projectRoot,
+      collabDirs: layers,
+    });
+    c.check(layered.retention().days === 1 && layered.retention().source === "conf",
+      "#23×#19: a GLOBAL-only retention setting binds in a project that never restates it");
+    c.check(layered.logDir() === path.join(projectRoot, "logs"),
+      "#23×#19: writes/logDir still derive from the PRIMARY root alone");
+
+    const r = enforceRetentionOnStart({
+      env: envForNoLogDir(),
+      collabDir: projectRoot,
+      collabDirs: layers,
+    });
+    c.check(!!r && r.dir === path.join(projectRoot, "logs") && r.removed.length === 1,
+      "#23×#19: the start hook prunes the PRIMARY root's logs, using the global window");
+    c.check(!existsSync(projectStale), "#23×#19: the primary root's stale run is removed");
+    c.check(existsSync(globalStale),
+      "#23×#19: the GLOBAL layer's logs are NOT pruned by a project's server start");
+
+    // The project layer overrides the global one, last-wins, as for every other key.
+    writeFileSync(path.join(projectRoot, "modelguild.conf.local"), "GUILD_LOG_RETENTION_DAYS=90\n");
+    const overridden = new EvidenceLog({
+      env: envForNoLogDir(),
+      collabDir: projectRoot,
+      collabDirs: layers,
+    });
+    c.check(overridden.retention().days === 90,
+      "#23×#19: a project retention setting overrides the global baseline");
+    // …and env still beats both (C35 order survives layering).
+    const envWins = new EvidenceLog({
+      env: envForNoLogDir({ GUILD_LOG_RETENTION_DAYS: "5" }),
+      collabDir: projectRoot,
+      collabDirs: layers,
+    });
+    c.check(envWins.retention().days === 5 && envWins.retention().source === "env",
+      "#23×#19: env still beats every conf layer (C35)");
   }
 
   // -------------------------------------------------------------------------
@@ -637,6 +1008,30 @@ function envForNoLogDir(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 }
 function gitInit(dir: string): void {
   spawnSync("git", ["init", "-q"], { cwd: dir });
+}
+
+/** Drive `modelguild logs clean` in-process (the doctor.test idiom) with stdout/stderr
+ * captured, so a refusal's WORDING can be asserted, not just its exit code. */
+async function captureCli(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number; out: string }> {
+  const origLog = console.log;
+  const origWarn = console.warn;
+  const origErr = console.error;
+  let out = "";
+  const sink = (...a: unknown[]) => { out += a.join(" ") + "\n"; };
+  console.log = sink;
+  console.warn = sink;
+  console.error = sink;
+  try {
+    const code = await runLogsClean(argv, { env });
+    return { code, out };
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+    console.error = origErr;
+  }
 }
 
 /** Spawn a child ASYNCHRONOUSLY (unlike spawnSync, which blocks the event loop and would
