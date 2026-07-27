@@ -34,7 +34,7 @@ import {
   type McpToolResult,
 } from "./consult.js";
 import {
-  readConfContents,
+  readLayeredConfContents,
   resolveModel,
   resolveMessageTimeoutMs,
   resolveAgentDefDirs,
@@ -129,11 +129,12 @@ export async function research(
   const cwd = deps.cwd ?? process.cwd();
   const home = deps.home ?? os.homedir();
 
-  // 1. Resolve the config root ONCE; surface a multi-root conflict.
+  // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19).
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDir = rootRes.root;
+  const collabDirs = rootRes.layers.map((l) => l.root);
+  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readConfContents(collabDir, env);
+  const confContents = readLayeredConfContents(collabDirs, env);
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
@@ -162,7 +163,7 @@ export async function research(
   const requestedModel = resolveModel({ flag: params.model, env, confContents });
 
   // 4. Gate: leading-dash refusal (C12) THEN policy tier (C1–C7), all BEFORE any log write.
-  const gate = gateModel(requestedModel, params.confirmed === true, { collabDir, env });
+  const gate = gateModel(requestedModel, params.confirmed === true, { collabDirs, env });
   if (!gate.ok) {
     return {
       ok: false,
@@ -178,7 +179,7 @@ export async function research(
   }
 
   // --- Past the gate: from here every path writes exactly one started + completed. ---
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(RESEARCH_COMMAND);
 

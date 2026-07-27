@@ -19,8 +19,11 @@ import {
   checkResolvedModelId,
   resolveCollabRoot,
   candidateRoots,
+  layeredRoots,
   resolveConfFile,
+  resolveConfFiles,
   readConfContents,
+  readLayeredConfContents,
   resolvePanelModels,
   resolveAgentDefDirs,
   hardenedDefPresentIn,
@@ -154,6 +157,48 @@ export async function run(): Promise<number> {
         "candidateRoots: reports overlapping roots for doctor conflict warning");
     }
 
+    // ---- LAYERED root resolution (issue #19) ------------------------------------
+    {
+      const projBase = tmp();
+      mkdirSync(path.join(projBase, "modelguild"), { recursive: true });
+      const home = tmp();
+      mkdirSync(path.join(home, ".claude", "modelguild"), { recursive: true });
+      const projectRoot = path.join(projBase, "modelguild");
+      const globalRoot = path.join(home, ".claude", "modelguild");
+
+      const both = layeredRoots({} as NodeJS.ProcessEnv, projBase, home);
+      t.check(both.length === 2 && both[0].root === projectRoot && both[1].root === globalRoot,
+        "layeredRoots: project layer sits ABOVE the global baseline (both bind, most-specific first)");
+      t.check(both[0].source === "project" && both[1].source === "home",
+        "layeredRoots: sources are project then home");
+
+      // The primary root (writes/logs) is still the most-specific layer — unchanged behaviour.
+      t.check(resolveCollabRoot({} as NodeJS.ProcessEnv, projBase, home).root === projectRoot,
+        "layeredRoots: resolveCollabRoot is layers[0] (the primary/write root)");
+
+      // Global-only: the single layer is the global baseline.
+      const noProj = tmp();
+      const globalOnly = layeredRoots({} as NodeJS.ProcessEnv, noProj, home);
+      t.check(globalOnly.length === 1 && globalOnly[0].root === globalRoot,
+        "layeredRoots: no project dir → the global baseline is the only layer");
+
+      // Project-only: the global root doesn't exist, so only the project layer.
+      const bareHome = tmp();
+      const projOnly = layeredRoots({} as NodeJS.ProcessEnv, projBase, bareHome);
+      t.check(projOnly.length === 1 && projOnly[0].root === projectRoot,
+        "layeredRoots: no global root on disk → project layer alone");
+
+      // Neither on disk → still non-empty (the home root is the primary an install targets).
+      const nothing = layeredRoots({} as NodeJS.ProcessEnv, tmp(), bareHome);
+      t.check(nothing.length === 1 && nothing[0].source === "home",
+        "layeredRoots: neither root on disk → home root alone (never empty)");
+
+      // $GUILD_ROOT is a SINGLE-ROOT override — NOT a top layer (documented decision).
+      const overridden = layeredRoots({ GUILD_ROOT: "/explicit/root" } as NodeJS.ProcessEnv, projBase, home);
+      t.check(overridden.length === 1 && overridden[0].root === "/explicit/root" && overridden[0].source === "env",
+        "layeredRoots: $GUILD_ROOT is a single-root override — no global baseline layered under it");
+    }
+
     // ---- config-file resolution (C9) -------------------------------------------
     {
       const root = tmp();
@@ -166,6 +211,59 @@ export async function run(): Promise<number> {
       t.check(readConfContents(root, {}).includes("openai/local"),
         "readConfContents: reads the resolved file");
       t.check(readConfContents(tmp(), {}) === "", "readConfContents: missing file → empty string");
+    }
+
+    // ---- LAYERED preference overlay (issue #19) ---------------------------------
+    // Global is the baseline; the project overlays it. A project key WINS; a key the
+    // project leaves unset falls THROUGH to global.
+    {
+      const globalRoot = tmp();
+      const projectRoot = tmp();
+      writeFileSync(
+        path.join(globalRoot, "modelguild.conf.local"),
+        // No trailing newline on purpose: the layer join must not fuse this into the next file.
+        "GUILD_MODEL=openai/global\nGUILD_MODELS=openai/g1 google/g2\nGUILD_LOG_PROMPTS=hash",
+      );
+      writeFileSync(
+        path.join(projectRoot, "modelguild.conf.local"),
+        "GUILD_MODEL=openai/project\n",
+      );
+      const roots = [projectRoot, globalRoot]; // most-specific first
+
+      const files = resolveConfFiles(roots, {} as NodeJS.ProcessEnv);
+      t.check(
+        files.length === 2 &&
+          files[0] === path.join(projectRoot, "modelguild.conf.local") &&
+          files[1] === path.join(globalRoot, "modelguild.conf.local"),
+        "resolveConfFiles: both layers' conf files, most-specific first",
+      );
+
+      const merged = readLayeredConfContents(roots, {} as NodeJS.ProcessEnv);
+      t.check(confGet(merged, "GUILD_MODEL") === "openai/project",
+        "layered conf: a project key OVERRIDES the global one");
+      t.check(confGet(merged, "GUILD_MODELS") === "openai/g1 google/g2",
+        "layered conf: a key the project leaves unset falls THROUGH to global");
+      t.check(confGet(merged, "GUILD_LOG_PROMPTS") === "hash",
+        "layered conf: global evidence knobs still bind in a project that doesn't restate them");
+
+      // Order matters: global alone must NOT see the project's value.
+      t.check(confGet(readLayeredConfContents([globalRoot], {} as NodeJS.ProcessEnv), "GUILD_MODEL") === "openai/global",
+        "layered conf: the global layer alone resolves to the global value");
+
+      // A missing project layer contributes nothing (no crash, global wins).
+      t.check(confGet(readLayeredConfContents([tmp(), globalRoot], {} as NodeJS.ProcessEnv), "GUILD_MODEL") === "openai/global",
+        "layered conf: an absent project conf file contributes nothing");
+
+      // $GUILD_CONF is a single-FILE override — no layering beneath it.
+      const loneDir = tmp();
+      const lone = path.join(loneDir, "explicit.conf");
+      writeFileSync(lone, "GUILD_MODEL=openai/explicit\n");
+      const env = { GUILD_CONF: lone } as NodeJS.ProcessEnv;
+      t.check(resolveConfFiles(roots, env).join(",") === lone,
+        "resolveConfFiles: $GUILD_CONF is a single-file override (no layers under it)");
+      const overridden = readLayeredConfContents(roots, env);
+      t.check(confGet(overridden, "GUILD_MODEL") === "openai/explicit" && confGet(overridden, "GUILD_MODELS") === "",
+        "layered conf: $GUILD_CONF replaces the whole chain (global keys do NOT leak through)");
     }
 
     // ---- panel unit assertions (C13/C14) ---------------------------------------

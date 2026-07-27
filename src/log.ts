@@ -123,9 +123,15 @@ export interface EvidenceLogOptions {
   env?: NodeJS.ProcessEnv;
   /** Working directory (for project-key derivation under partitioning). Default cwd. */
   cwd?: string;
-  /** The install's `modelguild/` dir — home of `modelguild.conf.local` and the default
-   * `logs/` root, mirroring bash `here`. Default: `<cwd>/collab`. */
+  /** The install's PRIMARY `modelguild/` dir — the default `logs/` root, mirroring bash
+   * `here`. WRITES always land here (the most-specific root). Default: `<cwd>/collab`. */
   collabDir?: string;
+  /** The LAYERED read roots, most-specific first (issue #19). The evidence knobs
+   * (`GUILD_LOG*`) are read across all of them — global baseline with the project overlaid
+   * on top — so a global `GUILD_LOG_PROMPTS=off` still binds in a project that does not
+   * restate it. Defaults to `[collabDir]`, i.e. the pre-layering single-root behaviour.
+   * Writes are unaffected: the log dir still derives from `collabDir` alone. */
+  collabDirs?: string[];
 }
 
 /**
@@ -163,29 +169,40 @@ export class EvidenceLog {
   readonly #env: NodeJS.ProcessEnv;
   readonly #cwd: string;
   readonly #collabDir: string;
-  readonly #confFile: string | undefined;
+  /** Conf files that contribute, LEAST-specific first (read order for last-wins overlay). */
+  readonly #confFiles: string[];
   #confContents: string | undefined;
 
   constructor(opts: EvidenceLogOptions = {}) {
     this.#env = opts.env ?? process.env;
     this.#cwd = opts.cwd ?? process.cwd();
     this.#collabDir = opts.collabDir ?? path.join(this.#cwd, "modelguild");
-    // Conf file resolution mirrors log.sh: GUILD_CONF > <collabDir>/modelguild.conf.local.
+    // Conf resolution mirrors log.sh, LAYERED (issue #19): GUILD_CONF is a single-FILE
+    // override; otherwise every layer's <root>/modelguild.conf.local that exists.
+    const roots =
+      opts.collabDirs && opts.collabDirs.length > 0 ? opts.collabDirs : [this.#collabDir];
     const confEnv = this.#env.GUILD_CONF;
-    if (confEnv) this.#confFile = confEnv;
+    if (confEnv) this.#confFiles = [confEnv];
     else {
-      const local = path.join(this.#collabDir, "modelguild.conf.local");
-      this.#confFile = existsSync(local) ? local : undefined;
+      const found: string[] = [];
+      // Most-specific first here, then reversed: the read order must put the project LAST
+      // so `confGet`'s last-assignment-wins makes the project key override the global one.
+      for (const root of roots) {
+        const local = path.join(root, "modelguild.conf.local");
+        if (existsSync(local) && !found.includes(local)) found.push(local);
+      }
+      this.#confFiles = found.reverse();
     }
   }
 
   #confRead(): string {
     if (this.#confContents === undefined) {
-      try {
-        this.#confContents = this.#confFile ? readFileSync(this.#confFile, "utf8") : "";
-      } catch {
-        this.#confContents = "";
+      const parts: string[] = [];
+      for (const file of this.#confFiles) {
+        try { parts.push(readFileSync(file, "utf8")); } catch { /* unreadable ⇒ no value */ }
       }
+      // `\n` join so a layer without a trailing newline cannot fuse into the next one.
+      this.#confContents = parts.join("\n");
     }
     return this.#confContents;
   }

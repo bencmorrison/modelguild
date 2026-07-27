@@ -437,7 +437,10 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
-  // 9. Multi-root conflict surfaces in guild_status (the M4 "doctor MUST warn").
+  // 9. LAYERED roots surface in guild_status's doctor seed (issue #19).
+  //    Pre-#19 this asserted a "multiple roots — one SHADOWS the others" warning. Roots are
+  //    now LAYERED (project over global baseline), so both bind and there is nothing to warn
+  //    about; what the seed must report instead is the whole chain.
   // -------------------------------------------------------------------------
   {
     // Two roots on disk: <cwd>/modelguild and <home>/.claude/modelguild, no GUILD_ROOT.
@@ -445,25 +448,46 @@ export async function run(): Promise<number> {
     mkdirSync(path.join(cwd, "modelguild"), { recursive: true });
     const home = tmp("m5-home-");
     mkdirSync(path.join(home, ".claude", "modelguild"), { recursive: true });
+    const projectRoot = path.join(cwd, "modelguild");
+    const globalRoot = path.join(home, ".claude", "modelguild");
     const env = envWith({}); // no GUILD_ROOT
 
     const seed = collabDoctorSeed(env, cwd, home);
-    c.check(seed.collabRoot.source === "project", "conflict: the project root wins");
-    c.check(typeof seed.collabRoot.conflict === "string", "conflict: a conflict warning is surfaced");
-    if (typeof seed.collabRoot.conflict === "string") {
-      c.check(seed.collabRoot.conflict.includes(path.join(cwd, "modelguild")), "conflict: names the winning root");
-      c.check(
-        seed.collabRoot.conflict.includes(path.join(home, ".claude", "modelguild")) &&
-          /shadow/i.test(seed.collabRoot.conflict),
-        "conflict: names the shadowed root",
-      );
-    }
-    c.check(typeof seed.policy.file === "string" && seed.policy.file.length > 0, "conflict: policy file + source reported");
-    c.check(typeof seed.logging.enabled === "boolean" && typeof seed.logging.logDir === "string", "conflict: logging on/off + log dir reported");
+    c.check(seed.collabRoot.source === "project", "layers: the project root is PRIMARY (writes/logs)");
+    c.check(seed.collabRoot.conflict === null,
+      "layers: project + global on disk is NOT a conflict any more — it is the layering");
+    c.check(
+      seed.collabRoot.layers.length === 2 &&
+        seed.collabRoot.layers[0].root === projectRoot &&
+        seed.collabRoot.layers[1].root === globalRoot,
+      "layers: the seed reports BOTH read layers, most-specific first",
+    );
+    c.check(
+      seed.policy.layers.some((l) => l.root === projectRoot) &&
+        seed.policy.layers.some((l) => l.root === globalRoot),
+      "layers: the policy chain reports a layer from EACH root (project + global)",
+    );
+    c.check(seed.policy.layers.every((l) => typeof l.exists === "boolean"),
+      "layers: each policy layer reports whether its file is present");
+    c.check(typeof seed.policy.file === "string" && seed.policy.file.length > 0, "layers: policy file + source reported");
+    c.check(typeof seed.logging.enabled === "boolean" && typeof seed.logging.logDir === "string", "layers: logging on/off + log dir reported");
 
-    // Single root → no conflict.
-    const single = collabDoctorSeed(envWith({ GUILD_ROOT: path.join(cwd, "modelguild") }), cwd, home);
-    c.check(single.collabRoot.conflict === null, "conflict: an explicit single root reports no conflict");
+    // $GUILD_ROOT is a SINGLE-ROOT override: exactly one layer, and — because a real global
+    // root exists on disk that is NOT layered under it — the note fires.
+    const single = collabDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), cwd, home);
+    c.check(single.collabRoot.layers.length === 1 && single.collabRoot.layers[0].root === projectRoot,
+      "layers: $GUILD_ROOT yields exactly one layer (single-root override)");
+    c.check(
+      typeof single.collabRoot.conflict === "string" &&
+        single.collabRoot.conflict.includes(globalRoot) &&
+        /NOT layered/i.test(single.collabRoot.conflict),
+      "layers: $GUILD_ROOT names the roots on disk it is leaving UNLAYERED",
+    );
+
+    // $GUILD_ROOT with nothing else on disk → nothing is being dropped, so no note.
+    const clean = collabDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), tmp("m5-noproj-"), tmp("m5-nohome-"));
+    c.check(clean.collabRoot.conflict === null,
+      "layers: $GUILD_ROOT with no other root on disk reports no note (nothing dropped)");
   }
 
   // -------------------------------------------------------------------------

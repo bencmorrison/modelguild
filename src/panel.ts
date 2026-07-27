@@ -51,7 +51,7 @@ import {
   type McpToolResult,
 } from "./consult.js";
 import {
-  readConfContents,
+  readLayeredConfContents,
   resolvePanelModels,
   resolveMessageTimeoutMs,
   resolveAgentDefDirs,
@@ -173,11 +173,12 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   const cwd = deps.cwd ?? process.cwd();
   const home = deps.home ?? os.homedir();
 
-  // 1. Resolve the config root ONCE; surface a multi-root conflict.
+  // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19).
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDir = rootRes.root;
+  const collabDirs = rootRes.layers.map((l) => l.root);
+  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readConfContents(collabDir, env);
+  const confContents = readLayeredConfContents(collabDirs, env);
 
   // 2. NO-FALLBACK def gate for the WHOLE panel (deviation from bash C16, mirroring
   //    guild_research/guild_delegate). Every member runs through the SAME hardened guild-read
@@ -224,7 +225,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
 
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
   const runId = params.runId && params.runId.length > 0 ? params.runId : log.newRun(PANEL_COMMAND);
   const confirmed = params.confirmed === true;
   const keepSessions = params.keepSessions === true;
@@ -237,7 +238,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //    refusal or failure never touches another's result (order preserved by Promise.all).
   const results = await Promise.all(
     panelRes.models.map(async (model): Promise<PanelMemberResult> => {
-      const gate = gateModel(model, confirmed, { collabDir, env });
+      const gate = gateModel(model, confirmed, { collabDirs, env });
       if (!gate.ok) {
         // A pre-log refusal: no call_id, nothing written for this member (gap parity).
         return {

@@ -20,7 +20,9 @@ import {
   hasRules,
   tierFromContents,
   resolvePolicyFile,
+  resolvePolicyLayers,
   policyTier,
+  policyTierAcross,
   type PolicyTier,
 } from "../src/policy.js";
 import { Checker } from "./harness.js";
@@ -178,6 +180,89 @@ export async function run(): Promise<number> {
       });
       t.check(dec.tier === "deny" && !!dec.reason && /malformed/.test(dec.reason),
         "policyTier: selected malformed file → deny with loud reason (C6)");
+    }
+
+    // ---- LAYERED policy: project over global baseline (issue #19) ---------------
+    {
+      const projectRoot = makeCollabDir({ policy: "" });
+      const globalRoot = makeCollabDir({ policy: "deny openai/gpt-5.5\nask *fable*\nallow *\n" });
+      const roots = [projectRoot, globalRoot]; // most-specific first
+      const tierOf = (m: string) => policyTierAcross(m, { collabDirs: roots, env: {} }).tier;
+
+      // Baseline binds through an EMPTY project layer — the pre-#19 bug this issue fixes:
+      // a project `modelguild/` used to shadow the global policy entirely.
+      t.check(tierOf("openai/gpt-5.5") === "deny",
+        "layered: a global deny still binds when the project layer says nothing (baseline, NOT shadowed)");
+      t.check(tierOf("anthropic/claude-fable-5") === "ask",
+        "layered: a global ask still binds through an empty project layer");
+
+      // The project can add a STRICTER deny on top of the global allow.
+      writeFileSync(path.join(projectRoot, "models.policy"), "deny google/*\n");
+      t.check(tierOf("google/gemini-2.5-pro") === "deny",
+        "layered: the project adds a stricter deny on top of the global 'allow *'");
+      t.check(tierOf("openai/gpt-5.5") === "deny",
+        "layered: the project's extra rule does not disturb the global deny");
+
+      // The project can add a LOOSER allow that beats the global deny (first-match-wins).
+      writeFileSync(path.join(projectRoot, "models.policy"), "allow openai/gpt-5.5\n");
+      t.check(tierOf("openai/gpt-5.5") === "allow",
+        "layered: a project allow overrides the global deny (project rules evaluated FIRST)");
+      t.check(tierOf("anthropic/claude-fable-5") === "ask",
+        "layered: the global ask still binds for ids the project doesn't name");
+
+      // Nothing anywhere → default-allow (C4 survives layering).
+      t.check(policyTierAcross("openai/x", { collabDirs: [makeCollabDir({}), makeCollabDir({})], env: {} }).tier === "allow",
+        "layered: no policy file in any layer → allow (C4)");
+
+      // Fail-closed is CHAIN-WIDE: a malformed GLOBAL layer denies even though the project
+      // layer is fine and already matched (the deliberate widening — see policyTierAcross).
+      const badGlobal = makeCollabDir({ policy: "allow *\nnotatier x\n" });
+      const okProject = makeCollabDir({ policy: "allow openai/gpt-5\n" });
+      const chainBad = policyTierAcross("openai/gpt-5", { collabDirs: [okProject, badGlobal], env: {} });
+      t.check(chainBad.tier === "deny" && !!chainBad.reason && /malformed/.test(chainBad.reason),
+        "layered: a malformed line in ANY layer fails the whole chain closed (C6, chain-wide)");
+
+      // $GUILD_POLICY replaces the ENTIRE chain (single-file override).
+      const envPol = writeTmpPolicy("allow *\n");
+      t.check(policyTierAcross("openai/gpt-5.5", { collabDirs: roots, env: { GUILD_POLICY: envPol } as NodeJS.ProcessEnv }).tier === "allow",
+        "layered: $GUILD_POLICY is a single-file override — no layers beneath it");
+    }
+
+    // ---- LAYERED policy: within-root .local above committed (issue #19) ---------
+    {
+      // `.local` no longer REPLACES the committed file — it sits above it, so a personal
+      // rule wins for the ids it names while committed rules keep binding for the rest.
+      const root = makeCollabDir({
+        policy: "deny anthropic/*\nallow *\n",
+        local: "allow openai/gpt-5.5\n",
+      });
+      const tierOf = (m: string) => policyTier(m, { collabDir: root, env: {} }).tier;
+      t.check(tierOf("openai/gpt-5.5") === "allow", "within-root: the .local rule wins for the id it names");
+      t.check(tierOf("anthropic/claude-fable-5") === "deny",
+        "within-root: a committed rule the .local doesn't name STILL binds (.local layers, no longer replaces)");
+
+      // C1/C2's `_has_rules` gate is KEPT: a ruleless .local is excluded from the chain
+      // entirely, so it can neither shadow committed nor fail the chain closed.
+      const bare = makeCollabDir({ policy: "deny openai/gpt-5.5\nallow *\n", local: "deny\n" });
+      const bareLayers = resolvePolicyLayers([bare], {});
+      t.check(bareLayers.length === 1 && bareLayers[0].source === "committed",
+        "within-root: a ruleless (bare-deny) .local is NOT a layer at all (C1/C2 gate kept)");
+      t.check(policyTier("openai/gpt-5", { collabDir: bare, env: {} }).tier === "allow",
+        "within-root: a ruleless .local does not fail the chain closed");
+
+      // resolvePolicyLayers reports the full chain with presence, most-specific first.
+      const projectRoot = makeCollabDir({ policy: "allow *\n", local: "deny google/*\n" });
+      const globalRoot = makeCollabDir({}); // no files at all
+      const layers = resolvePolicyLayers([projectRoot, globalRoot], {});
+      t.check(
+        layers.length === 3 &&
+          layers[0].source === "local" && layers[0].exists &&
+          layers[1].source === "committed" && layers[1].exists &&
+          layers[2].source === "committed" && !layers[2].exists,
+        "resolvePolicyLayers: project .local → project committed → global committed, with presence flags",
+      );
+      t.check(layers[0].root === projectRoot && layers[2].root === globalRoot,
+        "resolvePolicyLayers: each layer names the root that contributed it");
     }
 
     // ---- policy scenario corpus (TS is the reference; bash oracle retired M12) ---
