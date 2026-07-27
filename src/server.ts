@@ -23,7 +23,8 @@ import { panel, panelToToolResult } from "./panel.js";
 import { research, researchToToolResult } from "./research.js";
 import { delegate, delegateToToolResult } from "./delegate.js";
 import { models, modelsToToolResult } from "./models.js";
-import { parsePerCallTimeoutMs } from "./config.js";
+import { parsePerCallTimeoutMs, layeredRoots } from "./config.js";
+import { enforceRetentionOnStart } from "./log.js";
 
 const STATUS_TOOL = "guild_status";
 const CONSULT_TOOL = "guild_consult";
@@ -480,6 +481,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   throw new Error(`Unknown tool: ${name}`);
 });
+
+// ---------------------------------------------------------------------------
+// Log retention, once per server start (issue #23).
+//
+// The retention knob has always existed; before this, only `new-run` applied it — so a
+// session that started the server and made no model call never pruned, and the logs of a
+// project you stopped consulting sat there forever. This closes that gap at the one
+// moment the server is guaranteed to reach.
+//
+// The window is the SAME resolved `GUILD_LOG_RETENTION_DAYS` every other prune path uses
+// (env > modelguild.conf.local > default 14), so start-up prunes exactly what the next
+// model call would have pruned anyway — nothing new is put at risk, it just happens
+// sooner. `GUILD_LOG_RETENTION_DAYS=0` disables it, as everywhere else, and
+// `GUILD_LOG=off` skips it entirely (see `enforceRetentionOnStart`).
+//
+// LAYERED (issue #19), split the same way every tool splits it: the window is READ across
+// all root layers (`collabDirs`), so a global `GUILD_LOG_RETENTION_DAYS` binds in a project
+// that never restates it — but only the PRIMARY root's `logs/` is pruned (`collabDir` =
+// layers[0]). That is deliberate, not an oversight: logs are only ever WRITTEN to the
+// primary root, so the other layers hold no runs of ours, and a project's server start has
+// no business deleting a directory it does not write to. `resolveCollabRoot()` would give
+// the same primary root — `layeredRoots()` is used so both halves come from one call.
+//
+// NON-FATAL: it returns a result rather than throwing, and reports on stderr ONLY —
+// stdout is the MCP protocol channel and writing there would corrupt the stream.
+{
+  const roots = layeredRoots();
+  const pruned = enforceRetentionOnStart({
+    collabDir: roots[0].root,
+    collabDirs: roots.map((r) => r.root),
+  });
+  if (pruned && pruned.removed.length > 0) {
+    process.stderr.write(
+      `modelguild: log retention — removed ${pruned.removed.length} run(s) older than ` +
+        `${pruned.days} day(s) from ${pruned.dir}\n`,
+    );
+  }
+}
 
 const transport = new StdioServerTransport();
 

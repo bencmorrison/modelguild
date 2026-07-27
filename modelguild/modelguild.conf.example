@@ -68,7 +68,18 @@
 #                                 # prompt didn't change) or `off` on sensitive work.
 #                                 # Responses are ALWAYS kept in full: they are the
 #                                 # evidence, and they're the other model's words.
-# GUILD_LOG_RETENTION_DAYS=14    # prune runs older than this; 0 disables pruning
+# GUILD_LOG_RETENTION_DAYS=14    # prune runs older than this; 0 disables pruning.
+#                                 # Applied when the MCP server starts and at each new
+#                                 # run; `npx modelguild logs clean [--dry-run]` applies
+#                                 # it on demand. A run's age is its NEWEST content, so a
+#                                 # long-lived run still being written to is never pruned
+#                                 # out from under itself. A value that isn't a whole
+#                                 # number disables pruning rather than falling back to
+#                                 # 14 — a typo must never be a licence to delete.
+#                                 # Layered like every key here (a global value binds in
+#                                 # a project that doesn't restate it), but only the
+#                                 # most-specific root's logs/ is pruned — that is the
+#                                 # only root runs are ever written to.
 # GUILD_LOG_PARTITION=1          # opt-in (default OFF). Narrow the log root to a
 #                                 # per-project subdir BELOW the base logs tree:
 #                                 # <base>/<project-key>/<run>, keyed by the CWD's git

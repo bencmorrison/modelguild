@@ -6,6 +6,8 @@
  *   init              — place the MCP-era payload into a project (see init.ts).
  *   doctor            — a token-free health check (opencode present, MCP registration,
  *                       command docs + agent defs present, config/policy roots).
+ *   logs clean        — apply log retention by hand (issue #23): delete run dirs older
+ *                       than the configured (or `--days`) window, `--dry-run` to look.
  *
  * NOTE: this file carries NO shebang in source, on purpose — the repo's shebang lint
  * (`check-shebangs.sh`) requires `#!/usr/bin/env bash` on every tracked script, and this
@@ -20,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { init, mcpServerEntry, payloadFiles, payloadDest, resolveGlobalDirs, type ServerLaunch } from "./init.js";
 import { layeredRoots } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
+import { EvidenceLog, DEFAULT_RETENTION_DAYS } from "./log.js";
 
 const SELF = fileURLToPath(import.meta.url); // <pkg>/dist/cli.js  or  <pkg>/src/cli.ts
 const PACKAGE_ROOT = path.resolve(path.dirname(SELF), "..");
@@ -366,6 +369,171 @@ export async function runDoctor(
   return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// `modelguild logs …` — evidence-log maintenance (issue #23).
+// ---------------------------------------------------------------------------
+
+function logsUsage(): void {
+  console.log("Usage: modelguild logs clean [--days N] [--dry-run] [--dir D]");
+  console.log("  Delete evidence-log run directories older than the retention window.");
+  console.log("  --days N     Use an explicit window of N days instead of the configured one.");
+  console.log("  --dry-run    Report what WOULD be removed; delete nothing.");
+  console.log("  --dir D      Resolve the modelguild/ root from D instead of the cwd.");
+  console.log("");
+  console.log(`  Without --days the window comes from GUILD_LOG_RETENTION_DAYS (env >`);
+  console.log(`  modelguild/modelguild.conf.local > default ${DEFAULT_RETENTION_DAYS}). If that is 0 or`);
+  console.log("  unreadable, this refuses and asks for --days rather than guessing —");
+  console.log("  it will never treat 'no window' as 'delete everything'.");
+}
+
+function parseLogsCleanArgs(argv: string[]): {
+  days?: number;
+  dryRun: boolean;
+  targetDir: string;
+} {
+  let days: number | undefined;
+  let dryRun = false;
+  let targetDir = process.cwd();
+  const takeDays = (raw: string | undefined): number => {
+    if (raw === undefined) throw new Error("logs clean: --days needs a value (a whole number of days)");
+    if (!/^\d+$/.test(raw.trim())) {
+      throw new Error(`logs clean: --days must be a whole number of days (got '${raw}')`);
+    }
+    return parseInt(raw.trim(), 10);
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run" || a === "-n") dryRun = true;
+    else if (a === "--days") days = takeDays(argv[++i]);
+    else if (a.startsWith("--days=")) days = takeDays(a.slice("--days=".length));
+    else if (a === "--dir") targetDir = argv[++i] ?? targetDir;
+    else if (a.startsWith("--dir=")) targetDir = a.slice("--dir=".length);
+    else throw new Error(`logs clean: unknown argument '${a}'`);
+  }
+  return { days, dryRun, targetDir: path.resolve(targetDir) };
+}
+
+/** Human-readable byte size — enough precision to judge "is this worth clearing?". */
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`;
+}
+
+/**
+ * `modelguild logs clean`. Exported (like `runDoctor`) so the test suite drives it
+ * directly instead of shelling out.
+ *
+ * REFUSAL, not a default: with no `--days` and no usable configured window, this exits 2
+ * with the reason. "No retention configured" must never be read as "retention of zero
+ * days", because that reading deletes the entire log — the one outcome a cleanup command
+ * must not reach by accident.
+ */
+export async function runLogsClean(
+  argv: string[],
+  inject?: { env?: NodeJS.ProcessEnv; homeDir?: string },
+): Promise<number> {
+  let parsedArgs: ReturnType<typeof parseLogsCleanArgs>;
+  try {
+    parsedArgs = parseLogsCleanArgs(argv);
+  } catch (err) {
+    console.error(`modelguild: ${(err as Error).message}`);
+    return 2;
+  }
+  const { days, dryRun, targetDir } = parsedArgs;
+  const env = inject?.env ?? process.env;
+  const home = inject?.homeDir;
+  // LAYERED resolution (issue #19), split exactly the way the tools split it: the window
+  // is READ across every layer (`collabDirs`), so a global `GUILD_LOG_RETENTION_DAYS`
+  // binds in a project that never restates it — but the logs being cleaned live under the
+  // PRIMARY root alone (`collabDir` = layers[0]), because that is the only root writes
+  // ever land in. Cleaning a layer nobody writes to would be cleaning someone else's
+  // logs from this project's command.
+  const roots = home ? layeredRoots(env, targetDir, home) : layeredRoots(env, targetDir);
+  const { root, source } = roots[0];
+  const log = new EvidenceLog({
+    env,
+    cwd: targetDir,
+    collabDir: root,
+    collabDirs: roots.map((r) => r.root),
+  });
+
+  // Resolve the window BEFORE touching the filesystem, so a refusal costs nothing.
+  let window: number;
+  if (days !== undefined) {
+    if (days === 0) {
+      console.error(
+        "modelguild: logs clean --days 0 would delete every run in the log. " +
+          "0 is the value that DISABLES retention, not a window — pass a positive --days.",
+      );
+      return 2;
+    }
+    window = days;
+  } else {
+    const setting = log.retention();
+    if (!setting.valid) {
+      console.error(
+        `modelguild: GUILD_LOG_RETENTION_DAYS is '${setting.raw}' (from ${setting.source}), ` +
+          "which is not a whole number of days — refusing to guess a window. " +
+          "Fix the setting or pass --days N.",
+      );
+      return 2;
+    }
+    if (setting.days <= 0) {
+      console.error(
+        `modelguild: retention is disabled (GUILD_LOG_RETENTION_DAYS=${setting.raw}, from ` +
+          `${setting.source}) — there is no configured window to apply. Pass --days N to ` +
+          "clean explicitly, or set a positive GUILD_LOG_RETENTION_DAYS.",
+      );
+      return 2;
+    }
+    window = setting.days;
+  }
+
+  const setting = log.retention();
+  const windowSource = days !== undefined ? "--days" : setting.source;
+  const res = log.prune(window, { dryRun });
+
+  const row = (label: string, value: string) => console.log(`  ${(label + ":").padEnd(14)}${value}`);
+  console.log(`modelguild logs clean${dryRun ? " (dry run — nothing deleted)" : ""}`);
+  row("logs dir", res.dir);
+  row("root", `${root} (${source})`);
+  row("retention", `${res.days} day(s) (${windowSource})`);
+  if (res.reason === "no-log-dir") {
+    console.log("  nothing to do: the logs dir does not exist yet.");
+    return 0;
+  }
+  if (res.reason === "error") {
+    console.error(`  ! could not scan the logs dir: ${res.error}`);
+    return 1;
+  }
+  row("scanned", `${res.scanned} run(s)`);
+  const verb = dryRun ? "would remove" : "removed";
+  if (res.removed.length === 0) {
+    row(verb, `none — all ${res.kept} run(s) are inside the window`);
+  } else {
+    row(verb, `${res.removed.length} run(s), ${humanBytes(res.freedBytes)}`);
+    for (const r of res.removed) {
+      console.log(`    ${r.runId}  (${r.ageDays}d old, ${humanBytes(r.bytes)})`);
+    }
+    row("kept", `${res.kept} run(s) inside the window`);
+  }
+  if (res.skipped > 0) console.warn(`  ! ${res.skipped} run(s) skipped (unreadable)`);
+  return 0;
+}
+
+async function runLogs(argv: string[]): Promise<number> {
+  const sub = argv[0];
+  if (sub === "-h" || sub === "--help" || sub === "help") { logsUsage(); return 0; }
+  if (sub === undefined) { logsUsage(); return 2; }
+  if (sub === "clean") return runLogsClean(argv.slice(1));
+  console.error(`modelguild: unknown logs subcommand '${sub}' (see 'modelguild logs --help')`);
+  return 2;
+}
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
@@ -376,8 +544,9 @@ async function main(): Promise<number> {
   }
   if (cmd === "init") return runInit(argv.slice(1));
   if (cmd === "doctor") return runDoctor(argv.slice(1));
+  if (cmd === "logs") return runLogs(argv.slice(1));
   if (cmd === "-h" || cmd === "--help" || cmd === "help") {
-    console.log("Usage: modelguild <serve|init|doctor> [options]");
+    console.log("Usage: modelguild <serve|init|doctor|logs> [options]");
     console.log("  serve            Start the MCP stdio server (default; what .mcp.json launches).");
     console.log("  init [--dir D]   Place the MCP-era payload into a project (--uninstall to remove).");
     console.log("                   Does NOT write .mcp.json by default — it prints how to register");
@@ -390,6 +559,10 @@ async function main(): Promise<number> {
     console.log("       [--abs]     Pin an absolute path to this interpreter+entry (offline/no-registry).");
     console.log("       [--server-command \"cmd args\"]  Override the launch command verbatim.");
     console.log("  doctor [--dir D] Token-free health check ([--global] checks the global locations).");
+    console.log("  logs clean       Apply evidence-log retention by hand:");
+    console.log("       [--days N]   window in days (default: GUILD_LOG_RETENTION_DAYS,");
+    console.log(`                    env > modelguild.conf.local > ${DEFAULT_RETENTION_DAYS}; refuses if unset/0).`);
+    console.log("       [--dry-run]  report what would be removed, delete nothing.");
     return 0;
   }
   console.error(`modelguild: unknown command '${cmd}' (see --help)`);
