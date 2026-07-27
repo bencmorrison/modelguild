@@ -154,11 +154,24 @@ npx modelguild doctor --dir /path/to/your/project
   • local     /repo/modelguild/models.policy.local
   • committed /repo/modelguild/models.policy
   - committed ~/.claude/modelguild/models.policy (absent)
+✓ no upgrade drift: every installed file matches the version it was written from
 ✓ opencode present (…)
 
 doctor: OK
 ```
 (The `[found: …]` tag reports whether the payload was located in the project, globally, or a mix. The **layers** line shows the whole config/policy chain that actually binds — see [Global vs project config](#global-vs-project-config) — with `•` for a file that exists and `-` for one that doesn't.)
+
+**Upgrade drift.** Because `init` never overwrites a file you edited, an upgrade *skips* it — so you can end up running a stale command without noticing. Both `init` and `doctor` now tell you:
+```
+! 1 file(s) you edited are STALE — this release ships a newer version of them, and init never
+  overwrites your edits, so your copy stayed behind:
+    .claude/commands/guild/consult.md
+      diff "<the shipped file>" "<your copy>"
+  Keeping your version? Nothing to do. Want the current one? Save your copy, delete the file, and
+  re-run `npx modelguild init` (init rewrites a file only while it can prove the file is unedited).
+```
+It is a **warning, not a failure** — `doctor` still exits OK, because editing a command is a supported thing to do and your file is never touched. If a file differs from the shipped version but no install record covers it (you placed it there by hand, or the record was removed), `doctor` says it *cannot tell* an intentional edit from a stale leftover and names the missing record, rather than guessing.
+
 If the `claude` CLI isn't on PATH, `doctor` can't see a global registration and instead reports a warning (not a failure) telling you to verify with `claude mcp get modelguild`. Inside the restarted Claude Code, the `/guild:*` commands now appear in the slash-command list and the `guild_*` MCP tools are available. **The first time** Claude Code calls one, it asks a one-time permission for that tool (e.g. `mcp__modelguild__guild_consult`) — approve it (see [Skip the permission prompts](#skip-the-permission-prompts) to pre-approve them all).
 
 ### 6. Configure which models it uses

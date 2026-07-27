@@ -19,7 +19,18 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { init, mcpServerEntry, payloadFiles, payloadDest, resolveGlobalDirs, type ServerLaunch } from "./init.js";
+import {
+  init,
+  mcpServerEntry,
+  payloadFiles,
+  payloadDest,
+  recordPathFor,
+  resolveGlobalDirs,
+  scanDrift,
+  type DriftEntry,
+  type DriftScanEntry,
+  type ServerLaunch,
+} from "./init.js";
 import { layeredRoots } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
 import { EvidenceLog, DEFAULT_RETENTION_DAYS } from "./log.js";
@@ -138,12 +149,18 @@ function runInit(argv: string[]): number {
   }
   for (const w of res.warnings) console.warn(`  ! ${w}`);
   if (res.shadowed.length > 0) {
+    // `shadowed` is "the bytes at our command path are not ours" — which covers BOTH a command
+    // the user already had there AND our file after the user edited it. The old wording claimed
+    // only the first, and now reads as a contradiction next to the drift note ("you edited it
+    // since init wrote it"). Same set, accurate for both cases.
     console.warn(
-      `  ! ${res.shadowed.length} command(s) already existed at our path and are NOT ours ` +
-        `(shadowing): ${res.shadowed.join(", ")}. Those /guild:* commands are the user's, ` +
-        `not ModelGuild's — rename or remove them and re-run to use ours.`,
+      `  ! ${res.shadowed.length} /guild:* command(s) at our path hold content ModelGuild did ` +
+        `not write — your own command, or your edit of ours (shadowing): ` +
+        `${res.shadowed.join(", ")}. Those are the commands Claude Code will run; delete or ` +
+        `rename one and re-run to get ModelGuild's version back.`,
     );
   }
+  if (res.drifted.length > 0) printDriftNote(res.drifted, "  ");
   if (!uninstall && !writeMcp) printRegisterInstructions(targetDir, launch, global);
   if (!uninstall) {
     console.log("Next steps:");
@@ -159,6 +176,33 @@ function runInit(argv: string[]): number {
     console.log(`  4. Check the setup:        npx modelguild doctor${global ? " --global" : ""}`);
   }
   return 0;
+}
+
+/**
+ * UPGRADE DRIFT (issue #22) — the one user-facing report of a file that is ours, edited, and now
+ * behind the shipped payload. Printed by BOTH `init` (from the run it just did) and `doctor`
+ * (from a standalone scan), in one place so the two can't word it differently.
+ *
+ * It is a WARNING, never a failure: the edit is a supported act and the file is never touched,
+ * so a customized install must not read as broken. The hints are deliberately light — a `diff`
+ * line the user can paste, and delete-and-re-init to re-adopt the release. No `--force` flag is
+ * offered: overwriting an edit on the user's behalf is exactly what the ownership model exists
+ * to prevent, and a flag that does it invites the mistake the skip was protecting against.
+ */
+function printDriftNote(drifted: DriftEntry[], indent: string): void {
+  console.warn(
+    `${indent}! ${drifted.length} file(s) you edited are STALE — this release ships a newer ` +
+      `version of them, and init never overwrites your edits, so your copy stayed behind:`,
+  );
+  for (const d of drifted) {
+    console.warn(`${indent}    ${d.dest}`);
+    console.warn(`${indent}      diff "${d.shippedPath}" "${d.installedPath}"`);
+  }
+  console.warn(
+    `${indent}  Keeping your version? Nothing to do. Want the current one? Save your copy, ` +
+      `delete the file, and re-run \`npx modelguild init\` (init rewrites a file only while ` +
+      `it can prove the file is unedited).`,
+  );
 }
 
 /** Print the two ways to register the MCP server, in the DEFAULT (no `--write-mcp`) path:
@@ -355,6 +399,53 @@ export async function runDoctor(
       const mark = layer.exists ? "•" : "-";
       console.log(`  ${mark} ${layer.source.padEnd(9)} ${layer.file}${layer.exists ? "" : " (absent)"}`);
     }
+  }
+
+  // UPGRADE DRIFT (issue #22) — a file init wrote, the user then edited, whose shipped bytes have
+  // since changed: the upgrade skipped it (never clobber) and the user's copy is behind the
+  // release, silently. Doctor is where a user looks when something behaves oddly, so it must say
+  // so. Each file is judged against the record of the location it was FOUND in (project or
+  // global) — the same `locate` decision the presence checks used, so a mixed install reads each
+  // half against its own record.
+  //
+  // Honest about the limit: with no ownership record, an intentional edit and a stale leftover are
+  // byte-identical evidence. Doctor reports those as UNJUDGEABLE and names the missing record
+  // rather than guessing "stale". Neither case changes the exit code — an edit is supported.
+  const driftEntries: DriftScanEntry[] = [];
+  for (const { dest } of payloadFiles()) {
+    const where = locate(dest);
+    if (where === "none") continue;
+    const opts = where === "global" ? globalOpts : projectOpts;
+    const { base, rel } = payloadDest(dest, opts);
+    driftEntries.push({
+      dest,
+      installedPath: path.join(base, rel),
+      recordPath: recordPathFor(opts),
+    });
+  }
+  const drift = scanDrift(PACKAGE_ROOT, driftEntries);
+  if (drift.drifted.length > 0) {
+    printDriftNote(drift.drifted, "");
+  } else if (driftEntries.length > 0 && drift.unknown.length === 0) {
+    console.log("✓ no upgrade drift: every installed file matches the version it was written from");
+  }
+  if (drift.unknown.length > 0) {
+    console.warn(
+      `! ${drift.unknown.length} installed file(s) differ from the shipped version but no ` +
+        `ownership record covers them, so doctor CANNOT tell an intentional edit from a stale ` +
+        `leftover — it will not guess:`,
+    );
+    for (const d of drift.unknown) {
+      console.warn(`    ${d.dest}`);
+      console.warn(`      diff "${d.shippedPath}" "${d.installedPath}"`);
+    }
+    for (const p of drift.missingRecords) {
+      console.warn(`  no install record at ${p} — installed by hand, or the record was removed?`);
+    }
+    console.warn(
+      "  Compare them yourself. To adopt the shipped version, delete the file and re-run " +
+        "`npx modelguild init` — init never adopts a file it cannot prove it wrote.",
+    );
   }
 
   // opencode binary (best-effort; a missing binary is a warning, not a hard fail here).

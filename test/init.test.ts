@@ -6,11 +6,12 @@
  * (the payload assets live there — the same files npm's `files` allowlist ships).
  */
 
-import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Checker, repoRoot } from "./harness.js";
-import { init, type ServerLaunch } from "../src/init.js";
+import { init, isDrifted, type ServerLaunch } from "../src/init.js";
 
 // The shipped default launch line: portable, non-interactive npx form.
 const LAUNCH: ServerLaunch = { command: "npx", args: ["-y", "modelguild", "serve"] };
@@ -88,7 +89,6 @@ export async function run(): Promise<number> {
   writeFileSync(consultPath, "OLD OWNED CONTENT\n");
   const recPath = path.join(T, "modelguild/.modelguild-install.json");
   const rec = readJson(recPath);
-  const { createHash } = await import("node:crypto");
   rec.files[".claude/commands/guild/consult.md"] = createHash("sha256").update("OLD OWNED CONTENT\n").digest("hex");
   writeFileSync(recPath, JSON.stringify(rec, null, 2) + "\n");
   const res3 = init({ targetDir: T, packageRoot: repoRoot, serverLaunch: LAUNCH });
@@ -104,6 +104,90 @@ export async function run(): Promise<number> {
   );
   c.check(res4.skipped.includes(".claude/commands/guild/consult.md"), "the edited file is reported skipped");
   c.check(res4.shadowed.includes(".claude/commands/guild/consult.md"), "an unowned command doc raises a shadow warning");
+  // The edit above is against the CURRENT release (the record holds the shipped hash), so the
+  // skip is not drift — the user is customizing the latest version, not stuck on an old one.
+  c.check(res4.drifted.length === 0, "an edit against the current release is NOT reported as drift");
+
+  // --- issue #22: UPGRADE DRIFT — ours + user-edited + the release moved on ----
+  // The never-clobber skip is correct and stays; the bug was that it was SILENT, leaving the
+  // user on a stale command after an upgrade. Simulate the exact three-hash state: the file on
+  // disk is the user's edit, and the RECORD holds a hash that is neither the current bytes nor
+  // the shipped bytes (i.e. init wrote an older release, which the user then edited).
+  const TD = tempProject();
+  init({ targetDir: TD, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+  const setRecord = (dir: string, dest: string, hash: string | null) => {
+    const rp = path.join(dir, "modelguild/.modelguild-install.json");
+    const r = readJson(rp);
+    if (hash === null) delete r.files[dest];
+    else r.files[dest] = hash;
+    writeFileSync(rp, JSON.stringify(r, null, 2) + "\n");
+  };
+  const D_STALE = ".claude/commands/guild/consult.md";
+  const D_EDIT_CURRENT = ".claude/commands/guild/panel.md";
+  const D_NOT_OURS = ".claude/commands/guild/review.md";
+  // (i) drifted: edited + record points at a release the shipped bytes have moved past.
+  writeFileSync(path.join(TD, D_STALE), "MY EDIT OF AN OLD RELEASE\n");
+  setRecord(TD, D_STALE, sha("AN OLDER RELEASE\n"));
+  // (ii) control — edited, but the record still holds the CURRENT shipped hash (no drift).
+  writeFileSync(path.join(TD, D_EDIT_CURRENT), "MY EDIT OF THE CURRENT RELEASE\n");
+  // (iii) control — no record at all: never ours, so "stale" would be a guess, not a finding.
+  writeFileSync(path.join(TD, D_NOT_OURS), "MY OWN REVIEW COMMAND\n");
+  setRecord(TD, D_NOT_OURS, null);
+
+  const resd = init({ targetDir: TD, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  c.check(resd.drifted.length === 1, `drift: exactly one file reported stale (got ${resd.drifted.length})`);
+  c.check(resd.drifted[0]?.dest === D_STALE, "drift: names the ours-but-stale command doc");
+  c.check(
+    resd.drifted[0]?.installedPath === path.join(TD, D_STALE),
+    "drift: carries the absolute path of the user's copy (for a diff hint)",
+  );
+  c.check(
+    resd.drifted[0]?.shippedPath === path.join(repoRoot, D_STALE),
+    "drift: carries the absolute path of the shipped bytes (for a diff hint)",
+  );
+  c.check(
+    !resd.drifted.some((d) => d.dest === D_EDIT_CURRENT),
+    "drift: an edit against the still-shipped version is NOT drift",
+  );
+  c.check(
+    !resd.drifted.some((d) => d.dest === D_NOT_OURS),
+    "drift: a file with no ownership record is NOT drift (never ours — no basis to call it stale)",
+  );
+  c.check(
+    readFileSync(path.join(TD, D_STALE), "utf8") === "MY EDIT OF AN OLD RELEASE\n",
+    "drift: the stale file is still NOT clobbered (report only)",
+  );
+  c.check(
+    resd.skipped.includes(D_STALE),
+    "drift: the stale file is still reported skipped (drift is additive to the skip)",
+  );
+  c.check(
+    resd.warnings.some((w) => w.includes(D_STALE) && /stale/i.test(w)),
+    "drift: the per-file skip warning says the copy is stale",
+  );
+  c.check(
+    resd.warnings.some((w) => w.includes(D_EDIT_CURRENT) && /not stale/i.test(w)),
+    "drift: the non-stale edited file's warning says so explicitly (never claims staleness)",
+  );
+  // The record must NOT be advanced for a skipped file — the recorded hash is the evidence that
+  // the copy is behind, so a re-run must keep reporting it until the user acts.
+  const recd = readJson(path.join(TD, "modelguild/.modelguild-install.json"));
+  c.check(recd.files[D_STALE] === sha("AN OLDER RELEASE\n"), "drift: the recorded hash survives the skip");
+  const resd2 = init({ targetDir: TD, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  c.check(resd2.drifted.length === 1, "drift: a further re-run still reports it (not a one-shot warning)");
+  // Deleting the stale copy and re-running is the documented way to take the shipped version.
+  rmSync(path.join(TD, D_STALE));
+  const resd3 = init({ targetDir: TD, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  c.check(resd3.installed.includes(D_STALE), "drift: deleting the file and re-running installs the shipped version");
+  c.check(resd3.drifted.length === 0, "drift: nothing stale remains after adopting the shipped version");
+
+  // isDrifted's three-hash predicate, directly (the shared rule init and doctor both use).
+  c.check(isDrifted("a", "b", "c"), "isDrifted: three distinct hashes ⇒ stale");
+  c.check(!isDrifted(undefined, "b", "c"), "isDrifted: no record ⇒ not ours ⇒ not stale");
+  c.check(!isDrifted("a", "a", "c"), "isDrifted: unedited ⇒ not stale (the upgrade handles it)");
+  c.check(!isDrifted("a", "c", "c"), "isDrifted: already equals the shipped bytes ⇒ not stale");
+  c.check(!isDrifted("a", "b", "a"), "isDrifted: release unchanged since the edit ⇒ not stale");
 
   // --- --write-mcp merge preserves a sibling server ------------------------
   const T2 = tempProject();
@@ -280,6 +364,22 @@ export async function run(): Promise<number> {
   const resg3 = init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, ...gOpts });
   c.check(readFileSync(gConsult, "utf8") === "MY GLOBAL EDIT\n", "global: a user-edited file is not clobbered");
   c.check(resg3.skipped.includes(".claude/commands/guild/consult.md"), "global: the edited file is reported skipped");
+
+  // issue #22: drift in GLOBAL mode must be judged against the GLOBAL record, not a project one.
+  // `gConsult` above is already user-edited; point the GLOBAL record at an older release so the
+  // three hashes are distinct. (A project record does not exist here at all — if the mode picked
+  // the wrong record this would report nothing.)
+  const gRecPath = path.join(mgDir, ".modelguild-install.json");
+  const gRecNow = readJson(gRecPath);
+  gRecNow.files[".claude/commands/guild/consult.md"] = sha("AN OLDER GLOBAL RELEASE\n");
+  writeFileSync(gRecPath, JSON.stringify(gRecNow, null, 2) + "\n");
+  const resg4 = init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, ...gOpts });
+  c.check(resg4.drifted.length === 1, `global: drift is detected via the global record (got ${resg4.drifted.length})`);
+  c.check(
+    resg4.drifted[0]?.installedPath === gConsult,
+    "global: drift names the file in the GLOBAL commands dir, not a project path",
+  );
+  c.check(readFileSync(gConsult, "utf8") === "MY GLOBAL EDIT\n", "global: the stale file is still not clobbered");
 
   // uninstall --global removes only hash-verified files; the user-edited one survives.
   const resgu = init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, uninstall: true, ...gOpts });
