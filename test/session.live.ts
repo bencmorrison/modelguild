@@ -35,7 +35,7 @@ const CODEWORD_A = "PLATYPUS-ORBIT-7731";
 const CODEWORD_B = "NARWHAL-COMET-5142";
 
 async function setupProject(): Promise<string> {
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m7-sess-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m7-sess-"));
   await mkdir(path.join(scratch, ".opencode", "agent"), { recursive: true });
   await copyFile(
     path.join(repoRoot, ".opencode", "agent", "guild-read.md"),

@@ -1,8 +1,9 @@
 /**
- * log.ts — the ModelGuild evidence layer, ported from `collab/log.sh`.
+ * log.ts — the ModelGuild evidence layer, ported from `log.sh`.
  *
- * WHY A PORT, NOT A REWRITE. The log is the ONLY data source a watcher (`/guild:witness`)
- * audits instead of Claude's own summary, so its integrity is the whole honesty story.
+ * WHY A PORT, NOT A REWRITE. The log is the ONLY data source that can be audited instead
+ * of Claude's own summary, so its integrity is the whole honesty story. (The automated
+ * witness that once read it retired at M12; the receipts remain, for the developer to read.)
  * The bash `log.sh` is the oracle (CONTRACT.md area D, C22–C35); this module mirrors its
  * schema, hashing, and verify semantics BYTE-FOR-BYTE so that:
  *   - a TS-written run passes `bash log.sh verify`, and
@@ -70,8 +71,8 @@ export type PolicyTier = "allow" | "ask" | "deny";
 
 /**
  * `tier` / `confirmed` on a `started`/`completed` entry — a DELIBERATE positive-direction
- * addition OVER the bash oracle (bash records neither). Without them, `/guild:witness`
- * cannot audit whether an ask-tier model was consulted with claimed user approval. They
+ * addition OVER the bash oracle (bash records neither). Without them, nothing can audit
+ * whether an ask-tier model was consulted with claimed user approval. They
  * are OPTIONAL: emitted only when the caller supplies them, so allow-tier and legacy
  * (bash-written) entries carry neither key. Both verifiers accept entries with or without
  * these fields — bash `verify` recomputes `entry_hash` over `del(.entry_hash)` (the whole
@@ -181,14 +182,14 @@ export interface EvidenceLogOptions {
   /** Working directory (for project-key derivation under partitioning). Default cwd. */
   cwd?: string;
   /** The install's PRIMARY `modelguild/` dir — the default `logs/` root, mirroring bash
-   * `here`. WRITES always land here (the most-specific root). Default: `<cwd>/collab`. */
-  collabDir?: string;
+   * `here`. WRITES always land here (the most-specific root). Default: `<cwd>/modelguild`. */
+  guildDir?: string;
   /** The LAYERED read roots, most-specific first (issue #19). The evidence knobs
    * (`GUILD_LOG*`) are read across all of them — global baseline with the project overlaid
    * on top — so a global `GUILD_LOG_PROMPTS=off` still binds in a project that does not
-   * restate it. Defaults to `[collabDir]`, i.e. the pre-layering single-root behaviour.
-   * Writes are unaffected: the log dir still derives from `collabDir` alone. */
-  collabDirs?: string[];
+   * restate it. Defaults to `[guildDir]`, i.e. the pre-layering single-root behaviour.
+   * Writes are unaffected: the log dir still derives from `guildDir` alone. */
+  guildDirs?: string[];
 }
 
 /**
@@ -225,7 +226,7 @@ export function confGet(contents: string, key: string): string {
 export class EvidenceLog {
   readonly #env: NodeJS.ProcessEnv;
   readonly #cwd: string;
-  readonly #collabDir: string;
+  readonly #guildDir: string;
   /** Conf files that contribute, LEAST-specific first (read order for last-wins overlay). */
   readonly #confFiles: string[];
   #confContents: string | undefined;
@@ -233,11 +234,11 @@ export class EvidenceLog {
   constructor(opts: EvidenceLogOptions = {}) {
     this.#env = opts.env ?? process.env;
     this.#cwd = opts.cwd ?? process.cwd();
-    this.#collabDir = opts.collabDir ?? path.join(this.#cwd, "modelguild");
+    this.#guildDir = opts.guildDir ?? path.join(this.#cwd, "modelguild");
     // Conf resolution mirrors log.sh, LAYERED (issue #19): GUILD_CONF is a single-FILE
     // override; otherwise every layer's <root>/modelguild.conf.local that exists.
     const roots =
-      opts.collabDirs && opts.collabDirs.length > 0 ? opts.collabDirs : [this.#collabDir];
+      opts.guildDirs && opts.guildDirs.length > 0 ? opts.guildDirs : [this.#guildDir];
     const confEnv = this.#env.GUILD_CONF;
     if (confEnv) this.#confFiles = [confEnv];
     else {
@@ -300,7 +301,7 @@ export class EvidenceLog {
   #logDir(): string {
     const explicit = this.#cfg("GUILD_LOG_DIR", "");
     if (explicit !== "") return explicit;
-    const base = path.join(this.#collabDir, "logs");
+    const base = path.join(this.#guildDir, "logs");
     // Partition only when the root is OUR default (no explicit GUILD_LOG_DIR in env
     // OR conf), mirroring log.sh's guard exactly.
     const envLd = this.#env.GUILD_LOG_DIR;
@@ -710,7 +711,7 @@ export class EvidenceLog {
     }
   }
 
-  /** Record a Claude subagent's collab turn — a CLAIM, not captured evidence (C29/C30):
+  /** Record a Claude subagent's guild turn — a CLAIM, not captured evidence (C29/C30):
    * claim:true, captured:false, text in `claimed_response` (never `raw_response`). */
   async subagentVoice(args: {
     response: string;
@@ -870,7 +871,7 @@ export class EvidenceLog {
     }
 
     // 2b. A run is empty only if it has NEITHER a lifecycle call NOR a well-formed
-    // subagent voice (an all-Anthropic collab of subagent voices is a real exchange).
+    // subagent voice (an all-Anthropic exchange of subagent voices is a real exchange).
     const nExpected = expected.filter(
       (e) => typeof e.call_id === "string" && e.call_id !== "",
     ).length;

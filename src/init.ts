@@ -8,14 +8,14 @@
  *       `guild-research`) → `.opencode/agent/` (opencode serve resolves `--agent` from
  *       the project's `.opencode/`, and research/delegate REFUSE if their def is absent —
  *       so these are load-bearing, not optional);
- *   (c) the policy/config templates → `modelguild/` (where `resolveCollabRoot` reads them).
+ *   (c) the policy/config templates → `modelguild/` (where `resolveGuildRoot` reads them).
  * It does NOT install the bash wrappers or witness.md — those are retiring (M12).
  *
  * MCP REGISTRATION is user-driven by default: `init` does NOT touch `.mcp.json`. The user
  * registers the server themselves (`claude mcp add modelguild -s <scope> -- …`), choosing
  * per-project or global scope. The opt-in `--write-mcp` flag restores the old behavior —
  * writing/merging the project-scoped `.mcp.json` entry under the KEY `modelguild` (the
- * exact key the command grants `mcp__claudeguild__<tool>` require).
+ * exact key the command grants `mcp__modelguild__<tool>` require).
  *
  * OWNERSHIP is ported from `install.sh`'s SHA-256 model, not reinvented: every file we
  * write records the sha256 of its written bytes in `modelguild/.modelguild-install.json`.
@@ -63,7 +63,7 @@ const COMMAND_DOCS = [
   "collaborate",
   "configure",
 ] as const;
-/** The hardened agents the MCP tools resolve. collab-watch is witness-only (retired). */
+/** The hardened agents the MCP tools resolve. guild-watch is witness-only (retired). */
 const AGENT_DEFS = ["guild-read", "guild-build", "guild-research"] as const;
 const TEMPLATES = ["models.policy", "modelguild.conf.example"] as const;
 

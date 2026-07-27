@@ -132,7 +132,7 @@ export function worktreeDirty(repoDir: string): boolean {
  */
 export function snapshotTree(repoDir: string): string | null {
   if (!isGitWorktree(repoDir)) return null;
-  const idx = path.join(os.tmpdir(), `collab-index-${randomBytes(8).toString("hex")}`);
+  const idx = path.join(os.tmpdir(), `guild-index-${randomBytes(8).toString("hex")}`);
   const env: NodeJS.ProcessEnv = { GIT_INDEX_FILE: idx };
   try {
     if (git(repoDir, ["read-tree", "HEAD"], env).status !== 0) {

@@ -41,18 +41,18 @@ async function main(): Promise<number> {
   const c = new Checker();
   console.log("== delegate.live (M8) ==");
 
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m8-delegate-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m8-delegate-"));
   const agentDir = path.join(scratch, ".opencode", "agent");
   // The evidence log MUST live OUTSIDE the edited worktree: otherwise the calls.jsonl written
   // DURING the turn lands in the after-snapshot as a spurious changed file and perturbs the
   // ignored-file walk. In production GUILD_LOG_DIR is the gitignored modelguild/logs; here we
   // use a sibling temp dir (never a child of scratch) to reproduce that separation.
-  const logParent = await mkdtemp(path.join(tmpdir(), "collab-m8-delegate-logs-"));
+  const logParent = await mkdtemp(path.join(tmpdir(), "guild-m8-delegate-logs-"));
   const logDir = path.join(logParent, "logs");
   // HERMETICITY (issue #24): point XDG_CONFIG_HOME at an empty temp dir so the GLOBAL
   // opencode agent dir (`${XDG_CONFIG_HOME:-~/.config}/opencode/agent/`) resolves empty —
   // otherwise a box with a global install satisfies the def-missing refusal check globally.
-  const emptyXdg = await mkdtemp(path.join(tmpdir(), "collab-m8-delegate-xdg-"));
+  const emptyXdg = await mkdtemp(path.join(tmpdir(), "guild-m8-delegate-xdg-"));
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
   const env: NodeJS.ProcessEnv = {
     ...process.env,

@@ -28,7 +28,7 @@ async function main(): Promise<number> {
   const c = new Checker();
   console.log("== consult.live (M5) ==");
 
-  const scratch = await mkdtemp(path.join(tmpdir(), "collab-m5-live-"));
+  const scratch = await mkdtemp(path.join(tmpdir(), "guild-m5-live-"));
   const logDir = path.join(scratch, "logs");
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
   // GUILD_ROOT → scratch (no policy file there ⇒ default-allow); logs under scratch.

@@ -17,7 +17,7 @@ import {
   parsePerCallTimeoutMs,
   TIMER_MAX_MS,
   checkResolvedModelId,
-  resolveCollabRoot,
+  resolveGuildRoot,
   candidateRoots,
   layeredRoots,
   resolveConfFile,
@@ -137,20 +137,20 @@ export async function run(): Promise<number> {
     t.check(checkResolvedModelId("openai/gpt-5").ok === true,
       "checkResolvedModelId: normal id ok");
 
-    // ---- collab-root resolution (M4 order: env > project > home) ----------------
+    // ---- guild-root resolution (M4 order: env > project > home) ----------------
     {
       const projBase = tmp();
       mkdirSync(path.join(projBase, "modelguild"), { recursive: true });
       const home = tmp();
-      const r1 = resolveCollabRoot({ GUILD_ROOT: "/explicit/root" } as NodeJS.ProcessEnv, projBase, home);
-      t.check(r1.source === "env" && r1.root === "/explicit/root", "collab-root: $GUILD_ROOT wins");
-      const r2 = resolveCollabRoot({} as NodeJS.ProcessEnv, projBase, home);
+      const r1 = resolveGuildRoot({ GUILD_ROOT: "/explicit/root" } as NodeJS.ProcessEnv, projBase, home);
+      t.check(r1.source === "env" && r1.root === "/explicit/root", "guild-root: $GUILD_ROOT wins");
+      const r2 = resolveGuildRoot({} as NodeJS.ProcessEnv, projBase, home);
       t.check(r2.source === "project" && r2.root === path.join(projBase, "modelguild"),
-        "collab-root: project ./modelguild/ when it exists");
+        "guild-root: project ./modelguild/ when it exists");
       const noProj = tmp();
-      const r3 = resolveCollabRoot({} as NodeJS.ProcessEnv, noProj, home);
+      const r3 = resolveGuildRoot({} as NodeJS.ProcessEnv, noProj, home);
       t.check(r3.source === "home" && r3.root === path.join(home, ".claude", "modelguild"),
-        "collab-root: ~/.claude/modelguild fallback");
+        "guild-root: ~/.claude/modelguild fallback");
       // conflict detection for doctor
       const cands = candidateRoots({ GUILD_ROOT: "/x" } as NodeJS.ProcessEnv, projBase, home);
       t.check(cands.length >= 2 && cands[0].source === "env" && cands.some((c) => c.source === "project"),
@@ -173,8 +173,8 @@ export async function run(): Promise<number> {
         "layeredRoots: sources are project then home");
 
       // The primary root (writes/logs) is still the most-specific layer — unchanged behaviour.
-      t.check(resolveCollabRoot({} as NodeJS.ProcessEnv, projBase, home).root === projectRoot,
-        "layeredRoots: resolveCollabRoot is layers[0] (the primary/write root)");
+      t.check(resolveGuildRoot({} as NodeJS.ProcessEnv, projBase, home).root === projectRoot,
+        "layeredRoots: resolveGuildRoot is layers[0] (the primary/write root)");
 
       // Global-only: the single layer is the global baseline.
       const noProj = tmp();

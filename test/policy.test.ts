@@ -47,14 +47,14 @@ function bashCaseGlob(pattern: string, subject: string): boolean {
   return r.status === 0;
 }
 
-/** Build a `<dir>/modelguild/` with the given policy files, return the collab dir. */
-function makeCollabDir(files: { policy?: string; local?: string }): string {
+/** Build a `<dir>/modelguild/` with the given policy files, return the guild dir. */
+function makeGuildDir(files: { policy?: string; local?: string }): string {
   const base = tmp();
-  const collab = path.join(base, "modelguild");
-  spawnSync("mkdir", ["-p", collab]);
-  if (files.policy !== undefined) writeFileSync(path.join(collab, "models.policy"), files.policy);
-  if (files.local !== undefined) writeFileSync(path.join(collab, "models.policy.local"), files.local);
-  return collab;
+  const guildDir = path.join(base, "modelguild");
+  spawnSync("mkdir", ["-p", guildDir]);
+  if (files.policy !== undefined) writeFileSync(path.join(guildDir, "models.policy"), files.policy);
+  if (files.local !== undefined) writeFileSync(path.join(guildDir, "models.policy.local"), files.local);
+  return guildDir;
 }
 
 interface Scenario {
@@ -157,13 +157,13 @@ export async function run(): Promise<number> {
 
     // ---- resolvePolicyFile source reporting -------------------------------------
     {
-      const c = makeCollabDir({ policy: "allow *\n", local: "deny openai/gpt-5.5\n" });
+      const c = makeGuildDir({ policy: "allow *\n", local: "deny openai/gpt-5.5\n" });
       const r1 = resolvePolicyFile(c, {});
       t.check(r1.source === "local" && r1.file.endsWith("models.policy.local"),
         "resolve: ruleful .local is preferred (source=local)");
       const r2 = resolvePolicyFile(c, { GUILD_POLICY: "/some/override" } as NodeJS.ProcessEnv);
       t.check(r2.source === "env" && r2.file === "/some/override", "resolve: $GUILD_POLICY wins (source=env)");
-      const c2 = makeCollabDir({ policy: "allow *\n", local: "# empty\n" });
+      const c2 = makeGuildDir({ policy: "allow *\n", local: "# empty\n" });
       const r3 = resolvePolicyFile(c2, {});
       t.check(r3.source === "committed" && r3.file.endsWith("models.policy"),
         "resolve: empty .local falls through to committed (source=committed)");
@@ -171,11 +171,11 @@ export async function run(): Promise<number> {
 
     // ---- policyTier fail-closed + missing ---------------------------------------
     {
-      const cMissing = makeCollabDir({}); // no policy files at all
-      t.check(policyTier("openai/x", { collabDir: cMissing, env: {} }).tier === "allow",
+      const cMissing = makeGuildDir({}); // no policy files at all
+      t.check(policyTier("openai/x", { guildDir: cMissing, env: {} }).tier === "allow",
         "policyTier: no policy file → allow (C4)");
       const dec = policyTier("openai/x", {
-        collabDir: makeCollabDir({}),
+        guildDir: makeGuildDir({}),
         env: { GUILD_POLICY: makeMalformedFile() } as NodeJS.ProcessEnv,
       });
       t.check(dec.tier === "deny" && !!dec.reason && /malformed/.test(dec.reason),
@@ -184,10 +184,10 @@ export async function run(): Promise<number> {
 
     // ---- LAYERED policy: project over global baseline (issue #19) ---------------
     {
-      const projectRoot = makeCollabDir({ policy: "" });
-      const globalRoot = makeCollabDir({ policy: "deny openai/gpt-5.5\nask *fable*\nallow *\n" });
+      const projectRoot = makeGuildDir({ policy: "" });
+      const globalRoot = makeGuildDir({ policy: "deny openai/gpt-5.5\nask *fable*\nallow *\n" });
       const roots = [projectRoot, globalRoot]; // most-specific first
-      const tierOf = (m: string) => policyTierAcross(m, { collabDirs: roots, env: {} }).tier;
+      const tierOf = (m: string) => policyTierAcross(m, { guildDirs: roots, env: {} }).tier;
 
       // Baseline binds through an EMPTY project layer — the pre-#19 bug this issue fixes:
       // a project `modelguild/` used to shadow the global policy entirely.
@@ -211,20 +211,20 @@ export async function run(): Promise<number> {
         "layered: the global ask still binds for ids the project doesn't name");
 
       // Nothing anywhere → default-allow (C4 survives layering).
-      t.check(policyTierAcross("openai/x", { collabDirs: [makeCollabDir({}), makeCollabDir({})], env: {} }).tier === "allow",
+      t.check(policyTierAcross("openai/x", { guildDirs: [makeGuildDir({}), makeGuildDir({})], env: {} }).tier === "allow",
         "layered: no policy file in any layer → allow (C4)");
 
       // Fail-closed is CHAIN-WIDE: a malformed GLOBAL layer denies even though the project
       // layer is fine and already matched (the deliberate widening — see policyTierAcross).
-      const badGlobal = makeCollabDir({ policy: "allow *\nnotatier x\n" });
-      const okProject = makeCollabDir({ policy: "allow openai/gpt-5\n" });
-      const chainBad = policyTierAcross("openai/gpt-5", { collabDirs: [okProject, badGlobal], env: {} });
+      const badGlobal = makeGuildDir({ policy: "allow *\nnotatier x\n" });
+      const okProject = makeGuildDir({ policy: "allow openai/gpt-5\n" });
+      const chainBad = policyTierAcross("openai/gpt-5", { guildDirs: [okProject, badGlobal], env: {} });
       t.check(chainBad.tier === "deny" && !!chainBad.reason && /malformed/.test(chainBad.reason),
         "layered: a malformed line in ANY layer fails the whole chain closed (C6, chain-wide)");
 
       // $GUILD_POLICY replaces the ENTIRE chain (single-file override).
       const envPol = writeTmpPolicy("allow *\n");
-      t.check(policyTierAcross("openai/gpt-5.5", { collabDirs: roots, env: { GUILD_POLICY: envPol } as NodeJS.ProcessEnv }).tier === "allow",
+      t.check(policyTierAcross("openai/gpt-5.5", { guildDirs: roots, env: { GUILD_POLICY: envPol } as NodeJS.ProcessEnv }).tier === "allow",
         "layered: $GUILD_POLICY is a single-file override — no layers beneath it");
     }
 
@@ -232,27 +232,27 @@ export async function run(): Promise<number> {
     {
       // `.local` no longer REPLACES the committed file — it sits above it, so a personal
       // rule wins for the ids it names while committed rules keep binding for the rest.
-      const root = makeCollabDir({
+      const root = makeGuildDir({
         policy: "deny anthropic/*\nallow *\n",
         local: "allow openai/gpt-5.5\n",
       });
-      const tierOf = (m: string) => policyTier(m, { collabDir: root, env: {} }).tier;
+      const tierOf = (m: string) => policyTier(m, { guildDir: root, env: {} }).tier;
       t.check(tierOf("openai/gpt-5.5") === "allow", "within-root: the .local rule wins for the id it names");
       t.check(tierOf("anthropic/claude-fable-5") === "deny",
         "within-root: a committed rule the .local doesn't name STILL binds (.local layers, no longer replaces)");
 
       // C1/C2's `_has_rules` gate is KEPT: a ruleless .local is excluded from the chain
       // entirely, so it can neither shadow committed nor fail the chain closed.
-      const bare = makeCollabDir({ policy: "deny openai/gpt-5.5\nallow *\n", local: "deny\n" });
+      const bare = makeGuildDir({ policy: "deny openai/gpt-5.5\nallow *\n", local: "deny\n" });
       const bareLayers = resolvePolicyLayers([bare], {});
       t.check(bareLayers.length === 1 && bareLayers[0].source === "committed",
         "within-root: a ruleless (bare-deny) .local is NOT a layer at all (C1/C2 gate kept)");
-      t.check(policyTier("openai/gpt-5", { collabDir: bare, env: {} }).tier === "allow",
+      t.check(policyTier("openai/gpt-5", { guildDir: bare, env: {} }).tier === "allow",
         "within-root: a ruleless .local does not fail the chain closed");
 
       // resolvePolicyLayers reports the full chain with presence, most-specific first.
-      const projectRoot = makeCollabDir({ policy: "allow *\n", local: "deny google/*\n" });
-      const globalRoot = makeCollabDir({}); // no files at all
+      const projectRoot = makeGuildDir({ policy: "allow *\n", local: "deny google/*\n" });
+      const globalRoot = makeGuildDir({}); // no files at all
       const layers = resolvePolicyLayers([projectRoot, globalRoot], {});
       t.check(
         layers.length === 3 &&
@@ -387,7 +387,7 @@ export async function run(): Promise<number> {
         t.check(true, `[skipped as root] ${sc.name}`);
         continue;
       }
-      const collab = makeCollabDir(sc.files);
+      const guildDir = makeGuildDir(sc.files);
       let env: Record<string, string> = { ...(sc.env ?? {}) };
 
       // Scenarios that need a $GUILD_POLICY file created on the fly.
@@ -400,13 +400,13 @@ export async function run(): Promise<number> {
       }
 
       if (sc.chmodZero) {
-        const f = path.join(collab, sc.chmodZero === "policy" ? "models.policy" : "models.policy.local");
+        const f = path.join(guildDir, sc.chmodZero === "policy" ? "models.policy" : "models.policy.local");
         chmodSync(f, 0o000);
       }
 
       for (const cs of sc.cases) {
         crossChecks += 1;
-        const tsTier = policyTier(cs.model, { collabDir: collab, env: env as NodeJS.ProcessEnv }).tier;
+        const tsTier = policyTier(cs.model, { guildDir, env: env as NodeJS.ProcessEnv }).tier;
         if (tsTier === cs.expect) {
           crossAgree += 1;
         } else {
@@ -418,7 +418,7 @@ export async function run(): Promise<number> {
 
       if (sc.chmodZero) {
         // restore so rmSync can clean up
-        try { chmodSync(path.join(collab, "models.policy"), 0o644); } catch { /* noop */ }
+        try { chmodSync(path.join(guildDir, "models.policy"), 0o644); } catch { /* noop */ }
       }
     }
     t.check(crossMismatch === 0,

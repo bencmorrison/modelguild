@@ -42,7 +42,7 @@ import {
   checkResolvedModelId,
   resolveAgentDefDirs,
   hardenedDefPresentIn,
-  type CollabRoot,
+  type GuildRoot,
   type RootSource,
 } from "./config.js";
 import {
@@ -55,7 +55,7 @@ import {
 
 /** The read-only agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const CONSULT_AGENT = "guild-read";
-/** The command label recorded in the evidence log (drives `/guild:witness`). */
+/** The command label recorded in the evidence log. */
 export const CONSULT_COMMAND = "/guild:consult";
 
 // --- Root resolution + layering / shadowing surfacing (issue #19) ----------
@@ -64,9 +64,9 @@ export interface RootResolution {
   root: string;
   source: RootSource;
   /** The READ layers actually in effect, most-specific first (project over global). */
-  layers: CollabRoot[];
+  layers: GuildRoot[];
   /** Every root that exists on disk, precedence order (env > project > home). */
-  candidates: CollabRoot[];
+  candidates: GuildRoot[];
   /**
    * Set ONLY when a root that exists on disk is NOT layered — which, since #19, happens
    * for exactly one reason: an explicit `$GUILD_ROOT` single-root override. A project
@@ -76,7 +76,7 @@ export interface RootResolution {
 }
 
 /**
- * Resolve the collab root layers ONCE, and describe the one case where a root on disk is
+ * Resolve the guild root layers ONCE, and describe the one case where a root on disk is
  * NOT contributing, so the caller (tool metadata + `guild_status`) can surface it.
  *
  * BEFORE #19 this reported "multiple roots exist, one SHADOWS the others" — because it did.
@@ -111,13 +111,13 @@ export function resolveRootWithConflict(
 }
 
 // --- Doctor-seed checks (M4 "doctor MUST warn"; surfaced by guild_status) --
-export interface CollabDoctorSeed {
+export interface GuildDoctorSeed {
   /**
-   * The PRIMARY collab root (writes/logs), the ordered READ layers now in effect
+   * The PRIMARY guild root (writes/logs), the ordered READ layers now in effect
    * (project over global baseline — issue #19), and the note set only when a root on
    * disk is NOT layered (an explicit `$GUILD_ROOT`).
    */
-  collabRoot: {
+  guildRoot: {
     root: string;
     source: RootSource;
     layers: Array<{ root: string; source: RootSource }>;
@@ -145,19 +145,19 @@ export interface CollabDoctorSeed {
  * model is then allowed. `policy.layers` carries each layer's `exists` flag so the operator
  * can see that directly rather than assuming a policy binds when none is present.
  */
-export function collabDoctorSeed(
+export function guildDoctorSeed(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
-): CollabDoctorSeed {
+): GuildDoctorSeed {
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDirs = rootRes.layers.map((l) => l.root);
-  const collabDir = rootRes.root;
-  const layers = resolvePolicyLayers(collabDirs, env);
+  const guildDirs = rootRes.layers.map((l) => l.root);
+  const guildDir = rootRes.root;
+  const layers = resolvePolicyLayers(guildDirs, env);
   const head = layers.find((l) => l.exists) ?? layers[0];
-  const log = new EvidenceLog({ env, cwd, collabDir, collabDirs });
+  const log = new EvidenceLog({ env, cwd, guildDir, guildDirs });
   return {
-    collabRoot: {
+    guildRoot: {
       root: rootRes.root,
       source: rootRes.source,
       layers: rootRes.layers.map((l) => ({ root: l.root, source: l.source })),
@@ -195,7 +195,7 @@ export interface ConsultError {
   /**
    * The bash exit code this maps to: 5 agent-def-missing (C57), 2 model-id (C55), 3 deny
    * (C56), 4 ask (C56). For a `call-failed`/`agent-mismatch` this is **null**, NOT 0 — bash
-   * propagates opencode's own non-zero status verbatim (C53) with no fixed collab code, and
+   * propagates opencode's own non-zero status verbatim (C53) with no fixed ModelGuild code, and
    * 0 is reserved for success (C53), so a numeric code here would be a lie. `kind` + `isError`
    * is the failure signal; the message carries the underlying reason.
    */
@@ -259,7 +259,7 @@ export interface ConsultDeps {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
-  /** Injected in tests so root/policy/log all share one collab dir; else resolved. */
+  /** Injected in tests so root/policy/log all share one guild dir; else resolved. */
   log?: EvidenceLog;
   /** Per-turn timeout override (tests shorten it). */
   messageTimeoutMs?: number;
@@ -314,9 +314,9 @@ export type GateOutcome =
 export function gateModel(
   requestedModel: string,
   confirmed: boolean,
-  /** `collabDirs` are the LAYERED read roots, most-specific first (issue #19): the policy
+  /** `guildDirs` are the LAYERED read roots, most-specific first (issue #19): the policy
    * verdict walks project rules, then the global baseline, then default-allow. */
-  deps: { collabDirs: string[]; env: NodeJS.ProcessEnv },
+  deps: { guildDirs: string[]; env: NodeJS.ProcessEnv },
 ): GateOutcome {
   const idCheck = checkResolvedModelId(requestedModel);
   if (!idCheck.ok) {
@@ -330,7 +330,7 @@ export function gateModel(
       },
     };
   }
-  const decision = policyTierAcross(requestedModel, { collabDirs: deps.collabDirs, env: deps.env });
+  const decision = policyTierAcross(requestedModel, { guildDirs: deps.guildDirs, env: deps.env });
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   if (decision.tier === "deny") {
     return {
@@ -379,7 +379,7 @@ export interface LifecycleParams {
   /**
    * SESSION CONTINUATION (M7 / Option B). Continue this EXISTING opencode session
    * (skip create); its id is known up front so it is recorded on the `started` entry
-   * too, letting the witness see which turns shared a session. Omit to mint a fresh one.
+   * too, letting a reader of the log see which turns shared a session. Omit to mint a fresh one.
    */
   sessionId?: string;
   /** Keep the session alive after the turn (return its id); default deletes it. */
@@ -486,10 +486,10 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19);
   //    surface the note when an explicit $GUILD_ROOT leaves a root on disk unlayered.
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDirs = rootRes.layers.map((l) => l.root);
-  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
+  const guildDirs = rootRes.layers.map((l) => l.root);
+  const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readLayeredConfContents(collabDirs, env);
+  const confContents = readLayeredConfContents(guildDirs, env);
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, mirroring guild_research/guild_delegate).
   //    If the hardened guild-read def is not present in the resolved agent-def dir(s), REFUSE
@@ -532,10 +532,10 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   // impossible to self-authorise. Here the ask gate is instruction-layer (the error text
   // telling the driver the user must approve) PLUS the mechanical backstop that a
   // non-confirmed call cannot proceed, PLUS the tier/confirmed audit trail written into
-  // the evidence entries so /guild:witness can check after the fact whether an ask-tier
+  // the evidence entries so a reader of the log can check after the fact whether an ask-tier
   // consult claimed approval. That is NOT witness-grade parity — a driver that sets
   // confirmed:true without asking is caught only by audit, not prevented.
-  const gate = gateModel(requestedModel, params.confirmed === true, { collabDirs, env });
+  const gate = gateModel(requestedModel, params.confirmed === true, { guildDirs, env });
   if (!gate.ok) {
     return {
       ok: false,
@@ -551,7 +551,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   }
 
   // --- Past the gate: from here every path writes exactly one started + completed. ---
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
 
   // 5. Evidence lifecycle. Mint a fresh run only when the caller did not thread one; a
   //    provided runId reuses that run (so a workflow's calls share one auditable unit).

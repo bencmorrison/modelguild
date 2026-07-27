@@ -191,7 +191,7 @@ export async function createSession(opts: CreateSessionOpts): Promise<SessionRef
 }
 
 // --- sendMessage ----------------------------------------------------------
-/** An input message part. Only `text` is needed for the collab flows; the type is
+/** An input message part. Only `text` is needed for the guild flows; the type is
  * left open for the file/agent/subtask parts opencode also accepts. */
 export interface TextPartInput {
   type: "text";
