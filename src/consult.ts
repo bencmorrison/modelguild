@@ -34,9 +34,9 @@ import os from "node:os";
 import { askViaAgent, AgentMismatchError, type ServeProvider } from "./client.js";
 import { EvidenceLog } from "./log.js";
 import {
-  resolveCollabRoot,
   candidateRoots,
-  readConfContents,
+  layeredRoots,
+  readLayeredConfContents,
   resolveModel,
   resolveMessageTimeoutMs,
   checkResolvedModelId,
@@ -45,61 +45,90 @@ import {
   type CollabRoot,
   type RootSource,
 } from "./config.js";
-import { policyTier, resolvePolicyFile, type PolicyTier, type PolicySource } from "./policy.js";
+import {
+  policyTierAcross,
+  resolvePolicyLayers,
+  type PolicyTier,
+  type PolicySource,
+  type PolicyLayer,
+} from "./policy.js";
 
 /** The read-only agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const CONSULT_AGENT = "guild-read";
 /** The command label recorded in the evidence log (drives `/guild:witness`). */
 export const CONSULT_COMMAND = "/guild:consult";
 
-// --- Root resolution + conflict surfacing (M4 "doctor MUST warn") ----------
+// --- Root resolution + layering / shadowing surfacing (issue #19) ----------
 export interface RootResolution {
+  /** The PRIMARY root — the most-specific layer. Writes (the evidence `logs/`) go here. */
   root: string;
   source: RootSource;
+  /** The READ layers actually in effect, most-specific first (project over global). */
+  layers: CollabRoot[];
   /** Every root that exists on disk, precedence order (env > project > home). */
   candidates: CollabRoot[];
-  /** Set iff >1 root exists on disk: which won, which are shadowed, how to fix. */
+  /**
+   * Set ONLY when a root that exists on disk is NOT layered — which, since #19, happens
+   * for exactly one reason: an explicit `$GUILD_ROOT` single-root override. A project
+   * root sitting above a global one is no longer a conflict; it is the design.
+   */
   conflict?: string;
 }
 
 /**
- * Resolve the collab root ONCE and, if more than one root exists on disk, describe the
- * conflict so the caller (consult metadata + guild_status) can surface it. The chosen
- * root is `resolveCollabRoot`'s (env > project > home); when >1 candidate exists the
- * winner is `candidates[0]` and equals the chosen root.
+ * Resolve the collab root layers ONCE, and describe the one case where a root on disk is
+ * NOT contributing, so the caller (tool metadata + `guild_status`) can surface it.
+ *
+ * BEFORE #19 this reported "multiple roots exist, one SHADOWS the others" — because it did.
+ * Now the project layer sits ON TOP of the global baseline and both bind, so that is no
+ * longer a warning: nothing is silently lost. What IS still lossy is `$GUILD_ROOT`, which
+ * is a deliberate single-root override (see `layeredRoots`) — so when it is set AND some
+ * other root exists on disk, say plainly that the global baseline is not layered under it.
  */
 export function resolveRootWithConflict(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
 ): RootResolution {
-  const chosen = resolveCollabRoot(env, cwd, home);
+  const layers = layeredRoots(env, cwd, home);
+  const chosen = layers[0];
   const candidates = candidateRoots(env, cwd, home);
   const override = env.GUILD_ROOT;
   const hasOverride = override !== undefined && override.length > 0;
   let conflict: string | undefined;
-  // An explicit $GUILD_ROOT is a deliberate disambiguation — the winner is unambiguous
-  // and no root is *silently* shadowed, so it is NOT a conflict. The warning exists for
-  // the fail-open case where a policy in one root silently doesn't bind because a
-  // different root won WITHOUT the user having chosen (project vs home), so only report
-  // it when there was no override AND more than one root exists on disk.
-  if (!hasOverride && candidates.length > 1) {
-    const winner = candidates[0];
-    const shadowed = candidates.slice(1).map((r) => `${r.source} (${r.root})`);
-    conflict =
-      `multiple collab roots exist on disk — using ${winner.source} (${winner.root}); ` +
-      `shadowed: ${shadowed.join(", ")}. ` +
-      `The winning root's policy and config are the ones in effect; set $GUILD_ROOT to choose deliberately.`;
+  if (hasOverride) {
+    const unlayered = candidates.filter((c) => c.source !== "env" && c.root !== chosen.root);
+    if (unlayered.length > 0) {
+      conflict =
+        `$GUILD_ROOT is set (${chosen.root}) — that is a SINGLE-ROOT override, so these roots ` +
+        `that exist on disk are NOT layered under it: ` +
+        `${unlayered.map((r) => `${r.source} (${r.root})`).join(", ")}. ` +
+        `Their policy and preferences do NOT bind. Unset $GUILD_ROOT to get the layered ` +
+        `resolution (project over global baseline).`;
+    }
   }
-  return { root: chosen.root, source: chosen.source, candidates, conflict };
+  return { root: chosen.root, source: chosen.source, layers, candidates, conflict };
 }
 
 // --- Doctor-seed checks (M4 "doctor MUST warn"; surfaced by guild_status) --
 export interface CollabDoctorSeed {
-  /** Which collab root is in effect, and — if >1 exists on disk — the conflict note. */
-  collabRoot: { root: string; source: RootSource; conflict: string | null };
-  /** The model-policy file that would govern a call, and which slot supplied it. */
-  policy: { file: string; source: PolicySource };
+  /**
+   * The PRIMARY collab root (writes/logs), the ordered READ layers now in effect
+   * (project over global baseline — issue #19), and the note set only when a root on
+   * disk is NOT layered (an explicit `$GUILD_ROOT`).
+   */
+  collabRoot: {
+    root: string;
+    source: RootSource;
+    layers: Array<{ root: string; source: RootSource }>;
+    conflict: string | null;
+  };
+  /**
+   * The model-policy resolution: `file`/`source` are the most-specific slot (what the
+   * pre-#19 shape reported), and `layers` is the FULL chain a verdict walks, most-specific
+   * first — so `doctor` can show both the project and the global layer.
+   */
+  policy: { file: string; source: PolicySource; layers: PolicyLayer[] };
   /** Evidence layer on/off and the effective log directory. */
   logging: { enabled: boolean; logDir: string };
 }
@@ -110,11 +139,11 @@ export interface CollabDoctorSeed {
  * Pure and injectable so `guild_status` and its test drive the SAME code.
  *
  * CALLER-BEWARE (deliberate, not a bug): an explicit `$GUILD_ROOT` pointing at a root
- * that has NO policy file resolves to default-allow (C4) and reports NO conflict — the
- * override is trusted as the user's deliberate choice. So `policy.source` may read
- * `committed`/`local` for a file that does not exist there; every model is then allowed.
- * Surfaced here so the operator can see which root (and which policy file) is actually in
- * effect rather than assuming a policy binds when none is present.
+ * that has NO policy file resolves to default-allow (C4) — and, being a single-root
+ * override, nothing is layered beneath it, so a global policy does NOT rescue it. So
+ * `policy.source` may read `committed`/`local` for a file that does not exist there; every
+ * model is then allowed. `policy.layers` carries each layer's `exists` flag so the operator
+ * can see that directly rather than assuming a policy binds when none is present.
  */
 export function collabDoctorSeed(
   env: NodeJS.ProcessEnv = process.env,
@@ -122,12 +151,19 @@ export function collabDoctorSeed(
   home: string = os.homedir(),
 ): CollabDoctorSeed {
   const rootRes = resolveRootWithConflict(env, cwd, home);
+  const collabDirs = rootRes.layers.map((l) => l.root);
   const collabDir = rootRes.root;
-  const policy = resolvePolicyFile(collabDir, env);
-  const log = new EvidenceLog({ env, cwd, collabDir });
+  const layers = resolvePolicyLayers(collabDirs, env);
+  const head = layers.find((l) => l.exists) ?? layers[0];
+  const log = new EvidenceLog({ env, cwd, collabDir, collabDirs });
   return {
-    collabRoot: { root: rootRes.root, source: rootRes.source, conflict: rootRes.conflict ?? null },
-    policy: { file: policy.file, source: policy.source },
+    collabRoot: {
+      root: rootRes.root,
+      source: rootRes.source,
+      layers: rootRes.layers.map((l) => ({ root: l.root, source: l.source })),
+      conflict: rootRes.conflict ?? null,
+    },
+    policy: { file: head.file, source: head.source, layers },
     logging: { enabled: log.enabled(), logDir: log.logDir() },
   };
 }
@@ -278,7 +314,9 @@ export type GateOutcome =
 export function gateModel(
   requestedModel: string,
   confirmed: boolean,
-  deps: { collabDir: string; env: NodeJS.ProcessEnv },
+  /** `collabDirs` are the LAYERED read roots, most-specific first (issue #19): the policy
+   * verdict walks project rules, then the global baseline, then default-allow. */
+  deps: { collabDirs: string[]; env: NodeJS.ProcessEnv },
 ): GateOutcome {
   const idCheck = checkResolvedModelId(requestedModel);
   if (!idCheck.ok) {
@@ -292,7 +330,7 @@ export function gateModel(
       },
     };
   }
-  const decision = policyTier(requestedModel, { collabDir: deps.collabDir, env: deps.env });
+  const decision = policyTierAcross(requestedModel, { collabDirs: deps.collabDirs, env: deps.env });
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   if (decision.tier === "deny") {
     return {
@@ -445,11 +483,13 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   const cwd = deps.cwd ?? process.cwd();
   const home = deps.home ?? os.homedir();
 
-  // 1. Resolve the config root ONCE; surface a multi-root conflict.
+  // 1. Resolve the config root LAYERS ONCE (project over global baseline — issue #19);
+  //    surface the note when an explicit $GUILD_ROOT leaves a root on disk unlayered.
   const rootRes = resolveRootWithConflict(env, cwd, home);
-  const collabDir = rootRes.root;
+  const collabDirs = rootRes.layers.map((l) => l.root);
+  const collabDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
-  const confContents = readConfContents(collabDir, env);
+  const confContents = readLayeredConfContents(collabDirs, env);
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, mirroring guild_research/guild_delegate).
   //    If the hardened guild-read def is not present in the resolved agent-def dir(s), REFUSE
@@ -495,7 +535,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   // the evidence entries so /guild:witness can check after the fact whether an ask-tier
   // consult claimed approval. That is NOT witness-grade parity — a driver that sets
   // confirmed:true without asking is caught only by audit, not prevented.
-  const gate = gateModel(requestedModel, params.confirmed === true, { collabDir, env });
+  const gate = gateModel(requestedModel, params.confirmed === true, { collabDirs, env });
   if (!gate.ok) {
     return {
       ok: false,
@@ -511,7 +551,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   }
 
   // --- Past the gate: from here every path writes exactly one started + completed. ---
-  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir });
+  const log = deps.log ?? new EvidenceLog({ env, cwd, collabDir, collabDirs });
 
   // 5. Evidence lifecycle. Mint a fresh run only when the caller did not thread one; a
   //    provided runId reuses that run (so a workflow's calls share one auditable unit).

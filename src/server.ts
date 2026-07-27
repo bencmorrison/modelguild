@@ -114,9 +114,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: STATUS_TOOL,
       description:
         "Diagnostic: ensure the opencode serve child is running and report its version, " +
-        "port, pid, and agent count, PLUS the doctor-seed checks (which collab root is in " +
-        "effect and whether roots conflict, the active model-policy file, logging on/off " +
-        "and the log dir). Takes no arguments.",
+        "port, pid, and agent count, PLUS the doctor-seed checks (the primary collab root " +
+        "and the ordered config/policy LAYERS in effect — project over global baseline — " +
+        "the model-policy layer chain with each file's presence, whether an explicit " +
+        "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir). " +
+        "Takes no arguments.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {

@@ -8,9 +8,16 @@
 # vars still work as one-off overrides (precedence: explicit arg > env > this file).
 #
 # Values here are read by the guild MCP tools (GUILD_MODEL for single-model calls,
-# GUILD_MODELS for the panel). Model policy (deny/ask/allow) lives separately in
-# $GUILD_POLICY when set, otherwise a ruleful modelguild/models.policy.local,
-# otherwise committed modelguild/models.policy. See /guild:configure.
+# GUILD_MODELS for the panel). Model policy (deny/ask/allow) lives separately in the
+# models.policy files -- see modelguild/models.policy for that chain.
+#
+# LAYERED (issue #19): this file is read from BOTH roots. The global
+# ~/.claude/modelguild/modelguild.conf.local is the BASELINE and a project's own
+# <repo>/modelguild/modelguild.conf.local is overlaid ON TOP of it, key by key: a key
+# set in the project WINS, a key the project leaves unset falls THROUGH to global. So
+# set your defaults once globally and only override per project what differs.
+# $GUILD_CONF, when set, is a single-FILE override -- it replaces the whole chain.
+# See /guild:configure, which asks which root to write.
 
 # Default model for /guild:consult (and any single-model call). Prefer a NON-Claude model
 # so a second opinion is genuinely independent.
@@ -39,8 +46,11 @@
 # config, so this MUST point at the SAME directory the defs were actually installed to.
 # GUILD_AGENT_DIR=~/.config/opencode/agent
 
-# The guild root (where the policy/config/logs live). Resolved as $GUILD_ROOT, else
-# <cwd>/modelguild/, else ~/.claude/modelguild/. Set this only for a non-standard layout.
+# The guild root (where the policy/config/logs live). LAYERED: <cwd>/modelguild/ over
+# ~/.claude/modelguild/, most-specific first, both binding. $GUILD_ROOT overrides that
+# with a SINGLE root -- nothing is layered under it, so your global policy and
+# preferences stop binding. Set it only for a fixture, a CI sandbox, or a genuinely
+# non-standard layout. Writes (the evidence logs/) always go to the most-specific root.
 # GUILD_ROOT=/path/to/modelguild
 
 # --- Evidence layer (src/log.ts) ------------------------------------------------

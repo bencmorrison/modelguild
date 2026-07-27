@@ -23,30 +23,49 @@ import { MESSAGE_HTTP_MS } from "./client.js";
 export { confGet };
 
 /* ---------------------------------------------------------------------------
- * Collab-root resolution.
+ * Collab-root resolution — LAYERED (issue #19).
  *
- * The bash scripts resolve their config/policy/log siblings via `dirname "$0"` — the
- * directory of the running script, which for a per-project install is the project's
- * `modelguild/` and for a global install is `~/.claude/modelguild/`. The npm server has no
- * such fixed sibling, so it resolves the equivalent root explicitly, in order:
- *     1. `$GUILD_ROOT`            — explicit override (new in the TS layer; the bash
- *                                    layer has no single root env knob, so this is a
- *                                    documented addition, not a bash behaviour)
- *     2. `<cwd>/modelguild/`           — a project-local install (the common case)
- *     3. `~/.claude/modelguild/`       — a global install
- * `source` is exposed so `doctor` can warn when more than one candidate exists (M4:
- * "doctor warns on conflicts").
+ * The bash scripts resolved their config/policy/log siblings via `dirname "$0"` — one
+ * directory, whichever install was running. The TS server first reproduced that as a
+ * SINGLE-root, first-match chain (`$GUILD_ROOT` → `<cwd>/modelguild/` →
+ * `~/.claude/modelguild/`), which meant a project's `modelguild/` SHADOWED the global one
+ * entirely: install per-project and your carefully-set global model policy and preferences
+ * silently stopped binding.
+ *
+ * Resolution is now LAYERED. The global install is the BASELINE; the project overrides and
+ * extends it. `layeredRoots()` returns the read layers MOST-SPECIFIC FIRST:
+ *     1. `<cwd>/modelguild/`      — the project layer (if it exists on disk)
+ *     2. `~/.claude/modelguild/`  — the global baseline layer
+ * and the consumers combine them per their own merge rule:
+ *   - preferences (`modelguild.conf.local`): global read first, project overlaid on top —
+ *     a project key wins, an unset key falls THROUGH to global (`readLayeredConfContents`).
+ *   - model policy: project rules evaluated first, then global, then default-allow
+ *     (`policyTierAcross` in policy.ts). The project can add a stricter deny or a looser
+ *     allow on top of the global baseline.
+ *
+ * `$GUILD_ROOT` IS A SINGLE-ROOT OVERRIDE — DELIBERATE, NOT AN OVERSIGHT (decided for
+ * issue #19). When it is set, `layeredRoots()` returns EXACTLY that one root: no global
+ * baseline is layered under it. Rationale: the knob's whole purpose is "read config from
+ * HERE and nowhere else" — a test fixture, a CI sandbox, a deliberately isolated root.
+ * Silently layering `~/.claude/modelguild/` beneath it would make an explicitly-pinned root
+ * non-hermetic and would surprise exactly the caller who was most explicit. The cost is
+ * stated rather than hidden: with `$GUILD_ROOT` set you get NO global baseline, so a global
+ * deny does not bind — `resolveRootWithConflict` surfaces that as a note when other roots
+ * exist on disk. (`$GUILD_POLICY`/`$GUILD_CONF` behave the same way for the same reason:
+ * an explicit FILE is the whole answer, not a top layer.)
+ *
+ * `resolveCollabRoot()` remains the PRIMARY root — `layeredRoots()[0]`, i.e. the
+ * most-specific layer, falling back to the home root when nothing exists yet. It is what
+ * WRITES use (the evidence log's `logs/` dir) and what `doctor`/`guild_status` report as
+ * "the root in effect". Reads use the layers.
  *
  * TRUST: `$GUILD_ROOT` redirects where the policy AND config are read from, so it is a
  * control over the security policy. That grants NO new privilege: it is env-tier,
  * exactly like the already-conceded `$GUILD_POLICY` — anyone who can set process env
  * can already point policy resolution wherever they like, so redirecting the root is
- * the same authority by another lever, not an escalation. Note the cwd-relative step 2:
- * with no `$GUILD_ROOT`, the resolved root (hence the active policy) depends on the
- * process's CWD, so the caller must invoke from the intended project. Before M5 wires
- * this into production, `doctor` MUST use `candidateRoots()` to warn when more than one
- * root exists on disk — otherwise a user's policy in one root silently doesn't bind
- * because a different root won (the fail-open class — see AGENTS.md, model-policy resolution).
+ * the same authority by another lever, not an escalation. Note the cwd-relative project
+ * layer: with no `$GUILD_ROOT`, which project layer applies depends on the process's CWD,
+ * so the caller must invoke from the intended project.
  * --------------------------------------------------------------------------- */
 export type RootSource = "env" | "project" | "home";
 
@@ -55,21 +74,48 @@ export interface CollabRoot {
   source: RootSource;
 }
 
+/**
+ * The ordered READ layers, MOST-SPECIFIC FIRST. `$GUILD_ROOT` ⇒ exactly one layer (a
+ * single-root override — see the block comment). Otherwise the project layer (when
+ * `<cwd>/modelguild/` exists) sits above the global baseline (when
+ * `~/.claude/modelguild/` exists). Never empty: with neither on disk it returns the home
+ * root alone, so there is always a primary root to name and to write logs under.
+ */
+export function layeredRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+  home: string = os.homedir(),
+): CollabRoot[] {
+  const override = env.GUILD_ROOT;
+  if (override && override.length > 0) return [{ root: override, source: "env" }];
+  const out: CollabRoot[] = [];
+  const project = path.join(cwd, "modelguild");
+  if (existsSync(project)) out.push({ root: project, source: "project" });
+  const globalRoot = path.join(home, ".claude", "modelguild");
+  if (existsSync(globalRoot)) out.push({ root: globalRoot, source: "home" });
+  // Nothing on disk yet: the home root is still the primary (where an install would land).
+  if (out.length === 0) out.push({ root: globalRoot, source: "home" });
+  return out;
+}
+
+/**
+ * The PRIMARY root — the most-specific layer. Writes (the evidence log's `logs/` dir) go
+ * here, and this is the root `doctor`/`guild_status` name as "in effect". Identical to the
+ * pre-layering single-root chain by construction (`layeredRoots()[0]`).
+ */
 export function resolveCollabRoot(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   home: string = os.homedir(),
 ): CollabRoot {
-  const override = env.GUILD_ROOT;
-  if (override && override.length > 0) return { root: override, source: "env" };
-  const project = path.join(cwd, "modelguild");
-  if (existsSync(project)) return { root: project, source: "project" };
-  return { root: path.join(home, ".claude", "modelguild"), source: "home" };
+  return layeredRoots(env, cwd, home)[0];
 }
 
 /**
- * All roots that actually exist, in precedence order — for `doctor` conflict warnings.
- * `$GUILD_ROOT` is always included (it is an explicit intent even if empty on disk).
+ * Every root that exists on disk, precedence order — INCLUDING the ones `$GUILD_ROOT`
+ * excludes from layering. `layeredRoots()` says what actually binds; this says what is
+ * THERE, so `resolveRootWithConflict` can tell the user when an explicit `$GUILD_ROOT`
+ * is leaving a real global baseline unlayered.
  */
 export function candidateRoots(
   env: NodeJS.ProcessEnv = process.env,
@@ -197,6 +243,52 @@ export function readConfContents(
   const file = resolveConfFile(collabDir, env);
   if (!file) return "";
   try { return readFileSync(file, "utf8"); } catch { return ""; }
+}
+
+/**
+ * The config files that contribute, MOST-SPECIFIC FIRST (issue #19). `$GUILD_CONF` is a
+ * single-FILE override — exactly one file, no layering under it (same reasoning as
+ * `$GUILD_ROOT`: an explicit file is the whole answer). Otherwise: each root's
+ * `modelguild.conf.local` that exists, in the roots' order.
+ */
+export function resolveConfFiles(
+  collabDirs: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const override = env.GUILD_CONF;
+  if (override && override.length > 0) return [override];
+  const out: string[] = [];
+  for (const dir of collabDirs) {
+    const local = path.join(dir, "modelguild.conf.local");
+    if (existsSync(local) && !out.includes(local)) out.push(local);
+  }
+  return out;
+}
+
+/**
+ * LAYERED preference contents: the global baseline read first, each more-specific layer
+ * overlaid on top — so a project key WINS and an unset key falls THROUGH to global.
+ *
+ * The overlay is done by CONCATENATION, least-specific first, deliberately: `confGet`'s
+ * documented semantics are LAST-ASSIGNMENT-WINS (C10), so appending the project's file
+ * after the global one yields exactly "project key overrides, unset key inherited" with no
+ * second merge implementation to drift from the parser. Every consumer already threads a
+ * single `confContents` string, so nothing downstream changes shape.
+ *
+ * A `\n` separator is inserted between files so a final line lacking a trailing newline in
+ * one layer can never fuse with the first line of the next.
+ */
+export function readLayeredConfContents(
+  collabDirs: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const files = resolveConfFiles(collabDirs, env);
+  const parts: string[] = [];
+  // Least-specific first: reverse the most-specific-first file list.
+  for (const file of [...files].reverse()) {
+    try { parts.push(readFileSync(file, "utf8")); } catch { /* unreadable ⇒ contributes nothing */ }
+  }
+  return parts.join("\n");
 }
 
 /* ---------------------------------------------------------------------------

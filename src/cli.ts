@@ -18,6 +18,8 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { init, mcpServerEntry, payloadFiles, payloadDest, resolveGlobalDirs, type ServerLaunch } from "./init.js";
+import { layeredRoots } from "./config.js";
+import { resolvePolicyLayers } from "./policy.js";
 
 const SELF = fileURLToPath(import.meta.url); // <pkg>/dist/cli.js  or  <pkg>/src/cli.ts
 const PACKAGE_ROOT = path.resolve(path.dirname(SELF), "..");
@@ -327,6 +329,30 @@ export async function runDoctor(
     policyWhere !== "none",
     `model policy present (${policyLoc})${whereSuffix(new Set([policyWhere]))}`,
   );
+
+  // LAYERED config/policy resolution (issue #19) — report BOTH layers, not just the winner.
+  // Since #19 a project `modelguild/` no longer shadows the global one: it sits ON TOP of it
+  // (preferences overlay key-by-key, policy rules evaluate project-first then global). The
+  // operator needs to see the whole chain to know what actually binds, so print every layer
+  // and mark which files exist. `--global` is not special-cased here: the layers are whatever
+  // resolves for `targetDir`, and an injected homeDir keeps this test-drivable without ever
+  // touching the real `~`.
+  {
+    // Real `process.env` on purpose: `$GUILD_ROOT`/`$GUILD_POLICY` genuinely change what
+    // binds at runtime, so a doctor that ignored them would print a chain the server does
+    // not use. `targetDir`/`gdirs.homeDir` stay injectable so tests never read the real `~`.
+    const roots = layeredRoots(process.env, targetDir, gdirs.homeDir);
+    const label = (s: string) => (s === "project" ? "project" : s === "home" ? "global" : s);
+    console.log(
+      `✓ config/policy layers (most-specific first): ${roots
+        .map((r) => `${label(r.source)} ${r.root}`)
+        .join("  →  ")}  →  default-allow`,
+    );
+    for (const layer of resolvePolicyLayers(roots.map((r) => r.root), process.env)) {
+      const mark = layer.exists ? "•" : "-";
+      console.log(`  ${mark} ${layer.source.padEnd(9)} ${layer.file}${layer.exists ? "" : " (absent)"}`);
+    }
+  }
 
   // opencode binary (best-effort; a missing binary is a warning, not a hard fail here).
   const oc = spawnSync("opencode", ["--version"], { encoding: "utf8" });

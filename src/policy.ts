@@ -27,11 +27,23 @@ export type PolicySource = "env" | "local" | "committed";
 
 export interface PolicyDecision {
   tier: PolicyTier;
-  /** The file that was resolved and consulted (doctor + M5 diagnostics need it). */
+  /** The file that DECIDED (or, when no rule matched, the most-specific consulted layer). */
   policyFile: string;
   source: PolicySource;
   /** Set only on a fail-closed deny: the loud reason to surface to the user. */
   reason?: string;
+  /** Every layer that was consulted, most-specific first (issue #19; doctor reports it). */
+  layers?: PolicyLayer[];
+}
+
+/** One file in the layered policy chain (issue #19), most-specific first. */
+export interface PolicyLayer {
+  file: string;
+  source: PolicySource;
+  /** Which collab root contributed it — `undefined` for a `$GUILD_POLICY` override. */
+  root?: string;
+  /** Whether the file is present on disk (a reported-but-absent layer contributes nothing). */
+  exists: boolean;
 }
 
 /* ---------------------------------------------------------------------------
@@ -222,7 +234,7 @@ export function tierFromContents(
   contents: string,
   model: string,
   fileLabel = "policy",
-): { tier: PolicyTier; reason?: string } {
+): { tier: PolicyTier; reason?: string; matchedRule?: boolean } {
   let matched: PolicyTier | "" = "";
   const lines = contents.split("\n");
   for (let idx = 0; idx < lines.length; idx += 1) {
@@ -249,65 +261,155 @@ export function tierFromContents(
       matched = tier;
     }
   }
-  return { tier: matched === "" ? "allow" : matched };
+  // `matchedRule` distinguishes "a rule matched and its tier is allow" from "nothing
+  // matched, defaulting to allow". Layered evaluation NEEDS that distinction: a project
+  // `allow` that MATCHED must stop a global `deny` from applying, whereas a project file
+  // that matched nothing must fall through to the global layer. Additive — the pre-#19
+  // callers read only `tier`/`reason`.
+  return { tier: matched === "" ? "allow" : matched, matchedRule: matched !== "" };
 }
 
 /**
- * Policy file resolution (C1): `$GUILD_POLICY` if set, else a git-ignored
- * `models.policy.local` ONLY IF it carries ≥1 rule, else the committed `models.policy`.
- * `collabDir` is the directory the bash resolves via `dirname "$0"` (i.e. `modelguild/`).
+ * The ordered policy LAYERS (issue #19), MOST-SPECIFIC FIRST.
+ *
+ * `$GUILD_POLICY` is a single-FILE override: exactly one layer, nothing beneath it (same
+ * reasoning as `$GUILD_ROOT` in config.ts — an explicit file is the whole answer, not a top
+ * layer). Otherwise, for each collab root in order (project layer, then the global
+ * baseline):
+ *   - `models.policy.local` — included ONLY IF it carries ≥1 complete rule (C1/C2's
+ *     `_has_rules` gate, KEPT: an empty or comment-only `.local`, or a bare `deny` with no
+ *     pattern, must not affect resolution at all; excluding it here means it also cannot
+ *     fail the chain closed as a "malformed" layer, which is the pre-#19 behaviour).
+ *   - `models.policy` — the committed file, always a candidate (its `exists` flag says
+ *     whether it is actually there).
+ *
+ * NOTE the within-root change: `.local` no longer REPLACES the committed file, it sits
+ * ABOVE it. First-matching-rule-wins then does the right thing — a personal `.local` rule
+ * still beats a committed rule for the ids it names, while committed rules keep binding for
+ * the ids `.local` says nothing about. C1's "≥1 rule" gate and C2's "an empty `.local` does
+ * not shadow the committed policy" both survive unchanged.
+ */
+export function resolvePolicyLayers(
+  collabDirs: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): PolicyLayer[] {
+  const override = env.GUILD_POLICY;
+  if (override && override.length > 0) {
+    let exists = false;
+    try { exists = statSync(override).isFile(); } catch { exists = false; }
+    return [{ file: override, source: "env", exists }];
+  }
+  const out: PolicyLayer[] = [];
+  for (const collabDir of collabDirs) {
+    const local = path.join(collabDir, "models.policy.local");
+    let localContents: string | undefined;
+    try { localContents = readFileSync(local, "utf8"); } catch { localContents = undefined; }
+    if (localContents !== undefined && hasRules(localContents)) {
+      out.push({ file: local, source: "local", root: collabDir, exists: true });
+    }
+    const committed = path.join(collabDir, "models.policy");
+    let cExists = false;
+    try { cExists = statSync(committed).isFile(); } catch { cExists = false; }
+    out.push({ file: committed, source: "committed", root: collabDir, exists: cExists });
+  }
+  return out;
+}
+
+/**
+ * Policy file resolution (C1) for ONE root — the most-specific layer that root supplies:
+ * `$GUILD_POLICY` if set, else a git-ignored `models.policy.local` ONLY IF it carries ≥1
+ * rule, else the committed `models.policy`. Kept as the single-root view (`doctor` prints
+ * it, and it is the head of that root's layer list) and implemented in terms of
+ * `resolvePolicyLayers` so the two can never drift.
  */
 export function resolvePolicyFile(
   collabDir: string,
   env: NodeJS.ProcessEnv = process.env,
 ): { file: string; source: PolicySource } {
-  const override = env.GUILD_POLICY;
-  if (override && override.length > 0) return { file: override, source: "env" };
-  const local = path.join(collabDir, "models.policy.local");
-  let localContents: string | undefined;
-  try { localContents = readFileSync(local, "utf8"); } catch { localContents = undefined; }
-  if (localContents !== undefined && hasRules(localContents)) {
-    return { file: local, source: "local" };
-  }
-  return { file: path.join(collabDir, "models.policy"), source: "committed" };
+  const [head] = resolvePolicyLayers([collabDir], env);
+  return { file: head.file, source: head.source };
 }
 
 /**
- * Full policy verdict for a model (C1–C7). Resolves the file, then:
+ * SINGLE-ROOT policy verdict (C1–C7) — one collab root's layers only:
  *   - no such regular file            → allow (policy only ever restricts)
  *   - exists but unreadable           → deny, loud reason (fail-closed, C5)
  *   - malformed active line           → deny, loud reason (fail-closed, C6)
  *   - first matching glob wins        → its tier (C3)
  *   - no match / empty model id       → allow (C4)
  *
- * TOCTOU divergence (deliberate, in the safe direction): if the file vanishes between
- * the `statSync` and the `readFileSync`, this returns DENY (the read throws → the
- * unreadable branch). Bash's `[ -r ]`-then-read race would instead fall through to
- * `echo allow` (fail-OPEN) on that same window. A rare, intentional non-parity: a
- * disappearing policy file fails closed here, open there. Stated so it is not read as a
- * bug.
+ * Kept as the narrow view (and used by every existing caller/test); production callers go
+ * through `policyTierAcross` with the LAYERED roots. See it for the chain-wide semantics.
  */
 export function policyTier(
   model: string,
   opts: { collabDir: string; env?: NodeJS.ProcessEnv },
 ): PolicyDecision {
+  return policyTierAcross(model, { collabDirs: [opts.collabDir], env: opts.env });
+}
+
+/**
+ * LAYERED policy verdict (issue #19) — the production entry point.
+ *
+ * Evaluates the layers most-specific first (project `.local` → project committed → global
+ * `.local` → global committed) and takes the FIRST RULE that matches, anywhere in the
+ * chain; nothing matching anywhere is `allow` (C4 — policy only ever restricts). So the
+ * global install is the BASELINE and the project can add a stricter deny or a looser allow
+ * on top of it, instead of shadowing it wholesale as the pre-#19 single-root chain did.
+ *
+ * FAIL-CLOSED IS CHAIN-WIDE, and this is a deliberate widening: EVERY existing layer is
+ * parsed even after a rule has matched, exactly as `tierFromContents` parses a whole file
+ * after a match (C6). A malformed active line, or an existing-but-unreadable file, in ANY
+ * consulted layer resolves to `deny` with the loud reason naming that file. Cost, stated:
+ * a broken GLOBAL policy now denies in every project, not just in the global one — that is
+ * the fail-closed direction, and the reason names the offending file and line so it is
+ * fixable, which is the trade the repo already makes within a single file.
+ *
+ * TOCTOU divergence (deliberate, in the safe direction): if a file vanishes between the
+ * `statSync` and the `readFileSync`, this returns DENY (the read throws → the unreadable
+ * branch). Bash's `[ -r ]`-then-read race would instead fall through to `echo allow`
+ * (fail-OPEN). A rare, intentional non-parity: a disappearing policy file fails closed
+ * here, open there. Stated so it is not read as a bug.
+ */
+export function policyTierAcross(
+  model: string,
+  opts: { collabDirs: string[]; env?: NodeJS.ProcessEnv },
+): PolicyDecision {
   const env = opts.env ?? process.env;
-  const { file, source } = resolvePolicyFile(opts.collabDir, env);
-  // `[ -f "$policy_file" ]` — a missing file or non-regular path (e.g. a directory)
-  // means default-allow.
-  let st;
-  try { st = statSync(file); } catch { return { tier: "allow", policyFile: file, source }; }
-  if (!st.isFile()) return { tier: "allow", policyFile: file, source };
-  // `[ ! -r ]` — exists but unreadable ⇒ fail closed.
-  let contents: string;
-  try { contents = readFileSync(file, "utf8"); } catch {
-    return {
-      tier: "deny",
-      policyFile: file,
-      source,
-      reason: `policy file '${file}' exists but is unreadable — refusing (fail-closed).`,
-    };
+  const layers = resolvePolicyLayers(opts.collabDirs, env);
+  // Reported file/source when NOTHING matched: the most-specific layer that exists, else
+  // the most-specific candidate — so the diagnostic always names a real resolution slot.
+  const head = layers.find((l) => l.exists) ?? layers[0];
+  let decided: { tier: PolicyTier; layer: PolicyLayer } | undefined;
+
+  for (const layer of layers) {
+    // `[ -f "$policy_file" ]` — a missing file or non-regular path (e.g. a directory)
+    // contributes nothing (default-allow if no other layer matches).
+    let st;
+    try { st = statSync(layer.file); } catch { continue; }
+    if (!st.isFile()) continue;
+    // `[ ! -r ]` — exists but unreadable ⇒ fail closed for the whole chain.
+    let contents: string;
+    try { contents = readFileSync(layer.file, "utf8"); } catch {
+      return {
+        tier: "deny",
+        policyFile: layer.file,
+        source: layer.source,
+        layers,
+        reason: `policy file '${layer.file}' exists but is unreadable — refusing (fail-closed).`,
+      };
+    }
+    const res = tierFromContents(contents, model, layer.file);
+    if (res.reason !== undefined) {
+      return { tier: "deny", policyFile: layer.file, source: layer.source, layers, reason: res.reason };
+    }
+    if (decided === undefined && res.matchedRule === true) {
+      decided = { tier: res.tier, layer };
+    }
   }
-  const { tier, reason } = tierFromContents(contents, model, file);
-  return { tier, reason, policyFile: file, source };
+
+  if (decided !== undefined) {
+    return { tier: decided.tier, policyFile: decided.layer.file, source: decided.layer.source, layers };
+  }
+  return { tier: "allow", policyFile: head.file, source: head.source, layers };
 }

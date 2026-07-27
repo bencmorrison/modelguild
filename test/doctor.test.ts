@@ -106,6 +106,32 @@ export async function run(): Promise<number> {
   c.check(f.out.includes("missing: consult"), "(f) names the missing doc (consult)");
   c.check(f.out.includes("✗"), "(f) prints a ✗ line for the missing doc");
 
+  // ---- (g) LAYERED config/policy chain is REPORTED (issue #19) -------------
+  // A project install under a home that ALSO carries a global install: doctor must print
+  // BOTH layers (project over global baseline) plus every policy file in the chain, so the
+  // operator can see what actually binds rather than only the winner.
+  {
+    const layHome = tempDir();
+    const layXdg = tempDir();
+    const layProj = tempDir();
+    init({ targetDir: layProj, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    init({ targetDir: tempDir(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: layHome, xdgConfigHome: layXdg });
+    const g3 = await captureDoctor(["--dir", layProj], { homeDir: layHome, xdgConfigHome: layXdg });
+    c.check(g3.code === 0, `(g) layered project+global install: doctor PASSES (exit ${g3.code})`);
+    c.check(g3.out.includes("config/policy layers"), "(g) doctor prints the layered config/policy chain");
+    c.check(
+      g3.out.includes(path.join(layProj, "modelguild")) &&
+        g3.out.includes(path.join(layHome, ".claude", "modelguild")),
+      "(g) the chain names BOTH the project layer and the global baseline",
+    );
+    c.check(g3.out.includes("default-allow"), "(g) the chain ends at default-allow");
+    c.check(
+      g3.out.includes(path.join(layProj, "modelguild", "models.policy")) &&
+        g3.out.includes(path.join(layHome, ".claude", "modelguild", "models.policy")),
+      "(g) both roots' policy files are listed as layers",
+    );
+  }
+
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;
 }

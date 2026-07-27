@@ -7,17 +7,30 @@
 #   pattern = a shell glob matched against the FULL provider/model id
 #             (e.g. openai/gpt-5.6-sol, opencode/deepseek-v4-flash-free)
 #
-# FIRST MATCH WINS, top to bottom. Put specific rules above broad ones.
+# FIRST MATCH WINS, top to bottom -- and, since resolution is LAYERED (issue #19),
+# across the whole chain of policy files, not just this one.
 #   deny   — the guild tools hard-refuse to run this model (the call returns isError).
 #   ask    — Claude must confirm with you before using it (the tool call carries
 #            confirmed:true, which Claude sets only after you approve).
 #   allow  — use freely.
 #
 # Ships permissive (default-allow). Uncomment / edit to gate what YOU care about,
-# or run `/guild:configure` for guided setup. Effective resolution is
-# $GUILD_POLICY when set, otherwise a ruleful git-ignored
-# modelguild/models.policy.local, otherwise THIS shared/committed default. An empty or
-# comment-only local file does not override this file.
+# or run `/guild:configure` for guided setup.
+#
+# LAYERED RESOLUTION. Rules are evaluated most-specific first and the FIRST MATCHING
+# RULE ANYWHERE in this chain wins:
+#     <repo>/modelguild/models.policy.local        (project, personal, git-ignored)
+#   -> <repo>/modelguild/models.policy             (project, committed -- THIS file)
+#   -> ~/.claude/modelguild/models.policy.local    (global, personal)
+#   -> ~/.claude/modelguild/models.policy          (global, committed)
+#   -> default-allow
+# So a global deny KEEPS BINDING in this project unless a project rule matches first,
+# and a project rule can be stricter (an extra deny) or looser (an allow) without
+# disturbing the rest of the global baseline. A models.policy.local joins the chain
+# only if it has at least one complete rule -- an empty or comment-only local file
+# changes nothing. $GUILD_POLICY, when set, is a single-FILE override: it replaces the
+# entire chain. Fail-closed is chain-wide: a malformed or unreadable file in ANY layer
+# denies, with the offending file and line named.
 # Note: a call with no explicit model uses opencode's default model, whose id isn't
 # known here, so it can't be policed — pass a model to bring it under policy.
 #

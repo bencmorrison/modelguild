@@ -150,27 +150,40 @@ npx modelguild doctor --dir /path/to/your/project
 ✓ 8/8 command docs present in .claude/commands/guild/ or ~/.claude/commands/guild/ [found: project]
 ✓ 3/3 hardened agent defs present in .opencode/agent/ or ~/.config/opencode/agent/ [found: project]
 ✓ model policy present (modelguild/models.policy or ~/.claude/modelguild/models.policy) [found: project]
+✓ config/policy layers (most-specific first): project /repo/modelguild  →  global ~/.claude/modelguild  →  default-allow
+  • local     /repo/modelguild/models.policy.local
+  • committed /repo/modelguild/models.policy
+  - committed ~/.claude/modelguild/models.policy (absent)
 ✓ opencode present (…)
 
 doctor: OK
 ```
-(The `[found: …]` tag reports whether the payload was located in the project, globally, or a mix.)
+(The `[found: …]` tag reports whether the payload was located in the project, globally, or a mix. The **layers** line shows the whole config/policy chain that actually binds — see [Global vs project config](#global-vs-project-config) — with `•` for a file that exists and `-` for one that doesn't.)
 If the `claude` CLI isn't on PATH, `doctor` can't see a global registration and instead reports a warning (not a failure) telling you to verify with `claude mcp get modelguild`. Inside the restarted Claude Code, the `/guild:*` commands now appear in the slash-command list and the `guild_*` MCP tools are available. **The first time** Claude Code calls one, it asks a one-time permission for that tool (e.g. `mcp__modelguild__guild_consult`) — approve it (see [Skip the permission prompts](#skip-the-permission-prompts) to pre-approve them all).
 
 ### 6. Configure which models it uses
 
 Registering the server (step 3) does not choose *which* models it talks to or what your policy allows — that's this step, and it's separate. Two ways, both effective immediately (no restart):
 
-- **Interactive:** run **`/guild:configure`** inside Claude Code. It interviews you and writes your model policy (deny/ask/allow) and preferred-model defaults to the git-ignored config files.
-- **By hand:** edit the two git-ignored files under `modelguild/`:
-  - `modelguild/models.policy.local` — per-model `deny`/`ask`/`allow` rules (the committed `modelguild/models.policy` is default-allow).
-  - `modelguild/modelguild.conf.local` (copy from `modelguild/modelguild.conf.example`) — your default single model and panel set:
+- **Interactive:** run **`/guild:configure`** inside Claude Code. It asks whether you're configuring **globally** or **for this project**, interviews you, and writes your model policy (deny/ask/allow) and preferred-model defaults to the git-ignored config files.
+- **By hand:** edit the two git-ignored files under your chosen root (`~/.claude/modelguild/` for global, `<repo>/modelguild/` for this project only):
+  - `models.policy.local` — per-model `deny`/`ask`/`allow` rules (the committed `models.policy` is default-allow).
+  - `modelguild.conf.local` (copy from `modelguild/modelguild.conf.example`) — your default single model and panel set:
     ```
     GUILD_MODEL=openai/gpt-5
     GUILD_MODELS=openai/gpt-5 google/gemini-2.5-pro
     ```
 
 Prefer a **non-Claude** model for consults so the second opinion is genuinely independent. This step is optional — without it, commands use opencode's default model — but setting a policy and defaults is what makes day-to-day use smooth.
+
+#### Global vs project config
+
+Config is **layered**, not either/or. Your global root `~/.claude/modelguild/` is the **baseline**, and a project's own `<repo>/modelguild/` is overlaid **on top** of it:
+
+- **Preferences** (`modelguild.conf.local`) merge key by key. A key set in the project wins; a key you only set globally still applies in that project.
+- **Model policy** rules are evaluated **project first, then global**, first match wins, default-allow. So a project can add a stricter `deny` or a looser `allow` without disturbing the rest of your global policy — and a global `deny` keeps binding in every project that doesn't override it.
+
+Set it once globally and it works everywhere; add a project root only when that repo needs something different. (`$GUILD_ROOT` is the exception: it pins **one** root and layers nothing under it — a deliberate escape hatch for fixtures and CI, not a normal setting. `doctor` tells you when it's leaving a real root unlayered.)
 
 ### Updating
 
@@ -203,12 +216,12 @@ Examples:
 
 To see the exact provider/model ids your auth offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). Pass a specific model to any command; omit it to use your configured default.
 
-To set **persistent defaults** — a default single model for `/guild:consult` and a default panel set for `/guild:panel` — run **`/guild:configure`** (it walks you through it), or copy `modelguild/modelguild.conf.example` to `modelguild/modelguild.conf.local` (git-ignored) and set:
+To set **persistent defaults** — a default single model for `/guild:consult` and a default panel set for `/guild:panel` — run **`/guild:configure`** (it walks you through it, including whether to set them globally or per project — see [Global vs project config](#global-vs-project-config)), or copy `modelguild/modelguild.conf.example` to `modelguild.conf.local` in your chosen root (git-ignored) and set:
 ```
 GUILD_MODEL=openai/gpt-5
 GUILD_MODELS=openai/gpt-5 google/gemini-2.5-pro
 ```
-These take effect immediately — no restart. (The matching env vars still work as one-off overrides; precedence is arg → env → config file → opencode's default.) Prefer a **non-Claude** model for consults so the second opinion is genuinely independent.
+These take effect immediately — no restart. (The matching env vars still work as one-off overrides; precedence is arg → env → project config file → global config file → opencode's default.) Prefer a **non-Claude** model for consults so the second opinion is genuinely independent.
 
 If a heavy task on a slow reasoning model aborts with *"operation was aborted due to timeout"* — e.g. a whole-repo review or a long planning session — raise the per-turn HTTP timeout (default 15 minutes) in the same file:
 ```
@@ -221,7 +234,7 @@ Only the model-turn call uses it; the fast control-plane calls keep their own sh
 - **`npx modelguild …` says "package not found".** `modelguild` is published to npm, so check spelling and your network (or a stale npm cache — `npm cache verify`). If you're intentionally running an unreleased build, use the from-source path instead: `npm run build` in the checkout, then `node dist/cli.js init --dir <project>` (see [Setup step 2b](#2b-from-source-contributors-or-to-run-an-unreleased-build)).
 - **The `/guild:*` commands don't appear in Claude Code.** Restart Claude Code — it only reads its MCP registrations at session start (Setup step 4). Still missing? Confirm the server is registered — `claude mcp get modelguild` (any scope) — and run `doctor` (step 5) to check registration and payload.
 - **A `guild_*` tool call errors about opencode.** opencode isn't installed on PATH or isn't authenticated. Run `opencode auth login`, and `opencode models` to confirm at least one provider answers. If you built locally and moved the checkout, the launch `args` path is stale — re-run `claude mcp add` (or edit the registration) with the new path.
-- **A model is denied / not allowed.** That's the model policy. Run `/guild:configure`, or edit `modelguild/models.policy.local` (Setup step 6).
+- **A model is denied / not allowed.** That's the model policy. Run `/guild:configure`, or edit `models.policy.local` (Setup step 6). Remember the policy is **layered** — the rule denying it may live in your *global* root even though you're in a project; `doctor` prints the whole chain, and the error names the exact file that decided.
 - **Not sure what's wrong.** Run `doctor` — it reports each check with `✓`/`✗` and needs no model call.
 
 ## Safety
