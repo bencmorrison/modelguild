@@ -25,6 +25,9 @@ import { delegate, delegateToToolResult } from "./delegate.js";
 import { models, modelsToToolResult } from "./models.js";
 import { parsePerCallTimeoutMs, layeredRoots } from "./config.js";
 import { enforceRetentionOnStart } from "./log.js";
+// The progress channel lives in its own module so it can be tested: importing THIS file
+// constructs the MCP server and connects the stdio transport at module top level.
+import { withProgress, type ProgressCapableExtra } from "./progress.js";
 
 const STATUS_TOOL = "guild_status";
 const CONSULT_TOOL = "guild_consult";
@@ -347,8 +350,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
+  // The progress channel is per CALL: `extra` carries this request's `_meta.progressToken`
+  // (when the client sent one) and the transport-correct `sendNotification`.
+  const progressExtra = extra as unknown as ProgressCapableExtra;
 
   if (name === STATUS_TOOL) {
     const status = await guildStatus();
@@ -373,17 +379,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
-    const result = await consult(
-      {
-        question,
-        model: typeof a.model === "string" ? a.model : undefined,
-        runId: typeof a.runId === "string" ? a.runId : undefined,
-        confirmed: a.confirmed === true,
-        sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
-        keepSession: a.keepSession === true,
-        timeoutMs: tmo.value,
-      },
-      { serve: lifecycle },
+    const result = await withProgress(progressExtra, CONSULT_TOOL, (onActivity) =>
+      consult(
+        {
+          question,
+          model: typeof a.model === "string" ? a.model : undefined,
+          runId: typeof a.runId === "string" ? a.runId : undefined,
+          confirmed: a.confirmed === true,
+          sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
+          keepSession: a.keepSession === true,
+          timeoutMs: tmo.value,
+        },
+        { serve: lifecycle, onActivity },
+      ),
     );
     return consultToToolResult(result);
   }
@@ -413,16 +421,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
-    const result = await panel(
-      {
-        question,
-        models,
-        runId: typeof a.runId === "string" ? a.runId : undefined,
-        confirmed: a.confirmed === true,
-        keepSessions: a.keepSessions === true,
-        timeoutMs: tmo.value,
-      },
-      { serve: lifecycle },
+    const result = await withProgress(progressExtra, PANEL_TOOL, (onActivity) =>
+      panel(
+        {
+          question,
+          models,
+          runId: typeof a.runId === "string" ? a.runId : undefined,
+          confirmed: a.confirmed === true,
+          keepSessions: a.keepSessions === true,
+          timeoutMs: tmo.value,
+        },
+        { serve: lifecycle, onActivity },
+      ),
     );
     return panelToToolResult(result);
   }
@@ -440,15 +450,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
-    const result = await research(
-      {
-        question,
-        model: typeof a.model === "string" ? a.model : undefined,
-        runId: typeof a.runId === "string" ? a.runId : undefined,
-        confirmed: a.confirmed === true,
-        timeoutMs: tmo.value,
-      },
-      { serve: lifecycle },
+    const result = await withProgress(progressExtra, RESEARCH_TOOL, (onActivity) =>
+      research(
+        {
+          question,
+          model: typeof a.model === "string" ? a.model : undefined,
+          runId: typeof a.runId === "string" ? a.runId : undefined,
+          confirmed: a.confirmed === true,
+          timeoutMs: tmo.value,
+        },
+        { serve: lifecycle, onActivity },
+      ),
     );
     return researchToToolResult(result);
   }
@@ -466,15 +478,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
-    const result = await delegate(
-      {
-        task,
-        model: typeof a.model === "string" ? a.model : undefined,
-        runId: typeof a.runId === "string" ? a.runId : undefined,
-        confirmed: a.confirmed === true,
-        timeoutMs: tmo.value,
-      },
-      { serve: lifecycle },
+    const result = await withProgress(progressExtra, DELEGATE_TOOL, (onActivity) =>
+      delegate(
+        {
+          task,
+          model: typeof a.model === "string" ? a.model : undefined,
+          runId: typeof a.runId === "string" ? a.runId : undefined,
+          confirmed: a.confirmed === true,
+          timeoutMs: tmo.value,
+        },
+        { serve: lifecycle, onActivity },
+      ),
     );
     return delegateToToolResult(result);
   }

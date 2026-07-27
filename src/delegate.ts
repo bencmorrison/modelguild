@@ -44,8 +44,10 @@ import {
   resolveRootWithConflict,
   gateModel,
   runAgentLifecycle,
+  activityLayerFor,
   type McpToolResult,
 } from "./consult.js";
+import { type ActivityEvent, type ActivitySummary } from "./activity.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -83,6 +85,12 @@ export interface DelegateDeps {
   /** Injected in tests so root/policy/log all share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
+  /**
+   * LIVE sink for each normalized activity event (issue #20). This is the path the live
+   * visibility matters most on: a delegate turn is the 15-minute black box the issue was
+   * filed about, and its edits/bash calls are what the developer wants to watch happen.
+   */
+  onActivity?: (e: ActivityEvent) => void;
   /**
    * The worktree the model edits — the project dir the serve was spawned from. Defaults to
    * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default so the snapshot
@@ -151,6 +159,12 @@ export interface DelegateOk {
   attribution: DelegateAttribution;
   capture: DelegateCapture;
   rootConflict?: string;
+  /**
+   * Bounded live-activity summary (issue #20); absent when the layer is off. It is a
+   * READING AID, not a substitute for the diff review: it says what opencode reported the
+   * model doing, at opencode's fidelity. `capture.patchPath` is still what you review.
+   */
+  activity?: ActivitySummary;
 }
 export interface DelegateFail {
   ok: false;
@@ -159,6 +173,8 @@ export interface DelegateFail {
    * before failing is still captured and surfaced so the human can review/recover it. */
   capture?: DelegateCapture;
   rootConflict?: string;
+  /** Present when the turn RAN: the action trace up to the failure. */
+  activity?: ActivitySummary;
 }
 export type DelegateResult = DelegateOk | DelegateFail;
 
@@ -257,6 +273,7 @@ export async function delegate(
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
+      activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
     },
   );
 
@@ -272,7 +289,7 @@ export async function delegate(
   });
 
   if (outcome.ok) {
-    return {
+    const ok: DelegateOk = {
       ok: true,
       report: outcome.text,
       rootConflict,
@@ -285,6 +302,8 @@ export async function delegate(
       },
       capture,
     };
+    if (outcome.activity !== undefined) ok.activity = outcome.activity;
+    return ok;
   }
 
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
@@ -293,7 +312,7 @@ export async function delegate(
       ? outcome.reason
       : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
-  return {
+  const fail: DelegateFail = {
     ok: false,
     rootConflict,
     error: {
@@ -305,6 +324,8 @@ export async function delegate(
     // Surface the partial capture even on failure so the human can review/recover.
     capture,
   };
+  if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  return fail;
 }
 
 /**
@@ -447,11 +468,13 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
       capture: r.capture,
     };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.activity) structured.activity = r.activity;
     return { content: [{ type: "text", text: r.report }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.capture) structured.capture = r.capture;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.activity) structured.activity = r.activity;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

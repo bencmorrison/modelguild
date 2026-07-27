@@ -384,6 +384,50 @@ export function parsePerCallTimeoutMs(
 }
 
 /* ---------------------------------------------------------------------------
+ * Live-activity knobs (issue #20) — `GUILD_ACTIVITY`, `GUILD_ACTIVITY_DETAIL`.
+ *
+ * Same chain as every other knob: env override > `modelguild.conf.local` > default.
+ *
+ * `GUILD_ACTIVITY` defaults to **on**. Visibility into what an external model is doing is
+ * the point of the feature and it is capability-NEUTRAL: it removes nothing from the
+ * external path and adds no gate. `off` disables the layer entirely — no `/event`
+ * subscription is opened, no `activity.jsonl` is written, no `structuredContent.activity`
+ * is attached. The `off` test mirrors `GUILD_LOG`'s exactly (only the literal `off`
+ * disables, so a typo fails toward recording rather than toward silence).
+ *
+ * `GUILD_ACTIVITY_DETAIL` defaults to **summary**: the tool name plus a TRUNCATED
+ * rendering of its input. `full` additionally records each event's raw properties, which
+ * can carry tool OUTPUT — i.e. file contents the model read. That is the same sensitivity
+ * class as `GUILD_LOG_PROMPTS=full`, and the conf template says so. Anything other than
+ * the literal `full` resolves to `summary` (the same lenient shape as `#promptMode`).
+ * --------------------------------------------------------------------------- */
+export type ActivityDetail = "summary" | "full";
+
+export interface ActivitySettings {
+  enabled: boolean;
+  detail: ActivityDetail;
+}
+
+export function resolveActivitySettings(opts: {
+  env?: NodeJS.ProcessEnv;
+  confContents?: string;
+} = {}): ActivitySettings {
+  const env = opts.env ?? process.env;
+  const conf = opts.confContents ?? "";
+  const pick = (key: string, def: string): string => {
+    const fromEnv = env[key];
+    if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
+    const fromConf = confGet(conf, key);
+    return fromConf !== "" ? fromConf : def;
+  };
+  const enabled = pick("GUILD_ACTIVITY", "on").trim().toLowerCase() !== "off";
+  const detail = pick("GUILD_ACTIVITY_DETAIL", "summary").trim().toLowerCase() === "full"
+    ? "full"
+    : "summary";
+  return { enabled, detail };
+}
+
+/* ---------------------------------------------------------------------------
  * Default-model precedence (C8): `-m` flag > `$GUILD_MODEL` env > conf `GUILD_MODEL`
  * > opencode's own default (empty). `flag` is the value of an explicit `-m`; `undefined`
  * means none was given (an EMPTY `-m` value is a usage error handled by the caller's

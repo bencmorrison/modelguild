@@ -42,6 +42,7 @@ import {
   checkResolvedModelId,
   resolveAgentDefDirs,
   hardenedDefPresentIn,
+  resolveActivitySettings,
   type GuildRoot,
   type RootSource,
 } from "./config.js";
@@ -52,6 +53,13 @@ import {
   type PolicySource,
   type PolicyLayer,
 } from "./policy.js";
+import {
+  createActivityLayer,
+  type ActivityEvent,
+  type ActivityLayer,
+  type ActivityRecorder,
+  type ActivitySummary,
+} from "./activity.js";
 
 /** The read-only agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const CONSULT_AGENT = "guild-read";
@@ -220,12 +228,19 @@ export interface ConsultOk {
    * other model's words (the "Option B" session-continuation guarantee).
    */
   sessionId?: string;
+  /** Bounded live-activity summary for this call (issue #20); absent when the layer is
+   * off. `activity.degraded` means the stream was lost — a quiet list is then "we could
+   * not see", not "the model did nothing". */
+  activity?: ActivitySummary;
 }
 export interface ConsultFail {
   ok: false;
   error: ConsultError;
   /** Even on a refusal, tell the caller which root's policy did the refusing. */
   rootConflict?: string;
+  /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
+   * of a failed call is exactly what makes the failure diagnosable. */
+  activity?: ActivitySummary;
 }
 export type ConsultResult = ConsultOk | ConsultFail;
 
@@ -263,6 +278,12 @@ export interface ConsultDeps {
   log?: EvidenceLog;
   /** Per-turn timeout override (tests shorten it). */
   messageTimeoutMs?: number;
+  /**
+   * LIVE sink for each normalized activity event (issue #20). The MCP server wires this to
+   * `notifications/progress` when the client sent a `progressToken`; left unset, activity
+   * is still recorded to `activity.jsonl` and summarized on the result, just not streamed.
+   */
+  onActivity?: (e: ActivityEvent) => void;
 }
 
 /** A fresh, non-empty call id (the pairing key for a call's three lifecycle entries). */
@@ -390,11 +411,62 @@ export interface LifecycleDeps {
   serve: ServeProvider;
   log: EvidenceLog;
   messageTimeoutMs?: number;
+  /**
+   * LIVE ACTIVITY (issue #20). When present, each call gets its own recorder: it attaches
+   * to the turn's opencode session, appends `<runDir>/activity.jsonl`, and returns the
+   * bounded summary on the outcome. Absent (or a layer resolved `off`) ⇒ nothing changes
+   * on any existing path.
+   */
+  activity?: ActivityLayer;
 }
 
 export type LifecycleOutcome =
-  | { ok: true; text: string; callId: string; actualModel: string; sessionId: string }
-  | { ok: false; callId: string; reason: string; kind: "call-failed" | "agent-mismatch" };
+  | {
+      ok: true;
+      text: string;
+      callId: string;
+      actualModel: string;
+      sessionId: string;
+      /** Bounded activity summary for this call; absent when the layer is off. */
+      activity?: ActivitySummary;
+    }
+  | {
+      ok: false;
+      callId: string;
+      reason: string;
+      kind: "call-failed" | "agent-mismatch";
+      /** Present on failure too — a black-box call that DIED is exactly the one whose
+       * action trace matters most. */
+      activity?: ActivitySummary;
+    };
+
+/**
+ * Build the per-call activity layer from the resolved knobs, wired to write into the
+ * evidence run dir. Factored here so all four tools construct it identically — a second
+ * copy would be free to drift on the `GUILD_LOG=off` ⇒ no-file rule.
+ */
+export function activityLayerFor(deps: {
+  env: NodeJS.ProcessEnv;
+  confContents: string;
+  log: EvidenceLog;
+  onActivity?: (e: ActivityEvent) => void;
+}): ActivityLayer {
+  const settings = resolveActivitySettings({ env: deps.env, confContents: deps.confContents });
+  const opts: Parameters<typeof createActivityLayer>[0] = {
+    enabled: settings.enabled,
+    detail: settings.detail,
+    // NO run dir unless the evidence layer is ON *and* a run id exists. Both halves are
+    // load-bearing. `GUILD_LOG=off` normally yields an empty run id — but `runId` is a
+    // documented TOOL INPUT, so a caller threading one while logging is off would otherwise
+    // get a run directory holding `activity.jsonl` and no `calls.jsonl`, which `verify()`
+    // then fails as a broken run (exit-analogue 7). Turning the record off must leave
+    // nothing behind — including a DIFFERENT record.
+    runDir: (runId: string) =>
+      deps.log.enabled() && runId.length > 0 ? deps.log.dir(runId) : undefined,
+  };
+  if (deps.onActivity !== undefined) opts.onEvent = deps.onActivity;
+  return createActivityLayer(opts);
+}
 
 /**
  * The evidence spine every model turn shares: mint a call id, write expect→started
@@ -428,8 +500,26 @@ export async function runAgentLifecycle(
   // On a continuation the session id is known before the call, so it is stamped on
   // `started` too (a fresh session is only known post-call and lands on `completed`).
   const started = await d.log.started({ ...common, session: p.sessionId, prompt: p.question });
+  // One recorder per call. Undefined when the activity layer is absent or `off`, in which
+  // case `askViaAgent` opens no subscription at all and nothing below changes.
+  //
+  // CONSTRUCTED INSIDE THE TRY, and guarded on its own: everything between `started` and
+  // the `catch` must be covered by the completed-guarantee, and a throw from the visibility
+  // layer must never be the thing that leaves a dangling `started` with no `completed`.
+  let recorder: ActivityRecorder | undefined;
   try {
-    const result = await askViaAgent(d.serve, {
+    try {
+      recorder = d.activity?.recorder({
+        runId: p.runId,
+        callId,
+        model: p.requestedModel === "" ? "(opencode default)" : p.requestedModel,
+        agent: p.agent,
+        command: p.command,
+      });
+    } catch {
+      /* never fail a call over the visibility layer */
+    }
+    const askOpts: Parameters<typeof askViaAgent>[1] = {
       agent: p.agent,
       model: p.requestedModel === "" ? undefined : p.requestedModel,
       prompt: p.question,
@@ -439,7 +529,9 @@ export async function runAgentLifecycle(
       keepSession: p.keepSession,
       // Fail closed if opencode serves a different agent than the hardened one requested.
       expectedAgent: p.agent,
-    });
+    };
+    if (recorder !== undefined) askOpts.activity = recorder;
+    const result = await askViaAgent(d.serve, askOpts);
     await d.log.completed({
       ...common,
       exit: 0,
@@ -448,13 +540,15 @@ export async function runAgentLifecycle(
       captureState: "complete",
       response: result.text,
     });
-    return {
+    const ok: LifecycleOutcome = {
       ok: true,
       text: result.text,
       callId,
       actualModel: actualModel(p.requestedModel, result.metadata.providerID, result.metadata.modelID),
       sessionId: result.sessionId,
     };
+    if (recorder !== undefined) ok.activity = recorder.summary();
+    return ok;
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
     const reason = err instanceof Error ? err.message : String(err);
@@ -468,7 +562,18 @@ export async function runAgentLifecycle(
       session: mismatch ? err.sessionId : p.sessionId,
       captureState: "failed",
     });
-    return { ok: false, callId, reason, kind: mismatch ? "agent-mismatch" : "call-failed" };
+    const failed: LifecycleOutcome = {
+      ok: false,
+      callId,
+      reason,
+      kind: mismatch ? "agent-mismatch" : "call-failed",
+    };
+    if (recorder !== undefined) failed.activity = recorder.summary();
+    return failed;
+  } finally {
+    // Detach is idempotent — `askViaAgent` already ran it, but a throw BEFORE the turn
+    // (e.g. session creation failing) never reaches that finally, so close here too.
+    recorder?.close();
   }
 }
 
@@ -576,6 +681,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
+      activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
     },
   );
 
@@ -595,6 +701,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     // Only expose the session id when the caller asked to keep it — otherwise the
     // session is deleted and its id is a dangling reference.
     if (params.keepSession === true) ok.sessionId = outcome.sessionId;
+    if (outcome.activity !== undefined) ok.activity = outcome.activity;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
@@ -605,7 +712,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     outcome.kind === "agent-mismatch"
       ? outcome.reason
       : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
-  return {
+  const fail: ConsultFail = {
     ok: false,
     rootConflict,
     error: {
@@ -618,6 +725,8 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       message,
     },
   };
+  if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  return fail;
 }
 
 // --- MCP tool-result translation -------------------------------------------
@@ -646,10 +755,12 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
     // Surface the kept session id so the driver can thread a follow-up turn by id.
     if (r.sessionId) structured.sessionId = r.sessionId;
+    if (r.activity) structured.activity = r.activity;
     return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.activity) structured.activity = r.activity;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

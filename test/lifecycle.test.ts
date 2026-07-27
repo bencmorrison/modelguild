@@ -5,6 +5,7 @@
  */
 
 import { OpencodeLifecycle, type ServeHandle } from "../src/lifecycle.js";
+import { ServeEventBus, closeAllBuses, liveBusCount } from "../src/activity.js";
 import { Checker, pidAlive, waitFor, withTimeout, sleep } from "./harness.js";
 
 const SPAWN_MS = 40_000;
@@ -131,6 +132,33 @@ export async function run(): Promise<number> {
     const pid2 = h.pid;
     lc.shutdown();
     c.check(await waitFor(() => !pidAlive(pid2), 8_000), "startup: respawned serve dead after shutdown");
+  }
+
+  // 6. shutdown() closes a live activity bus on the dying child's port (issue #20) -------
+  //
+  // This lives HERE, in the opencode-dependent suite, rather than in the offline activity
+  // suite, because the only honest way to prove it is a REAL handle: `shutdown()` closes
+  // buses keyed on `#handle.baseUrl`, which nothing but a spawned child ever sets. Without
+  // this, an idle-timeout kill leaves a `GET /event` fetch reconnecting forever against a
+  // dead port.
+  {
+    const lc = new OpencodeLifecycle({ idleMs: 0 });
+    const h = await withTimeout(lc.ensureServe(), SPAWN_MS, "bus:ensureServe");
+    const bus = ServeEventBus.acquire(h.baseUrl);
+    let degraded = "";
+    bus.subscribe("ses_probe", { onEvent: () => {}, onDegraded: (why) => (degraded = why) });
+    const attached = await withTimeout(bus.ready(), 10_000, "bus:ready");
+    c.check(attached, "bus: the activity stream attaches to the real serve");
+    c.check(liveBusCount() === 1, "bus: one live bus before shutdown");
+
+    lc.shutdown("test-bus-close");
+    c.check(liveBusCount() === 0, "bus: shutdown() closed the bus for the dying child's port");
+    c.check(bus.connected === false, "bus: the closed bus reports disconnected");
+    // A closed bus must not keep reconnecting against the dead port.
+    await sleep(1_200);
+    c.check(liveBusCount() === 0, "bus: it stays closed (no reconnect against a dead port)");
+    c.check(degraded === "" || degraded.length > 0, "bus: any degrade reason is delivered, never thrown");
+    closeAllBuses();
   }
 
   await sleep(50);

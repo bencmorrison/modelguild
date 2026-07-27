@@ -90,3 +90,29 @@
 #                                 # NON-repo project the key uses $PWD (logical), so
 #                                 # entering the same dir via different symlink paths
 #                                 # yields two buckets — bounded, not corruption.
+
+# --- Live activity (src/activity.ts) --------------------------------------------
+# While a guild call runs, the server subscribes to opencode's event stream and records
+# what the external model is DOING — the files it read, what it grepped, fetched and
+# edited, the shell commands it ran — line by line to
+# modelguild/logs/<run_id>/activity.jsonl, as it happens. Tail it live with
+# `npx modelguild watch`; every tool result also carries a bounded summary. This is
+# visibility, NOT containment: seeing a command scroll past does not gate it, and the
+# delegate diff review is still the review point. It is also not the RECEIPTS — the
+# model's actual words stay in calls.jsonl; these lines are opencode's report of the
+# model's actions, at opencode's fidelity. On by default: a stream you have to remember
+# to turn on before a 15-minute delegate call is a stream you will not have.
+# GUILD_ACTIVITY=off             # stop watching entirely: no event subscription is
+#                                 # opened, no activity.jsonl, no summary on the result.
+#                                 # GUILD_LOG=off silences it too — with no run directory
+#                                 # there is nowhere to write, and turning the record off
+#                                 # must not leave a different record behind.
+# GUILD_ACTIVITY_DETAIL=summary  # summary | full — how much of each event to keep.
+#                                 # Default `summary`: the tool name plus a TRUNCATED
+#                                 # rendering of its input (the path read, the command
+#                                 # run). `full` also records each event's raw properties,
+#                                 # which can carry tool OUTPUT — that is file contents
+#                                 # the model read, landing on your disk. Same sensitivity
+#                                 # trade-off as GUILD_LOG_PROMPTS=full: reach for it when
+#                                 # you are debugging what a model did, not as a standing
+#                                 # default on sensitive work.

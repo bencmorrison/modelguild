@@ -95,8 +95,14 @@ that matter here:
 | `session.idle` | `{sessionID}` — turn finished |
 | `session.error` | `{sessionID, error}` |
 
-Every one carries `sessionID`, so a single stream can be routed to concurrent calls (a `guild_panel`
-runs 2–3 sessions on one serve child).
+Most carry `sessionID`, so a single stream can be routed to concurrent calls (a `guild_panel`
+runs 2–3 sessions on one serve child). **CORRECTED 2026-07-27 (implementation review, verified on
+1.18.7): "every one" is FALSE.** `file.edited` carries `properties = {file}` and nothing else — no
+`sessionID` — so it cannot be routed at all. `src/activity.ts` broadcasts session-less events to
+every subscriber of the serve child and flags them `unattributed`; routing them by session (the
+original implementation, written from this table) dropped every one of them and left
+`structuredContent.activity.filesEdited` permanently empty against a real opencode. Any future
+consumer of this table must check the payload rather than trust the "every one" claim.
 
 Also probed and relevant:
 
@@ -459,3 +465,108 @@ change, not "later"):
    either. If you would rather have an `ask` option on the read paths' `webfetch` (the egress the
    security scan surfaced), say so — it is the one place where the ratified harness difference could
    justify an *offered, opt-in* gate rather than a fence.
+
+---
+
+## Slice 0 probe results (2026-07-27)
+
+Run against **opencode 1.18.5** and **Claude Code 2.1.220** (MCP protocol `2025-11-25`). These
+are the evidence gate §5 required before shipping. **The findings were re-validated against
+opencode 1.18.7** during implementation review (the dev container auto-upgraded past 1.18.5); the
+event shapes and the permission behaviour below hold on both, and 1.18.7 is where the two
+shape defects the review found — `pending` tool parts carrying `input: {}`, and `file.edited`
+carrying no `sessionID` — were reproduced and fixed. **Where a verdict below contradicts the
+design text above, the probe wins and the text above is stale** — §2's event table in
+particular.
+
+**P1 — MCP progress: GREEN. Slice 3 shipped.**
+Claude Code sends a `progressToken` in the tool-call `_meta` on **every** call, accepts
+server-initiated `notifications/progress`, and renders them as ephemeral developer-facing tool
+progress (`mcp_progress`). Confirmed **not** injected into the model's context — it is a
+developer channel, which is what issue #20 asked for. Bonus finding: progress notifications
+feed Claude Code's MCP idle watchdog (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`), so emitting them
+during a long turn prevents an idle abort — which matters most on the 15-minute delegate
+default, and is why the shipped emitter also heartbeats through a quiet stretch. Channel 4
+(`notifications/message`) stays **unimplemented**: §3.2 gated it on P1 being red, and it is not.
+
+**P2 — session permission ruleset: GREEN, and it MERGES. Design A confirmed; design B is dead.**
+`POST /session`'s `permission` ruleset is **appended after the agent def's resolved array** and
+evaluated last-match-wins, so it **merges** rather than replaces — and it can **override in both
+directions**. Evidence, on `guild-read`: `[{bash, *, allow}]` produced a *working* `bash` tool
+(it ran a command, exit 0) while every unmentioned tool (`edit`/`write`/`patch`/`task`) stayed
+denied — i.e. the def's `"*": deny` floor survives the merge; and `[{read, *, deny}, …]` removed
+the `read` tool. Three consequences for §3.4:
+- **Design A works and design B is unnecessary.** No fourth agent def, so none of the
+  `AGENT_DEFS` / package-`files` / `check-agent-permissions.sh` / `check-contract-counts.sh` /
+  `verify-guild-build-ask.sh` surface B would have added has to move.
+- **The bridge emits ONLY `ask` rules.** Because the floor survives, there is no need to mirror
+  the complete ruleset (floor + allows) that §3.4 proposed as insurance against replacement — so
+  **the drift risk in open question 5 never has to be accepted**. That paragraph of §3.4 is
+  superseded: emit the gated subset at `ask`, nothing else.
+- **The never-emit-`allow` invariant is LOAD-BEARING, not hygiene.** The same one-line ruleset
+  that proved the merge (`{bash, *, allow}`) demonstrably hands a **working shell to the
+  read-only agent**. Assert it on the constructed ruleset before sending, as §3.4 requires.
+
+**The v2 trap stands, confirmed:** `POST /api/session/{id}/permission` (the v2 *evaluate*
+endpoint) **must not be used for anything** — it ignores session-stored rulesets and returns
+wrong answers. Bridge work routes around it.
+
+**P3 — `ask` on a non-TTY: RESOLVED GREEN. The hard gate is cleared; the bridge is buildable
+on 1.18.5.** The design (and `AGENTS.md`) recorded that an `ask` tier auto-rejects on a non-TTY,
+fail-closed. Under `opencode serve` that is **false**: the server emits `permission.asked` and
+then **waits** for an HTTP reply — the tool part pins at `running`, and the call hangs until
+`GUILD_MESSAGE_TIMEOUT_MS`. That is exactly the behaviour a detached approval client needs, and
+the affirmative half was probed too, not just inferred:
+- With **no client attached**, the ask sat pending **70+ seconds** with **no auto-reject**.
+- `POST /session/{id}/permissions/{permID}` with `{"response":"once"}` **unblocked** the tool and
+  the turn completed.
+- The reject path (`POST /permission/{id}/reply`) delivered the reject **verbatim to the model**
+  and the turn **continued normally** — HTTP 200, `finish: stop`. A rejection is a denied tool
+  call the model reasons around, **not** an aborted turn.
+
+Two consequences, both recorded in the same change as this addendum: (1) `AGENTS.md`'s `--auto`
+bullet was corrected — `--auto` is a no-op because the hardened defs leave nothing at `ask`,
+**not** because an unanswered ask fails closed; (2) "unanswered ⇒ hang, not reject" makes the
+fail-closed timeout of §3.4 **load-bearing rather than belt-and-braces**, and makes the "no
+channel attached ⇒ do not arm" refusal mandatory: arming without a live answering client
+deadlocks the turn.
+
+**P4 — elicitation: ADVERTISED and answered, but blocked by the SDK, and it auto-cancels
+headless.** Claude Code's `initialize` declares `"elicitation": {}`, and raw `elicitation/create`
+requests are **answered, not rejected**. Two findings that constrain how §3.4 may use it:
+- **Headless auto-cancels.** Under `claude -p`, an elicitation is answered
+  `{"action":"cancel"}` automatically. So **cancel must map to REJECT (fail-closed)**, never to
+  "proceed" or "retry", and elicitation is **not** a viable approval channel for a
+  non-interactive run — `modelguild watch` (approval channel 2) is the only one that works
+  there. This does not change the preference order in §3.4; it bounds channel 1's reach.
+- **SDK blocker.** `@modelcontextprotocol/sdk@1.29.0`'s `Server.elicitInput()` gates on
+  `_clientCapabilities.elicitation.form`, which Claude Code's bare `{}` does not carry, so the
+  helper **throws before sending anything**. Slice 4 must therefore issue a raw
+  `server.request({ method: "elicitation/create", … })` or wait for an SDK fix — using the
+  convenience helper would fail against the very client it is meant to reach.
+
+**Still human-unverified:** whether the interactive TUI actually *renders* the prompt. Slice 4
+was out of scope for this change and nothing in it shipped.
+
+**Additional Slice 0 finding that shaped slice 1 — the event names in §2 are wrong.**
+Observed distribution across ~6 turns: `message.part.delta` (261), `message.part.updated` (80),
+`message.updated` (52), `server.heartbeat` (51), `session.status` (31), `session.updated` (28),
+`session.diff` (16), `session.deleted` (10), `session.idle` (6), `session.created` (6),
+`permission.replied` (3), `permission.asked` (3). The `session.next.tool.called/.success/.failed`
+and `session.next.text.delta` names in §2's table **exist in the event union but never fired**.
+Tool activity actually arrives as `message.part.updated` with `part.type === "tool"`, whose
+`state.status` walks `pending` → `running` → `completed`|`error` carrying `tool`, `callID`,
+`input`, `output`, and `metadata.exit`. `src/activity.ts` is built on the observed set, still
+understands the `session.next.*` names, and drops unknown types silently.
+
+### What shipped (2026-07-27)
+
+Slices **1–3**. Slice 4 (the approval bridge) and slice 5 (`prompt_async`) did **not** ship —
+they were out of scope for this change, not blocked by evidence: **slice 4's evidence gate is now
+GREEN** (P2 merges, P3 waits and both reply paths work, P4 is advertised). What remains before it
+can be built is the **maintainer's** answers to §7 — in particular Q2 (the default), Q3 (whether
+`GUILD_APPROVE=all` should exist at all) and Q8 — plus the P4 SDK blocker; Q5 is now moot, since
+P2 removed the ruleset-mirroring drift it asked about. Nothing in this change adds a
+restriction, gates a tool call, or alters an agent def — the visibility slices carry no parity
+burden (§4), and the honest bound of §1 stands unchanged: this makes a run watchable, it does
+not make it safe.

@@ -48,8 +48,10 @@ import {
   resolveRootWithConflict,
   gateModel,
   runAgentLifecycle,
+  activityLayerFor,
   type McpToolResult,
 } from "./consult.js";
+import { type ActivityEvent, type ActivitySummary } from "./activity.js";
 import {
   readLayeredConfContents,
   resolvePanelModels,
@@ -101,6 +103,15 @@ export interface PanelDeps {
   /** Injected in tests so root/policy/log share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
+  /** LIVE sink for each normalized activity event (issue #20). Every member's events flow
+   * through this ONE sink, so attribution has to be carried on the events themselves: each
+   * member's recorder stamps its `model` and `callId` on the way out (see
+   * `ActivityRecorder#handle`), which is what stops a 3-model panel's progress lines from
+   * interleaving into an anonymous blur. Two caveats, both real: a `file.edited` event
+   * carries no session id and is broadcast to every member flagged `unattributed`, and the
+   * MCP progress channel has a single token for the whole call, so the per-line model label
+   * is the only thing distinguishing members there. */
+  onActivity?: (e: ActivityEvent) => void;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -133,6 +144,10 @@ export interface PanelMemberResult {
   /** The member's opencode session id — present ONLY when `keepSessions` was requested
    * AND the call succeeded. Pass it back as `guild_consult({ sessionId })` for round 2. */
   sessionId?: string;
+  /** This member's bounded live-activity summary (issue #20). PER MEMBER, not per panel:
+   * one merged blob would lose which model did what. Absent when the layer is off or the
+   * member was refused before it ran. */
+  activity?: ActivitySummary;
 }
 
 export interface PanelOk {
@@ -233,6 +248,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // param (validated by the server) applies to every member; else env/conf/default.
   const messageTimeoutMs =
     deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents });
+  // ONE activity layer for the panel; each member's recorder is minted per call and routes
+  // by its own opencode session id, so concurrent members never see each other's events.
+  const activity = activityLayerFor({ env, confContents, log, onActivity: deps.onActivity });
 
   // 5. Members run CONCURRENTLY; each is gated + logged independently. One member's
   //    refusal or failure never touches another's result (order preserved by Promise.all).
@@ -263,7 +281,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           confirmed: gate.confirmed,
           keepSession: keepSessions,
         },
-        { serve: deps.serve, log, messageTimeoutMs },
+        { serve: deps.serve, log, messageTimeoutMs, activity },
       );
       if (outcome.ok) {
         const member: PanelMemberResult = {
@@ -273,6 +291,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         };
         // Return the id ONLY when kept — a deleted session's id is a dangling reference.
         if (keepSessions) member.sessionId = outcome.sessionId;
+        if (outcome.activity !== undefined) member.activity = outcome.activity;
         return member;
       }
       // A FAILED member (call-failed OR agent-mismatch) carries NO sessionId even under
@@ -284,7 +303,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         outcome.kind === "agent-mismatch"
           ? outcome.reason
           : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
-      return {
+      const failed: PanelMemberResult = {
         model,
         callId: outcome.callId,
         error: {
@@ -293,6 +312,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           message,
         },
       };
+      if (outcome.activity !== undefined) failed.activity = outcome.activity;
+      return failed;
     }),
   );
 

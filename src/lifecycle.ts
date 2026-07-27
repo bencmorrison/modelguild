@@ -18,6 +18,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import type { Readable } from "node:stream";
+import { closeBusesFor } from "./activity.js";
 
 export interface LifecycleOptions {
   /** Project dir to spawn `opencode serve` from (its `.opencode/agent/` holds the defs). */
@@ -206,6 +207,18 @@ export class OpencodeLifecycle {
     this.#handle = undefined;
     this.#starting = undefined;
     this.#startPromise = undefined;
+    // Close any live activity subscription against the dying child's port (issue #20).
+    // Without this an idle-timeout kill leaves a `GET /event` fetch stream dangling on a
+    // dead port, reconnecting forever. Guarded: the visibility layer must never be able
+    // to break the teardown path the M1 orphan proof rests on.
+    for (const url of [h?.baseUrl, starting?.baseUrl]) {
+      if (url === undefined) continue;
+      try {
+        closeBusesFor(url);
+      } catch {
+        /* best-effort */
+      }
+    }
     killServe(h?.proc);
     // Kill the not-yet-ready child directly too: the startup poll may be mid-fetch
     // or mid-sleep for hundreds of ms, and teardown must be prompt (the abort check
