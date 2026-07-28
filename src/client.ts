@@ -443,6 +443,23 @@ export interface ServeProvider {
   withServe<T>(fn: (h: ServeHandle) => Promise<T>): Promise<T>;
 }
 
+/**
+ * LIVE-ACTIVITY ATTACHMENT (issue #20). The one seam this module gains: something that
+ * can attach itself to a session's event stream for the duration of the turn.
+ *
+ * Deliberately STRUCTURAL — `client.ts` imports nothing from `src/activity.ts`. This file's
+ * two documented invariants are about NOT leaking the sync response upward, and it stays
+ * the thin typed transport it was: it knows only "attach before the turn, call the returned
+ * detach afterwards". `ActivityRecorder` satisfies this shape; a test fake satisfies it too.
+ *
+ * `attach` MUST NOT reject — a visibility failure is never a call failure — and it resolves
+ * only once the stream is attached (or has definitively failed), so events emitted at the
+ * very start of the turn are not missed.
+ */
+export interface ActivityAttachable {
+  attach(baseUrl: string, sessionId: string): Promise<() => void>;
+}
+
 export interface AskViaAgentOpts {
   agent: string;
   /** `"provider/model"`; omit to let opencode use its own default. */
@@ -477,6 +494,14 @@ export interface AskViaAgentOpts {
    * unset (e.g. low-level client tests), no check is done.
    */
   expectedAgent?: string;
+  /**
+   * LIVE ACTIVITY (issue #20). Attached immediately after the session id is known — a
+   * fresh session's, or the continued `sessionId`'s — and BEFORE the turn is sent, so the
+   * model's first tool call is already being watched. Detached in the same `finally` that
+   * handles session deletion. Optional and failure-tolerant: an attach that throws is
+   * swallowed, and the turn proceeds unwatched rather than failing.
+   */
+  activity?: ActivityAttachable;
 }
 
 export interface AskResult {
@@ -526,6 +551,17 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         })
       ).id;
 
+    // Attach the activity stream BEFORE the turn (issue #20). A failure here is swallowed:
+    // the call runs unwatched rather than failing over a visibility feature.
+    let detachActivity: (() => void) | undefined;
+    if (opts.activity !== undefined) {
+      try {
+        detachActivity = await opts.activity.attach(h.baseUrl, sessionId);
+      } catch {
+        /* never fail the call over activity */
+      }
+    }
+
     let succeeded = false;
     try {
       const metadata = await sendMessage({
@@ -565,6 +601,13 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       succeeded = true;
       return result;
     } finally {
+      // Detach the activity stream first — it is scoped to the turn, and unsubscribing
+      // before the session delete keeps the bus refcount tidy on every path.
+      try {
+        detachActivity?.();
+      } catch {
+        /* best-effort */
+      }
       // DELETION MATRIX (ownership × outcome × intent). Deletion means "we tear this
       // session down"; a delete failure is swallowed so it never masks a real error.
       //

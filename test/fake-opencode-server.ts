@@ -8,6 +8,12 @@
  * in the `GET .../message` history, so a client that (wrongly) read the sync body
  * would return the wrong string and the test would catch it.
  *
+ * It also serves a SCRIPTED `GET /event` SSE stream (issue #20) so the live-activity
+ * layer is testable entirely offline: `eventScript` is emitted to every attached client
+ * when a turn is sent, and `emit()` pushes an arbitrary frame on demand. The frames are
+ * raw opencode-shaped `{type, properties}` objects — the tests assert the NORMALIZER
+ * against real observed shapes, not against a convenience shape of our own invention.
+ *
  * No opencode, no model, no network beyond loopback — this is a pure protocol fake.
  */
 
@@ -45,6 +51,21 @@ export interface FakeOpencodeOpts {
    * any id, so continuation (`GET`/`POST /session/<id>/message`) still works unchanged.
    */
   distinctSessions?: boolean;
+  /**
+   * SSE script (issue #20): raw `{type, properties}` frames pushed to every attached
+   * `GET /event` client when a turn is POSTed, before the sync response is sent. The
+   * default is no script (the stream attaches and stays silent). A FUNCTION receives the
+   * session id the turn was sent to, so a panel fixture can script each member's own
+   * session and prove the per-member summaries do not cross-contaminate.
+   */
+  eventScript?: unknown[] | ((sessionId: string) => unknown[]);
+  /** Delay (ms) between scripted frames. Default 0 (emit them back to back). */
+  eventDelayMs?: number;
+  /** Refuse `GET /event` with a 500 — drives the `activity.degraded` path. */
+  failEvents?: boolean;
+  /** Accept `GET /event` and NEVER answer — a black hole. Drives the "attach must not hang
+   * the call" guarantee: without a bounded wait this wedges the whole turn. */
+  hangEvents?: boolean;
 }
 
 export interface FakeOpencode {
@@ -55,7 +76,17 @@ export interface FakeOpencode {
     messageBodies: Array<Record<string, unknown>>;
     deletes: string[];
     historyGets: string[];
+    /** How many times `GET /event` was subscribed — proves the ONE-bus-per-serve-child
+     * refcounting, and proves `GUILD_ACTIVITY=off` opens no subscription at all. */
+    eventSubscribes: number;
   };
+  /** Push one raw SSE frame to every attached client. */
+  emit(event: unknown): void;
+  /** Abruptly end every attached `GET /event` response — simulates a stream that attaches
+   * and then drops mid-turn (serve restart, idle kill, network blip). */
+  dropEventClients(): void;
+  /** How many `GET /event` clients are attached right now. */
+  attachedEventClients(): number;
   close(): Promise<void>;
 }
 
@@ -76,9 +107,21 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
     messageBodies: [],
     deletes: [],
     historyGets: [],
+    eventSubscribes: 0,
   };
 
   let createCount = 0;
+  const eventClients = new Set<import("node:http").ServerResponse>();
+  const emit = (event: unknown): void => {
+    const frame = `data: ${JSON.stringify(event)}\n\n`;
+    for (const res of eventClients) {
+      try {
+        res.write(frame);
+      } catch {
+        /* a closed client is dropped on its own 'close' handler */
+      }
+    }
+  };
 
   const server: Server = createServer(async (req, res) => {
     const url = req.url ?? "";
@@ -89,6 +132,31 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
     };
 
     try {
+      // GET /event — the SSE stream the activity layer subscribes to.
+      if (method === "GET" && (url === "/event" || url.startsWith("/event?"))) {
+        recorded.eventSubscribes += 1;
+        if (opts.failEvents) {
+          send(500, { error: "forced event-stream failure" });
+          return;
+        }
+        if (opts.hangEvents) {
+          // Headers never sent, connection never closed: the fetch stays pending forever.
+          req.on("close", () => {});
+          return;
+        }
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        // A first frame flushes the headers and proves attachment; it normalizes to
+        // nothing, so it can never pollute what a test asserts.
+        res.write(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`);
+        eventClients.add(res);
+        req.on("close", () => eventClients.delete(res));
+        return;
+      }
+
       // POST /session
       if (method === "POST" && url === "/session") {
         recorded.createBodies.push(JSON.parse((await readBody(req)) || "{}"));
@@ -103,6 +171,18 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       if (method === "POST" && msgMatch) {
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         recorded.messageBodies.push(body);
+        // Play the scripted activity BEFORE answering, exactly as a real turn does: the
+        // events stream while the message POST is still blocking.
+        const script =
+          typeof opts.eventScript === "function"
+            ? opts.eventScript(msgMatch[1])
+            : (opts.eventScript ?? []);
+        for (const ev of script) {
+          emit(ev);
+          if (opts.eventDelayMs) await new Promise((r) => setTimeout(r, opts.eventDelayMs));
+        }
+        // Yield once so the client's stream reader drains before the POST resolves.
+        await new Promise((r) => setTimeout(r, 10));
         if (opts.messageDelayMs) await new Promise((r) => setTimeout(r, opts.messageDelayMs));
         // Per-model failure: 500 only for the targeted model (siblings still succeed).
         if (opts.failMessageForModel) {
@@ -217,8 +297,31 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       resolve({
         baseUrl: `http://127.0.0.1:${port}`,
         recorded,
+        emit,
+        dropEventClients: () => {
+          for (const res of eventClients) {
+            try {
+              res.destroy();
+            } catch {
+              /* best-effort */
+            }
+          }
+          eventClients.clear();
+        },
+        attachedEventClients: () => eventClients.size,
         close: () =>
-          new Promise<void>((r) => server.close(() => r())),
+          new Promise<void>((r) => {
+            // An attached SSE response keeps the server alive; end them first.
+            for (const res of eventClients) {
+              try {
+                res.end();
+              } catch {
+                /* best-effort */
+              }
+            }
+            eventClients.clear();
+            server.close(() => r());
+          }),
       });
     });
   });

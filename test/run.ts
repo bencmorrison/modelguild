@@ -7,6 +7,7 @@ import { run as lifecycle } from "./lifecycle.test.js";
 import { run as orphan } from "./orphan.test.js";
 import { run as mcpClient } from "./mcp-client.test.js";
 import { run as client } from "./client.test.js";
+import { run as activity } from "./activity.test.js";
 import { run as log } from "./log.test.js";
 import { run as policy } from "./policy.test.js";
 import { run as config } from "./config.test.js";
@@ -23,6 +24,7 @@ const suites: Array<[string, () => Promise<number>]> = [
   ["orphan", orphan],
   ["mcp-client", mcpClient],
   ["client", client],
+  ["activity", activity],
   ["log", log],
   ["policy", policy],
   ["config", config],

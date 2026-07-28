@@ -33,8 +33,10 @@ import {
   resolveRootWithConflict,
   gateModel,
   runAgentLifecycle,
+  activityLayerFor,
   type McpToolResult,
 } from "./consult.js";
+import { type ActivityEvent, type ActivitySummary } from "./activity.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -71,6 +73,8 @@ export interface ResearchDeps {
   /** Injected in tests so root/policy/log all share one guild dir; else resolved. */
   log?: EvidenceLog;
   messageTimeoutMs?: number;
+  /** LIVE sink for each normalized activity event (issue #20) — the MCP progress channel. */
+  onActivity?: (e: ActivityEvent) => void;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -111,11 +115,15 @@ export interface ResearchOk {
   answer: string;
   attribution: ResearchAttribution;
   rootConflict?: string;
+  /** Bounded live-activity summary (issue #20); absent when the layer is off. */
+  activity?: ActivitySummary;
 }
 export interface ResearchFail {
   ok: false;
   error: ResearchError;
   rootConflict?: string;
+  /** Present when the call actually RAN (call-failed / agent-mismatch). */
+  activity?: ActivitySummary;
 }
 export type ResearchResult = ResearchOk | ResearchFail;
 
@@ -201,11 +209,12 @@ export async function research(
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
+      activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
     },
   );
 
   if (outcome.ok) {
-    return {
+    const ok: ResearchOk = {
       ok: true,
       answer: outcome.text,
       rootConflict,
@@ -217,6 +226,8 @@ export async function research(
         callId: outcome.callId,
       },
     };
+    if (outcome.activity !== undefined) ok.activity = outcome.activity;
+    return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   // agent-mismatch (positive-direction addition over bash; no exit analogue) carries its
@@ -225,7 +236,7 @@ export async function research(
     outcome.kind === "agent-mismatch"
       ? outcome.reason
       : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
-  return {
+  const fail: ResearchFail = {
     ok: false,
     rootConflict,
     error: {
@@ -235,6 +246,8 @@ export async function research(
       message,
     },
   };
+  if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  return fail;
 }
 
 // --- MCP tool-result translation -------------------------------------------
@@ -248,10 +261,12 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
   if (r.ok) {
     const structured: Record<string, unknown> = { answer: r.answer, ...r.attribution };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.activity) structured.activity = r.activity;
     return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.activity) structured.activity = r.activity;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

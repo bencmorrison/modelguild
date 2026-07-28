@@ -6,6 +6,8 @@
  *   init              — place the MCP-era payload into a project (see init.ts).
  *   doctor            — a token-free health check (opencode present, MCP registration,
  *                       command docs + agent defs present, config/policy roots).
+ *   watch             — tail the live activity of guild model calls (issue #20): the
+ *                       external model's reads/greps/fetches/edits/commands as they happen.
  *   logs clean        — apply log retention by hand (issue #23): delete run dirs older
  *                       than the configured (or `--days`) window, `--dry-run` to look.
  *
@@ -16,7 +18,7 @@
  * source stays lint-clean while the shipped artifact is directly executable.
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -616,6 +618,268 @@ export async function runLogsClean(
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// `modelguild watch` — live activity tail (issue #20, slice 2).
+//
+// THIS IS THE CHANNEL THE ISSUE ACTUALLY ASKED FOR, and the only one this repo can promise
+// works: it is a file and a terminal. It depends on nothing about Claude Code's rendering,
+// nothing about the MCP spec, and nothing about Claude choosing to relay anything. The MCP
+// progress notifications (server.ts) are additive; this is the floor.
+//
+// It tails `<logDir>/<run>/activity.jsonl`. With no `--run` it FOLLOWS the newest run —
+// re-resolving `EvidenceLog.latest()` on every poll — because the normal way to use it is
+// to start it BEFORE the delegate call, when the run does not exist yet.
+// ---------------------------------------------------------------------------
+
+function watchUsage(): void {
+  console.log("Usage: modelguild watch [--run ID] [--dir D] [--no-follow] [--json]");
+  console.log("  Tail the live activity of guild model calls: which files the external");
+  console.log("  model read, what it grepped, fetched, edited, and which commands it ran.");
+  console.log("  --run ID     Watch a specific run id instead of following the newest run.");
+  console.log("  --dir D      Resolve the modelguild/ root from D instead of the cwd.");
+  console.log("  --no-follow  Print what is already recorded and exit.");
+  console.log("  --json       Print the raw JSONL lines instead of the formatted view.");
+  console.log("");
+  console.log("  Activity is written by the MCP server while a call runs; GUILD_ACTIVITY=off");
+  console.log("  disables it, and GUILD_LOG=off leaves no run dir to write into. These lines");
+  console.log("  are opencode's report of the model's ACTIONS — the model's words are the");
+  console.log("  receipts in calls.jsonl, and the delegate diff is still what you review.");
+}
+
+interface WatchArgs {
+  run?: string;
+  targetDir: string;
+  follow: boolean;
+  json: boolean;
+}
+
+/** Take a value-taking flag's value, refusing a MISSING one and one that is itself a flag.
+ * `--run` with nothing after it used to fall through to `undefined` and silently follow the
+ * newest run — the opposite of what was asked — and `--run --json` ate the flag as the id.
+ * Both are usage errors, matching how the rest of this CLI treats a bad argument. */
+function watchValue(flag: string, raw: string | undefined): string {
+  if (raw === undefined || raw.length === 0) {
+    throw new Error(`watch: ${flag} needs a value`);
+  }
+  if (raw.startsWith("-")) {
+    throw new Error(`watch: ${flag} needs a value, got the flag '${raw}'`);
+  }
+  return raw;
+}
+
+function parseWatchArgs(argv: string[]): WatchArgs {
+  let run: string | undefined;
+  let targetDir = process.cwd();
+  let follow = true;
+  let json = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--no-follow" || a === "-1") follow = false;
+    else if (a === "--follow" || a === "-f") follow = true;
+    else if (a === "--json") json = true;
+    else if (a === "--run") run = watchValue("--run", argv[++i]);
+    else if (a.startsWith("--run=")) run = watchValue("--run", a.slice("--run=".length));
+    else if (a === "--dir") targetDir = watchValue("--dir", argv[++i]);
+    else if (a.startsWith("--dir=")) targetDir = watchValue("--dir", a.slice("--dir=".length));
+    else throw new Error(`watch: unknown argument '${a}'`);
+  }
+  const parsed: WatchArgs = { targetDir: path.resolve(targetDir), follow, json };
+  if (run !== undefined) parsed.run = run;
+  return parsed;
+}
+
+/** `HH:MM:SS` from the line's ISO timestamp; `--:--:--` when it is missing/unparseable. */
+function watchClock(ts: unknown): string {
+  if (typeof ts !== "string") return "--:--:--";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "--:--:--";
+  return d.toTimeString().slice(0, 8);
+}
+
+/**
+ * Format one activity line. Returns the lines to print: a context banner the FIRST time a
+ * `call_id` is seen (a panel writes three models into one file, so anonymous rows would be
+ * unreadable), then the event row itself.
+ */
+export function formatActivityLine(
+  raw: string,
+  seenCalls: Set<string>,
+): string[] {
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    // A torn/foreign line is shown verbatim rather than swallowed — the watcher must not
+    // quietly hide something it did not understand.
+    return [`  ?  ${raw}`];
+  }
+  const out: string[] = [];
+  const callId = typeof obj.call_id === "string" ? obj.call_id : "";
+  const short = callId.length > 0 ? callId.replace(/^call-/, "").slice(0, 6) : "??????";
+  if (callId.length > 0 && !seenCalls.has(callId)) {
+    seenCalls.add(callId);
+    const bits = [obj.command, obj.model, obj.agent].filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    out.push(`── [${short}] ${bits.join("  ·  ")}`);
+  }
+  const kind = typeof obj.kind === "string" ? obj.kind : "?";
+  const summary = typeof obj.summary === "string" ? obj.summary : "";
+  out.push(`${watchClock(obj.ts)} [${short}] ${kind.padEnd(17)} ${summary}`);
+  return out;
+}
+
+/**
+ * `modelguild watch`. Exported (like `runDoctor`/`runLogsClean`) so the test suite drives
+ * it directly instead of shelling out.
+ *
+ * The tail is a POLL over a byte offset, not `fs.watch`: `fs.watch` semantics differ
+ * across platforms and filesystems (and are unreliable over bind mounts and network
+ * shares, which is exactly where a dev container puts things), while a 300 ms stat+read is
+ * portable and cheap. A file that SHRANK is treated as replaced and re-read from zero.
+ */
+export async function runWatch(
+  argv: string[],
+  inject?: {
+    env?: NodeJS.ProcessEnv;
+    homeDir?: string;
+    /** Test seam: stop after this many polls (production runs until interrupted). */
+    maxPolls?: number;
+    pollMs?: number;
+  },
+): Promise<number> {
+  let args: WatchArgs;
+  try {
+    args = parseWatchArgs(argv);
+  } catch (err) {
+    console.error(`modelguild: ${(err as Error).message}`);
+    return 2;
+  }
+  const env = inject?.env ?? process.env;
+  const home = inject?.homeDir;
+  const pollMs = inject?.pollMs ?? 300;
+  // Same layered resolution as `logs clean`: knobs are read across every layer, but runs
+  // only ever exist under the PRIMARY root, so that is the one whose logs/ we tail.
+  const roots = home ? layeredRoots(env, args.targetDir, home) : layeredRoots(env, args.targetDir);
+  const log = new EvidenceLog({
+    env,
+    cwd: args.targetDir,
+    guildDir: roots[0].root,
+    guildDirs: roots.map((r) => r.root),
+  });
+  const logDir = log.logDir();
+
+  console.log(`modelguild watch — ${logDir}`);
+  if (!log.enabled()) {
+    console.log("  ! GUILD_LOG=off — no run directory is created, so no activity is recorded.");
+  }
+
+  const seenCalls = new Set<string>();
+  let currentRun: string | undefined;
+  let offset = 0;
+  let partial = "";
+  let announcedWaiting = false;
+
+  const openRun = (runId: string): void => {
+    currentRun = runId;
+    offset = 0;
+    partial = "";
+    console.log(`── run ${runId}`);
+  };
+
+  /** Rotate to a new run, DRAINING THE OUTGOING ONE FIRST. Without that drain, events
+   * appended to run A inside the same poll window that mints run B were never printed:
+   * `openRun` reset the offset and they were skipped forever. The last thing a run did is
+   * often the most interesting thing it did. */
+  const switchRun = (runId: string): void => {
+    if (currentRun !== undefined) drain();
+    openRun(runId);
+  };
+
+  const drain = (): void => {
+    if (currentRun === undefined) return;
+    const file = path.join(logDir, currentRun, "activity.jsonl");
+    let size: number;
+    try {
+      size = statSync(file).size;
+    } catch {
+      return; // not created yet (or removed) — nothing to read this poll
+    }
+    if (size < offset) {
+      // Truncated or replaced: start over rather than reading from a stale offset.
+      offset = 0;
+      partial = "";
+    }
+    if (size === offset) return;
+    let chunk = "";
+    let fd: number | undefined;
+    try {
+      fd = openSync(file, "r");
+      const len = size - offset;
+      const buf = Buffer.allocUnsafe(len);
+      const read = readSync(fd, buf, 0, len, offset);
+      chunk = buf.subarray(0, read).toString("utf8");
+      offset += read;
+    } catch {
+      return;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    partial += chunk;
+    const lines = partial.split("\n");
+    // The last element is whatever came after the final newline — an incomplete line the
+    // writer has not finished. Hold it until the rest arrives.
+    partial = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.length === 0) continue;
+      if (args.json) {
+        console.log(line);
+        continue;
+      }
+      for (const out of formatActivityLine(line, seenCalls)) console.log(out);
+    }
+  };
+
+  const resolveRun = (): void => {
+    if (args.run !== undefined) {
+      if (currentRun !== args.run) switchRun(args.run);
+      return;
+    }
+    const latest = log.latest();
+    if (latest === undefined) {
+      if (!announcedWaiting) {
+        console.log("  (no runs yet — waiting for the next guild call…)");
+        announcedWaiting = true;
+      }
+      return;
+    }
+    if (latest !== currentRun) switchRun(latest);
+  };
+
+  resolveRun();
+  drain();
+
+  if (!args.follow) {
+    if (currentRun === undefined) console.log("  nothing to show yet.");
+    return 0;
+  }
+
+  let polls = 0;
+  for (;;) {
+    if (inject?.maxPolls !== undefined && polls >= inject.maxPolls) return 0;
+    polls += 1;
+    await new Promise((r) => setTimeout(r, pollMs));
+    resolveRun();
+    drain();
+  }
+}
+
 async function runLogs(argv: string[]): Promise<number> {
   const sub = argv[0];
   if (sub === "-h" || sub === "--help" || sub === "help") { logsUsage(); return 0; }
@@ -636,8 +900,16 @@ async function main(): Promise<number> {
   if (cmd === "init") return runInit(argv.slice(1));
   if (cmd === "doctor") return runDoctor(argv.slice(1));
   if (cmd === "logs") return runLogs(argv.slice(1));
+  if (cmd === "watch") {
+    const sub = argv[1];
+    if (sub === "-h" || sub === "--help" || sub === "help") {
+      watchUsage();
+      return 0;
+    }
+    return runWatch(argv.slice(1));
+  }
   if (cmd === "-h" || cmd === "--help" || cmd === "help") {
-    console.log("Usage: modelguild <serve|init|doctor|logs> [options]");
+    console.log("Usage: modelguild <serve|init|doctor|watch|logs> [options]");
     console.log("  serve            Start the MCP stdio server (default; what .mcp.json launches).");
     console.log("  init [--dir D]   Place the MCP-era payload into a project (--uninstall to remove).");
     console.log("                   Does NOT write .mcp.json by default — it prints how to register");
@@ -650,6 +922,10 @@ async function main(): Promise<number> {
     console.log("       [--abs]     Pin an absolute path to this interpreter+entry (offline/no-registry).");
     console.log("       [--server-command \"cmd args\"]  Override the launch command verbatim.");
     console.log("  doctor [--dir D] Token-free health check ([--global] checks the global locations).");
+    console.log("  watch            Tail LIVE what an external model is doing (reads, greps,");
+    console.log("                   fetches, edits, shell commands) while a guild call runs.");
+    console.log("       [--run ID]   watch one run instead of following the newest.");
+    console.log("       [--no-follow] print what is recorded and exit; [--json] raw lines.");
     console.log("  logs clean       Apply evidence-log retention by hand:");
     console.log("       [--days N]   window in days (default: GUILD_LOG_RETENTION_DAYS,");
     console.log(`                    env > modelguild.conf.local > ${DEFAULT_RETENTION_DAYS}; refuses if unset/0).`);

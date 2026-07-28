@@ -260,6 +260,23 @@ ModelGuild has real, verifiable guardrails — but it is **not a sandbox**. Use 
 - **External model output is treated as data, not instructions** — a consulted model can't smuggle commands into Claude's control flow.
 - Run `doctor` (step 5 of [Setup](#setup)) to check your setup before relying on any of this.
 
+## Watch it live
+
+`/guild:delegate` on a slow model is otherwise a fifteen-minute black box that ends with a diff. Open a second terminal and run:
+
+```bash
+npx modelguild watch
+```
+
+It tails what the external model is doing **as it happens** — which files it read, what it grepped, what it fetched, what it edited, which shell commands it ran — for every guild call, read paths included. With no arguments it follows the newest run, so you can start it *before* the call; `--run ID` pins one run, `--no-follow` prints what is already there and exits, `--json` gives you the raw lines.
+
+The same trace is written to `modelguild/logs/<run_id>/activity.jsonl` and summarised on each tool result (`structuredContent.activity`: counts by tool, files edited, errors, the first few actions), so Claude can tell you "it ran 14 tool calls, 3 of them shell, and edited 5 files" instead of only handing you a diff.
+
+- **It is visibility, not containment.** Seeing a command scroll past does not gate it — nothing here asks your permission before the model acts. The diff review is still the review point.
+- **It is not the receipts either.** These lines are opencode's report of the model's *actions*, at opencode's fidelity. The model's actual *words* are in `calls.jsonl` (below).
+- **If the stream drops, it says so.** `activity.degraded` is set on the result, so a quiet trace is never mistaken for a quiet model.
+- **Knobs:** `GUILD_ACTIVITY=off` turns it off entirely; `GUILD_ACTIVITY_DETAIL=full` records each event's raw payload, which can include file contents the model read — same sensitivity trade-off as `GUILD_LOG_PROMPTS=full`. Both live in `modelguild/modelguild.conf.local`.
+
 ## The record it keeps
 
 Every model call is logged to `modelguild/logs/<run_id>/calls.jsonl` as three lifecycle entries sharing one `call_id`: `expected-call` before capture setup, `started` before execution, and `completed` after it. Three calls produce nine lifecycle entries. The record includes the exact prompt sent, the model's full untruncated answer, model, agent, and exit status. It's git-ignored and stays on your machine.
