@@ -664,3 +664,38 @@ is inert** on 1.18.7 (`edit` gates the write/patch family, probed), so `edit` mu
 a tier and the result reports the effective family; and the watch terminal prompts **one
 request at a time**, so a second request arriving mid-prompt burns its own deadline waiting —
 it is announced immediately, and the trade-off is documented rather than hidden.
+
+### Slice 4 follow-up: the elicitation prompt is a no-field form (2026-07-28)
+
+**Provenance: the maintainer's live interactive test.** The elicitation prompt *does* render in
+Claude Code's TUI — the first thing about it that was human-verified rather than inferred, and
+the open question §5/P4 left. But the single boolean `approve` field rendered as a **checkbox
+you had to space-select and then submit**: two non-obvious steps to answer a question whose
+entire value is being answerable in one keypress.
+
+**Fix.** `requestedSchema` is now `{type: "object", properties: {}}` — no fields, so the
+client's own **Accept / Decline** buttons *are* the decision. Everything the developer needs to
+read moved into the message (`elicitationMessage`): command, model, tool, sanitized detail, the
+bash-approves-a-shell note, the edit-covers-write/patch note, and the fail-closed deadline.
+
+**Probe evidence for the shape** (`claude -p` + a raw `elicitation/create`, the same method as
+the Slice 0 P4 probe, run in this worktree): Claude Code **accepts and answers** the empty-field
+form exactly as it does the boolean and enum forms — all three returned `{"action":"cancel"}`
+headlessly, none errored. It is also valid per the SDK's own `ElicitRequestFormParamsSchema`
+(`properties` is a `z.record`, an empty record is a record; `required` is optional). The
+single-enum fallback was therefore not needed.
+
+**Mapping change, and why it is safe.** The old code required `content.approve === true` and
+read an `accept` without it as a DECLINE. That was correct for a checkbox — "accepted the form,
+left the box unticked" was a real way to say no. **It cannot happen now:** there is no field to
+leave unset, so an `accept` is unambiguously the Accept button, and keeping the rule would have
+turned every real approval into a rejection. It is removed. What is unchanged, and now stated as
+a positive rule the tests pin: **only the literal `"accept"` approves** — `"decline"` rejects,
+`"cancel"` keeps its abstain-or-reject handling, and any other value (unknown action strings,
+missing/malformed results, transport failures, timeouts) is a cancel and never consent.
+
+**Incidental probe finding, recorded because it makes an existing claim stale.** This Claude Code
+build advertises `elicitation: {"form":{}}`, not the bare `{}` P4 observed — so the SDK's
+`elicitInput()` helper would no longer throw against it. The raw `server.request` is kept
+regardless: it works against both shapes, so the channel does not depend on which one a client
+version sends. Nothing else in the bridge changed.

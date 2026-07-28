@@ -365,12 +365,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
  * The approval bridge's elicitation channel (issue #20 slice 4) — a RAW
  * `elicitation/create`, deliberately not `server.elicitInput()`.
  *
- * PROBED, not assumed (P4, re-read in the installed `@modelcontextprotocol/sdk` for this
- * slice): `elicitInput()` gates on `_clientCapabilities.elicitation.form`, which Claude
- * Code's bare `"elicitation": {}` does NOT carry, so the helper throws before sending
- * anything. `server.request()` asserts only that the capability EXISTS, which the bare
- * object satisfies — so the raw request is the only form that reaches the very client this
- * channel is meant to reach.
+ * PROBED, not assumed (P4, re-read in the installed `@modelcontextprotocol/sdk`):
+ * `elicitInput()` gates on `_clientCapabilities.elicitation.form`, which Claude Code's bare
+ * `"elicitation": {}` did NOT carry, so the helper threw before sending anything.
+ * `server.request()` asserts only that the capability EXISTS, which the bare object
+ * satisfies — so the raw request is the form that reaches this client.
+ *
+ * UPDATED 2026-07-28: a fresh probe found this Claude Code build advertising
+ * `elicitation: {"form":{}}`, so `elicitInput()` would no longer throw against it. The raw
+ * request is KEPT anyway, deliberately: it works against BOTH the bare and the `form`
+ * shapes, so the channel does not depend on which one a given client version sends — and
+ * the helper would add nothing but a capability check we already pass.
  *
  * TWO BOUNDS, both carried into the mapping in `makeElicitationRequester`:
  *   - a HEADLESS run (`claude -p`) auto-answers `{"action":"cancel"}`, and cancel maps to
