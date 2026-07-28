@@ -12,17 +12,72 @@
  * call rather than a test-only command knob the production path would never take.
  */
 
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { OpencodeLifecycle } from "../src/lifecycle.js";
-import { Checker, pidAlive, waitFor, withTimeout, sleep } from "./harness.js";
+import { Checker, pidAlive, waitFor, withTimeout, sleep, tsxBin, repoRoot } from "./harness.js";
+
+/** Every temp dir this suite mints, removed at the end (no /tmp litter per run). */
+const tempDirs: string[] = [];
+
+function mkTemp(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
 
 /** Write a fake `opencode` (bash) into a fresh temp dir and return the dir. */
 function makeShim(body: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mg-serve-stderr-"));
+  const dir = mkTemp("mg-serve-stderr-");
   fs.writeFileSync(path.join(dir, "opencode"), `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
   return dir;
+}
+
+/**
+ * Drive ONE ensureServe() in a SEPARATE process (issue #75, review finding F1).
+ *
+ * A separate process is the only honest way to test "the rejection is not swallowed":
+ * the bug is that with every handle unref'd, Node exits mid-await and the promise never
+ * settles — invisible inside a suite whose loop is kept alive by other work. The driver
+ * has nothing else on its loop, so a swallowed rejection shows up as a process that
+ * exits without printing RESULT (exit 13, "unsettled top-level await").
+ */
+function runDriver(shimDir: string): Promise<{ code: number | null; out: string }> {
+  const driver = path.join(shimDir, "driver.mts");
+  fs.writeFileSync(
+    driver,
+    [
+      `import { OpencodeLifecycle } from ${JSON.stringify(path.join(repoRoot, "src", "lifecycle.ts"))};`,
+      `const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: process.argv[2], readyTimeoutMs: 8000 });`,
+      `try {`,
+      `  await lc.ensureServe();`,
+      `  console.log("RESULT:" + JSON.stringify("resolved-unexpectedly"));`,
+      `} catch (err) {`,
+      `  console.log("RESULT:" + JSON.stringify(err instanceof Error ? err.message : String(err)));`,
+      `}`,
+      `lc.shutdown("driver-done");`,
+      "",
+    ].join("\n"),
+  );
+  return new Promise((resolve) => {
+    const child = spawn(tsxBin, [driver, shimDir], {
+      cwd: shimDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}` },
+    });
+    let out = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (d: string) => (out += d));
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (d: string) => (out += d));
+    const guard = setTimeout(() => child.kill("SIGKILL"), 40_000);
+    child.on("close", (code) => {
+      clearTimeout(guard);
+      resolve({ code, out });
+    });
+  });
 }
 
 /** Run `fn` with `dir` prepended to PATH, restoring PATH afterwards. */
@@ -129,12 +184,16 @@ export async function run(): Promise<number> {
     c.check(msg.includes("exit code 7"), "silent child: the exit code is still named");
   }
 
-  // 6. a spawn failure (no binary at all) rejects — it does NOT crash the process ----
-  //    Before the fix the ChildProcess 'error' event had no listener, so an ENOENT was
-  //    re-thrown as an uncaught exception: in production that takes the MCP server down.
-  //    This suite reaching check 7 IS the proof it no longer does.
+  // 6. a spawn failure (no binary at all): rejects WITH THE ERRNO, no crash -----------
+  //    Two regressions in one place. (a) The ChildProcess 'error' event had no listener,
+  //    so an ENOENT was re-thrown as an uncaught exception — in production that takes the
+  //    MCP server down; this suite reaching check 7 is the proof it no longer does.
+  //    (b) The pidless-spawn path threw before Node had reported WHY, so the commonest
+  //    startup failure of all (opencode not on PATH) surfaced as a bare "(no pid)".
+  //    The assertion below deliberately requires the errno: matching merely "failed to
+  //    spawn" would pass against that opaque string and let the gap return silently.
   {
-    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "mg-serve-nopath-"));
+    const empty = mkTemp("mg-serve-nopath-");
     const prev = process.env.PATH;
     process.env.PATH = empty; // no `opencode` anywhere on it
     let msg = "";
@@ -150,13 +209,35 @@ export async function run(): Promise<number> {
       process.env.PATH = prev;
     }
     c.check(msg.length > 0, "spawn failure: ensureServe rejects");
+    const first = msg.split("\n")[0];
     c.check(
-      msg.includes("failed to spawn") || msg.includes("ENOENT"),
-      `spawn failure: the message names the spawn error (got: ${msg.split("\n")[0]})`,
+      /failed to spawn `opencode serve`: .*ENOENT/.test(msg),
+      `spawn failure: the message carries the ERRNO, not a bare "no pid" (got: ${first})`,
     );
+    c.check(msg.includes("opencode"), "spawn failure: the message names the binary it could not run");
+    c.check(msg.includes(`cwd=${empty}`), "spawn failure: the message names the cwd it tried");
     // Give any stray async 'error' emission a tick to blow up if it were unhandled.
     await sleep(100);
     c.check(true, "spawn failure: the process survived the failed spawn (no uncaught 'error')");
+  }
+
+  // 6b. THE REJECTION MUST ACTUALLY ARRIVE (review finding F1) -------------------------
+  //     A grandchild inheriting the stderr pipe keeps it open after the child exits, so
+  //     the drain wait cannot end early. With the drain timer AND the stream both unref'd
+  //     there is nothing left holding the event loop: Node exits mid-await and the whole
+  //     rejection vanishes (observed: exit 13, nothing printed). Driven in a separate
+  //     process because that is the only place "the loop had no other work" is true.
+  {
+    const dir = makeShim(
+      "(sleep 5) &\n" +
+        'printf "grandchild still holds this pipe (marker-delta)\\n" >&2\n' +
+        "exit 4",
+    );
+    const { code, out } = await runDriver(dir);
+    c.check(out.includes("RESULT:"), "unsettled: the driver settled and printed a result (not swallowed)");
+    c.check(code === 0, `unsettled: the driver exited cleanly, not 13/unsettled-await (exit ${code})`);
+    c.check(out.includes("marker-delta"), "unsettled: the settled rejection still carries the stderr tail");
+    c.check(out.includes("exit code 4"), "unsettled: it still names the child's exit code");
   }
 
   // 7. the HAPPY path is unperturbed: a serve that comes up still comes up ------------
@@ -184,6 +265,14 @@ export async function run(): Promise<number> {
       lc.shutdown("test");
       c.check(await waitFor(() => !pidAlive(h.pid), 8_000), "happy: the child dies on shutdown (teardown unchanged)");
     });
+  }
+
+  for (const dir of tempDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* leftover temp dirs are not a test failure */
+    }
   }
 
   console.log(`serve-stderr.test: ${c.passes} passed, ${c.failures} failed`);
