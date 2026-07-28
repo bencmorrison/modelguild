@@ -248,21 +248,38 @@ export const RUN_ID_MAX_LENGTH = 128;
  * hidden dirs are out), and whitespace. */
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** `latest` is the symlink `#ensureRun` maintains beside the run dirs in the same logs
- * root. A run by that name collides with it and leaves the pointer permanently broken
- * (the unlink/symlink both fail against a directory), so the one reserved name is
- * refused rather than half-worked. */
-const RUN_ID_RESERVED = new Set(["latest"]);
+/** Names already taken by something else in the SAME logs root, so a run dir by one of
+ * them collides: `latest` is the symlink `#ensureRun` maintains (the unlink and the symlink
+ * both fail against a directory, leaving the pointer permanently broken), and `watchers` is
+ * the approval bridge's presence dir (`watcherDirFor` in `src/approve.ts`) — a run there
+ * would sit among the watcher heartbeat files (review finding F4).
+ *
+ * Compared **case-insensitively**: macOS's default APFS is case-insensitive, so `LATEST`
+ * aliases `latest` there — and macOS is a platform this repo's CI covers explicitly. */
+const RUN_ID_RESERVED = new Set(["latest", "watchers"]);
 
 /** Render an offending value for an error message: echoed so the caller can see what it
- * sent, with control characters neutralized and the length capped. */
+ * sent, with control characters neutralized and the length capped.
+ *
+ * Rendering HOSTILE input is its whole job, so it must not throw (review finding F7):
+ * `JSON.stringify` rejects a BigInt and a circular object, and a caller-controlled
+ * `toString`/`toJSON` can throw as well. */
 function showRunId(value: unknown): string {
-  const s =
-    typeof value === "string"
-      ? value
-      : value === null || value === undefined
-        ? String(value)
-        : JSON.stringify(value);
+  let s: string;
+  try {
+    s =
+      typeof value === "string"
+        ? value
+        : value === null || value === undefined
+          ? String(value)
+          : (JSON.stringify(value) ?? String(value));
+  } catch {
+    try {
+      s = String(value);
+    } catch {
+      s = `<unprintable ${typeof value}>`;
+    }
+  }
   // Escaped explicitly: control characters must never appear RAW in source.
   const flat = s.replace(/[\u0000-\u001f\u007f]/g, "?");
   return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
@@ -270,7 +287,8 @@ function showRunId(value: unknown): string {
 
 const RUN_ID_RULE =
   "a run id is a single path segment: letters/digits/'.'/'_'/'-', starting with a letter " +
-  `or digit, no '/', '\\', '..' or leading '.', at most ${RUN_ID_MAX_LENGTH} characters ` +
+  `or digit, no '/', '\\', '..' or leading '.', at most ${RUN_ID_MAX_LENGTH} characters, ` +
+  "and not the reserved names 'latest'/'watchers' (in any case) " +
   "(run ids are minted by the tools, e.g. 20260728T055956Z-7526f9dd — pass one back " +
   "verbatim, or omit it for a fresh run)";
 
@@ -282,7 +300,8 @@ export function isRunId(value: unknown): value is string {
   // `a..b` cannot traverse, but `..` is never something we mint and is what the report
   // names — refusing it outright keeps the rule to one sentence.
   if (value.includes("..")) return false;
-  return !RUN_ID_RESERVED.has(value);
+  // Case-INSENSITIVE: see RUN_ID_RESERVED (a case-insensitive filesystem aliases them).
+  return !RUN_ID_RESERVED.has(value.toLowerCase());
 }
 
 /**
@@ -608,7 +627,12 @@ export class EvidenceLog {
     const l = path.join(this.#logDir(), "latest");
     if (!isSymlink(l)) return undefined;
     try {
-      return path.basename(readlinkSync(l));
+      const name = path.basename(readlinkSync(l));
+      // The symlink's TARGET is data on disk, not something we minted this process — and
+      // `runWatch` joins this straight onto the logs root without going through `dir()`,
+      // so a `latest` pointing at `..` would make the watcher tail above the root (review
+      // finding F5). Anything that is not a run id is "no latest run", not a path.
+      return isRunId(name) ? name : undefined;
     } catch {
       return undefined;
     }
@@ -1101,7 +1125,12 @@ export class EvidenceLog {
       const rh = typeof e.response_hash === "string" ? e.response_hash : "";
       if (rh !== "") {
         if (e.type === "delegate-diff") {
-          const pf = path.join(rd, typeof e.patch === "string" ? e.patch : "");
+          // `basename` on the READ side too (review finding F6): `diff()` stores a basename,
+          // but the value being joined here comes from the FILE, so an edited entry could
+          // otherwise point the audit at an arbitrary path. Same join-a-component shape as
+          // issue #73; the hash chain would flag the edit, but the audit must not read
+          // outside the run dir on its way to saying so.
+          const pf = path.join(rd, path.basename(typeof e.patch === "string" ? e.patch : ""));
           if (!existsSync(pf)) {
             return fail7Raw(`INTEGRITY FAIL: line ${i} references patch '${path.basename(pf)}' which is MISSING — the record points at evidence that no longer exists.`);
           }

@@ -614,6 +614,87 @@ export async function run(): Promise<number> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Issue #73, review findings F1/F2 — GUILD_LOG=off on the WRITE path (the suite only
+  // ever set GUILD_LOG_DIR before, so neither bug had a test that could see it).
+  //
+  // With the evidence layer off, `runId` is `""` — which is FALSY, so `#resolveRun` fell
+  // through to `$GUILD_RUN_ID`:
+  //   F1 — a hostile `$GUILD_RUN_ID` then threw out of `log.dir()`, which sits outside
+  //        every `try` in `captureAndLog`, so the exception escaped `delegate()` AFTER the
+  //        model had already edited files, taking the report and the recovery hint with
+  //        it. Exactly the failure C31 forbids.
+  //   F2 — and with `$GUILD_RUN_ID` merely absent it minted a FRESH run id anyway, so the
+  //        mkdir created a run dir and a patch was written into it with logging off —
+  //        contradicting "GUILD_LOG=off mints no run dir".
+  // -------------------------------------------------------------------------
+  {
+    // (a) hostile GUILD_RUN_ID + GUILD_LOG=off: the call still succeeds and still reports.
+    const escapeDir = path.join(tmpdir(), `mg73-delegate-escape-${process.pid}`);
+    const repo = initRepo({ "a.txt": "A\n" });
+    const env = envWith({
+      GUILD_ROOT: tmp("m8-guild-"),
+      GUILD_LOG_DIR: tmp("m8-logs-off-"),
+      GUILD_AGENT_DIR: defDirWithBuild(),
+      GUILD_LOG: "off",
+      GUILD_RUN_ID: `../../../../../../${path.basename(tmpdir())}/${path.basename(escapeDir)}`,
+    });
+    const fake = await startFakeOpencode({ historyText: "edited a.txt" });
+    let threw = false;
+    let r;
+    try {
+      r = await delegate(
+        { task: "edit a.txt", model: "openai/m" },
+        {
+          serve: mutatingServe(fake, () => writeFileSync(path.join(repo, "a.txt"), "A1\n")),
+          env,
+          repoDir: repo,
+          messageTimeoutMs: 5_000,
+        },
+      );
+    } catch {
+      threw = true;
+    } finally {
+      await fake.close();
+    }
+    c.check(!threw, "F1: GUILD_LOG=off + a hostile GUILD_RUN_ID does NOT throw out of delegate()");
+    c.check(r !== undefined && r.ok, "F1: the call still succeeds — a log-path failure never discards the model's work");
+    if (r !== undefined && r.ok) {
+      c.check(r.report === "edited a.txt", "F1: the model's report still reaches the caller");
+      c.check(r.capture.patchPath === null && r.capture.incompleteReason === "logging-off",
+        "F1: the absent capture is REPORTED with its reason, not silently missing");
+    }
+    c.check(!existsSync(escapeDir), "F1: the write path writes nothing outside the logs root either");
+
+    // (b) GUILD_LOG=off with NO ambient run id: the logs root stays EMPTY.
+    const repo2 = initRepo({ "b.txt": "B\n" });
+    const logDir2 = tmp("m8-logs-off2-");
+    const env2 = envWith({
+      GUILD_ROOT: tmp("m8-guild-"),
+      GUILD_LOG_DIR: logDir2,
+      GUILD_AGENT_DIR: defDirWithBuild(),
+      GUILD_LOG: "off",
+    });
+    const fake2 = await startFakeOpencode({ historyText: "edited b.txt" });
+    let r2;
+    try {
+      r2 = await delegate(
+        { task: "edit b.txt", model: "openai/m" },
+        {
+          serve: mutatingServe(fake2, () => writeFileSync(path.join(repo2, "b.txt"), "B1\n")),
+          env: env2,
+          repoDir: repo2,
+          messageTimeoutMs: 5_000,
+        },
+      );
+    } finally {
+      await fake2.close();
+    }
+    c.check(r2 !== undefined && r2.ok, "F2: a GUILD_LOG=off delegation succeeds");
+    c.check(existsSync(logDir2) && readdirSync(logDir2).length === 0,
+      "F2: GUILD_LOG=off mints NO run dir and writes NO patch (the documented claim, now true)");
+  }
+
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
   console.log(`delegate.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

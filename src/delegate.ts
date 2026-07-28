@@ -117,8 +117,11 @@ export interface DelegateCapture {
   preTree: string | null;
   afterTree: string | null;
   filesChanged: number;
-  /** false ⇒ the recorded patch is a partial/incomplete record; the log fails integrity
-   * loudly (C40). The reason names why (ignored/submodule/tree state unrepresentable). */
+  /** false ⇒ no COMPLETE patch record exists. Either the recorded patch is a partial record
+   * — the log then fails integrity loudly (C40), and the reason names why (ignored/submodule/
+   * tree state unrepresentable, `capture-crashed`) — or none was recorded at all because the
+   * evidence layer is off (`logging-off`, review finding F2; `patchPath` is then null and
+   * `recoveryHint` is the way back). */
   captureComplete: boolean;
   incompleteReason: string;
   /** `git checkout <preTree> -- <path>` template, surfaced when the worktree was dirty. */
@@ -418,6 +421,35 @@ async function captureAndLog(
   const scaffoldWarning = scaffoldChanged
     ? "the transport's plugin directory (.opencode/node_modules + manifests) changed during this call — review it; this directory is loaded by opencode serve"
     : null;
+
+  // NO RUN, NO CAPTURE — the guard `consult.ts` and `approve.ts` already apply before
+  // calling `log.dir()`, missing here (review finding F1/F2 on issue #73). Two reasons,
+  // both load-bearing:
+  //   1. C31. With `GUILD_LOG=off` (or a failed `newRun`) `runId` is `""`, which is falsy,
+  //      so `#resolveRun` would fall through to `$GUILD_RUN_ID` — and an invalid one now
+  //      THROWS. This call site sits outside every `try` below, so that throw would escape
+  //      through `delegate()` to the MCP handler AFTER the model already edited files,
+  //      discarding the report AND the recovery hint. The exact failure C31 forbids.
+  //   2. Logging off must mean nothing on disk. `dir()`/`path()` never consult `#disabled()`,
+  //      so `dir("")` minted a FRESH run id and the mkdir below created that directory and
+  //      wrote a patch into it — with no calls.jsonl beside it, and against the documented
+  //      "GUILD_LOG=off mints no run dir".
+  // The capture is reported as absent WITH ITS REASON rather than silently skipped: the
+  // model did edit files, so `recoveryHint` and the scaffold tamper signal still ride out.
+  if (!ctx.log.enabled() || ctx.runId.length === 0) {
+    return {
+      gitWorktree: true,
+      patchPath: null,
+      preTree: before.tree,
+      afterTree: null,
+      filesChanged: 0,
+      captureComplete: false,
+      incompleteReason: "logging-off",
+      recoveryHint,
+      scaffoldChanged,
+      scaffoldWarning,
+    };
+  }
 
   // The run dir already exists (expect/started/completed wrote to it); ensure it anyway so
   // the patch write can't race a missing dir. The patch MUST live in the run dir — log.diff

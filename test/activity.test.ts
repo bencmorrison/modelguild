@@ -766,6 +766,23 @@ export async function run(): Promise<number> {
       "#73 watch: --run with a traversing run id exits 2 and states the rule",
     );
 
+    // F8: this is the surface a run id gets PASTED into, so surrounding whitespace off a
+    // copied log line is trimmed rather than rejected as an invisible charset error.
+    const pastedOut: string[] = [];
+    console.log = (...a: unknown[]) => {
+      pastedOut.push(a.map(String).join(" "));
+    };
+    let pastedCode: number;
+    try {
+      pastedCode = await runWatch(["--run", `  ${runId}\n`, "--no-follow"], { env });
+    } finally {
+      console.log = realLog;
+    }
+    c.check(
+      pastedCode === 0 && pastedOut.join("\n").includes(runId),
+      "#73 watch: a PASTED run id with surrounding whitespace is trimmed, not rejected",
+    );
+
     // The banner is emitted once per call id.
     const seen = new Set<string>();
     const line = JSON.stringify({ ts: "2026-07-27T01:02:03Z", call_id: "call-x", kind: "tool-called", summary: "s" });

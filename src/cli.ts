@@ -732,7 +732,10 @@ function watchValue(flag: string, raw: string | undefined): string {
  * layer enforces (issue #73). A usage error, consistent with every other bad argument
  * here, rather than a silent tail of a path outside the logs root. */
 function watchRunValue(raw: string | undefined): string {
-  const value = watchValue("--run", raw);
+  // TRIMMED first: this is the one surface a run id gets PASTED into, and a trailing
+  // newline off a copied log line would otherwise be rejected as an invisible charset
+  // error (review finding F8). Whitespace is still refused *inside* the id.
+  const value = watchValue("--run", raw).trim();
   const parsed = parseRunId(value);
   if (!parsed.ok) throw new Error(`watch: --run ${parsed.error}`);
   return parsed.value;

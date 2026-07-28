@@ -27,6 +27,7 @@ import {
   confGet,
   enforceRetentionOnStart,
   isRunId,
+  parseRunId,
   resolveRunIdArg,
   type PromptMode,
 } from "../src/log.js";
@@ -1025,7 +1026,12 @@ export async function run(): Promise<number> {
       "a\0b",
       "a\nb",
       "a b",
+      // Reserved: something else in the SAME logs root already owns these names (F4).
       "latest", // the symlink `#ensureRun` maintains beside the run dirs
+      "LATEST", // aliases it on a case-insensitive filesystem — macOS APFS, a CI platform
+      "Latest",
+      "watchers", // the approval bridge's presence dir (`watcherDirFor`)
+      "WATCHERS",
       "A".repeat(129),
       "",
       42,
@@ -1113,6 +1119,88 @@ export async function run(): Promise<number> {
     await okLog.completed({ callId: "call-ok", model: "m/x", agent: "guild-read", response: "hi", captureState: "complete", run: rid });
     c.check(existsSync(path.join(okDir, rid, "calls.jsonl")) && okLog.verify(rid).ok,
       "#73: a minted run id still writes inside the root and verifies clean");
+  }
+
+  // -------------------------------------------------------------------------
+  // 19b. Issue #73 review findings — the other places a path COMPONENT is read from
+  //      somewhere other than the caller: the `latest` symlink's target (F5), a
+  //      delegate-diff entry's `patch` field (F6), and hostile input reaching the error
+  //      renderer (F7). All are the same join-a-component shape #73 fixed.
+  // -------------------------------------------------------------------------
+  {
+    // --- F5: `latest` is data on disk, and `runWatch` joins it WITHOUT going through
+    //     dir(), so a symlink pointing at `..` would tail one level above the logs root.
+    const dir = tmp();
+    const log = new EvidenceLog({ env: envFor(dir) });
+    const real = log.newRun("/guild:consult");
+    c.check(log.latest() === real, "F5: latest() returns a well-formed run id normally");
+    const latestLink = path.join(dir, "latest");
+    rmSync(latestLink, { force: true });
+    symlinkSync("..", latestLink);
+    c.check(log.latest() === undefined,
+      "F5: a `latest` symlink pointing OUTSIDE the root reads as no-latest, not as a path");
+    // A DEEPER target is confined by the basename rather than refused — honest statement of
+    // what the check buys: `../../etc` reads as the (nonexistent) run `etc`, never as a
+    // path above the root. The property that matters is confinement, so assert THAT.
+    rmSync(latestLink, { force: true });
+    symlinkSync("../../etc", latestLink);
+    const deep = log.latest();
+    const confined =
+      deep === undefined || !path.relative(dir, path.join(dir, deep)).startsWith("..");
+    c.check(confined && deep !== "../../etc",
+      "F5: a deeper traversal target cannot name a path above the logs root");
+
+    // --- F6: verify() joins the entry's `patch` field, which comes from the FILE. diff()
+    //     basenames on write; the read side must too, or a doctored entry points the audit
+    //     at an arbitrary file. Built with a CORRECTLY re-hashed line so the chain does not
+    //     fail first and mask the behaviour under test.
+    const d2 = tmp();
+    const env2 = envFor(d2, { GUILD_RUN_ID: "f6" });
+    const log2 = new EvidenceLog({ env: env2 });
+    await log2.expect({ callId: "d1", model: "m/x", agent: "guild-build" });
+    const st2 = await log2.started({ callId: "d1", model: "m/x", agent: "guild-build", prompt: "p" });
+    await log2.completed({ callId: "d1", exit: 0, turn: st2.turn, captureState: "complete", response: "did work" });
+    const rd2 = log2.dir("f6");
+    const patchBody = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-o\n+n\n";
+    const patch2 = path.join(rd2, "diff-d1.patch");
+    writeFileSync(patch2, patchBody);
+    await log2.diff({ callId: "d1", patchFile: patch2, base: "bt", after: "at" });
+    c.check(log2.verify("f6").ok, "F6: the honest run verifies first");
+    // Now point the entry OUTSIDE the run dir, at a byte-identical file that would
+    // hash-match — the only interesting case, since a mismatch fails anyway.
+    const outside = path.join(d2, "outside.patch");
+    writeFileSync(outside, patchBody);
+    rmSync(patch2);
+    const callsFile = path.join(rd2, "calls.jsonl");
+    const allLines = lines(callsFile);
+    const lastEntry = JSON.parse(allLines[allLines.length - 1]) as Parameters<typeof buildEntryLine>[0];
+    delete lastEntry.entry_hash;
+    lastEntry.patch = "../outside.patch";
+    allLines[allLines.length - 1] = buildEntryLine(lastEntry).line;
+    writeFileSync(callsFile, allLines.join("\n") + "\n");
+    const v6 = log2.verify("f6");
+    c.check(v6.code === 7 && v6.message.includes("outside.patch"),
+      "F6: a `patch` field pointing outside the run dir is basenamed on READ ⇒ MISSING, not followed");
+
+    // --- F7: the error renderer handles hostile input, so it must not throw itself.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const hostile: unknown[] = [
+      circular,
+      BigInt(7),
+      { toJSON: () => { throw new Error("nope"); } },
+      { toString: () => { throw new Error("nope"); } },
+    ];
+    let renderThrew = false;
+    for (const h of hostile) {
+      try {
+        const r7 = parseRunId(h);
+        if (r7.ok) renderThrew = true; // must not be accepted either
+      } catch {
+        renderThrew = true;
+      }
+    }
+    c.check(!renderThrew, "F7: rendering a circular/BigInt/throwing value in the error never throws (and never accepts)");
   }
 
   // cleanup
