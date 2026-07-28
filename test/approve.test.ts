@@ -1993,7 +1993,11 @@ export async function run(): Promise<number> {
       const file = path.join(dir, APPROVALS_FILE);
       const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91b" });
       const prompts: string[] = [];
-      const { bridge } = await relistBridge(fake, "ses_91b", { prompts, file, stubReplies: true });
+      const { bridge, posted } = await relistBridge(fake, "ses_91b", {
+        prompts,
+        file,
+        stubReplies: true,
+      });
       fake.addPendingPermission({ id: "per_alreadyrejected", sessionID: "ses_91b" });
       // Seen on the stream, then the stream dies with it open ⇒ rejected fail-closed (M6).
       // `degrade` runs in the SAME synchronous block as `handleEvent`, so it settles the
@@ -2012,8 +2016,20 @@ export async function run(): Promise<number> {
       bridge.degrade("event stream dropped: socket hang up");
       await waitFor(() => bridge.summary().rejected === 1, 2_000, 25);
       const promptsAfterReject = prompts.length;
+      const postsAfterReject = posted.length;
+      // The setup itself needs asserting: if opencode were NOT still listing the request, the
+      // dedup checks below would pass for the wrong reason (nothing to dedup).
+      c.check(
+        fake.pendingPermissions().includes("per_alreadyrejected"),
+        "#91b: setup — opencode still lists the request we already rejected (the reply was swallowed)",
+      );
       await bridge.reattached();
       const s = bridge.summary();
+      // NOTE, so a reader does not over-count this block's coverage: these four hold even if
+      // `#relist` did nothing at all (a no-op cannot prompt, recover, or change an outcome, and
+      // `degraded` was already set). They are here to pin that the re-list does not REGRESS
+      // them. The two that actually bite on a re-list that skipped the dedup are the reply
+      // count and the `relist-unsettled` record below.
       c.check(
         prompts.length === promptsAfterReject,
         `#91b: a request already answered is NOT put to the developer a second time (${prompts.length} vs ${promptsAfterReject})`,
@@ -2023,6 +2039,10 @@ export async function run(): Promise<number> {
       c.check(
         s.degraded === true,
         "#91b: degraded STAYS set — our reply demonstrably did not take effect, so we cannot claim to be fine",
+      );
+      c.check(
+        posted.length === postsAfterReject,
+        `#91b: and NO second reply is sent for it — one request, one decision (${JSON.stringify(posted)})`,
       );
       const lines = readApprovals(dir);
       c.check(
@@ -2066,6 +2086,45 @@ export async function run(): Promise<number> {
         listed.otherSessions === 1 && listed.pending.every((p) => p.sessionID === "ses_91c"),
         `#91c: listPendingPermissions filters and COUNTS the rest (${JSON.stringify(listed)})`,
       );
+      // ATTRIBUTION BEFORE JUDGEMENT (review finding 3). `malformed` gates the bridge's
+      // recovery, so counting brokenness before the session filter made ANOTHER member's bad
+      // entry keep this bridge degraded for the rest of its call — on the one function whose
+      // design point is that sessions do not affect each other. Driven straight against the
+      // classifier with a canned body, because that is exactly where the ordering lives.
+      const canned = (body: unknown): typeof fetch =>
+        (async () =>
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })) as unknown as typeof fetch;
+      const mixed = await listPendingPermissions({
+        baseUrl: fake.baseUrl,
+        sessionId: "ses_mine",
+        fetchImpl: canned([
+          { id: "per_ok", sessionID: "ses_mine" },
+          { sessionID: "ses_theirs" }, // another member's, and broken: not ours to judge
+          { id: "per_x", sessionID: "ses_theirs" },
+          { sessionID: "ses_mine" }, // ours, and unusable: a real gap for us
+          { id: "per_nosession" }, // nobody's identifiable — might be ours
+          "not an object",
+        ]),
+      });
+      c.check(
+        mixed.pending.length === 1 && mixed.pending[0].id === "per_ok",
+        `#91c: only our usable entries are returned (${JSON.stringify(mixed.pending)})`,
+      );
+      c.check(
+        mixed.malformed === 1,
+        `#91c: 'malformed' counts OUR broken entries only — another session's cannot gate us (${JSON.stringify(mixed)})`,
+      );
+      c.check(
+        mixed.otherSessions === 2,
+        `#91c: a known other session's entries are theirs, broken or not (${JSON.stringify(mixed)})`,
+      );
+      c.check(
+        mixed.unattributable === 2,
+        `#91c: and entries naming no session at all are counted apart, since they MIGHT be ours (${JSON.stringify(mixed)})`,
+      );
       bridge.close();
       closeAllBuses();
       await fake.close();
@@ -2081,9 +2140,78 @@ export async function run(): Promise<number> {
       await bridge.reattached();
       const s = bridge.summary();
       c.check(s.degraded === false, `#91d: a clean re-list clears it (${JSON.stringify(s)})`);
+      // Incidental (a no-op re-list would also leave these): they pin that CLEARING the flag
+      // does not also erase the record of the window. The assertion that bites here is the one
+      // above.
       c.check(
         s.blindWindows === 1 && s.degradedReason !== null,
         `#91d: but the window and its reason are LATCHED — recovered is not the same as never happened (${JSON.stringify(s)})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (d2) A SNAPSHOT IN FLIGHT ACROSS A SECOND DROP MUST NOT ASSERT SIGHT (review finding 1).
+    //      The first cut compared `#blindWindows`, which only moves on the false→true
+    //      transition — and `degraded` only clears inside the re-list — so a re-drop while
+    //      still degraded moved it not at all, and the stale snapshot cleared the flag anyway.
+    //      `#bus.connected` did not save it: the reconnect backoff is faster than the GET.
+    //      This case FAILS against that code and passes against the `#blindEpoch` guard.
+    {
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91d2" });
+      // A GET the test holds open, so "in flight across the second drop" is a fact rather than
+      // a race: the snapshot is empty and was taken BEFORE the request below existed.
+      let releaseGet: (() => void) | undefined;
+      const held = new Promise<void>((r) => (releaseGet = r));
+      let gets = 0;
+      const fetchImpl = (async (url: unknown, init: unknown) => {
+        const isList =
+          String(url).includes("/permission") &&
+          String((init as { method?: unknown })?.method ?? "GET") === "GET";
+        if (isList && ++gets === 1) {
+          // ONLY the first list is the stale one: held open across the second drop, and
+          // answering with the world as it was BEFORE the request below existed. Every later
+          // list goes to the fake and sees reality, which is what makes the "not sticky"
+          // assertion at the end mean something.
+          await held;
+          return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return fetch(url as string, init as RequestInit);
+      }) as unknown as typeof fetch;
+      const bridge = new ApprovalBridge({
+        settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+        gatedTools: ["bash"],
+        channels: ["elicitation"],
+        context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+        armed: true,
+        elicitation: stubElicitation("accept"),
+        fetchImpl,
+      });
+      await bridge.attach(fake.baseUrl, "ses_91d2");
+      bridge.degrade("event stream dropped: drop 1");
+      const inFlight = bridge.reattached();
+      // …the world moves on while that GET is held: a second outage, and a request raised in it.
+      fake.addPendingPermission({ id: "per_missed_in_window2", sessionID: "ses_91d2" });
+      bridge.degrade("event stream dropped: drop 2");
+      releaseGet?.();
+      await inFlight;
+      const s = bridge.summary();
+      c.check(
+        s.degraded === true,
+        `#91d2: a snapshot older than the last outage does NOT get to claim the bridge can see (${JSON.stringify(s)})`,
+      );
+      c.check(
+        fake.pendingPermissions().includes("per_missed_in_window2"),
+        "#91d2: and the request raised inside that second window is still open, unseen by the stale snapshot",
+      );
+      // The guard is not sticky: a FRESH re-list, taken after the last drop, still recovers.
+      await bridge.reattached();
+      await waitFor(() => bridge.summary().recovered === 1, 3_000, 25);
+      const after = bridge.summary();
+      c.check(
+        after.recovered === 1 && after.degraded === false,
+        `#91d2: the next re-list recovers it and clears the flag — the guard rejects stale data, not all data (${JSON.stringify(after)})`,
       );
       bridge.close();
       closeAllBuses();
@@ -2160,6 +2288,9 @@ export async function run(): Promise<number> {
             elicitation: stubElicitation("accept", prompts),
           },
         );
+        // Incidental: the fake's `gateTimeoutMs` releases the blocked turn eventually, so
+        // `r.ok` holds even with the re-list ripped out. The assertion that bites is the next
+        // one — without the recovery the gate reports `(never answered)`.
         c.check(r.ok, `#91f: the turn COMPLETED (${!r.ok ? r.error.message : ""})`);
         c.check(
           fake.gateOutcomes()[0] === "once",

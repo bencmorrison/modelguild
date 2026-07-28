@@ -343,11 +343,29 @@ export interface ListPendingPermissionsResult {
   pending: PendingPermission[];
   /** Entries dropped for want of a usable `id`/`sessionID`. REPORTED rather than silently
    * skipped: a caller deciding "have I now seen everything?" must not read a silent drop as
-   * an empty list. */
+   * an empty list.
+   *
+   * SCOPED TO THE SESSION ASKED ABOUT, ON PURPOSE (review finding 3). It used to be counted
+   * BEFORE the session filter, so on a panel sharing one serve child another member's broken
+   * entry landed in this caller's count — and because the approval bridge refuses to clear
+   * `degraded` while this is non-zero, one member's malformed entry could keep a sibling
+   * bridge degraded for the rest of its call. That is a cross-session dependency in the one
+   * function whose entire design point is that sessions do not affect one another. */
   malformed: number;
-  /** Open requests belonging to OTHER sessions on this serve child — counted, never returned.
-   * Visible so the global-ness of the endpoint is a fact on the result, not folklore. */
+  /** Open requests belonging to OTHER sessions on this serve child — counted, never returned,
+   * whatever else may be wrong with them. Visible so the global-ness of the endpoint is a fact
+   * on the result, not folklore. */
   otherSessions: number;
+  /**
+   * Entries attributable to NO session: not an object, or carrying no `sessionID` (which
+   * opencode's own schema marks required, so this is a protocol violation rather than an
+   * expected shape).
+   *
+   * Kept apart from `malformed` because the two deserve different treatment. One of these
+   * might be the caller's own, so a caller deciding "have I seen everything?" should still
+   * treat it as a gap — whereas a KNOWN other-session entry never is one.
+   */
+  unattributable: number;
 }
 
 export interface ListPendingPermissionsOpts {
@@ -397,27 +415,38 @@ export async function listPendingPermissions(
   const pending: PendingPermission[] = [];
   let malformed = 0;
   let otherSessions = 0;
+  let unattributable = 0;
+  // THE SESSION FILTER RUNS FIRST, and everything else is judged inside it (review finding 3):
+  // an entry belongs to this caller, to somebody else, or to nobody identifiable, and only the
+  // first two of those can be decided at all. Counting brokenness before attribution let one
+  // session's bad data become another's problem.
   for (const entry of raw) {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-      malformed += 1;
+      unattributable += 1;
       continue;
     }
     const rec = entry as Record<string, unknown>;
-    const id = typeof rec.id === "string" ? rec.id : "";
     const sessionID = typeof rec.sessionID === "string" ? rec.sessionID : "";
-    // Both are required by opencode's own schema. Without either there is nothing a caller
-    // could do with the entry — it cannot be replied to, or cannot be attributed.
-    if (id.length === 0 || sessionID.length === 0) {
-      malformed += 1;
+    if (sessionID.length === 0) {
+      // No session named at all — it could be anyone's, including ours.
+      unattributable += 1;
       continue;
     }
     if (sessionID !== opts.sessionId) {
+      // Somebody else's, broken or not. Not this caller's business either way.
       otherSessions += 1;
+      continue;
+    }
+    // Ours. `id` is what a reply is addressed to, so without one there is nothing to be done
+    // with the entry beyond reporting that we saw something we could not use.
+    const id = typeof rec.id === "string" ? rec.id : "";
+    if (id.length === 0) {
+      malformed += 1;
       continue;
     }
     pending.push(rec as PendingPermission);
   }
-  return { pending, malformed, otherSessions };
+  return { pending, malformed, otherSessions, unattributable };
 }
 
 // --- sendMessage ----------------------------------------------------------
