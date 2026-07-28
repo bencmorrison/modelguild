@@ -393,14 +393,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
  * shapes, so the channel does not depend on which one a given client version sends — and
  * the helper would add nothing but a capability check we already pass.
  *
- * TWO BOUNDS, both carried into the mapping in `makeElicitationRequester`:
+ * ONE BOUND AND ONE ONCE-OPEN QUESTION, both carried into the mapping in
+ * `makeElicitationRequester`:
  *   - a HEADLESS run (`claude -p`) auto-answers `{"action":"cancel"}`, and cancel maps to
  *     REJECT — so this channel cannot approve anything unattended, by design. The
  *     `modelguild watch --approve` terminal is the channel that works there;
- *   - whether the interactive TUI actually RENDERS the prompt is still human-unverified.
- *     That is why arming never depends on this channel alone being *good*, only on some
- *     channel being *present*, and why an unanswered request still fails closed on the
- *     bridge's own timeout.
+ *   - whether the interactive TUI actually RENDERS the prompt is VERIFIED, no longer
+ *     inferred (maintainer, live interactive test, 2026-07-28, after the empty-schema
+ *     redesign): it renders as the client's own **Accept / Decline** buttons, answerable in
+ *     one keypress. The first cut's single boolean `approve` field rendered instead as a
+ *     checkbox you had to space-select and then submit — which is why `requestedSchema`
+ *     declares no fields at all. Arming still does not depend on this channel being *good*,
+ *     only on some channel being *present*, and an unanswered request still fails closed on
+ *     the bridge's own timeout.
  *
  * Capabilities are read per call rather than cached: they are only populated after
  * `initialize`, and a tool call cannot happen before that.

@@ -555,7 +555,10 @@ requests are **answered, not rejected**. Two findings that constrain how §3.4 m
   convenience helper would fail against the very client it is meant to reach.
 
 **Still human-unverified:** whether the interactive TUI actually *renders* the prompt. Slice 4
-was out of scope for this change and nothing in it shipped.
+was out of scope for this change and nothing in it shipped. *(**CORRECTED 2026-07-28**: it does
+render — the maintainer's live interactive test after the no-field redesign saw the client's own
+one-keypress Accept/Decline prompt. See "Slice 4 follow-up: the elicitation prompt is a no-field
+form" below.)*
 
 **Additional Slice 0 finding that shaped slice 1 — the event names in §2 are wrong.**
 Observed distribution across ~6 turns: `message.part.delta` (261), `message.part.updated` (80),
@@ -627,7 +630,10 @@ and the SDK still gates `elicitInput()` on `elicitation.form` while `server.requ
 that the capability exists — so the raw request remains the only form that reaches Claude Code.
 **Still human-unverified:** whether the interactive TUI renders an elicitation prompt. That is why
 arming never depends on elicitation being *good*, only on *some* channel being present, and why the
-fail-closed timeout settles anything nobody answers.
+fail-closed timeout settles anything nobody answers. *(**CORRECTED 2026-07-28**: it renders —
+verified by the maintainer's live interactive test, which is also what found the checkbox UX and
+produced the no-field form; see the follow-up section below. The arming rule is unchanged: some
+channel present, never this one being good.)*
 
 **Parity, unchanged from §4 and now carried in `AGENTS.md`:** with the knob off the asymmetry runs
 in the permissive direction (allowed); turning it on reaches Claude Code's own default without
