@@ -226,14 +226,14 @@ parsed by `confGet` (`src/log.ts:139`), documented in `modelguild/modelguild.con
 | `GUILD_ACTIVITY` | `on` | Write `activity.jsonl` and populate `structuredContent.activity`. `off` disables the bus entirely (no SSE subscription is opened). |
 | `GUILD_ACTIVITY_DETAIL` | `summary` | `summary` (tool name + truncated input) or `full` (raw event properties). `full` can capture file contents that pass through tool outputs — same sensitivity class as `GUILD_LOG_PROMPTS=full`, and it must say so in the conf template. |
 | `GUILD_APPROVE` | `off` | The write-path approval bridge. `off` \| `write` (gate `edit`/`write`/`patch`) \| `all` (also `bash`). §3.4. |
-| `GUILD_APPROVE_TIMEOUT_MS` | `300000` | Unanswered approval → **reject** (fail-closed). |
+| `GUILD_APPROVE_TIMEOUT_MS` | `300000` | Unanswered approval → **reject** (fail-closed). **CORRECTED 2026-07-28: the shipped default is `120000`, not `300000`** — long enough to read a command and decide, short enough that an unattended run fails closed well inside the 15-minute model-turn budget it shares rather than eating a third of it. Every other document states 120000; this row was the last stale copy. |
 
 `activity.degraded: true` is set on the tool result when the bus could not subscribe or dropped
 mid-turn — so a quiet activity list is never mistaken for a quiet model.
 
 ### 3.4 The approval bridge (opt-in, default OFF)
 
-**Shape.** When `GUILD_APPROVE` is not `off`, `guild_delegate` (only — see the parity audit) creates
+**Shape.** *(**CORRECTED 2026-07-28**: "`guild_delegate` (only)" is superseded. The maintainer's Q8 answer added `GUILD_APPROVE_EGRESS`, a separate default-off knob that can gate `webfetch`/`websearch` on the READ paths too, so the bridge is wired into all four tools. What remains true is that `GUILD_APPROVE` **alone** gates nothing outside the write path — not by tool policy but by construction, since the gated set is the intersection with the agent def's own allow-set and the read agents hold none of `edit`/`write`/`patch`/`bash`.)* When `GUILD_APPROVE` is not `off`, `guild_delegate` creates
 its session with a per-session permission ruleset that moves the gated tools from `allow` to `ask`,
 subscribes to `permission.asked`, routes each request to a human, and replies over HTTP.
 
@@ -570,3 +570,97 @@ P2 removed the ruleset-mirroring drift it asked about. Nothing in this change ad
 restriction, gates a tool call, or alters an agent def — the visibility slices carry no parity
 burden (§4), and the honest bound of §1 stands unchanged: this makes a run watchable, it does
 not make it safe.
+
+### Slice 4 shipped (2026-07-28) — the approval bridge
+
+`src/approve.ts`, wired through `src/client.ts` (session ruleset + the gate-verification), the
+shared spine in `src/consult.ts`, all four tools, `src/server.ts` (the elicitation channel) and
+`modelguild watch --approve`. Covered by `test/approve.test.ts` (offline). **Default OFF.**
+
+**What the maintainer decided (2026-07-28), answering §7:** Q2 — `GUILD_APPROVE` default `off`,
+tiers `off|write|all`. Q3 — `all` **exists**, with the honest bound documented everywhere it is
+described. Q8 — a **separate** default-off knob offering `ask` on `webfetch`/`websearch` for the
+read paths, whose docs must name its provenance (the ratified egress harness difference).
+
+**Where the implementation resolved an ambiguity, recorded rather than buried.** Q2's gloss listed
+`bash` under *both* `write` and `all`, which cannot both hold — it would make `all` a synonym for
+`write` and leave Q3 deciding nothing. Since Q3's entire rationale is that an approved `bash` is an
+approved shell, `bash` is what `all` adds: **`write` = `edit`/`write`/`patch`, `all` = those plus
+`bash`** (also §3.3's own wording). It lives in one table in `src/approve.ts` so the other reading
+is a one-line change if that was the intent.
+
+**Two corrections to §3.4 above, both from probe results the addendum already records.** The
+"emit the complete ruleset (floor + allows)" insurance against *replacement* semantics is **dead** —
+P2 proved the ruleset merges and the `"*": deny` floor survives, so the bridge emits **only** the
+gated subset at `ask`. And a **second** invariant joined the never-emit-`allow` one, which §3.4 did
+not anticipate: **never gate a tool the agent does not already allow**. `ask` is not `allow`, but on
+a *denied* tool it is still a widening — `{bash,*,ask}` on `guild-read` would put an approvable
+shell one keystroke away. Gated tools are therefore the intersection with the agent's own allow-set,
+which is also why `GUILD_APPROVE=all` gates nothing on the read paths and why Q8 needed its own knob.
+
+**Design choices §3.4 left open, decided here.** *Watch conveyance:* the server publishes each
+request to `<runDir>/approvals.jsonl` and `modelguild watch --approve` **replies to the loopback
+serve port itself** — no proxy, no back-channel; the bridge keeps only the timeout and the refusal
+logic. Both channels may answer: first reply wins, opencode arbitrates (a second reply to a settled
+id is a 404, verified). *Presence:* a heartbeat file under `<logDir>/watchers/` (mtime within 20 s,
+`mode:"approve"`); a plain `watch` does not count because it cannot prompt. Failure modes are stated
+in the code: a `SIGKILL`ed watcher leaves a stale file for up to 20 s (the call then hangs to the
+fail-closed timeout — bounded, never silent), and a watcher on a *different* log dir is invisible, so
+the refusal names the directory it searched. *Continuations:* a per-session ruleset is fixed at
+creation, so the bridge **verifies** the session actually carries the rules (opencode echoes them on
+create and on `GET /session/{id}`) and refuses `approval-not-applied` rather than running ungated —
+which also catches an opencode build that ignored the field.
+
+**Re-verified live on opencode 1.18.7** while building this (the probes ran on 1.18.5): `POST
+/session` accepts and **echoes** `permission: PermissionRule[]`; `GET /session/{id}` returns it;
+both reply endpoints exist with the probed bodies; a reply to an unknown permission id is **404**;
+and the SDK still gates `elicitInput()` on `elicitation.form` while `server.request()` asks only
+that the capability exists — so the raw request remains the only form that reaches Claude Code.
+**Still human-unverified:** whether the interactive TUI renders an elicitation prompt. That is why
+arming never depends on elicitation being *good*, only on *some* channel being present, and why the
+fail-closed timeout settles anything nobody answers.
+
+**Parity, unchanged from §4 and now carried in `AGENTS.md`:** with the knob off the asymmetry runs
+in the permissive direction (allowed); turning it on reaches Claude Code's own default without
+exceeding it; **no new harness difference is claimed**; and the honest bound of §1 stands — this
+makes a run watchable and interruptible, it does not make it safe.
+
+### Slice 4 review corrections (2026-07-28)
+
+An adversarial + functional review of the slice-4 branch ran 9 live checks (all PASS — the
+ask-gate genuinely blocks a live turn on 1.18.7, and approve/reject/timeout are all proven
+against a real serve) and reproduced 12 defects with probes. The behaviour-changing ones, and
+what the fix chose, recorded here because several of them are *design* corrections rather
+than bugs:
+
+- **The allow-set must come from the def in force (H3).** The first implementation held a
+  hard-coded mirror of the three shipped defs and enforced "never gate a denied tool" against
+  *that*. Pointing `GUILD_AGENT_DIR` at a user-hardened `guild-build.md` that denied `bash`
+  still emitted `{bash,*,ask}` — turning a user-denied tool into an approvable one. The mirror
+  is deleted; the def's `permission:` block is parsed (last-match-wins, submaps resolved by
+  their own `"*"`, unresolved ⇒ not allowed) and an unparseable def **refuses to arm**.
+- **Elicitation must not pre-empt the watch terminal (H2).** Headless MCP clients auto-answer
+  `cancel` in ~2 ms; with cancel⇒reject and first-reply-wins, every gated call auto-rejected
+  before the developer's window opened (49 ms against a 120 s deadline) — contradicting the
+  documented "the watch terminal is the channel that works headless". A cancel now **abstains**
+  while another live channel could answer and still **rejects** when elicitation is the sole
+  channel, so fail-closed survives exactly where it was load-bearing. An explicit *decline*
+  always settles.
+- **Model-controlled text reaches a terminal (H1).** JS `\s` excludes ESC, so the whitespace
+  collapse left ANSI intact and a crafted `metadata.command` could repaint the watcher's
+  prompt as a benign one. Control characters are replaced with U+FFFD *before* collapsing —
+  visibly, so tampering reads as mangled rather than being silently cleaned.
+- **Counters must come from evidence (M5)** — a reply that 404'd or never left the process was
+  being counted as a decision; and **a bridge that goes blind must say so (M6)** — it now
+  rejects what is open and reports `degraded`, but deliberately does **not** kill the turn
+  (the `GUILD_MESSAGE_TIMEOUT_MS` backstop bounds the worst case, and a transport blip is not
+  evidence of misbehaviour).
+- **The stored-ruleset check needed both halves (M7)** — a subset check passed a continued
+  session that *also* carried `{bash,*,allow}`; it now rejects any stored rule that widens the
+  agent. The two predicates that had drifted apart (one tested, one shipped) are now one.
+
+Two findings changed no behaviour but are worth carrying: opencode's **`write` permission key
+is inert** on 1.18.7 (`edit` gates the write/patch family, probed), so `edit` must never leave
+a tier and the result reports the effective family; and the watch terminal prompts **one
+request at a time**, so a second request arriving mid-prompt burns its own deadline waiting —
+it is announced immediately, and the trade-off is documented rather than hidden.

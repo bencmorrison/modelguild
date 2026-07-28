@@ -31,7 +31,12 @@
 
 import { randomBytes } from "node:crypto";
 import os from "node:os";
-import { askViaAgent, AgentMismatchError, type ServeProvider } from "./client.js";
+import {
+  askViaAgent,
+  AgentMismatchError,
+  SessionPermissionMismatchError,
+  type ServeProvider,
+} from "./client.js";
 import { EvidenceLog } from "./log.js";
 import {
   candidateRoots,
@@ -60,6 +65,16 @@ import {
   type ActivityRecorder,
   type ActivitySummary,
 } from "./activity.js";
+import {
+  approvalDoctorInfo,
+  armApproval,
+  type ApprovalArming,
+  type ApprovalBridge,
+  type ApprovalRefusal,
+  type ApprovalDoctorInfo,
+  type ApprovalSummary,
+  type ElicitationRequester,
+} from "./approve.js";
 
 /** The read-only agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const CONSULT_AGENT = "guild-read";
@@ -139,6 +154,9 @@ export interface GuildDoctorSeed {
   policy: { file: string; source: PolicySource; layers: PolicyLayer[] };
   /** Evidence layer on/off and the effective log directory. */
   logging: { enabled: boolean; logDir: string };
+  /** The approval bridge's knobs and whether anything can answer (issue #20 slice 4). A
+   * token-free answer to "am I actually gated, and why did that call refuse?". */
+  approval: ApprovalDoctorInfo;
 }
 
 /**
@@ -164,6 +182,7 @@ export function guildDoctorSeed(
   const layers = resolvePolicyLayers(guildDirs, env);
   const head = layers.find((l) => l.exists) ?? layers[0];
   const log = new EvidenceLog({ env, cwd, guildDir, guildDirs });
+  const confContents = readLayeredConfContents(guildDirs, env);
   return {
     guildRoot: {
       root: rootRes.root,
@@ -173,6 +192,7 @@ export function guildDoctorSeed(
     },
     policy: { file: head.file, source: head.source, layers },
     logging: { enabled: log.enabled(), logDir: log.logDir() },
+    approval: approvalDoctorInfo({ env, confContents, logDir: log.logDir() }),
   };
 }
 
@@ -182,6 +202,13 @@ export type ConsultErrorKind =
   | "model-id"
   | "policy-deny"
   | "policy-ask"
+  // The approval bridge's three refusals (issue #20 slice 4). `approval-config` and
+  // `approval-channel-missing` are decided BEFORE any log write (gap parity, C24);
+  // `approval-not-applied` needs a serve round-trip, so it lands as a completed-with-failure
+  // call that never reached the model.
+  | "approval-config"
+  | "approval-channel-missing"
+  | "approval-not-applied"
   | "call-failed"
   | "agent-mismatch";
 
@@ -232,6 +259,10 @@ export interface ConsultOk {
    * off. `activity.degraded` means the stream was lost — a quiet list is then "we could
    * not see", not "the model did nothing". */
   activity?: ActivitySummary;
+  /** Present only when the approval bridge was ARMED for this call (issue #20 slice 4):
+   * what was gated, which channels could answer, and how each request was settled. Its
+   * `note` carries the honest bound — approval is not containment. */
+  approval?: ApprovalSummary;
 }
 export interface ConsultFail {
   ok: false;
@@ -241,6 +272,9 @@ export interface ConsultFail {
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
    * of a failed call is exactly what makes the failure diagnosable. */
   activity?: ActivitySummary;
+  /** Present when the bridge was armed and the turn ran: a failed gated call's approval
+   * record is exactly what explains WHY it failed (e.g. every request timed out). */
+  approval?: ApprovalSummary;
 }
 export type ConsultResult = ConsultOk | ConsultFail;
 
@@ -284,6 +318,12 @@ export interface ConsultDeps {
    * is still recorded to `activity.jsonl` and summarized on the result, just not streamed.
    */
   onActivity?: (e: ActivityEvent) => void;
+  /**
+   * The MCP elicitation channel (issue #20 slice 4), supplied by `src/server.ts`. Only
+   * consulted when the approval bridge is armed; absent ⇒ that channel is unavailable and
+   * the watch terminal is the only way to answer.
+   */
+  elicitation?: ElicitationRequester;
 }
 
 /** A fresh, non-empty call id (the pairing key for a call's three lifecycle entries). */
@@ -407,6 +447,13 @@ export interface LifecycleParams {
   keepSession?: boolean;
 }
 
+/** Every tool's approval plumbing, resolved once by `armApproval` and threaded through the
+ * spine. `undefined` (the default) means nothing is gated and this file behaves exactly as
+ * it did before slice 4. */
+export interface LifecycleApproval {
+  arming: ApprovalArming;
+}
+
 export interface LifecycleDeps {
   serve: ServeProvider;
   log: EvidenceLog;
@@ -418,6 +465,12 @@ export interface LifecycleDeps {
    * on any existing path.
    */
   activity?: ActivityLayer;
+  /**
+   * THE APPROVAL BRIDGE (issue #20 slice 4). Present only when `armApproval` armed it, which
+   * requires an explicit knob AND a channel that can answer. When present, the session is
+   * created with the `ask` ruleset and this call's bridge answers the requests.
+   */
+  approval?: LifecycleApproval;
 }
 
 export type LifecycleOutcome =
@@ -429,15 +482,21 @@ export type LifecycleOutcome =
       sessionId: string;
       /** Bounded activity summary for this call; absent when the layer is off. */
       activity?: ActivitySummary;
+      /** Approval record for this call; absent unless the bridge was armed. */
+      approval?: ApprovalSummary;
     }
   | {
       ok: false;
       callId: string;
       reason: string;
-      kind: "call-failed" | "agent-mismatch";
+      /** `approval-not-applied` is only reachable when the bridge is armed: the session this
+       * turn would run in is not carrying the `ask` rules, so the turn was refused rather
+       * than run ungated. No model was called. */
+      kind: "call-failed" | "agent-mismatch" | "approval-not-applied";
       /** Present on failure too — a black-box call that DIED is exactly the one whose
        * action trace matters most. */
       activity?: ActivitySummary;
+      approval?: ApprovalSummary;
     };
 
 /**
@@ -467,6 +526,47 @@ export function activityLayerFor(deps: {
   if (deps.onActivity !== undefined) opts.onEvent = deps.onActivity;
   return createActivityLayer(opts);
 }
+
+/**
+ * Arm (or decline to arm) the approval bridge for one call — the shared pre-flight all four
+ * tools run, factored here beside `activityLayerFor` for the same reason: a second copy
+ * would be free to drift on the one rule that matters, which is that this decision happens
+ * BEFORE anything is logged.
+ *
+ * Three outcomes:
+ *   - `{ok:true}` with no `approval` — nothing is gated for this agent (the default, and for
+ *     every read path unless `GUILD_APPROVE_EGRESS=ask`). Byte-identical behaviour to before.
+ *   - `{ok:true, approval}` — armed: the ruleset goes on the session, the bridge answers.
+ *   - `{ok:false, refusal}` — a bad knob value, or armed with no channel that can answer.
+ *     The caller turns it into its own structured error and returns WITHOUT logging (C24).
+ */
+export function approvalFor(deps: {
+  agent: string;
+  env: NodeJS.ProcessEnv;
+  confContents: string;
+  /** The SAME dirs the caller's def-presence pre-check just used. The allow-set the bridge
+   * intersects against is read from the def in force, not from a table (review finding H3). */
+  agentDefDirs: readonly string[];
+  log: EvidenceLog;
+  elicitation?: ElicitationRequester;
+}): { ok: true; approval?: LifecycleApproval } | { ok: false; refusal: ApprovalRefusal } {
+  const armed = armApproval({
+    agent: deps.agent,
+    env: deps.env,
+    confContents: deps.confContents,
+    agentDefDirs: deps.agentDefDirs,
+    log: deps.log,
+    ...(deps.elicitation !== undefined ? { elicitation: deps.elicitation } : {}),
+  });
+  if (!armed.ok) return { ok: false, refusal: armed.refusal };
+  if (armed.arming === undefined) return { ok: true };
+  return { ok: true, approval: { arming: armed.arming } };
+}
+
+/** The exit analogue for an approval refusal. **null, not a number**: these refusals have no
+ * bash-era counterpart (the bash wrapper had no approval bridge), and inventing a code would
+ * collide with the table in CONTRACT.md area H. `kind` + `isError` carry the signal. */
+export const APPROVAL_EXIT_ANALOGUE = null;
 
 /**
  * The evidence spine every model turn shares: mint a call id, write expect→started
@@ -507,18 +607,24 @@ export async function runAgentLifecycle(
   // the `catch` must be covered by the completed-guarantee, and a throw from the visibility
   // layer must never be the thing that leaves a dangling `started` with no `completed`.
   let recorder: ActivityRecorder | undefined;
+  // The approval bridge, by contrast, is NOT swallow-on-throw: if it cannot be built the
+  // turn must not run, because it would run ungated. It is constructed before the try so a
+  // construction failure surfaces as a normal thrown call rather than a silent downgrade.
+  let approver: ApprovalBridge | undefined;
+  const ctx = {
+    runId: p.runId,
+    callId,
+    model: p.requestedModel === "" ? "(opencode default)" : p.requestedModel,
+    agent: p.agent,
+    command: p.command,
+  };
   try {
     try {
-      recorder = d.activity?.recorder({
-        runId: p.runId,
-        callId,
-        model: p.requestedModel === "" ? "(opencode default)" : p.requestedModel,
-        agent: p.agent,
-        command: p.command,
-      });
+      recorder = d.activity?.recorder(ctx);
     } catch {
       /* never fail a call over the visibility layer */
     }
+    if (d.approval !== undefined) approver = d.approval.arming.bridge(ctx);
     const askOpts: Parameters<typeof askViaAgent>[1] = {
       agent: p.agent,
       model: p.requestedModel === "" ? undefined : p.requestedModel,
@@ -531,6 +637,15 @@ export async function runAgentLifecycle(
       expectedAgent: p.agent,
     };
     if (recorder !== undefined) askOpts.activity = recorder;
+    if (d.approval !== undefined && approver !== undefined) {
+      askOpts.permission = d.approval.arming.ruleset;
+      // Invariant 2 at the WIRE (review finding M4) and the ONE stored-ruleset predicate
+      // (M10) both travel with the ruleset, so `client.ts` enforces the same rules this
+      // module does without importing it.
+      askOpts.allowedTools = [...d.approval.arming.allowSet];
+      askOpts.permissionCheck = (stored) => d.approval!.arming.checkStored(stored);
+      askOpts.approval = approver;
+    }
     const result = await askViaAgent(d.serve, askOpts);
     await d.log.completed({
       ...common,
@@ -548,9 +663,11 @@ export async function runAgentLifecycle(
       sessionId: result.sessionId,
     };
     if (recorder !== undefined) ok.activity = recorder.summary();
+    if (approver !== undefined) ok.approval = approver.summary();
     return ok;
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
+    const ungated = err instanceof SessionPermissionMismatchError;
     const reason = err instanceof Error ? err.message : String(err);
     await d.log.completed({
       ...common,
@@ -566,14 +683,18 @@ export async function runAgentLifecycle(
       ok: false,
       callId,
       reason,
-      kind: mismatch ? "agent-mismatch" : "call-failed",
+      kind: mismatch ? "agent-mismatch" : ungated ? "approval-not-applied" : "call-failed",
     };
     if (recorder !== undefined) failed.activity = recorder.summary();
+    if (approver !== undefined) failed.approval = approver.summary();
     return failed;
   } finally {
     // Detach is idempotent — `askViaAgent` already ran it, but a throw BEFORE the turn
     // (e.g. session creation failing) never reaches that finally, so close here too.
     recorder?.close();
+    // Closing the approver also REJECTS anything still open, so a turn that died mid-flight
+    // never leaves opencode waiting on a prompt nobody will answer.
+    approver?.close();
   }
 }
 
@@ -655,14 +776,40 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
 
-  // --- Past the gate: from here every path writes exactly one started + completed. ---
+  // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does), so the
+  //     approval pre-flight below still happens before any log entry exists. ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
 
-  // 5. Evidence lifecycle. Mint a fresh run only when the caller did not thread one; a
+  // 5. APPROVAL BRIDGE pre-flight (issue #20 slice 4). Default OFF ⇒ `approval` is undefined
+  //    and nothing below changes. Armed with no channel that can answer ⇒ REFUSE here,
+  //    before any log write: an unanswered `ask` HANGS the turn under `opencode serve`
+  //    (probe P3), so arming blind would deadlock rather than fail closed.
+  const armed = approvalFor({
+    agent: CONSULT_AGENT,
+    env,
+    confContents,
+    agentDefDirs,
+    log,
+    ...(deps.elicitation !== undefined ? { elicitation: deps.elicitation } : {}),
+  });
+  if (!armed.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: armed.refusal.kind,
+        model: requestedModel,
+        exitAnalogue: APPROVAL_EXIT_ANALOGUE,
+        message: armed.refusal.message,
+      },
+    };
+  }
+
+  // 6. Evidence lifecycle. Mint a fresh run only when the caller did not thread one; a
   //    provided runId reuses that run (so a workflow's calls share one auditable unit).
   const runId = params.runId && params.runId.length > 0 ? params.runId : log.newRun(CONSULT_COMMAND);
 
-  // 6. The model turn, via the UNMODIFIED guild-read agent (shared spine).
+  // 7. The model turn, via the UNMODIFIED guild-read agent (shared spine).
   const outcome = await runAgentLifecycle(
     {
       question: params.question,
@@ -682,6 +829,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
+      ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
     },
   );
 
@@ -702,6 +850,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     // session is deleted and its id is a dangling reference.
     if (params.keepSession === true) ok.sessionId = outcome.sessionId;
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
+    if (outcome.approval !== undefined) ok.approval = outcome.approval;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
@@ -709,7 +858,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   // agent check); it has NO bash exit analogue, so exitAnalogue stays null like
   // call-failed — the kind + isError carry the fail-closed signal.
   const message =
-    outcome.kind === "agent-mismatch"
+    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
       ? outcome.reason
       : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ConsultFail = {
@@ -726,6 +875,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     },
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  if (outcome.approval !== undefined) fail.approval = outcome.approval;
   return fail;
 }
 
@@ -756,11 +906,13 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
     // Surface the kept session id so the driver can thread a follow-up turn by id.
     if (r.sessionId) structured.sessionId = r.sessionId;
     if (r.activity) structured.activity = r.activity;
+    if (r.approval) structured.approval = r.approval;
     return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.activity) structured.activity = r.activity;
+  if (r.approval) structured.approval = r.approval;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

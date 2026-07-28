@@ -329,8 +329,13 @@ export const TIMER_MAX_MS = 2 ** 31 - 1;
  * `max` (trimmed, case-insensitive) → `TIMER_MAX_MS`; a positive finite number →
  * `min(n, TIMER_MAX_MS)`; 0, negative, and non-numeric → `null`. `Number` (not parseInt)
  * so trailing garbage ("900000abc") is rejected.
+ *
+ * EXPORTED so `src/approve.ts` resolves `GUILD_APPROVE_TIMEOUT_MS` through this same core:
+ * a second coercion would be free to drift on the cap, on `max`, and on the positivity rule
+ * — and the approval timeout is the fail-closed deadline, the last knob that should have its
+ * own parsing quirks.
  */
-function coerceTimeoutMs(raw: string): number | null {
+export function coerceTimeoutMs(raw: string): number | null {
   if (raw.trim().toLowerCase() === "max") return TIMER_MAX_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.min(n, TIMER_MAX_MS) : null;

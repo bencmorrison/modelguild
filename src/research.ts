@@ -34,9 +34,12 @@ import {
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
+  approvalFor,
+  APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
 import { type ActivityEvent, type ActivitySummary } from "./activity.js";
+import { type ApprovalSummary, type ElicitationRequester } from "./approve.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -75,6 +78,11 @@ export interface ResearchDeps {
   messageTimeoutMs?: number;
   /** LIVE sink for each normalized activity event (issue #20) — the MCP progress channel. */
   onActivity?: (e: ActivityEvent) => void;
+  /**
+   * The MCP elicitation channel (issue #20 slice 4). Only consulted when the approval
+   * bridge is armed, which on this read path needs `GUILD_APPROVE_EGRESS=ask`.
+   */
+  elicitation?: ElicitationRequester;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -83,6 +91,12 @@ export type ResearchErrorKind =
   | "model-id"
   | "policy-deny"
   | "policy-ask"
+  // The approval bridge's refusals (issue #20 slice 4). On this READ path they are only
+  // reachable under the opt-in `GUILD_APPROVE_EGRESS=ask` knob, which gates webfetch/
+  // websearch — the one place the ratified egress harness difference buys a gate.
+  | "approval-config"
+  | "approval-channel-missing"
+  | "approval-not-applied"
   | "call-failed"
   | "agent-mismatch";
 
@@ -117,6 +131,8 @@ export interface ResearchOk {
   rootConflict?: string;
   /** Bounded live-activity summary (issue #20); absent when the layer is off. */
   activity?: ActivitySummary;
+  /** Present only when the approval bridge was ARMED for this call (issue #20 slice 4). */
+  approval?: ApprovalSummary;
 }
 export interface ResearchFail {
   ok: false;
@@ -124,6 +140,8 @@ export interface ResearchFail {
   rootConflict?: string;
   /** Present when the call actually RAN (call-failed / agent-mismatch). */
   activity?: ActivitySummary;
+  /** Present when the bridge was armed and the turn ran. */
+  approval?: ApprovalSummary;
 }
 export type ResearchResult = ResearchOk | ResearchFail;
 
@@ -188,8 +206,33 @@ export async function research(
     };
   }
 
-  // --- Past the gate: from here every path writes exactly one started + completed. ---
+  // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
+
+  // 4b. APPROVAL BRIDGE pre-flight (issue #20 slice 4). On the read paths this only arms
+  //     under the separate, opt-in `GUILD_APPROVE_EGRESS=ask`; `GUILD_APPROVE` alone gates
+  //     nothing here, because guild-research holds none of edit/write/patch/bash.
+  const armed = approvalFor({
+    agent: RESEARCH_AGENT,
+    env,
+    confContents,
+    agentDefDirs,
+    log,
+    ...(deps.elicitation !== undefined ? { elicitation: deps.elicitation } : {}),
+  });
+  if (!armed.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: armed.refusal.kind,
+        model: requestedModel,
+        exitAnalogue: APPROVAL_EXIT_ANALOGUE,
+        message: armed.refusal.message,
+      },
+    };
+  }
+
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(RESEARCH_COMMAND);
 
@@ -210,6 +253,7 @@ export async function research(
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
+      ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
     },
   );
 
@@ -227,13 +271,14 @@ export async function research(
       },
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
+    if (outcome.approval !== undefined) ok.approval = outcome.approval;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   // agent-mismatch (positive-direction addition over bash; no exit analogue) carries its
   // own message; a plain call failure is wrapped. Both stay exitAnalogue null.
   const message =
-    outcome.kind === "agent-mismatch"
+    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
       ? outcome.reason
       : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ResearchFail = {
@@ -247,6 +292,7 @@ export async function research(
     },
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  if (outcome.approval !== undefined) fail.approval = outcome.approval;
   return fail;
 }
 
@@ -262,11 +308,13 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
     const structured: Record<string, unknown> = { answer: r.answer, ...r.attribution };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
     if (r.activity) structured.activity = r.activity;
+    if (r.approval) structured.approval = r.approval;
     return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.activity) structured.activity = r.activity;
+  if (r.approval) structured.approval = r.approval;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

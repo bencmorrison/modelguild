@@ -33,9 +33,18 @@ import {
   type DriftScanEntry,
   type ServerLaunch,
 } from "./init.js";
-import { layeredRoots } from "./config.js";
+import { layeredRoots, readLayeredConfContents } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
 import { EvidenceLog, DEFAULT_RETENTION_DAYS } from "./log.js";
+import {
+  approvalDoctorInfo,
+  APPROVALS_FILE,
+  resolveApprovalSettings,
+  sanitizeForDisplay,
+  startWatcherHeartbeat,
+  watcherDirFor,
+  type WatcherHeartbeat,
+} from "./approve.js";
 
 const SELF = fileURLToPath(import.meta.url); // <pkg>/dist/cli.js  or  <pkg>/src/cli.ts
 const PACKAGE_ROOT = path.resolve(path.dirname(SELF), "..");
@@ -403,6 +412,49 @@ export async function runDoctor(
     }
   }
 
+  // APPROVAL BRIDGE (issue #20 slice 4) — token-free, and worth a line even when off, because
+  // "am I actually gated?" and "why did that call refuse?" otherwise have no cheap answer
+  // (review finding L12). Reads the real layered conf, like the rest of doctor.
+  {
+    const roots = layeredRoots(process.env, targetDir, gdirs.homeDir);
+    const log = new EvidenceLog({
+      env: process.env,
+      cwd: targetDir,
+      guildDir: roots[0].root,
+      guildDirs: roots.map((r) => r.root),
+    });
+    const info = approvalDoctorInfo({
+      env: process.env,
+      confContents: readLayeredConfContents(roots.map((r) => r.root), process.env),
+      logDir: log.logDir(),
+    });
+    if (info.error !== null) {
+      line(false, `approval bridge: GUILD_APPROVE/GUILD_APPROVE_EGRESS is invalid — ${info.error}`);
+    } else if (!info.requested) {
+      console.log(
+        "✓ approval bridge: OFF (default) — GUILD_APPROVE=off, GUILD_APPROVE_EGRESS=off; " +
+          "no tool call is gated",
+      );
+    } else {
+      console.log(
+        `✓ approval bridge: ARMED (GUILD_APPROVE=${info.tier}, GUILD_APPROVE_EGRESS=${info.egress}, ` +
+          `timeout ${info.timeoutMs}ms)`,
+      );
+      if (info.watchers > 0) {
+        console.log(`  • ${info.watchers} live \`watch --approve\` terminal(s) in ${info.watcherDir}`);
+      } else {
+        // NOT a ✗: an MCP client that can prompt is an equally valid channel, and doctor
+        // cannot see the client's capabilities from here. Say what it can and cannot know.
+        console.warn(
+          `  ! no live \`modelguild watch --approve\` found (looked in ${info.watcherDir}). ` +
+            "A gated call will be REFUSED up front unless your MCP client can prompt you " +
+            "itself — start one in another terminal before the call. (Approving bash " +
+            "approves a shell; this is attention, not containment.)",
+        );
+      }
+    }
+  }
+
   // UPGRADE DRIFT (issue #22) — a file init wrote, the user then edited, whose shipped bytes have
   // since changed: the upgrade skipped it (never clobber) and the user's copy is behind the
   // release, silently. Doctor is where a user looks when something behaves oddly, so it must say
@@ -632,13 +684,20 @@ export async function runLogsClean(
 // ---------------------------------------------------------------------------
 
 function watchUsage(): void {
-  console.log("Usage: modelguild watch [--run ID] [--dir D] [--no-follow] [--json]");
+  console.log("Usage: modelguild watch [--run ID] [--dir D] [--no-follow] [--json] [--approve]");
   console.log("  Tail the live activity of guild model calls: which files the external");
   console.log("  model read, what it grepped, fetched, edited, and which commands it ran.");
   console.log("  --run ID     Watch a specific run id instead of following the newest run.");
   console.log("  --dir D      Resolve the modelguild/ root from D instead of the cwd.");
   console.log("  --no-follow  Print what is already recorded and exit.");
   console.log("  --json       Print the raw JSONL lines instead of the formatted view.");
+  console.log("  --approve    Also ANSWER gated tool calls from this terminal (issue #20).");
+  console.log("               Only meaningful with GUILD_APPROVE / GUILD_APPROVE_EGRESS set");
+  console.log("               on the MCP server; needs a TTY, and must run against the same");
+  console.log("               project/log dir as the server. It is what makes the server");
+  console.log("               willing to arm at all — without a live --approve watcher (or");
+  console.log("               MCP elicitation) an armed call is REFUSED up front.");
+  console.log("               Approving a bash call approves a SHELL, not a diff.");
   console.log("");
   console.log("  Activity is written by the MCP server while a call runs; GUILD_ACTIVITY=off");
   console.log("  disables it, and GUILD_LOG=off leaves no run dir to write into. These lines");
@@ -651,6 +710,7 @@ interface WatchArgs {
   targetDir: string;
   follow: boolean;
   json: boolean;
+  approve: boolean;
 }
 
 /** Take a value-taking flag's value, refusing a MISSING one and one that is itself a flag.
@@ -672,18 +732,26 @@ function parseWatchArgs(argv: string[]): WatchArgs {
   let targetDir = process.cwd();
   let follow = true;
   let json = false;
+  let approve = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-follow" || a === "-1") follow = false;
     else if (a === "--follow" || a === "-f") follow = true;
     else if (a === "--json") json = true;
+    else if (a === "--approve") approve = true;
     else if (a === "--run") run = watchValue("--run", argv[++i]);
     else if (a.startsWith("--run=")) run = watchValue("--run", a.slice("--run=".length));
     else if (a === "--dir") targetDir = watchValue("--dir", argv[++i]);
     else if (a.startsWith("--dir=")) targetDir = watchValue("--dir", a.slice("--dir=".length));
     else throw new Error(`watch: unknown argument '${a}'`);
   }
-  const parsed: WatchArgs = { targetDir: path.resolve(targetDir), follow, json };
+  // `--approve` with `--no-follow` is a contradiction: approving means being here WHEN the
+  // request arrives, and a one-shot print has already exited by then. A usage error beats
+  // silently advertising a presence that will be gone a millisecond later.
+  if (approve && !follow) {
+    throw new Error("watch: --approve cannot be combined with --no-follow (approving means staying attached)");
+  }
+  const parsed: WatchArgs = { targetDir: path.resolve(targetDir), follow, json, approve };
   if (run !== undefined) parsed.run = run;
   return parsed;
 }
@@ -729,6 +797,104 @@ export function formatActivityLine(
   return out;
 }
 
+/** One line of `approvals.jsonl` as the watcher cares about it. */
+interface ApprovalAskLine {
+  permission_id: string;
+  session_id: string;
+  base_url: string;
+  tool: string;
+  detail: string;
+  model: string;
+  command: string;
+  deadline: string;
+  timeout_ms: number;
+}
+
+/** Render the approval question a human answers. Exported so a test pins the wording that
+ * carries the honest bound — a prompt that reads like a containment guarantee is the one
+ * way this feature can actively mislead. */
+export function formatApprovalPrompt(a: ApprovalAskLine): string[] {
+  // MODEL-CONTROLLED TEXT, SANITIZED AT THE RENDER POINT (review finding H1, probed). `tool`
+  // and `detail` originate in the external model's own tool call. JS `\s` does not include
+  // ESC, so a whitespace collapse alone leaves ANSI intact and a crafted command can repaint
+  // this prompt as a benign one. The bridge sanitizes on the way into `approvals.jsonl`; the
+  // watcher sanitizes again on the way out, because a record written by an older build (or
+  // by hand) must not be able to drive the terminal either.
+  const tool = sanitizeForDisplay(a.tool).replace(/\s+/g, " ").trim();
+  const detail = sanitizeForDisplay(a.detail).replace(/\s+/g, " ").trim();
+  const command = sanitizeForDisplay(a.command).replace(/\s+/g, " ").trim();
+  const model = sanitizeForDisplay(a.model).replace(/\s+/g, " ").trim();
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(`!! APPROVAL NEEDED — ${command}  ·  ${model}`);
+  lines.push(`   tool: ${tool}${detail ? `  ${detail}` : ""}`);
+  // HONEST SCOPE (probed on 1.18.7): opencode routes the write/patch family through the
+  // `edit` permission key, so an `edit` approval is broader than the word suggests. Say so
+  // where the decision is made, not only in the tool result nobody reads mid-prompt.
+  if (tool === "edit") {
+    lines.push("   NOTE: approving 'edit' covers this agent's write/patch family, not one file op.");
+  }
+  if (tool === "bash") {
+    lines.push(
+      "   NOTE: approving bash approves a SHELL for this call — it can read any file, reach",
+    );
+    lines.push(
+      "         the network, and spawn processes that raise no further prompts. Not containment.",
+    );
+  }
+  const secs = Math.round((a.timeout_ms || 0) / 1000);
+  lines.push(`   no answer within ~${secs}s ⇒ the server REJECTS it (fail-closed).`);
+  return lines;
+}
+
+/** A one-line notice for a request that arrived while another prompt is open (review finding
+ * F4). Same sanitizing rule as the prompt itself. */
+export function formatApprovalNotice(a: ApprovalAskLine): string {
+  const tool = sanitizeForDisplay(a.tool).replace(/\s+/g, " ").trim();
+  const detail = sanitizeForDisplay(a.detail).replace(/\s+/g, " ").trim();
+  const secs = Math.round((a.timeout_ms || 0) / 1000);
+  return `   .. queued: ${tool}${detail ? ` ${detail}` : ""} (waiting behind the prompt above; its own ~${secs}s deadline is already running)`;
+}
+
+/**
+ * Reply to opencode's loopback serve directly from this terminal.
+ *
+ * THE WATCHER ANSWERS THE SERVE PORT ITSELF; the MCP server never proxies this decision.
+ * That keeps the conveyance to one direction (server publishes a request → watcher answers
+ * opencode) with no back-channel to build or secure, and it means the watcher works even if
+ * the MCP server is wedged.
+ *
+ * BOTH the watcher and the server's own bridge may answer the same request. **First reply
+ * wins and opencode is the arbiter** — a reply to an already-settled permission id is a 404
+ * (verified on opencode 1.18.7), which is reported here as "already answered", never retried.
+ */
+async function replyToPermission(
+  a: ApprovalAskLine,
+  approve: boolean,
+  fetchImpl: typeof fetch,
+): Promise<{ status: number; error?: string }> {
+  try {
+    const url = approve
+      ? `${a.base_url}/session/${encodeURIComponent(a.session_id)}/permissions/${encodeURIComponent(a.permission_id)}`
+      : `${a.base_url}/permission/${encodeURIComponent(a.permission_id)}/reply`;
+    const body = approve
+      ? { response: "once" }
+      : {
+          reply: "reject",
+          message: "rejected by the developer at the `modelguild watch --approve` terminal",
+        };
+    const res = await fetchImpl(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+    return { status: res.status };
+  } catch (err) {
+    return { status: 0, error: (err as Error).message };
+  }
+}
+
 /**
  * `modelguild watch`. Exported (like `runDoctor`/`runLogsClean`) so the test suite drives
  * it directly instead of shelling out.
@@ -737,6 +903,10 @@ export function formatActivityLine(
  * across platforms and filesystems (and are unreliable over bind mounts and network
  * shares, which is exactly where a dev container puts things), while a 300 ms stat+read is
  * portable and cheap. A file that SHRANK is treated as replaced and re-read from zero.
+ *
+ * `--approve` adds the SECOND job (issue #20 slice 4): announce a heartbeat presence file so
+ * the server is willing to arm the approval bridge at all, tail the run's `approvals.jsonl`,
+ * and prompt for each request on this TTY.
  */
 export async function runWatch(
   argv: string[],
@@ -746,6 +916,10 @@ export async function runWatch(
     /** Test seam: stop after this many polls (production runs until interrupted). */
     maxPolls?: number;
     pollMs?: number;
+    /** Test seam: answer the approval prompt without a TTY. Returning "y"/"yes" approves. */
+    prompt?: (question: string) => Promise<string>;
+    /** Test seam: intercept the reply POST. */
+    fetchImpl?: typeof fetch;
   },
 ): Promise<number> {
   let args: WatchArgs;
@@ -774,16 +948,56 @@ export async function runWatch(
     console.log("  ! GUILD_LOG=off — no run directory is created, so no activity is recorded.");
   }
 
+  // --- approval mode (issue #20 slice 4) -----------------------------------
+  const askPrompt = inject?.prompt;
+  let heartbeat: WatcherHeartbeat | undefined;
+  if (args.approve) {
+    // A watcher that cannot READ a decision must never advertise that it can answer one —
+    // the server trusts the presence file and would arm into a deadlock.
+    if (askPrompt === undefined && !process.stdin.isTTY) {
+      console.error(
+        "modelguild: watch --approve needs a TTY to ask you y/N. Run it in an interactive " +
+          "terminal; without one the server would arm the approval bridge believing someone " +
+          "can answer, and every gated call would sit until the fail-closed timeout.",
+      );
+      return 2;
+    }
+    if (!log.enabled()) {
+      console.error(
+        "modelguild: watch --approve needs the evidence log ON — GUILD_LOG=off means no run " +
+          "directory, and the run directory is where the server publishes an approval request. " +
+          "Unset GUILD_LOG=off (or drop --approve to just watch).",
+      );
+      return 2;
+    }
+    heartbeat = startWatcherHeartbeat(logDir);
+    console.log(`   approval mode ON — presence: ${heartbeat.file}`);
+    console.log(`   (the server looks in ${watcherDirFor(logDir)}; it must resolve the SAME`);
+    console.log("    project/log dir, or it will refuse to arm rather than hang.)");
+    console.log(
+      "   Approving a bash call approves a SHELL, not a diff — this is attention, not containment.",
+    );
+  }
+
   const seenCalls = new Set<string>();
   let currentRun: string | undefined;
   let offset = 0;
   let partial = "";
+  let approvalOffset = 0;
+  let approvalPartial = "";
   let announcedWaiting = false;
+  /** Permission ids already settled (by us, by the server's bridge, or by anyone) — so a
+   * request that timed out while we were reading is never prompted for. */
+  const settled = new Set<string>();
+  const askQueue: ApprovalAskLine[] = [];
+  let prompting = false;
 
   const openRun = (runId: string): void => {
     currentRun = runId;
     offset = 0;
     partial = "";
+    approvalOffset = 0;
+    approvalPartial = "";
     console.log(`── run ${runId}`);
   };
 
@@ -792,36 +1006,42 @@ export async function runWatch(
    * `openRun` reset the offset and they were skipped forever. The last thing a run did is
    * often the most interesting thing it did. */
   const switchRun = (runId: string): void => {
-    if (currentRun !== undefined) drain();
+    if (currentRun !== undefined) {
+      drain();
+      drainApprovals();
+    }
     openRun(runId);
   };
 
-  const drain = (): void => {
-    if (currentRun === undefined) return;
-    const file = path.join(logDir, currentRun, "activity.jsonl");
+  /**
+   * Read whatever is new in `file` since `state.offset` and return the COMPLETE lines.
+   * Shared by the activity tail and the approvals tail so the two cannot drift on the two
+   * things that are easy to get wrong: holding a half-written final line, and treating a
+   * SHRUNK file as replaced rather than reading from a now-past-the-end offset.
+   */
+  const readNewLines = (file: string, state: { offset: number; partial: string }): string[] => {
     let size: number;
     try {
       size = statSync(file).size;
     } catch {
-      return; // not created yet (or removed) — nothing to read this poll
+      return []; // not created yet (or removed) — nothing to read this poll
     }
-    if (size < offset) {
-      // Truncated or replaced: start over rather than reading from a stale offset.
-      offset = 0;
-      partial = "";
+    if (size < state.offset) {
+      state.offset = 0;
+      state.partial = "";
     }
-    if (size === offset) return;
+    if (size === state.offset) return [];
     let chunk = "";
     let fd: number | undefined;
     try {
       fd = openSync(file, "r");
-      const len = size - offset;
+      const len = size - state.offset;
       const buf = Buffer.allocUnsafe(len);
-      const read = readSync(fd, buf, 0, len, offset);
+      const read = readSync(fd, buf, 0, len, state.offset);
       chunk = buf.subarray(0, read).toString("utf8");
-      offset += read;
+      state.offset += read;
     } catch {
-      return;
+      return [];
     } finally {
       if (fd !== undefined) {
         try {
@@ -831,19 +1051,126 @@ export async function runWatch(
         }
       }
     }
-    partial += chunk;
-    const lines = partial.split("\n");
+    state.partial += chunk;
+    const lines = state.partial.split("\n");
     // The last element is whatever came after the final newline — an incomplete line the
     // writer has not finished. Hold it until the rest arrives.
-    partial = lines.pop() ?? "";
+    state.partial = lines.pop() ?? "";
+    return lines.filter((l) => l.length > 0);
+  };
+
+  const drain = (): void => {
+    if (currentRun === undefined) return;
+    const state = { offset, partial };
+    const lines = readNewLines(path.join(logDir, currentRun, "activity.jsonl"), state);
+    offset = state.offset;
+    partial = state.partial;
     for (const line of lines) {
-      if (line.length === 0) continue;
       if (args.json) {
         console.log(line);
         continue;
       }
       for (const out of formatActivityLine(line, seenCalls)) console.log(out);
     }
+  };
+
+  /**
+   * Tail the run's `approvals.jsonl` (issue #20 slice 4). `asked` lines join the prompt
+   * queue; `decided` lines mark a request settled so we never prompt for something the
+   * server's own bridge (or another watcher) has already answered.
+   */
+  const drainApprovals = (): void => {
+    if (!args.approve || currentRun === undefined) return;
+    const state = { offset: approvalOffset, partial: approvalPartial };
+    const lines = readNewLines(path.join(logDir, currentRun, APPROVALS_FILE), state);
+    approvalOffset = state.offset;
+    approvalPartial = state.partial;
+    for (const line of lines) {
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue; // a torn/foreign line is not a decision; the next poll re-reads the rest
+      }
+      const id = typeof obj.permission_id === "string" ? obj.permission_id : "";
+      if (id.length === 0) continue;
+      if (obj.kind === "decided") {
+        settled.add(id);
+        console.log(`   · request ${id} already answered (${String(obj.decision)}, by ${String(obj.by)})`);
+        continue;
+      }
+      if (obj.kind !== "asked" || settled.has(id)) continue;
+      const ask: ApprovalAskLine = {
+        permission_id: id,
+        session_id: typeof obj.session_id === "string" ? obj.session_id : "",
+        base_url: typeof obj.base_url === "string" ? obj.base_url : "",
+        tool: typeof obj.tool === "string" ? obj.tool : "",
+        detail: typeof obj.detail === "string" ? obj.detail : "",
+        model: typeof obj.model === "string" ? obj.model : "",
+        command: typeof obj.command === "string" ? obj.command : "",
+        deadline: typeof obj.deadline === "string" ? obj.deadline : "",
+        timeout_ms: typeof obj.timeout_ms === "number" ? obj.timeout_ms : 0,
+      };
+      askQueue.push(ask);
+      // ONE PROMPT AT A TIME (see `pump`), so a request that arrives while you are deciding
+      // would otherwise sit invisible and burn its whole deadline. Announce it immediately —
+      // a non-blocking line, so you at least know the clock is running on a second one
+      // (review finding F4).
+      if (prompting) console.log(formatApprovalNotice(ask));
+    }
+    void pump();
+  };
+
+  /**
+   * Ask about queued requests ONE AT A TIME, skipping any that got settled while we waited.
+   *
+   * ONE AT A TIME IS DELIBERATE AND HAS A COST, STATED (review finding F4): two prompts
+   * racing for one stdin would interleave unreadably and you could not tell which request
+   * your "y" answered. The cost is that a second request arriving mid-prompt waits its turn
+   * while its OWN deadline runs — so `drainApprovals` prints a notice the moment it lands,
+   * and a busy gated run may see the queued one time out before you reach it. That is
+   * fail-closed (the model is told and continues), not a lost turn.
+   */
+  const pump = async (): Promise<void> => {
+    if (prompting) return;
+    prompting = true;
+    try {
+      for (;;) {
+        const next = askQueue.shift();
+        if (next === undefined) return;
+        if (settled.has(next.permission_id)) continue;
+        for (const l of formatApprovalPrompt(next)) console.log(l);
+        const answer = (await askApprove("   Approve? [y/N] ")).trim().toLowerCase();
+        if (settled.has(next.permission_id)) {
+          console.log("   · answered elsewhere while you were deciding — your answer is dropped.");
+          continue;
+        }
+        const yes = answer === "y" || answer === "yes";
+        const res = await replyToPermission(next, yes, inject?.fetchImpl ?? fetch);
+        settled.add(next.permission_id);
+        if (res.status === 404) {
+          console.log("   · too late: opencode had already settled this request (timeout, or another answerer).");
+        } else if (res.status === 0 || res.status >= 400) {
+          console.log(`   ! reply failed (${res.status}${res.error ? ` ${res.error}` : ""}) — the server's fail-closed timeout will reject it.`);
+        } else {
+          console.log(yes ? "   → approved (once)." : "   → rejected; the model is told and continues.");
+        }
+      }
+    } finally {
+      prompting = false;
+    }
+  };
+
+  /** Ask the human. A readline interface is created lazily and reused, so an idle watcher
+   * holds no stdin resources until the first request arrives. */
+  let rl: import("node:readline").Interface | undefined;
+  const askApprove = async (question: string): Promise<string> => {
+    if (askPrompt !== undefined) return askPrompt(question);
+    if (rl === undefined) {
+      const readline = await import("node:readline");
+      rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    }
+    return new Promise<string>((resolve) => rl!.question(question, resolve));
   };
 
   const resolveRun = (): void => {
@@ -862,21 +1189,36 @@ export async function runWatch(
     if (latest !== currentRun) switchRun(latest);
   };
 
-  resolveRun();
-  drain();
-
-  if (!args.follow) {
-    if (currentRun === undefined) console.log("  nothing to show yet.");
-    return 0;
-  }
-
-  let polls = 0;
-  for (;;) {
-    if (inject?.maxPolls !== undefined && polls >= inject.maxPolls) return 0;
-    polls += 1;
-    await new Promise((r) => setTimeout(r, pollMs));
+  try {
     resolveRun();
     drain();
+    drainApprovals();
+
+    if (!args.follow) {
+      if (currentRun === undefined) console.log("  nothing to show yet.");
+      return 0;
+    }
+
+    let polls = 0;
+    for (;;) {
+      if (inject?.maxPolls !== undefined && polls >= inject.maxPolls) {
+        // Drain the prompt queue before returning so a test (and a Ctrl-C'd terminal) does
+        // not leave a request the server is still waiting on.
+        await pump();
+        return 0;
+      }
+      polls += 1;
+      await new Promise((r) => setTimeout(r, pollMs));
+      resolveRun();
+      drain();
+      drainApprovals();
+    }
+  } finally {
+    // Retract the presence file the moment this watcher stops: a stale one would let the
+    // server arm believing somebody is listening (bounded by WATCHER_STALE_MS, but there is
+    // no reason to spend even that on a clean exit).
+    heartbeat?.stop();
+    rl?.close();
   }
 }
 
@@ -926,6 +1268,9 @@ async function main(): Promise<number> {
     console.log("                   fetches, edits, shell commands) while a guild call runs.");
     console.log("       [--run ID]   watch one run instead of following the newest.");
     console.log("       [--no-follow] print what is recorded and exit; [--json] raw lines.");
+    console.log("       [--approve]  also ANSWER gated tool calls from this terminal");
+    console.log("                    (needs GUILD_APPROVE/GUILD_APPROVE_EGRESS on the server");
+    console.log("                    and a TTY). Approving bash approves a shell, not a diff.");
     console.log("  logs clean       Apply evidence-log retention by hand:");
     console.log("       [--days N]   window in days (default: GUILD_LOG_RETENTION_DAYS,");
     console.log(`                    env > modelguild.conf.local > ${DEFAULT_RETENTION_DAYS}; refuses if unset/0).`);
