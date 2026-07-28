@@ -747,6 +747,25 @@ export async function run(): Promise<number> {
     }
     c.check(badCode === 2, "watch: an unknown argument exits 2");
 
+    // Issue #73: `--run` is the ONE run id a human types by hand, and it is joined onto
+    // the logs root to build the file this tails — so it goes through the same grammar
+    // the evidence layer enforces, and a traversal is a usage error rather than a tail
+    // of some path outside the root.
+    const errs: string[] = [];
+    console.error = (...a: unknown[]) => {
+      errs.push(a.map(String).join(" "));
+    };
+    let traversalCode: number;
+    try {
+      traversalCode = await runWatch(["--run", "../../../etc", "--no-follow"], { env });
+    } finally {
+      console.error = realErr;
+    }
+    c.check(
+      traversalCode === 2 && errs.join("\n").includes("single path segment"),
+      "#73 watch: --run with a traversing run id exits 2 and states the rule",
+    );
+
     // The banner is emitted once per call id.
     const seen = new Set<string>();
     const line = JSON.stringify({ ts: "2026-07-27T01:02:03Z", call_id: "call-x", kind: "tool-called", summary: "s" });

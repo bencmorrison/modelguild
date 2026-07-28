@@ -23,8 +23,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   EvidenceLog,
+  assertRunId,
   confGet,
   enforceRetentionOnStart,
+  isRunId,
+  resolveRunIdArg,
   type PromptMode,
 } from "../src/log.js";
 import { runLogsClean } from "../src/cli.js";
@@ -984,6 +987,132 @@ export async function run(): Promise<number> {
     c.check(turns.size === 3, "C34: concurrent started entries get 3 DISTINCT turns (turn counted inside the lock)");
     c.check(new EvidenceLog({ env: envFor(dir) }).verify(runId).ok, "C34: the concurrent run verifies");
     console.log(`    [overlap evidence] spans: ${spans.map((s) => `${s.start % 100000}..${s.end % 100000}`).join(", ")} → latestStart ${latestStart % 100000} < earliestEnd ${earliestEnd % 100000}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 19. Issue #73 — a runId is a DIRECTORY NAME under the logs root, so it is validated
+  //     at the single choke point (`#resolveRun`) on BOTH supplied paths: the caller's
+  //     argument and `$GUILD_RUN_ID`. Before this it was used verbatim, so `../../..`
+  //     wrote calls.jsonl / activity.jsonl / delegate patches outside the root.
+  //
+  //     The posture is fail-LOUD, never a silent fresh-run fallback: a caller that thinks
+  //     it threaded a run must not quietly be handed a different one.
+  // -------------------------------------------------------------------------
+  {
+    // --- the grammar itself ------------------------------------------------
+    const minted = new EvidenceLog({ env: envFor(tmp()) }).newRun("/guild:consult");
+    const good = [
+      minted,
+      "20260728T055956Z-7526f9dd",
+      "r",
+      "run-1",
+      "run_b",
+      "a.b",
+      "20260727T000000Z-threaded",
+      "A".repeat(128),
+    ];
+    c.check(good.every((g) => isRunId(g)), "#73: the minted shape and conservative segments are ACCEPTED");
+    const bad: unknown[] = [
+      "../escape",
+      "../../../../tmp/pwn",
+      "/etc/passwd",
+      "a/b",
+      "a\\b",
+      "..",
+      ".",
+      ".hidden",
+      "a..b",
+      "a\0b",
+      "a\nb",
+      "a b",
+      "latest", // the symlink `#ensureRun` maintains beside the run dirs
+      "A".repeat(129),
+      "",
+      42,
+      null,
+      { toString: () => "ok" },
+    ];
+    const rejected = bad.filter((v) => !isRunId(v));
+    c.check(rejected.length === bad.length,
+      `#73: every unsafe/ill-formed run id is REJECTED (${rejected.length}/${bad.length})`);
+
+    // --- the argument path: nothing is written, inside or outside the root ---
+    const dir = tmp();
+    const escapeName = `mg73-escape-${process.pid}-${Date.now()}`;
+    const escapeTarget = path.join(tmpdir(), escapeName);
+    const traversal = `${"../".repeat(dir.split(path.sep).length + 3)}${path.basename(tmpdir())}/${escapeName}`;
+    const log = new EvidenceLog({ env: envFor(dir) });
+    let argThrew = false;
+    let argRes;
+    try {
+      argRes = await log.expect({ callId: "call-x", command: "/guild:consult", run: traversal });
+    } catch {
+      argThrew = true;
+    }
+    c.check(!argThrew && argRes !== undefined && argRes.ok === false,
+      "#73: a traversing runId argument returns ok:false (C31: never throws into the call)");
+    c.check(!existsSync(escapeTarget),
+      "#73: NOTHING is written outside the logs root (the pre-fix repro wrote calls.jsonl there)");
+    // The escape is refused, not silently redirected into a fresh run inside the root:
+    // a fallback would leave the caller's entries in a run it was never told about.
+    c.check(!existsSync(path.join(dir, "latest")),
+      "#73: the refused call mints NO fallback run (no `latest`, no run dir)");
+
+    // The read-only path helpers refuse too, rather than handing back an escaping path.
+    let dirThrew = false;
+    try { log.dir(traversal); } catch { dirThrew = true; }
+    let pathThrew = false;
+    try { log.path(traversal); } catch { pathThrew = true; }
+    c.check(dirThrew && pathThrew, "#73: dir()/path() refuse an invalid runId instead of returning an escaping path");
+
+    // --- the env path: same refusal, and the error NAMES the env var --------
+    const envLog = new EvidenceLog({ env: envFor(dir, { GUILD_RUN_ID: traversal }) });
+    let envThrew = false;
+    let envRes;
+    try {
+      envRes = await envLog.started({ callId: "call-y", model: "m/x", agent: "guild-read", prompt: "p" });
+    } catch {
+      envThrew = true;
+    }
+    c.check(!envThrew && envRes !== undefined && envRes.ok === false,
+      "#73: a traversing $GUILD_RUN_ID returns ok:false rather than writing outside the root");
+    c.check(!existsSync(escapeTarget),
+      "#73: the env path writes nothing outside the logs root either");
+    let envMsg = "";
+    try { assertRunId(traversal, "GUILD_RUN_ID"); } catch (err) { envMsg = String(err); }
+    c.check(envMsg.includes("GUILD_RUN_ID"),
+      "#73: the env-path error NAMES GUILD_RUN_ID (a bare 'runId' would send the operator to the wrong knob)");
+
+    // --- verify(): data, not an exception (the 13b posture) ----------------
+    let verifyThrew = false;
+    let v;
+    try { v = log.verify(traversal); } catch { verifyThrew = true; }
+    c.check(!verifyThrew && v !== undefined && !v.ok && v.code === 7,
+      "#73: verify() on an invalid runId returns code 7, never throws");
+
+    // --- the tool-INPUT surface (what an MCP handler returns) ---------------
+    const absent = resolveRunIdArg("guild_consult", undefined);
+    const empty = resolveRunIdArg("guild_consult", "");
+    const ok = resolveRunIdArg("guild_consult", minted);
+    const nope = resolveRunIdArg("guild_consult", traversal);
+    const nonString = resolveRunIdArg("guild_delegate", 7);
+    c.check("value" in absent && absent.value === undefined, "#73: resolveRunIdArg: an ABSENT runId is undefined (fresh run)");
+    c.check("value" in empty && empty.value === undefined, "#73: resolveRunIdArg: an EMPTY runId keeps its 'absent' meaning");
+    c.check("value" in ok && ok.value === minted, "#73: resolveRunIdArg: a valid runId passes through verbatim");
+    c.check("error" in nope && nope.error.startsWith("guild_consult: runId ") && nope.error.includes("single path segment"),
+      "#73: resolveRunIdArg: an invalid runId is a TOOL INPUT ERROR naming the tool, the field and the rule");
+    c.check("error" in nonString && nonString.error.startsWith("guild_delegate: runId "),
+      "#73: resolveRunIdArg: a non-string runId is an input error, NOT a silent fall to a fresh run");
+
+    // --- and the good path is untouched end-to-end -------------------------
+    const okDir = tmp();
+    const okLog = new EvidenceLog({ env: envFor(okDir) });
+    const rid = okLog.newRun("/guild:consult");
+    await okLog.expect({ callId: "call-ok", command: "/guild:consult", run: rid });
+    await okLog.started({ callId: "call-ok", model: "m/x", agent: "guild-read", prompt: "p", run: rid });
+    await okLog.completed({ callId: "call-ok", model: "m/x", agent: "guild-read", response: "hi", captureState: "complete", run: rid });
+    c.check(existsSync(path.join(okDir, rid, "calls.jsonl")) && okLog.verify(rid).ok,
+      "#73: a minted run id still writes inside the root and verifies clean");
   }
 
   // cleanup
