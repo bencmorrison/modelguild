@@ -48,6 +48,8 @@ interface InternalHandle extends ServeHandle {
   /** Set when the spawn ITSELF failed (ENOENT, EACCES) — see the 'error' listener in #start. */
   spawnError: Error | undefined;
   stderr: StderrTail;
+  /** When the child was spawned — the clock the port-race window is measured against. */
+  spawnedAt: number;
 }
 
 const DEFAULT_IDLE_MS = 600_000; // 10 minutes
@@ -66,6 +68,52 @@ const STDERR_DRAIN_GRACE_MS = 250;
 /** Bounded wait for the ChildProcess 'error' that explains a pidless spawn. Node reports
  * it asynchronously (~3ms measured); without the wait the failure is a bare "no pid". */
 const SPAWN_ERROR_GRACE_MS = 500;
+/** How many times the negotiate→spawn→ready sequence is attempted when the child dies
+ * with a port-conflict signature (issue #79). Each attempt negotiates a FRESH port. */
+const PORT_RETRY_ATTEMPTS = 3;
+/**
+ * How soon after spawn a child must die for its death to count as a lost port race
+ * (issue #79). A bind conflict fails at BIND time — the loser is dead in milliseconds —
+ * so a child that ran for half a minute and only then raised the same error held the port
+ * the whole time and is failing for some other reason.
+ *
+ * This is a cost bound, not a nicety, and it is why the retry stays cheap (review finding
+ * 1). Without it a child dying just short of the readiness deadline was retried at full
+ * price: worst case ~3 × readyTimeoutMs (≈90s, and under `GUILD_SERVE_PER_CALL=1` on
+ * every call) against a hard ~30s ceiling before the retry existed. With it, the two
+ * retried attempts cost at most 2 × this window, so the worst-case start is
+ * readyTimeoutMs + 2 × PORT_RACE_WINDOW_MS (≈40s) — and "a retried failure is a fast
+ * failure" is true by construction rather than by assumption.
+ */
+const PORT_RACE_WINDOW_MS = 5_000;
+
+/**
+ * A startup failure whose stderr says the port was taken — the TOCTOU loser (issue #79).
+ * The only failure class `#start` retries, because it is the only one a different port
+ * can fix: a missing binary, a bad config or an auth failure would fail identically on
+ * every attempt and just multiply the wait.
+ */
+class PortTakenError extends Error {}
+
+/**
+ * Does this startup stderr read as a bind conflict?
+ *
+ * `ServeError` is in the set because on opencode 1.18.7 it is the ONLY signal: a probe
+ * against a port held by another listener printed exactly `Error: Unexpected error` +
+ * `ServeError` — no errno, no port number (the same probe issue #75 quotes). That makes
+ * the match imprecise in one stated direction: another serve-startup failure that also
+ * raises `ServeError` is retried too. **The cost of that imprecision, stated honestly:**
+ * up to two extra attempts, each bounded by PORT_RACE_WINDOW_MS because a slower death
+ * is not classified as a race at all — so at most ~10s, not up to 2 × the readiness
+ * timeout. Matching nothing on the version we actually ship against would instead make
+ * the retry decorative. The errno forms are kept for other builds and for a future
+ * opencode that surfaces the OS error; `already in use` deliberately covers both the
+ * `address` and `port` phrasings (review finding 2 — the `port …` form was missed, and
+ * this suite's own early-exit fixture had used exactly that wording).
+ */
+function looksLikePortConflict(stderr: string): boolean {
+  return /\bEADDRINUSE\b|already in use|is port \d+ in use|\bServeError\b/i.test(stderr);
+}
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -77,11 +125,26 @@ function envInt(name: string, fallback: number): number {
 /**
  * Ask the OS for a free loopback TCP port by binding to :0 and reading it back.
  *
- * Accepted TOCTOU: this probe listener closes before `opencode serve` binds the
- * same port, leaving a gap another process could win. There's no way to close it —
- * opencode has no `--port 0` readback that would let us hand it an already-bound
- * socket. A racer landing in that gap surfaces loudly, as `opencode serve` exiting
- * before becoming ready (see the readiness poll in `#start`), never as a silent hang.
+ * TOCTOU, and what is done about it (issue #79): this probe listener closes before
+ * `opencode serve` binds the same port, leaving a gap another process can win. The gap
+ * cannot be closed — opencode takes a port number, not an inherited socket — so it is
+ * SURVIVED instead: the loser is loud (the child exits before becoming ready, never a
+ * silent hang), and `#start` retries the whole negotiate→spawn→ready sequence on a fresh
+ * port, bounded by PORT_RETRY_ATTEMPTS.
+ *
+ * Why not let opencode pick (`--port 0`), probed on 1.18.7 (2026-07-28) and rejected:
+ *   - `--port 0` is opencode's own default, and it is NOT ephemeral-first. With 4096
+ *     free it binds 4096 — the well-known opencode port — and only falls back to an
+ *     ephemeral one when 4096 is taken (observed: 4096, then 39329 for a second serve).
+ *     A supervised child that silently claims the user's default port is a worse problem
+ *     than the race it would fix.
+ *   - The chosen port is discoverable ONLY by scraping a human-readable STDOUT line
+ *     (`opencode server listening on http://127.0.0.1:39329`). There is no machine
+ *     readable readback: no flag prints it, and the only other copy is the debug log.
+ *     That would mean piping and parsing stdout — reversing issue #75's deliberate
+ *     stdout-ignored decision — and pinning startup to a log string, on a dependency
+ *     this repo deliberately tracks unpinned. A wording change would then break startup
+ *     outright, trading a rare intermittent failure for a total one.
  */
 function pickFreePort(host: string): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -476,11 +539,22 @@ export class OpencodeLifecycle {
     return stderrSuffix(h.stderr);
   }
 
-  async #exitedBeforeReady(h: InternalHandle): Promise<string> {
-    return (
+  /**
+   * The error for a child that died during startup. Typed as `PortTakenError` when the
+   * captured stderr reads as a bind conflict AND the child died inside the port-race
+   * window, which together are what `#start` retries on (issue #79) — the classification
+   * lives here because this is the one place that has the exit, its timing and the stderr
+   * tail. The window is load-bearing on cost, not decoration: see PORT_RACE_WINDOW_MS.
+   */
+  async #exitedBeforeReady(h: InternalHandle): Promise<Error> {
+    const report = await this.#stderrReport(h);
+    const msg =
       `opencode serve exited before becoming ready ` +
-      `(cwd=${this.#projectDir}, ${exitDesc(h)})${await this.#stderrReport(h)}`
-    );
+      `(cwd=${this.#projectDir}, ${exitDesc(h)})${report}`;
+    // Measured at classification time, so it includes the ≤STDERR_DRAIN_GRACE_MS drain.
+    // The window is orders of magnitude larger, so the slack costs nothing.
+    const raced = Date.now() - h.spawnedAt <= PORT_RACE_WINDOW_MS;
+    return raced && looksLikePortConflict(report) ? new PortTakenError(msg) : new Error(msg);
   }
 
   #clearIdleTimer(): void {
@@ -519,7 +593,46 @@ export class OpencodeLifecycle {
     }
   }
 
+  /**
+   * Start a serve child, retrying the whole negotiate→spawn→ready sequence when the
+   * child dies having lost the port race (issue #79).
+   *
+   * Narrow on purpose, in two dimensions. Only a `PortTakenError` is retried — a spawn
+   * failure (opencode not on PATH), an auth/config failure and a readiness TIMEOUT all
+   * propagate on the first attempt, the last of them because the child was alive and
+   * merely slow. And a `PortTakenError` is only minted for a child that died INSIDE
+   * PORT_RACE_WINDOW_MS, which is what bounds the cost: worst case
+   * `readyTimeoutMs + 2 × PORT_RACE_WINDOW_MS` (≈40s at the defaults) against the ~30s
+   * ceiling a single start always had.
+   */
   async #start(): Promise<InternalHandle> {
+    for (let attempt = 1; ; attempt++) {
+      // The generation #startOnce claims synchronously at its top; if it no longer holds
+      // after a failure, a shutdown() landed and this start must not spawn again.
+      const gen = this.#startGen + 1;
+      try {
+        return await this.#startOnce();
+      } catch (err) {
+        if (!(err instanceof PortTakenError)) throw err;
+        if (this.#startGen !== gen) {
+          // A shutdown() landed while this failure was being assembled (the stderr drain
+          // is up to STDERR_DRAIN_GRACE_MS wide). Report it as what it is: rethrowing the
+          // PortTakenError would hand the operator a port-conflict diagnosis for an idle
+          // timeout or a transport close (review finding 3). Same text every other
+          // shutdown-during-startup path produces.
+          throw new Error("opencode serve shut down during startup");
+        }
+        if (attempt >= PORT_RETRY_ATTEMPTS) {
+          throw new Error(
+            `${err.message}\n(gave up after ${PORT_RETRY_ATTEMPTS} attempts, ` +
+              `each on a freshly negotiated port)`,
+          );
+        }
+      }
+    }
+  }
+
+  async #startOnce(): Promise<InternalHandle> {
     this.#installBackstop();
     // Claim a generation; shutdown() bumps #startGen to abandon this start. Every
     // checkpoint below re-checks it so a shutdown() arriving anywhere in the
@@ -606,6 +719,7 @@ export class OpencodeLifecycle {
       exitSignal: null,
       spawnError: undefined,
       stderr: stderrTail,
+      spawnedAt: Date.now(),
     };
     recordSpawnError = (err: Error) => {
       handle.spawnError = err;
@@ -643,7 +757,7 @@ export class OpencodeLifecycle {
           );
         }
         if (handle.exited) {
-          throw new Error(await this.#exitedBeforeReady(handle));
+          throw await this.#exitedBeforeReady(handle);
         }
         try {
           const res = await fetch(`${baseUrl}/doc`, { signal: AbortSignal.timeout(READY_HTTP_MS) });
@@ -677,7 +791,7 @@ export class OpencodeLifecycle {
       // and now, /doc may have been answered by an unrelated process that rebound
       // the freed port, so treat readiness as invalid.
       if (handle.exited) {
-        throw new Error(await this.#exitedBeforeReady(handle));
+        throw await this.#exitedBeforeReady(handle);
       }
       this.#handle = handle;
       return handle;

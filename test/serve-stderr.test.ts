@@ -36,6 +36,50 @@ function makeShim(body: string): string {
 }
 
 /**
+ * A shim that RECORDS every invocation (issue #79). Each run appends the `--port` it was
+ * handed to `<dir>/ports`, so a test can assert both how many attempts happened and that
+ * each one negotiated a fresh port — the whole point of retrying.
+ *
+ * `bodyFor` receives the attempt number as the shell variable `$n` and the dir as `$dir`.
+ */
+function makeCountingShim(body: string): { dir: string; ports: () => string[] } {
+  const dir = mkTemp("mg-serve-retry-");
+  const prelude = [
+    `dir=${JSON.stringify(dir)}`,
+    'port=""',
+    'while [ "$#" -gt 0 ]; do case "$1" in --port) port="$2"; shift 2;; *) shift;; esac; done',
+    'printf "%s\\n" "$port" >> "$dir/ports"',
+    'n=$(wc -l < "$dir/ports" | tr -d " ")',
+  ].join("\n");
+  fs.writeFileSync(path.join(dir, "opencode"), `#!/usr/bin/env bash\n${prelude}\n${body}\n`, {
+    mode: 0o755,
+  });
+  return {
+    dir,
+    ports: () => {
+      try {
+        return fs
+          .readFileSync(path.join(dir, "ports"), "utf8")
+          .split("\n")
+          .filter((l) => l.trim() !== "");
+      } catch {
+        return [];
+      }
+    },
+  };
+}
+
+/** The shim tail that becomes a real `GET /doc` responder on the port it was given. */
+const FAKE_SERVE =
+  "exec node -e " +
+  "'require(\"http\").createServer((q,s)=>{s.writeHead(200,{\"content-type\":\"application/json\"});s.end(\"{}\")}).listen(Number(process.argv[1]),\"127.0.0.1\")'" +
+  ' "$port"';
+
+/** What opencode 1.18.7 prints when the port it was handed is already bound. */
+const PORT_TAKEN =
+  'printf "\\033[91m\\033[1mError: \\033[0mUnexpected error\\n\\nServeError\\n" >&2\nexit 1';
+
+/**
  * Drive ONE ensureServe() in a SEPARATE process (issue #75, review finding F1).
  *
  * A separate process is the only honest way to test "the rejection is not swallowed":
@@ -111,10 +155,40 @@ export async function run(): Promise<number> {
   const c = new Checker();
   console.log("== serve-stderr.test ==");
 
+  // Every OpencodeLifecycle installs its own process-level backstop listeners (exit +
+  // three signals), and this suite mints more than ten of them, which trips Node's
+  // MaxListeners warning. Raise the ceiling for the duration and RESTORE it afterwards —
+  // leaving it raised would hide a real listener leak in a later suite in this process.
+  // The restore and the temp-dir cleanup are in a FINALLY (review finding 4): the checks
+  // below have unguarded awaits, `test/run.ts` catches a suite throw and carries on, so
+  // an early exit from here must not leak either the ceiling or the temp dirs.
+  const prevMaxListeners = process.getMaxListeners();
+  process.setMaxListeners(prevMaxListeners + 16);
+  try {
+    await checks(c);
+  } finally {
+    process.setMaxListeners(prevMaxListeners);
+    for (const dir of tempDirs) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* leftover temp dirs are not a test failure */
+      }
+    }
+  }
+
+  console.log(`serve-stderr.test: ${c.passes} passed, ${c.failures} failed`);
+  return c.failures;
+}
+
+async function checks(c: Checker): Promise<void> {
   // 1. a child that dies during startup carries its stderr into the error ------------
+  //    Its stderr is deliberately NOT port-conflict-shaped: this case is about the
+  //    reporting, and a bind-conflict signature would (correctly) send it down the
+  //    retry path instead (review finding 2).
   {
     const msg = await failureMessage(
-      'printf "ERROR: port already in use (marker-alpha)\\n" >&2\nexit 3',
+      'printf "ERROR: config parse failed (marker-alpha)\\n" >&2\nexit 3',
     );
     c.check(
       msg.includes("exited before becoming ready"),
@@ -267,16 +341,169 @@ export async function run(): Promise<number> {
     });
   }
 
-  for (const dir of tempDirs) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      /* leftover temp dirs are not a test failure */
-    }
+  // 8. the port race is SURVIVED: a lost port is retried on a fresh one (issue #79) ---
+  //    The shim loses the bind on its first invocation and serves on its second. It uses
+  //    the `port already in use` phrasing on purpose — the form the first cut of
+  //    `looksLikePortConflict` did NOT match (review finding 2).
+  //
+  //    NOTE what is deliberately NOT asserted: that the two attempts got DIFFERENT ports.
+  //    This shim never binds the port it "loses", so the OS is free to hand the same one
+  //    back; asserting distinctness would test the kernel's allocation order and flake at
+  //    roughly 0.1% a run (review finding 5). What IS ours to assert is that a fresh
+  //    negotiation happened per attempt and the handle names the port that came up.
+  {
+    const lost = 'printf "listen: port already in use\\n" >&2\nexit 1';
+    const shim = makeCountingShim(`if [ "$n" -lt 2 ]; then\n${lost}\nfi\n${FAKE_SERVE}`);
+    await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 15_000 });
+      let handle: { baseUrl: string; port: number; pid: number } | undefined;
+      try {
+        handle = await withTimeout(lc.ensureServe(), 40_000, "retry:ensureServe");
+      } catch (err) {
+        c.check(false, `retry: ensureServe should have recovered (${String(err).split("\n")[0]})`);
+      }
+      const ports = shim.ports();
+      c.check(handle !== undefined && lc.isRunning, "retry: a lost port race still yields a ready serve");
+      c.check(ports.length === 2, `retry: exactly one retry was spent (attempts=${ports.length})`);
+      c.check(
+        ports.length === 2 && ports.every((p) => Number(p) > 1024),
+        `retry: every attempt was handed a freshly negotiated port (${ports.join(",")})`,
+      );
+      c.check(
+        handle !== undefined && String(handle.port) === ports[ports.length - 1],
+        "retry: the handle points at the port the surviving attempt bound",
+      );
+      lc.shutdown("test");
+    });
   }
 
-  console.log(`serve-stderr.test: ${c.passes} passed, ${c.failures} failed`);
-  return c.failures;
+  // 9. the retry is BOUNDED, and giving up still reports the child's own diagnosis -----
+  {
+    const shim = makeCountingShim(PORT_TAKEN);
+    const msg = await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 8_000 });
+      try {
+        await withTimeout(lc.ensureServe(), 40_000, "bounded:ensureServe");
+        return "<<no error: ensureServe resolved>>";
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      } finally {
+        lc.shutdown("test");
+      }
+    });
+    const ports = shim.ports();
+    c.check(ports.length === 3, `bounded: the retry stops at 3 attempts (attempts=${ports.length})`);
+    c.check(
+      ports.every((p) => Number(p) > 1024),
+      `bounded: every attempt was handed a freshly negotiated port (${ports.join(",")})`,
+    );
+    c.check(msg.includes("gave up after 3 attempts"), "bounded: the final error says the retry was exhausted");
+    c.check(msg.includes("exited before becoming ready"), "bounded: it still reports how the child failed");
+    c.check(msg.includes("ServeError"), "bounded: it still carries the child's own stderr");
+  }
+
+  // 10. a NON-port failure is not retried — an auth/config error must fail once --------
+  {
+    const shim = makeCountingShim('printf "Error: not logged in (marker-epsilon)\\n" >&2\nexit 1');
+    const msg = await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 8_000 });
+      try {
+        await withTimeout(lc.ensureServe(), 30_000, "noretry:ensureServe");
+        return "<<no error: ensureServe resolved>>";
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      } finally {
+        lc.shutdown("test");
+      }
+    });
+    c.check(shim.ports().length === 1, `no-retry: a non-port failure runs once (attempts=${shim.ports().length})`);
+    c.check(msg.includes("marker-epsilon"), "no-retry: the failure still carries its stderr");
+    c.check(!msg.includes("gave up after"), "no-retry: it is not reported as an exhausted port retry");
+  }
+
+  // 11. a READINESS TIMEOUT is not retried either -------------------------------------
+  //     The child is alive and merely slow; retrying would multiply the wait for nothing.
+  {
+    const shim = makeCountingShim('printf "still starting\\n" >&2\nsleep 60');
+    const msg = await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 1_500 });
+      try {
+        await withTimeout(lc.ensureServe(), 20_000, "timeout-noretry:ensureServe");
+        return "<<no error: ensureServe resolved>>";
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      } finally {
+        lc.shutdown("test");
+      }
+    });
+    c.check(msg.includes("did not become ready"), "timeout: still reported as a readiness timeout");
+    c.check(
+      shim.ports().length === 1,
+      `timeout: a readiness timeout is NOT retried (attempts=${shim.ports().length})`,
+    );
+  }
+
+  // 12. THE COST BOUND: a LATE death is not a lost race, whatever its stderr says ------
+  //     A bind conflict kills the child in milliseconds. A child that lived past
+  //     PORT_RACE_WINDOW_MS held the port all along, so retrying it buys nothing and
+  //     costs a full attempt each time — the difference between a worst case of
+  //     `readyTimeoutMs + 2 × window` and one of `3 × readyTimeoutMs` (review finding 1).
+  //     The shim raises the REAL 1.18.7 signature, so only the timing separates this case
+  //     from case 9's exhausted retry.
+  {
+    const shim = makeCountingShim(`sleep 6\n${PORT_TAKEN}`);
+    const t0 = Date.now();
+    const msg = await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 20_000 });
+      try {
+        await withTimeout(lc.ensureServe(), 40_000, "late-death:ensureServe");
+        return "<<no error: ensureServe resolved>>";
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      } finally {
+        lc.shutdown("test");
+      }
+    });
+    const elapsed = Date.now() - t0;
+    c.check(
+      shim.ports().length === 1,
+      `late death: a port-shaped error AFTER the race window is not retried (attempts=${shim.ports().length})`,
+    );
+    c.check(msg.includes("ServeError"), "late death: the child's own diagnosis is still reported");
+    c.check(!msg.includes("gave up after"), "late death: it is not dressed up as an exhausted port retry");
+    c.check(elapsed < 20_000, `late death: it fails once, not three times over (${elapsed}ms)`);
+  }
+
+  // 13. a shutdown mid-retry is reported as a SHUTDOWN, never as a port conflict -------
+  //     (review finding 3.) The failure is assembled across the stderr drain, so a
+  //     shutdown() — an idle timeout, a transport close — can land while a PortTakenError
+  //     is in flight; rethrowing it would hand the operator a bind-conflict diagnosis for
+  //     something that was not one. The assertion holds for EVERY ordering, which is what
+  //     keeps it out of the flaky category: a shutdown before the child exits aborts
+  //     inside the attempt, one during the drain hits the generation check in `#start`,
+  //     one after it aborts the next attempt — all three produce the same message.
+  {
+    const shim = makeCountingShim(`sleep 0.5\n${PORT_TAKEN}`);
+    const msg = await withPath(shim.dir, async () => {
+      const lc = new OpencodeLifecycle({ idleMs: 0, projectDir: shim.dir, readyTimeoutMs: 20_000 });
+      const pending = lc.ensureServe();
+      const teardown = setTimeout(() => lc.shutdown("test-teardown"), 700);
+      try {
+        await withTimeout(pending, 30_000, "shutdown-race:ensureServe");
+        return "<<no error: ensureServe resolved>>";
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      } finally {
+        clearTimeout(teardown);
+        lc.shutdown("test");
+      }
+    });
+    c.check(msg.includes("shut down during startup"), `shutdown race: reported as a shutdown (got: ${msg.split("\n")[0]})`);
+    c.check(
+      !msg.includes("ServeError") && !msg.includes("exited before becoming ready"),
+      "shutdown race: NOT dressed up as a port conflict the operator would chase",
+    );
+  }
 }
 
 // Allow standalone execution: `tsx test/serve-stderr.test.ts`.
