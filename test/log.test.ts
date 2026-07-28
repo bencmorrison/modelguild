@@ -18,6 +18,7 @@ import {
   rmSync,
   utimesSync,
   symlinkSync,
+  lstatSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -36,6 +37,8 @@ import { canonicalStringify, buildEntryLine } from "../src/canonical.js";
 import { Checker, repoRoot, tsxBin, sleep } from "./harness.js";
 
 const CHILD = path.join(repoRoot, "test", "log-writer-child.ts");
+/** The issue-#80 actor: one whole SESSION (own run + own retention passes). */
+const SESSION_CHILD = path.join(repoRoot, "test", "log-session-child.ts");
 
 /** A fresh temp dir, cleaned at suite end. */
 const tmpDirs: string[] = [];
@@ -694,7 +697,13 @@ export async function run(): Promise<number> {
 
     const wet = log.prune(14);
     c.check(!existsSync(oldRun) && wet.removed.length === 1, "#23: the same call without dryRun removes it");
-    c.check(log.latest() === undefined, "#23: a `latest` left dangling by a prune is dropped");
+    // ASSERT ON THE LINK, NOT ON latest() (restored after review, issue #80). Since
+    // `latest()` gained its run-dir existence check, `latest() === undefined` here is true
+    // whether or not `#dropDanglingLatest` ran at all — the assertion had become
+    // tautological, and stubbing the whole method to `return;` left the suite green. The
+    // link's own absence is the property C32 actually states.
+    c.check(!linkExists(path.join(dir, "latest")), "#23: a `latest` left dangling by a prune is DROPPED — the link itself is gone");
+    c.check(log.latest() === undefined, "#23: and latest() then reports no run");
   }
 
   // -------------------------------------------------------------------------
@@ -1104,6 +1113,189 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 18a. Issue #80 (C34) — TWO SESSIONS, ONE ROOT: the churn on what a run does NOT own.
+  //
+  //      Case 18 proves the shared-file lock: many writers, ONE run, one calls.jsonl.
+  //      Two Claude Code sessions open on one project do something else — each mints its
+  //      OWN run, so `calls.jsonl` is never contended, and the only shared state left is
+  //      the `latest` symlink that `#ensureRun` refreshes on EVERY append. Retention is
+  //      DISABLED here so nothing but the symlink is in play (18b adds pruning).
+  //
+  //      The reader is the point. `modelguild watch` resolves `latest` on every poll, so
+  //      the invariant is not "latest is eventually right" but "latest is never
+  //      OBSERVABLY absent" — an unlink-then-symlink refresh is two syscalls with a hole
+  //      between them, and with two sessions appending that hole is entered constantly.
+  //      This is why the actors are real processes: `unlinkSync`/`symlinkSync` cannot
+  //      interleave with a reader inside one process.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const nCalls = 6;
+    const labels = ["a", "b", "c", "d"];
+    const gate = Date.now() + 900; // shared start instant, so the actors race rather than queue
+    const watcher = watchLatest(dir);
+    const results = await Promise.all(
+      labels.map((id) =>
+        spawnAsync(
+          tsxBin,
+          [SESSION_CHILD],
+          envFor(dir, {
+            GUILD_LOG_RETENTION_DAYS: "0", // no pruning in this case
+            SESSION_ID: id,
+            SESSION_CALLS: String(nCalls),
+            SESSION_PRUNES: "0",
+            SESSION_GAP_MS: "4",
+            SESSION_START_AT: String(gate),
+          }),
+        ),
+      ),
+    );
+    const obs = await watcher.stop();
+    const sessions = results.map((r) => parseSession(r.stdout)).filter((s): s is Session => !!s);
+    const runIds = sessions.map((s) => s.run);
+    const spans = sessions.map((s) => ({ start: s.start, end: s.end }));
+    const overlapped =
+      spans.length === labels.length &&
+      Math.max(...spans.map((s) => s.start)) < Math.min(...spans.map((s) => s.end));
+    const reader = new EvidenceLog({ env: envFor(dir) });
+    const allVerify = runIds.every((r) => reader.verify(r).ok);
+    const allComplete = runIds.every((r) => entryCount(path.join(dir, r, "calls.jsonl")) === nCalls * 3);
+
+    c.check(results.every((r) => r.status === 0), "#80: all 4 concurrent sessions exited 0");
+    c.check(new Set(runIds).size === labels.length, "#80: 4 sessions mint 4 DISTINCT runs in one root");
+    c.check(overlapped, "#80: the 4 sessions genuinely OVERLAP (all alive at one instant)");
+    c.check(allComplete, `#80: every run holds all ${nCalls * 3} of its entries (no lost/torn appends across sessions)`);
+    c.check(allVerify, "#80: every interleaved run still verifies");
+    c.check(
+      obs.absentAfterFirst === 0,
+      `#80: 'latest' is NEVER observed absent once it exists (${obs.absentAfterFirst} absent sightings in ${obs.samples} reads) — the refresh must be atomic, not unlink-then-symlink`,
+    );
+    c.check(
+      obs.dangling.length === 0,
+      `#80: latest() never names a run dir that is not there (${obs.dangling.slice(0, 3).join(",")})`,
+    );
+    const finalLatest = reader.latest();
+    c.check(
+      finalLatest !== undefined && runIds.includes(finalLatest),
+      "#80: after the race, latest names one of the four real runs",
+    );
+    console.log(`    [reader evidence] ${obs.samples} latest reads, ${obs.ids.size} distinct ids seen, ${obs.absentAfterFirst} absent`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 18b. Issue #80 — retention passes racing live writers on one shared root.
+  //
+  //      Two sessions writing (each pruning at `new-run` and again mid-run) against two
+  //      more that only prune — a second server that started and made no model call
+  //      (`enforceRetentionOnStart`). Seeded old runs give every pass something real to
+  //      delete, and `latest` starts out pointing at one of them, so the dangling-latest
+  //      path is entered WHILE another session is repointing it.
+  //
+  //      `absentAfterFirst` is deliberately NOT asserted here: dropping a dangling
+  //      `latest` is a legitimate unlink, so an absent sighting is correct in this case.
+  //      What must hold is that latest() never NAMES a run that is not on disk — the
+  //      difference between "no latest run" and a lie a watcher would then tail.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const nCalls = 5;
+    const oldIds = ["20200101T000000Z-a1a1a1a1", "20200101T000000Z-b2b2b2b2", "20200101T000000Z-c3c3c3c3"];
+    for (const id of oldIds) seedOldRun(dir, id, 40);
+    symlinkSync(oldIds[0], path.join(dir, "latest")); // latest starts on a doomed run
+    const gate = Date.now() + 900;
+    const watcher = watchLatest(dir);
+    const spec = [
+      { SESSION_ID: "w1", SESSION_CALLS: String(nCalls), SESSION_PRUNES: "3" },
+      { SESSION_ID: "w2", SESSION_CALLS: String(nCalls), SESSION_PRUNES: "3" },
+      { SESSION_ID: "p1", SESSION_CALLS: "0", SESSION_PRUNES: "10" },
+      { SESSION_ID: "p2", SESSION_CALLS: "0", SESSION_PRUNES: "10" },
+    ];
+    const results = await Promise.all(
+      spec.map((s) =>
+        spawnAsync(
+          tsxBin,
+          [SESSION_CHILD],
+          envFor(dir, { GUILD_LOG_RETENTION_DAYS: "14", SESSION_GAP_MS: "4", SESSION_START_AT: String(gate), ...s }),
+        ),
+      ),
+    );
+    const obs = await watcher.stop();
+    const sessions = results.map((r) => parseSession(r.stdout)).filter((s): s is Session => !!s);
+    const writerRuns = sessions.filter((s) => s.run !== "-").map((s) => s.run);
+    const reader = new EvidenceLog({ env: envFor(dir) });
+
+    c.check(results.every((r) => r.status === 0), "#80: 2 writing + 2 pruning sessions all exited 0");
+    c.check(
+      sessions.length === spec.length && sessions.every((s) => s.pruneErrors === 0),
+      "#80: no retention pass errored while another session wrote (prune returns data, never throws)",
+    );
+    c.check(oldIds.every((id) => !existsSync(path.join(dir, id))), "#80: the seeded old runs are pruned by the racing passes");
+    c.check(
+      writerRuns.length === 2 && writerRuns.every((r) => existsSync(path.join(dir, r))),
+      "#80: a run written DURING a concurrent prune is never deleted out from under it",
+    );
+    c.check(
+      writerRuns.every((r) => entryCount(path.join(dir, r, "calls.jsonl")) === nCalls * 3),
+      "#80: those runs keep every entry written while retention ran",
+    );
+    c.check(writerRuns.every((r) => reader.verify(r).ok), "#80: those runs verify after the prune race");
+    // A REGRESSION GUARD, and only that — say so rather than let it look like proof.
+    // `latest()` now checks the run dir exists, so this can no longer fail while that
+    // check is in place; what it catches is the check being removed again (reverting it
+    // reproduces the failure). The property that a dangling link is actually DROPPED is
+    // asserted on the link itself in case 14c, not here.
+    c.check(
+      obs.dangling.length === 0,
+      `#80: latest() never named a pruned run (${obs.dangling.slice(0, 3).join(",")} in ${obs.samples} reads)`,
+    );
+    // Quiescent end state: with the race over, `latest` must resolve to a real run again.
+    await reader.final("post-race", writerRuns[0]);
+    const finalLatest = reader.latest();
+    c.check(
+      finalLatest !== undefined && existsSync(path.join(dir, finalLatest)),
+      "#80: once quiet, latest points at an existing run dir",
+    );
+    console.log(`    [prune evidence] removals counted: ${sessions.map((s) => s.removed).join("+")} over ${sessions.reduce((n, s) => n + s.prunes, 0)} passes; ${obs.samples} latest reads`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 18c. Issue #80 — two retention passes deleting the SAME runs at the same time.
+  //      Nobody owns the scan, so both passes see all six and both call rmSync on them.
+  //      The contract is C32's posture: a raced-away run is data (`skipped`), never an
+  //      exception, and never a half-deleted directory left behind.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const oldIds = Array.from({ length: 6 }, (_, i) => `20200101T000000Z-d${i}d${i}d${i}d${i}`);
+    for (const id of oldIds) seedOldRun(dir, id, 40);
+    const gate = Date.now() + 700;
+    const results = await Promise.all(
+      ["x1", "x2", "x3"].map((id) =>
+        spawnAsync(
+          tsxBin,
+          [SESSION_CHILD],
+          envFor(dir, {
+            GUILD_LOG_RETENTION_DAYS: "14",
+            SESSION_ID: id,
+            SESSION_CALLS: "0",
+            SESSION_PRUNES: "4",
+            SESSION_GAP_MS: "2",
+            SESSION_START_AT: String(gate),
+          }),
+        ),
+      ),
+    );
+    const sessions = results.map((r) => parseSession(r.stdout)).filter((s): s is Session => !!s);
+    c.check(results.every((r) => r.status === 0), "#80: 3 simultaneous retention passes exited 0");
+    c.check(sessions.every((s) => s.pruneErrors === 0), "#80: none of the racing passes errored");
+    c.check(oldIds.every((id) => !existsSync(path.join(dir, id))), "#80: every old run is fully removed (no half-deleted dir)");
+    c.check(
+      sessions.reduce((n, s) => n + s.removed, 0) >= oldIds.length,
+      "#80: every removal is accounted for by the pass that made it",
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // 19. Issue #73 — a runId is a DIRECTORY NAME under the logs root, so it is validated
   //     at the single choke point (`#resolveRun`) on BOTH supplied paths: the caller's
   //     argument and `$GUILD_RUN_ID`. Before this it was used verbatim, so `../../..`
@@ -1382,6 +1574,119 @@ function spawnAsync(
     child.on("close", (code) => resolve({ status: code ?? -1, stdout, stderr }));
     child.on("error", () => resolve({ status: -1, stdout, stderr }));
   });
+}
+
+/** Whether a path EXISTS AS A LINK/FILE without following it — `existsSync` follows a
+ * symlink, so it answers false for a dangling one and cannot tell "no link" from "link to
+ * nothing". Case 14c needs exactly that distinction. */
+function linkExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Entries in a calls.jsonl, or -1 when the file is not there — an absent log is a test
+ * FAILURE to report, never an exception that takes the suite down mid-race. */
+function entryCount(file: string): number {
+  return existsSync(file) ? lines(file).length : -1;
+}
+
+/** One `log-session-child.ts` actor's report (issue #80). */
+interface Session {
+  run: string;
+  calls: number;
+  prunes: number;
+  removed: number;
+  pruneErrors: number;
+  start: number;
+  end: number;
+}
+
+/** Parse the session actor's one-line report. */
+function parseSession(s: string): Session | undefined {
+  const m = s.match(
+    /RUN (\S+) CALLS (\d+) PRUNES (\d+) REMOVED (\d+) PRUNE_ERRORS (\d+) START (\d+) END (\d+)/,
+  );
+  return m
+    ? {
+        run: m[1],
+        calls: Number(m[2]),
+        prunes: Number(m[3]),
+        removed: Number(m[4]),
+        pruneErrors: Number(m[5]),
+        start: Number(m[6]),
+        end: Number(m[7]),
+      }
+    : undefined;
+}
+
+/** A run dir that is `ageDays` old THROUGHOUT (dir + contents), so C32's newest-content
+ * age rule reads it as prunable. */
+function seedOldRun(logDir: string, runId: string, ageDays: number): void {
+  const rd = path.join(logDir, runId);
+  mkdirSync(path.join(rd, "reports"), { recursive: true });
+  writeFileSync(path.join(rd, "calls.jsonl"), "{}\n");
+  const old = new Date(Date.now() - ageDays * 86_400_000);
+  for (const p of [path.join(rd, "calls.jsonl"), path.join(rd, "reports"), rd]) utimesSync(p, old, old);
+}
+
+/**
+ * Hammer the `latest` symlink from the PARENT process while child sessions race in it
+ * (issue #80) — the `modelguild watch` reader, running at full tilt.
+ *
+ * Two things are recorded, and they are not the same fact:
+ *   - `absentAfterFirst` — the raw link was missing on a read AFTER it had been seen.
+ *     A refresh that unlinks and then symlinks is observably absent in between.
+ *   - `dangling` — `latest()` returned a run id whose directory is not on disk. The
+ *     test's fresh runs are never prunable, so a hit here is a real lie, not a race
+ *     against this reader's own second look.
+ * `setImmediate` between reads yields the loop, so the spawns still settle.
+ */
+function watchLatest(logDir: string): {
+  stop(): Promise<{ samples: number; absentAfterFirst: number; dangling: string[]; ids: Set<string> }>;
+} {
+  const log = new EvidenceLog({ env: envFor(logDir) });
+  const link = path.join(logDir, "latest");
+  const state = { samples: 0, absentAfterFirst: 0, dangling: [] as string[], ids: new Set<string>() };
+  let running = true;
+  let sawLink = false;
+  const loop = (async () => {
+    while (running) {
+      state.samples += 1;
+      let present = false;
+      try {
+        lstatSync(link);
+        present = true;
+      } catch {
+        present = false;
+      }
+      if (present) sawLink = true;
+      else if (sawLink) state.absentAfterFirst += 1;
+      const id = log.latest();
+      if (id !== undefined) {
+        state.ids.add(id);
+        // ORDER MATTERS, and it is not the obvious order. "latest() answered, then I
+        // looked and the dir was gone" is NOT a fault — a racing prune may have deleted
+        // it in between, and this reader is watching the race, not exempt from it (that
+        // false positive was observed). So confirm the dir is gone FIRST, then read
+        // latest() AGAIN: a run id is never reused, so once its dir is gone an honest
+        // latest() can only answer undefined. Still naming it is a pointer that outlived
+        // its run — exactly what `modelguild watch` would then try to tail.
+        if (!existsSync(path.join(logDir, id)) && log.latest() === id) state.dangling.push(id);
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+  })();
+  return {
+    async stop() {
+      running = false;
+      await loop;
+      return state;
+    },
+  };
 }
 
 /** Parse `START <ms> END <ms>` overlap markers a child (or shell) prints. */

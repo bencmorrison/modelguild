@@ -43,6 +43,7 @@ import {
   readlinkSync,
   symlinkSync,
   unlinkSync,
+  renameSync,
   readdirSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -501,20 +502,59 @@ export class EvidenceLog {
     return `${nowStamp()}-${randHex()}`;
   }
 
+  /**
+   * Create the run dir and point `latest` at it.
+   *
+   * THE `latest` REFRESH IS ATOMIC, AND SKIPPED WHEN IT IS ALREADY RIGHT (issue #80).
+   * `#ensureRun` runs on EVERY append, and the old refresh was `ln -sfn`'s pair —
+   * `unlinkSync` then `symlinkSync` — which leaves a window in which `latest` does not
+   * exist at all. That is not theoretical: `modelguild watch` re-resolves `latest` on
+   * every poll, and with two Claude Code sessions open on one project a hammering reader
+   * caught the link absent 108 times in 86k reads (test/log.test.ts case 18a, which fails
+   * on the old code). `rename(2)` over the existing link replaces it in one step, so a
+   * concurrent reader sees the old target or the new one — never nothing. The
+   * already-correct early-out is the other half: a single session now touches the link
+   * once per run instead of once per entry, so the window is not merely narrower, it is
+   * almost never entered.
+   *
+   * ATOMICITY IS `rename(2)`'s, AND THAT IS A PLATFORM PROPERTY: POSIX specifies the
+   * replacement as atomic, and CI exercises this on Linux only (the macOS job runs the
+   * shell lints, not the node suites). It is relied on, not proven here on macOS.
+   */
   #ensureRun(runId: string): string {
     const rd = this.#runDir(runId);
     mkdirSync(path.join(rd, "reports"), { recursive: true });
-    // Refresh `latest` → runId (relative target, like `ln -sfn`).
     const latest = path.join(this.#logDir(), "latest");
+    if (readlinkSafe(latest) === runId) return rd; // already ours — no churn at all
+    // Unique per WRITER, not merely per process: `process.pid` alone collides across pid
+    // namespaces, and this repo's own devcontainer story (a host workspace bind-mounted
+    // into containers) is exactly how two writers get the same pid on one logs root —
+    // whereupon A's cleanup unlink deletes B's in-flight temp link, B's rename fails, and
+    // B silently drops into the non-atomic fallback below. The random suffix removes the
+    // class. Within ONE process these calls are synchronous and cannot interleave.
+    const tmpLink = path.join(this.#logDir(), `.latest.${process.pid}.${randHex()}.tmp`);
     try {
-      if (existsSync(latest) || isSymlink(latest)) unlinkSync(latest);
+      symlinkSync(runId, tmpLink);
+      renameSync(tmpLink, latest);
     } catch {
-      /* best-effort */
-    }
-    try {
-      symlinkSync(runId, latest);
-    } catch {
-      /* best-effort — a symlink-less FS must not fail the call */
+      // Fallback for a filesystem that cannot rename over a symlink (or has no symlinks
+      // at all). It reopens the window the atomic path exists to close, which is exactly
+      // why it is the fallback and not the default.
+      try {
+        rmSync(tmpLink, { force: true });
+      } catch {
+        /* best-effort */
+      }
+      try {
+        if (existsSync(latest) || isSymlink(latest)) unlinkSync(latest);
+      } catch {
+        /* best-effort */
+      }
+      try {
+        symlinkSync(runId, latest);
+      } catch {
+        /* best-effort — a symlink-less FS must not fail the call (C31) */
+      }
     }
     return rd;
   }
@@ -625,14 +665,26 @@ export class EvidenceLog {
   /** The most recent run's id (via the `latest` symlink). Returns undefined if none. */
   latest(): string | undefined {
     const l = path.join(this.#logDir(), "latest");
-    if (!isSymlink(l)) return undefined;
+    // ONE readlink, not isSymlink-then-readlinkSync: the two-call form can disagree about
+    // a path that changed between them, which is the whole reason `readlinkSafe` exists.
+    const target = readlinkSafe(l);
+    if (target === undefined) return undefined;
     try {
-      const name = path.basename(readlinkSync(l));
+      const name = path.basename(target);
       // The symlink's TARGET is data on disk, not something we minted this process — and
       // `runWatch` joins this straight onto the logs root without going through `dir()`,
       // so a `latest` pointing at `..` would make the watcher tail above the root (review
       // finding F5). Anything that is not a run id is "no latest run", not a path.
-      return isRunId(name) ? name : undefined;
+      if (!isRunId(name)) return undefined;
+      // AND the run must still BE there (issue #80). `prune` deletes run dirs and only
+      // then drops a dangling `latest`, and a SECOND session can be pruning while this
+      // one reads — so the link names a deleted run for a window a reader really does hit
+      // (test/log.test.ts case 18b caught it). `runWatch` joins this name onto the logs
+      // root and tails the file under it, so a name with no directory behind it is "no
+      // latest run", not a run to follow. This check — not the unlink in
+      // `#dropDanglingLatest` — is where the guarantee lives: with it, the worst a raced
+      // drop can do is leave NO pointer, never a pointer to nothing.
+      return existsSync(path.join(this.#logDir(), name)) ? name : undefined;
     } catch {
       return undefined;
     }
@@ -1309,7 +1361,13 @@ export class EvidenceLog {
             res.kept++;
             continue;
           }
-          if (!dryRun) rmSync(full, { recursive: true, force: true });
+          // `maxRetries` is for the multi-session case (issue #80): a second session's
+          // retention pass removing the same tree, or an `#ensureRun`/`acquireLock`
+          // mkdir landing inside it mid-walk, surfaces as ENOTEMPTY/EBUSY — which would
+          // otherwise be caught below as `skipped` with the directory left PARTLY
+          // emptied. Retrying finishes the job in the ordinary case; if it still fails
+          // the run is still old and still in scope, so the next pass completes it.
+          if (!dryRun) rmSync(full, { recursive: true, force: true, maxRetries: 3 });
           res.removed.push({
             runId: name,
             ageDays: Math.floor((now - scan.newestMs) / 86_400_000),
@@ -1330,13 +1388,33 @@ export class EvidenceLog {
     }
   }
 
-  /** After a prune, drop a `latest` symlink whose target no longer exists — otherwise
-   * `latest()` keeps naming a run that `dir()`/`path()` then resolve to nothing. */
+  /**
+   * After a prune, drop a `latest` symlink whose target no longer exists (C32).
+   *
+   * THIS IS HYGIENE, NOT THE GUARANTEE — the opposite of how it was first written up.
+   * Since `latest()` requires the run dir to exist, a dangling pointer already reads as
+   * "no latest run"; all the unlink buys is that a human listing the logs root does not
+   * find a pointer to nothing. It is kept for that, and because C32 specifies it.
+   *
+   * ITS RESIDUAL RACE, STATED HONESTLY (corrected by review, 2026-07-28). The re-read
+   * below narrows the window in which this could unlink a pointer another session just
+   * repointed at a live run of its own; it does not close it — there is no
+   * unlink-if-target-matches syscall. **There is no backstop for the remainder.** An
+   * earlier version of this comment (and of C34) said "the next append repoints the link
+   * regardless", which is FALSE precisely when the racing append was the run's LAST one —
+   * the `completed` of the final call, i.e. the ordinary way a run ends. Then `latest`
+   * stays absent until some later run starts, and `modelguild watch` says "no runs yet"
+   * about a run that finished fine. Sub-microsecond window and no evidence at risk, but
+   * a real outcome, and not one to paper over with a backstop that does not exist.
+   */
   #dropDanglingLatest(): void {
     try {
       const l = path.join(this.#logDir(), "latest");
-      if (!isSymlink(l)) return;
-      if (!existsSync(l)) unlinkSync(l); // existsSync FOLLOWS the link ⇒ false when dangling
+      const target = readlinkSafe(l);
+      if (target === undefined) return; // not a symlink ⇒ not ours to remove
+      if (existsSync(l)) return; // existsSync FOLLOWS the link ⇒ target present
+      if (readlinkSafe(l) !== target) return; // repointed under us ⇒ not the link we judged
+      unlinkSync(l);
     } catch {
       /* best-effort */
     }
@@ -1438,6 +1516,17 @@ function randHex(): string {
 
 function nullIfEmpty(s: string | undefined): JsonValue {
   return s === undefined || s === "" ? null : s;
+}
+
+/** The symlink target at `p`, or undefined when `p` is not a symlink (or unreadable).
+ * One call instead of `isSymlink` + `readlinkSync`, so the two cannot disagree about a
+ * path that changed between them. */
+function readlinkSafe(p: string): string | undefined {
+  try {
+    return readlinkSync(p);
+  } catch {
+    return undefined;
+  }
 }
 
 function isSymlink(p: string): boolean {
