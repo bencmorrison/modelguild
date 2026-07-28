@@ -49,9 +49,12 @@ import {
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
+  approvalFor,
+  APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
 import { type ActivityEvent, type ActivitySummary } from "./activity.js";
+import { type ApprovalSummary, type ElicitationRequester } from "./approve.js";
 import {
   readLayeredConfContents,
   resolvePanelModels,
@@ -112,6 +115,12 @@ export interface PanelDeps {
    * MCP progress channel has a single token for the whole call, so the per-line model label
    * is the only thing distinguishing members there. */
   onActivity?: (e: ActivityEvent) => void;
+  /**
+   * The MCP elicitation channel (issue #20 slice 4). ONE arming decision covers the whole
+   * panel (every member runs the same guild-read agent), and each member gets its own bridge
+   * so its requests and decisions stay attributable to that member.
+   */
+  elicitation?: ElicitationRequester;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -119,6 +128,8 @@ export type PanelMemberErrorKind =
   | "model-id"
   | "policy-deny"
   | "policy-ask"
+  /** Only reachable under the opt-in `GUILD_APPROVE_EGRESS=ask` (issue #20 slice 4). */
+  | "approval-not-applied"
   | "call-failed"
   | "agent-mismatch";
 
@@ -148,6 +159,9 @@ export interface PanelMemberResult {
    * one merged blob would lose which model did what. Absent when the layer is off or the
    * member was refused before it ran. */
   activity?: ActivitySummary;
+  /** PER MEMBER, like `activity`: present only when the approval bridge was armed (issue
+   * #20 slice 4) — which on this read path needs `GUILD_APPROVE_EGRESS=ask`. */
+  approval?: ApprovalSummary;
 }
 
 export interface PanelOk {
@@ -171,7 +185,12 @@ export interface PanelFail {
    */
   error:
     | { kind: "agent-def-missing"; message: string; exitAnalogue: number }
-    | { kind: "no-models"; message: string; exitAnalogue: number };
+    | { kind: "no-models"; message: string; exitAnalogue: number }
+    // Panel-wide, like the def check: every member runs the same agent, so a bad approval
+    // knob or a missing answering channel refuses the WHOLE panel up front — before any log
+    // write, and before a single member is dispatched.
+    | { kind: "approval-config"; message: string; exitAnalogue: null }
+    | { kind: "approval-channel-missing"; message: string; exitAnalogue: null };
   warnings: string[];
   rootConflict?: string;
 }
@@ -241,6 +260,31 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
+
+  // 4b. APPROVAL BRIDGE pre-flight for the WHOLE panel (issue #20 slice 4), before `newRun`
+  //     so a refusal writes nothing. One check: every member uses the same guild-read agent,
+  //     so what is gated and whether anyone can answer is identical for all of them.
+  const armed = approvalFor({
+    agent: PANEL_AGENT,
+    env,
+    confContents,
+    agentDefDirs,
+    log,
+    ...(deps.elicitation !== undefined ? { elicitation: deps.elicitation } : {}),
+  });
+  if (!armed.ok) {
+    return {
+      ok: false,
+      warnings: panelRes.warnings,
+      rootConflict,
+      error: {
+        kind: armed.refusal.kind,
+        message: armed.refusal.message,
+        exitAnalogue: APPROVAL_EXIT_ANALOGUE,
+      },
+    };
+  }
+
   const runId = params.runId && params.runId.length > 0 ? params.runId : log.newRun(PANEL_COMMAND);
   const confirmed = params.confirmed === true;
   const keepSessions = params.keepSessions === true;
@@ -281,7 +325,13 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           confirmed: gate.confirmed,
           keepSession: keepSessions,
         },
-        { serve: deps.serve, log, messageTimeoutMs, activity },
+        {
+          serve: deps.serve,
+          log,
+          messageTimeoutMs,
+          activity,
+          ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
+        },
       );
       if (outcome.ok) {
         const member: PanelMemberResult = {
@@ -292,6 +342,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         // Return the id ONLY when kept — a deleted session's id is a dangling reference.
         if (keepSessions) member.sessionId = outcome.sessionId;
         if (outcome.activity !== undefined) member.activity = outcome.activity;
+        if (outcome.approval !== undefined) member.approval = outcome.approval;
         return member;
       }
       // A FAILED member (call-failed OR agent-mismatch) carries NO sessionId even under
@@ -300,7 +351,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       // round-2 continuation at a dead/wrong session. The absent sessionId is exactly what
       // makes the round-2 consult loop skip this member.
       const message =
-        outcome.kind === "agent-mismatch"
+        outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
           ? outcome.reason
           : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
@@ -313,6 +364,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         },
       };
       if (outcome.activity !== undefined) failed.activity = outcome.activity;
+      if (outcome.approval !== undefined) failed.approval = outcome.approval;
       return failed;
     }),
   );

@@ -15,6 +15,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ElicitResultSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { OpencodeLifecycle, type ServeHandle } from "./lifecycle.js";
@@ -28,6 +29,9 @@ import { enforceRetentionOnStart } from "./log.js";
 // The progress channel lives in its own module so it can be tested: importing THIS file
 // constructs the MCP server and connects the stdio transport at module top level.
 import { withProgress, type ProgressCapableExtra } from "./progress.js";
+// The approval bridge's elicitation channel (issue #20 slice 4). Only the raw-request
+// closure lives here so `src/approve.ts` stays free of the MCP SDK and unit-testable.
+import { makeElicitationRequester, type ElicitationRequester } from "./approve.js";
 
 const STATUS_TOOL = "guild_status";
 const CONSULT_TOOL = "guild_consult";
@@ -313,7 +317,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "diff`, which misses files the model created). Uncommitted work is snapshotted first " +
         "and recoverable via capture.recoveryHint. Subject to the model policy (deny/ask/" +
         "allow) like guild_consult. If the hardened guild-build agent def is missing this " +
-        "tool REFUSES (no fallback to the unrestricted editor) rather than silently degrading.",
+        "tool REFUSES (no fallback to the unrestricted editor) rather than silently degrading. " +
+        "OPTIONAL APPROVAL BRIDGE (off unless the USER set GUILD_APPROVE): when armed, the " +
+        "model's edit/write/patch (and, at 'all', bash) calls are put to the user for approval " +
+        "before opencode runs them, and the result carries structuredContent.approval. You " +
+        "CANNOT approve anything — there is no such argument and the decision is the user's. " +
+        "It is not containment: an approved bash call is an approved shell, so the diff review " +
+        "is still the review point. An 'approval-channel-missing' refusal means the user must " +
+        "start `npx modelguild watch --approve` or unset the knob — relay that, do not retry.",
       inputSchema: {
         type: "object",
         properties: {
@@ -350,8 +361,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
+/**
+ * The approval bridge's elicitation channel (issue #20 slice 4) — a RAW
+ * `elicitation/create`, deliberately not `server.elicitInput()`.
+ *
+ * PROBED, not assumed (P4, re-read in the installed `@modelcontextprotocol/sdk` for this
+ * slice): `elicitInput()` gates on `_clientCapabilities.elicitation.form`, which Claude
+ * Code's bare `"elicitation": {}` does NOT carry, so the helper throws before sending
+ * anything. `server.request()` asserts only that the capability EXISTS, which the bare
+ * object satisfies — so the raw request is the only form that reaches the very client this
+ * channel is meant to reach.
+ *
+ * TWO BOUNDS, both carried into the mapping in `makeElicitationRequester`:
+ *   - a HEADLESS run (`claude -p`) auto-answers `{"action":"cancel"}`, and cancel maps to
+ *     REJECT — so this channel cannot approve anything unattended, by design. The
+ *     `modelguild watch --approve` terminal is the channel that works there;
+ *   - whether the interactive TUI actually RENDERS the prompt is still human-unverified.
+ *     That is why arming never depends on this channel alone being *good*, only on some
+ *     channel being *present*, and why an unanswered request still fails closed on the
+ *     bridge's own timeout.
+ *
+ * Capabilities are read per call rather than cached: they are only populated after
+ * `initialize`, and a tool call cannot happen before that.
+ */
+function elicitationChannel(): ElicitationRequester {
+  return makeElicitationRequester({
+    capabilities: server.getClientCapabilities() as { elicitation?: unknown } | undefined,
+    send: async (params, timeoutMs) => {
+      const res = await server.request(
+        { method: "elicitation/create", params },
+        ElicitResultSchema,
+        // Bound it with the SAME deadline the bridge uses, so a client that never answers
+        // cannot outlive the fail-closed reject the bridge is already scheduling.
+        { timeout: timeoutMs },
+      );
+      return res as { action?: unknown; content?: unknown };
+    },
+  });
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
+  // Built per call; `available` is false unless the client advertised `elicitation`, and the
+  // approval pre-flight treats an unavailable channel as absent.
+  const elicitation = elicitationChannel();
   // The progress channel is per CALL: `extra` carries this request's `_meta.progressToken`
   // (when the client sent one) and the transport-correct `sendNotification`.
   const progressExtra = extra as unknown as ProgressCapableExtra;
@@ -390,7 +443,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           keepSession: a.keepSession === true,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity },
+        { serve: lifecycle, onActivity, elicitation },
       ),
     );
     return consultToToolResult(result);
@@ -431,7 +484,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           keepSessions: a.keepSessions === true,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity },
+        { serve: lifecycle, onActivity, elicitation },
       ),
     );
     return panelToToolResult(result);
@@ -459,7 +512,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           confirmed: a.confirmed === true,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity },
+        { serve: lifecycle, onActivity, elicitation },
       ),
     );
     return researchToToolResult(result);
@@ -487,7 +540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           confirmed: a.confirmed === true,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity },
+        { serve: lifecycle, onActivity, elicitation },
       ),
     );
     return delegateToToolResult(result);

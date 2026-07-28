@@ -66,6 +66,26 @@ export interface FakeOpencodeOpts {
   /** Accept `GET /event` and NEVER answer — a black hole. Drives the "attach must not hang
    * the call" guarantee: without a bounded wait this wedges the whole turn. */
   hangEvents?: boolean;
+  /**
+   * APPROVAL BRIDGE (issue #20 slice 4). When set, a turn does NOT answer immediately:
+   * before the sync response the fake emits a `permission.asked` event for this tool and
+   * BLOCKS — exactly as `opencode serve` does under an `ask` rule (probe P3: it waits
+   * indefinitely for an HTTP reply, it does NOT auto-reject) — until a reply lands on one
+   * of the two reply endpoints, or `gateTimeoutMs` elapses. That makes "the tool part
+   * really is gated on the reply" a property the offline suite can assert, rather than a
+   * behaviour we assume of the real server.
+   */
+  gateTool?: string;
+  /** Metadata carried on the gated `permission.asked` (e.g. `{command: "rm -rf /"}`), so a
+   * test can assert what the developer would actually have been shown. */
+  gateMetadata?: Record<string, unknown>;
+  /** Give up waiting for a reply after this long, so a wedged test cannot hang forever.
+   * Default 5000ms. The PRODUCT has no such fallback — that is the point of P3. */
+  gateTimeoutMs?: number;
+  /** Reject session-create when a `permission` ruleset is present, and echo NOTHING back —
+   * models an opencode build that silently ignores the field, which must be caught rather
+   * than run ungated. */
+  ignoreSessionPermission?: boolean;
 }
 
 export interface FakeOpencode {
@@ -87,6 +107,21 @@ export interface FakeOpencode {
   dropEventClients(): void;
   /** How many `GET /event` clients are attached right now. */
   attachedEventClients(): number;
+  /** Every permission reply the fake received, in arrival order — the assertion surface for
+   * "who answered, how, and with what message". */
+  permissionReplies(): Array<{
+    permissionId: string;
+    via: "session" | "global";
+    response: string;
+    message?: string;
+    sessionId?: string;
+  }>;
+  /** The permission ids currently awaiting a reply (a gated tool is blocking on each). */
+  pendingPermissions(): string[];
+  /** For each gated turn, the reply the blocked tool actually observed — `"once"`,
+   * `"reject"`, or the sentinel `"(never answered)"`. This is what proves the gate BLOCKED,
+   * not merely that a reply was sent somewhere. */
+  gateOutcomes(): string[];
   close(): Promise<void>;
 }
 
@@ -111,7 +146,25 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   };
 
   let createCount = 0;
+  let permCount = 0;
   const eventClients = new Set<import("node:http").ServerResponse>();
+  /** Permission requests awaiting a reply, keyed by id → the resolver that unblocks the
+   * gated tool. This is the fake's whole model of probe P3: an `ask` blocks the turn. */
+  const pendingPerms = new Map<string, (reply: string) => void>();
+  const replies: Array<{
+    permissionId: string;
+    via: "session" | "global";
+    response: string;
+    message?: string;
+    sessionId?: string;
+  }> = [];
+  /** permission id → the session its request belongs to (the global reply endpoint carries
+   * no session, but the `permission.replied` event does). */
+  const permSessions = new Map<string, string>();
+  /** Stored per-session rulesets, so `GET /session/{id}` can echo them like the real one. */
+  const sessionPermissions = new Map<string, unknown>();
+  /** What each gated turn's blocked tool ultimately observed. */
+  const gateOutcomes: string[] = [];
   const emit = (event: unknown): void => {
     const frame = `data: ${JSON.stringify(event)}\n\n`;
     for (const res of eventClients) {
@@ -159,10 +212,84 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
 
       // POST /session
       if (method === "POST" && url === "/session") {
-        recorded.createBodies.push(JSON.parse((await readBody(req)) || "{}"));
+        const createBody = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        recorded.createBodies.push(createBody);
         createCount += 1;
         const id = opts.distinctSessions ? `${sessionId}-${createCount}` : sessionId;
-        send(200, { id, title: "fake", time: { created: Date.now() } });
+        const created: Record<string, unknown> = { id, title: "fake", time: { created: Date.now() } };
+        // Real opencode 1.18.7 ECHOES the stored ruleset back on create (verified against a
+        // live serve). That echo is the only proof the ruleset took, so the fake reproduces
+        // it — and `ignoreSessionPermission` reproduces a build that does NOT.
+        if (createBody.permission !== undefined && !opts.ignoreSessionPermission) {
+          created.permission = createBody.permission;
+          sessionPermissions.set(id, createBody.permission);
+        }
+        send(200, created);
+        return;
+      }
+
+      // GET /session/{id} — the session record, including its stored ruleset.
+      const getSessionMatch = url.match(/^\/session\/([^/]+)$/);
+      if (method === "GET" && getSessionMatch) {
+        const id = getSessionMatch[1];
+        const rec: Record<string, unknown> = { id, title: "fake" };
+        const perm = sessionPermissions.get(id);
+        if (perm !== undefined) rec.permission = perm;
+        send(200, rec);
+        return;
+      }
+
+      // POST /session/{id}/permissions/{permId}  — the session-scoped reply (approve path).
+      const sessPermMatch = url.match(/^\/session\/([^/]+)\/permissions\/([^/]+)$/);
+      if (method === "POST" && sessPermMatch) {
+        const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        const permId = sessPermMatch[2];
+        const resolve = pendingPerms.get(permId);
+        if (resolve === undefined) {
+          // Verified against opencode 1.18.7: an unknown/already-settled id is a 404. That is
+          // what makes "first reply wins, opencode is the arbiter" observable.
+          send(404, { error: `no pending permission ${permId}` });
+          return;
+        }
+        const response = String(body.response ?? "");
+        replies.push({ permissionId: permId, via: "session", response, sessionId: sessPermMatch[1] });
+        pendingPerms.delete(permId);
+        resolve(response);
+        emit({
+          type: "permission.replied",
+          properties: { sessionID: sessPermMatch[1], requestID: permId, reply: response },
+        });
+        send(200, {});
+        return;
+      }
+
+      // POST /permission/{id}/reply — the global reply, the only one carrying a MESSAGE
+      // (which reaches the model verbatim; the bridge uses it for rejects).
+      const globalPermMatch = url.match(/^\/permission\/([^/]+)\/reply$/);
+      if (method === "POST" && globalPermMatch) {
+        const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        const permId = globalPermMatch[1];
+        const resolve = pendingPerms.get(permId);
+        if (resolve === undefined) {
+          send(404, { error: `no pending permission ${permId}` });
+          return;
+        }
+        const response = String(body.reply ?? "");
+        const entry: {
+          permissionId: string;
+          via: "session" | "global";
+          response: string;
+          message?: string;
+        } = { permissionId: permId, via: "global", response };
+        if (typeof body.message === "string") entry.message = body.message;
+        replies.push(entry);
+        pendingPerms.delete(permId);
+        resolve(response);
+        emit({
+          type: "permission.replied",
+          properties: { sessionID: permSessions.get(permId) ?? "", requestID: permId, reply: response },
+        });
+        send(200, {});
         return;
       }
 
@@ -180,6 +307,36 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         for (const ev of script) {
           emit(ev);
           if (opts.eventDelayMs) await new Promise((r) => setTimeout(r, opts.eventDelayMs));
+        }
+        // GATED TOOL (issue #20 slice 4): emit `permission.asked` and BLOCK the turn until
+        // somebody replies — the behaviour probe P3 found in `opencode serve`. Without this,
+        // an offline test could only assert that a reply was POSTed, never that the tool
+        // actually waited for it.
+        if (opts.gateTool) {
+          const turnSession = msgMatch[1];
+          permCount += 1;
+          const permId = `per_fake${permCount}`;
+          permSessions.set(permId, turnSession);
+          const waited = new Promise<string>((resolve) => {
+            pendingPerms.set(permId, resolve);
+            const t = setTimeout(() => {
+              if (pendingPerms.delete(permId)) resolve("(never answered)");
+            }, opts.gateTimeoutMs ?? 5_000);
+            if (typeof t.unref === "function") t.unref();
+          });
+          emit({
+            type: "permission.asked",
+            properties: {
+              id: permId,
+              sessionID: turnSession,
+              permission: opts.gateTool,
+              patterns: ["*"],
+              metadata: opts.gateMetadata ?? {},
+              always: [],
+              tool: { messageID: "msg_asst", callID: "call_gated" },
+            },
+          });
+          gateOutcomes.push(await waited);
         }
         // Yield once so the client's stream reader drains before the POST resolves.
         await new Promise((r) => setTimeout(r, 10));
@@ -309,6 +466,9 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
           eventClients.clear();
         },
         attachedEventClients: () => eventClients.size,
+        permissionReplies: () => [...replies],
+        pendingPermissions: () => [...pendingPerms.keys()],
+        gateOutcomes: () => [...gateOutcomes],
         close: () =>
           new Promise<void>((r) => {
             // An attached SSE response keeps the server alive; end them first.

@@ -116,3 +116,59 @@
 #                                 # trade-off as GUILD_LOG_PROMPTS=full: reach for it when
 #                                 # you are debugging what a model did, not as a standing
 #                                 # default on sensitive work.
+
+# --- Approval bridge (src/approve.ts) -------------------------------------------
+# OPT-IN, OFF BY DEFAULT. Watching is not gating: the activity stream above shows you what
+# the model DID. This makes it ask BEFORE it acts, by moving the chosen tools to `ask` for
+# that one session (the hardened agent defs are never modified) and routing each request to
+# you. It is what issue #20 called the write-path approval bridge.
+#
+# THE HONEST BOUND, because it decides whether this is worth turning on: APPROVING `bash`
+# APPROVES A SHELL. The prompt shows you a command string; that command can read any file
+# (including your credentials), reach the network, and start processes that raise no further
+# prompts. This buys ATTENTION and an INTERRUPT — it is NOT containment, and the delegate
+# diff review remains the review point. Anyone reading an approval prompt as a guarantee has
+# been misled.
+#
+# YOU MUST BE ABLE TO ANSWER, OR THE CALL IS REFUSED UP FRONT. Run `npx modelguild watch
+# --approve` in another terminal (same project, logging on) before the call, or use an MCP
+# client that can prompt you itself. With neither, the tool refuses instead of arming —
+# because under `opencode serve` an unanswered permission request does NOT fail closed, it
+# HANGS the turn until the model-turn timeout. A refusal naming the fix beats a 15-minute
+# silence. A headless run (`claude -p`) auto-cancels its own prompt within milliseconds; that
+# cancel DEFERS to a live watch terminal when there is one (so it cannot pre-empt your
+# window) and REJECTS when it is the only channel. Either way a cancel is never consent.
+#
+# WHAT GETS GATED IS THE INTERSECTION with the agent def's own allow-set, read from the def
+# in force at call time. So hardening a def further (denying `bash` in your own
+# guild-build.md, say) also shrinks what the bridge will ever ask you about — it can never
+# put a tool your def denies in front of you as an approvable one. If the def cannot be
+# parsed, the call is refused rather than run ungated.
+# GUILD_APPROVE=write            # off (default) | write | all
+#                                 # write = gate edit/write/patch on /guild:delegate.
+#                                 # all   = also gate bash (see the honest bound above).
+#                                 # A typo here is an ERROR that refuses the call, NOT a
+#                                 # silent fall to `off` — believing your edits are gated
+#                                 # when they are not is the worst failure this can have.
+# GUILD_APPROVE_TIMEOUT_MS=120000 # Unanswered ⇒ REJECT (fail-closed). Default 120000 (2 min).
+#                                 # The model is told why, verbatim, and continues — a
+#                                 # rejection is a denied tool call, not an aborted turn. Two
+#                                 # costs: a rejected mid-sequence edit can leave a PARTIAL
+#                                 # change set (still captured, still recoverable via
+#                                 # capture.recoveryHint), and the wait is spent inside the
+#                                 # SAME GUILD_MESSAGE_TIMEOUT_MS budget as the model turn.
+# GUILD_APPROVE_EGRESS=ask        # off (default) | ask. SEPARATE knob, also opt-in: put
+#                                 # webfetch/websearch behind the same prompt on the READ
+#                                 # paths (guild-read/guild-research), i.e. /guild:consult,
+#                                 # /guild:panel, /guild:research and friends.
+#                                 # PROVENANCE, because this one is an asymmetry: the read
+#                                 # paths are deliberately NOT fenced (the 2026-07-22
+#                                 # realignment removed the secret-glob and grep/glob denials
+#                                 # as vendor bias). The one ratified harness difference that
+#                                 # survives is that a read on those paths EGRESSES to a
+#                                 # third-party model provider, whereas a Claude subagent's
+#                                 # read stays inside Anthropic. This knob is the single
+#                                 # place that difference buys something — and it buys an
+#                                 # OFFERED, OPT-IN gate, never a fence. Nothing is removed
+#                                 # from the read paths, and the default is off.
+#                                 # Maintainer decision, 2026-07-28 (design open question 8).

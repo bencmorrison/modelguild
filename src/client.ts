@@ -141,6 +141,79 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
   return res.json();
 }
 
+// --- session permission ruleset (issue #20 slice 4) ------------------------
+/**
+ * One `PermissionRule` for `POST /session`'s `permission` field — verified against opencode
+ * 1.18.7's `/doc` (`{permission, pattern, action}`; the ruleset is `PermissionRule[]`).
+ *
+ * Typed with `action: "ask"` ONLY, at the transport, on purpose. The session ruleset MERGES
+ * over the agent def's resolved array (probe P2) and can override in BOTH directions, so an
+ * `allow` line here would re-open a tool a hardened def denies — probe P2 proved exactly
+ * that by handing a working shell to `guild-read` with one rule. The type makes the illegal
+ * value unrepresentable in TypeScript and `assertAskOnlyRuleset` makes it unrepresentable at
+ * runtime, for a caller who casts.
+ */
+export interface SessionPermissionRuleWire {
+  permission: string;
+  pattern: string;
+  action: "ask";
+}
+
+/** Thrown when a caller tries to send anything but `ask` rules. */
+export class SessionPermissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionPermissionError";
+  }
+}
+
+/**
+ * THE WIRE BOUNDARY for BOTH approval invariants. `src/approve.ts` asserts them at
+ * construction; this asserts them again at the only place a ruleset can actually leave the
+ * process, so no future caller can route around that module.
+ *
+ *   1. **Only `ask`.** A session ruleset merges over the agent def (last-match-wins), so an
+ *      `allow` here could re-open a tool the def denies.
+ *   2. **Only tools the agent already allows** (review finding M4 — the wire used to check
+ *      invariant 1 alone, and happily accepted `{bash,*,ask}` for `guild-read`). An `ask` on
+ *      a DENIED tool converts it into an approvable one, which is a widening too. The
+ *      allow-set is passed in by the caller (the bridge reads it from the def in force);
+ *      when it is omitted the check cannot run, so the ruleset must be empty.
+ */
+export function assertAskOnlyRuleset(
+  rules: readonly { action: string; permission: string }[],
+  allowedTools?: readonly string[],
+): void {
+  for (const r of rules) {
+    if (r.action !== "ask") {
+      throw new SessionPermissionError(
+        `refusing to POST a session permission rule with action '${r.action}' for ` +
+          `'${r.permission}'. A session ruleset MERGES over the agent def (last-match-wins), ` +
+          `so anything but 'ask' could WIDEN a hardened agent. Only the approval bridge may ` +
+          `send rules, and only 'ask' ones.`,
+      );
+    }
+  }
+  if (rules.length === 0) return;
+  if (allowedTools === undefined) {
+    throw new SessionPermissionError(
+      "refusing to POST a session permission ruleset with no agent allow-set to check it " +
+        "against: an 'ask' on a tool the agent def DENIES would convert a denied tool into " +
+        "an approvable one. Pass `allowedTools` (the def's own allow-set) with any ruleset.",
+    );
+  }
+  const allowed = new Set(allowedTools);
+  for (const r of rules) {
+    if (!allowed.has(r.permission)) {
+      throw new SessionPermissionError(
+        `refusing to POST an 'ask' rule for '${r.permission}': the agent def does NOT allow ` +
+          `that tool, and gating a denied tool would make it approvable — a widening wearing ` +
+          `a safety feature's clothes. Allowed here: ${[...allowed].join(", ") || "(nothing)"}.`,
+      );
+    }
+  }
+}
+
 // --- createSession --------------------------------------------------------
 export interface CreateSessionOpts {
   baseUrl: string;
@@ -149,13 +222,24 @@ export interface CreateSessionOpts {
   /** Optional `"provider/model"`. When given it is encoded as the session-create
    * shape `{id, providerID}` (distinct from the message-send shape). */
   model?: string;
+  /**
+   * Per-session permission ruleset (the approval bridge's seam — issue #20 slice 4). Sent
+   * verbatim as `permission`; `ask` rules only, asserted before the request is built.
+   */
+  permission?: readonly SessionPermissionRuleWire[];
+  /** The agent def's own allow-set, so the wire can enforce invariant 2 (see
+   * `assertAskOnlyRuleset`). Required whenever `permission` is non-empty. */
+  allowedTools?: readonly string[];
   timeoutMs?: number;
   signal?: AbortSignal;
 }
 
-/** A minimal reference to a created session — its id is all later calls need. */
+/** A minimal reference to a created session. `permission` is the ruleset opencode ECHOED
+ * back on create — the only evidence that the ruleset actually took, which is what lets a
+ * caller refuse rather than run ungated against a build that ignored the field. */
 export interface SessionRef {
   id: string;
+  permission?: unknown;
 }
 
 /** `POST /session` — create a session bound to `agent`. */
@@ -164,12 +248,17 @@ export async function createSession(opts: CreateSessionOpts): Promise<SessionRef
     title?: string;
     agent?: string;
     model?: SessionCreateModel;
+    permission?: readonly SessionPermissionRuleWire[];
   } = {};
   if (opts.title !== undefined) body.title = opts.title;
   if (opts.agent !== undefined) body.agent = opts.agent;
   if (opts.model !== undefined) {
     const { providerID, modelID } = splitModel(opts.model);
     body.model = { id: modelID, providerID }; // session-create shape: {id, providerID}
+  }
+  if (opts.permission !== undefined && opts.permission.length > 0) {
+    assertAskOnlyRuleset(opts.permission, opts.allowedTools);
+    body.permission = opts.permission;
   }
 
   const raw = (await requestJson({
@@ -179,7 +268,7 @@ export async function createSession(opts: CreateSessionOpts): Promise<SessionRef
     timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
     signal: opts.signal,
     body,
-  })) as { id?: unknown };
+  })) as { id?: unknown; permission?: unknown };
 
   if (typeof raw.id !== "string" || raw.id.length === 0) {
     throw new OpencodeHttpError(`session create returned no id: ${JSON.stringify(raw)}`, {
@@ -187,7 +276,31 @@ export async function createSession(opts: CreateSessionOpts): Promise<SessionRef
       path: "/session",
     });
   }
-  return { id: raw.id };
+  const ref: SessionRef = { id: raw.id };
+  if (raw.permission !== undefined) ref.permission = raw.permission;
+  return ref;
+}
+
+export interface FetchSessionOpts {
+  baseUrl: string;
+  sessionId: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** `GET /session/{id}` — the session record, including the `permission` ruleset it was
+ * CREATED with (verified on 1.18.7: create and get both echo it). A per-session ruleset is
+ * fixed at creation, so this is the only honest way to answer "is this continuation gated?". */
+export async function fetchSession(opts: FetchSessionOpts): Promise<{ permission?: unknown }> {
+  const raw = (await requestJson({
+    baseUrl: opts.baseUrl,
+    path: `/session/${opts.sessionId}`,
+    method: "GET",
+    timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
+    sessionId: opts.sessionId,
+    signal: opts.signal,
+  })) as { permission?: unknown };
+  return raw;
 }
 
 // --- sendMessage ----------------------------------------------------------
@@ -460,6 +573,47 @@ export interface ActivityAttachable {
   attach(baseUrl: string, sessionId: string): Promise<() => void>;
 }
 
+/**
+ * The APPROVAL bridge's seam (issue #20 slice 4) — structurally identical to
+ * `ActivityAttachable`, named separately because it means something different: this one is
+ * what ANSWERS a `permission.asked` while the turn blocks. Kept as its own type so a reader
+ * of `askViaAgent` can see that two distinct things attach to the session, and so a caller
+ * cannot pass an activity recorder where an approver is required.
+ *
+ * `src/approve.ts` `ApprovalBridge` satisfies it; a test fake satisfies it too. This module
+ * imports nothing from `approve.ts` — it stays the thin typed transport it was.
+ */
+export interface ApprovalAttachable {
+  attach(baseUrl: string, sessionId: string): Promise<() => void>;
+}
+
+/**
+ * Raised when the approval bridge is armed but the session this turn will run in is NOT
+ * carrying the required `ask` rules — i.e. the gate the caller believes is on is not on.
+ *
+ * Two ways it happens, both fail-closed here rather than running ungated:
+ *   - a CONTINUED session (`sessionId`) created before the bridge was armed. A per-session
+ *     ruleset is fixed at creation; opencode offers no way to add one later, so this turn
+ *     cannot be gated;
+ *   - a session we just created whose echoed `permission` does not carry our rules — an
+ *     opencode build that ignored the field. That is precisely the case a "silently ungated"
+ *     run would be worst, so it is checked rather than assumed.
+ */
+export class SessionPermissionMismatchError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly continued: boolean,
+    detail: string,
+  ) {
+    super(
+      `the approval bridge is armed but session '${sessionId}' is not carrying the required ` +
+        `'ask' rules — ${detail}. Refusing to run the turn UNGATED while the caller believes ` +
+        `it is gated.`,
+    );
+    this.name = "SessionPermissionMismatchError";
+  }
+}
+
 export interface AskViaAgentOpts {
   agent: string;
   /** `"provider/model"`; omit to let opencode use its own default. */
@@ -502,6 +656,28 @@ export interface AskViaAgentOpts {
    * swallowed, and the turn proceeds unwatched rather than failing.
    */
   activity?: ActivityAttachable;
+  /**
+   * APPROVAL BRIDGE (issue #20 slice 4). `permission` is the per-session `ask` ruleset sent
+   * at session creation; `approval` is the thing that answers the resulting requests.
+   *
+   * UNLIKE `activity`, THIS IS NOT FAILURE-TOLERANT, and the difference is deliberate: a
+   * visibility failure costs you a trace, but an approval failure would run a gated turn
+   * UNGATED. So when `permission` is set, the ruleset is VERIFIED to be on the session
+   * (echoed on create, or read back on a continuation) and a mismatch throws
+   * `SessionPermissionMismatchError` BEFORE the turn is sent.
+   */
+  permission?: readonly SessionPermissionRuleWire[];
+  /** The agent def's allow-set — forwarded to `createSession` for the wire-boundary check. */
+  allowedTools?: readonly string[];
+  /**
+   * THE predicate for "is the session this turn will run in genuinely gated?", supplied by
+   * `src/approve.ts`. Injected rather than implemented here for two reasons: this module
+   * keeps importing nothing from the bridge, and there is exactly ONE implementation, so the
+   * one the tests pin is the one that ships (review finding M10 — there used to be two, and
+   * only the unused one was tested).
+   */
+  permissionCheck?: (stored: unknown) => { ok: true } | { ok: false; reason: string };
+  approval?: ApprovalAttachable;
 }
 
 export interface AskResult {
@@ -536,34 +712,96 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
   // Ownership: did WE create this session, or are we continuing the caller's?
   const continued = opts.sessionId !== undefined;
 
+  const gated = opts.permission !== undefined && opts.permission.length > 0;
+  if (gated) assertAskOnlyRuleset(opts.permission!, opts.allowedTools);
+
   return serve.withServe(async (h) => {
-    // Continue an existing session (no create) or mint a fresh one.
+    // Continue an existing session (no create) or mint a fresh one. The approval ruleset can
+    // ONLY be applied at creation (opencode stores it on the session), so a continuation
+    // carries whatever it was created with — verified below rather than assumed.
+    let createdPermission: unknown;
     const sessionId =
       opts.sessionId ??
-      (
-        await createSession({
+      (await (async () => {
+        const created = await createSession({
           baseUrl: h.baseUrl,
           agent: opts.agent,
           title: opts.title,
           model: opts.model,
+          ...(gated
+            ? { permission: opts.permission, allowedTools: opts.allowedTools }
+            : {}),
           timeoutMs: shortMs,
           signal: opts.signal,
-        })
-      ).id;
+        });
+        createdPermission = created.permission;
+        return created;
+      })()).id;
 
-    // Attach the activity stream BEFORE the turn (issue #20). A failure here is swallowed:
-    // the call runs unwatched rather than failing over a visibility feature.
+    // EVERYTHING from here is inside the try, so the teardown `finally` runs on EVERY path.
+    // That matters more since slice 4: the gate verification and the approval attach can both
+    // THROW (unlike the activity attach, which is swallowed), and outside the try a throw
+    // would have left the session we just created undeleted — a durable on-disk orphan
+    // produced by the very feature meant to make the run safer to watch.
     let detachActivity: (() => void) | undefined;
-    if (opts.activity !== undefined) {
-      try {
-        detachActivity = await opts.activity.attach(h.baseUrl, sessionId);
-      } catch {
-        /* never fail the call over activity */
-      }
-    }
-
+    let detachApproval: (() => void) | undefined;
     let succeeded = false;
     try {
+      // GATE VERIFICATION, before anything is sent. Fail closed: running ungated while the
+      // caller believes the turn is gated is the one outcome this feature must never produce.
+      if (gated) {
+        const stored = continued
+          ? (
+              await fetchSession({
+                baseUrl: h.baseUrl,
+                sessionId,
+                timeoutMs: shortMs,
+                signal: opts.signal,
+              })
+            ).permission
+          : createdPermission;
+        // ONE predicate, injected (see `permissionCheck`). It checks both that the required
+        // `ask` rules are present AND that the stored ruleset carries nothing that WIDENS
+        // the agent — a subset check alone passed a session that also held `{bash,*,allow}`
+        // (review finding M7, probed).
+        const verdict = opts.permissionCheck?.(stored) ?? {
+          ok: false as const,
+          reason:
+            "no permission check was supplied with the ruleset, so the gate cannot be verified",
+        };
+        if (!verdict.ok) {
+          throw new SessionPermissionMismatchError(
+            sessionId,
+            continued,
+            continued
+              ? `${verdict.reason}. A session's permission ruleset is fixed when the session ` +
+                "is CREATED: this one was created before the bridge was armed, or by " +
+                "something else. Start a fresh session — drop sessionId — or turn the " +
+                "approval knob off"
+              : `${verdict.reason} — opencode did not store the ruleset as sent, so the gate ` +
+                "did not take (a build that ignores the `permission` field would leave the " +
+                "turn silently ungated)",
+          );
+        }
+      }
+
+      // Attach the activity stream BEFORE the turn (issue #20). A failure here is swallowed:
+      // the call runs unwatched rather than failing over a visibility feature.
+      if (opts.activity !== undefined) {
+        try {
+          detachActivity = await opts.activity.attach(h.baseUrl, sessionId);
+        } catch {
+          /* never fail the call over activity */
+        }
+      }
+      // Attach the APPROVER before the turn too — a `permission.asked` can land on the model's
+      // first tool call, and a bridge that attached late would miss it and let it hang. NOT
+      // swallowed: a blind approver would never answer, and an unanswered request hangs the
+      // turn rather than failing closed (probe P3).
+      if (opts.approval !== undefined) {
+        detachApproval = await opts.approval.attach(h.baseUrl, sessionId);
+      }
+
       const metadata = await sendMessage({
         baseUrl: h.baseUrl,
         sessionId,
@@ -601,7 +839,14 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       succeeded = true;
       return result;
     } finally {
-      // Detach the activity stream first — it is scoped to the turn, and unsubscribing
+      // Detach the APPROVER first: closing it rejects any request still open, so the model
+      // is never left waiting on a prompt whose listener has gone away.
+      try {
+        detachApproval?.();
+      } catch {
+        /* best-effort */
+      }
+      // Then the activity stream — it is scoped to the turn, and unsubscribing
       // before the session delete keeps the bus refcount tidy on every path.
       try {
         detachActivity?.();

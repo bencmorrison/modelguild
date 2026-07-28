@@ -113,6 +113,20 @@ export interface ActivityEvent {
   /** The MODELGUILD call id (recorder context). Distinct from `toolCallId`, which is
    * opencode's per-tool-invocation id. */
   callId?: string;
+  /**
+   * opencode's permission-request id (`per_…`) on `permission-asked`/`permission-replied`.
+   *
+   * PULLED OUT OF `detail` DELIBERATELY (issue #20 slice 4): it is the ONLY handle by which
+   * a request can be answered, so the approval bridge must not have to fish it out of an
+   * untyped raw payload — and a normalizer that surfaces it is unit-testable against the
+   * probed event shape. The `activity.jsonl` LINE shape is unchanged: the recorder writes an
+   * explicit field list, so this rides in memory only.
+   */
+  permissionId?: string;
+  /** The tool the permission request is about, when opencode named it. */
+  permissionTool?: string;
+  /** `once` | `always` | `reject` on `permission-replied`. */
+  permissionReply?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,17 +323,40 @@ export function normalizeServeEvent(raw: unknown): ActivityEvent | undefined {
 
     case "permission.asked":
     case "permission.v2.asked": {
+      // Probed shape (1.18.7 `/doc`): `{id ^per, sessionID, permission, patterns[],
+      // metadata, always[], tool?{messageID, callID}}`; the v2 event uses `action`/
+      // `resources` instead. `permission` is the TOOL name (`bash`, `edit`, …).
       const what =
         str(props.permission) ??
         str(asRecord(props.metadata).title) ??
         str(props.action) ??
         "permission";
-      return { ts, sessionId, kind: "permission-asked", summary: `permission asked: ${oneLine(what)}` };
+      const e: ActivityEvent = {
+        ts,
+        sessionId,
+        kind: "permission-asked",
+        summary: `permission asked: ${oneLine(what)}`,
+      };
+      const id = str(props.id);
+      if (id !== undefined) e.permissionId = id;
+      const tool = str(props.permission) ?? str(props.action);
+      if (tool !== undefined) e.permissionTool = tool;
+      return e;
     }
     case "permission.replied":
     case "permission.v2.replied": {
       const reply = str(props.reply) ?? str(props.response) ?? "?";
-      return { ts, sessionId, kind: "permission-replied", summary: `permission ${reply}` };
+      const e: ActivityEvent = {
+        ts,
+        sessionId,
+        kind: "permission-replied",
+        summary: `permission ${reply}`,
+        permissionReply: reply,
+      };
+      // Probed: the REPLIED event names the request as `requestID`, not `id`.
+      const id = str(props.requestID) ?? str(props.id);
+      if (id !== undefined) e.permissionId = id;
+      return e;
     }
 
     case "session.idle":

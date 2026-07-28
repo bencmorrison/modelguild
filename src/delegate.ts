@@ -45,9 +45,12 @@ import {
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
+  approvalFor,
+  APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
 import { type ActivityEvent, type ActivitySummary } from "./activity.js";
+import { type ApprovalSummary, type ElicitationRequester } from "./approve.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -92,6 +95,11 @@ export interface DelegateDeps {
    */
   onActivity?: (e: ActivityEvent) => void;
   /**
+   * The MCP elicitation channel (issue #20 slice 4), supplied by `src/server.ts`. Consulted
+   * only when the approval bridge is armed.
+   */
+  elicitation?: ElicitationRequester;
+  /**
    * The worktree the model edits — the project dir the serve was spawned from. Defaults to
    * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default so the snapshot
    * targets the SAME tree opencode mutates. Injected in tests to point at a disposable repo.
@@ -130,6 +138,12 @@ export type DelegateErrorKind =
   | "model-id"
   | "policy-deny"
   | "policy-ask"
+  // The approval bridge's refusals (issue #20 slice 4). `approval-config` and
+  // `approval-channel-missing` are decided BEFORE any log write and before the worktree
+  // snapshot (nothing ran); `approval-not-applied` needs a serve round-trip.
+  | "approval-config"
+  | "approval-channel-missing"
+  | "approval-not-applied"
   | "call-failed"
   | "agent-mismatch";
 
@@ -165,6 +179,13 @@ export interface DelegateOk {
    * model doing, at opencode's fidelity. `capture.patchPath` is still what you review.
    */
   activity?: ActivitySummary;
+  /**
+   * Present only when the approval bridge was ARMED (issue #20 slice 4): the tools gated,
+   * the channels that could answer, and how each request was settled. Its `note` carries the
+   * honest bound — an approved `bash` is an approved shell, so this is attention, not
+   * containment, and `capture.patchPath` remains the review point.
+   */
+  approval?: ApprovalSummary;
 }
 export interface DelegateFail {
   ok: false;
@@ -175,6 +196,8 @@ export interface DelegateFail {
   rootConflict?: string;
   /** Present when the turn RAN: the action trace up to the failure. */
   activity?: ActivitySummary;
+  /** Present when the bridge was armed and the turn ran — e.g. every gated call timed out. */
+  approval?: ApprovalSummary;
 }
 export type DelegateResult = DelegateOk | DelegateFail;
 
@@ -246,8 +269,35 @@ export async function delegate(
     };
   }
 
-  // --- Past the gate: from here every path writes exactly one started + completed. ---
+  // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
+
+  // 4b. APPROVAL BRIDGE pre-flight (issue #20 slice 4). This is THE path the bridge exists
+  //     for. Refused here — before any log write AND before the worktree snapshot — so a
+  //     refusal leaves nothing behind at all. Arming with no answering channel would
+  //     DEADLOCK the turn rather than fail closed (probe P3), which is why this is a
+  //     refusal and not a warning.
+  const armed = approvalFor({
+    agent: DELEGATE_AGENT,
+    env,
+    confContents,
+    agentDefDirs,
+    log,
+    ...(deps.elicitation !== undefined ? { elicitation: deps.elicitation } : {}),
+  });
+  if (!armed.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: armed.refusal.kind,
+        model: requestedModel,
+        exitAnalogue: APPROVAL_EXIT_ANALOGUE,
+        message: armed.refusal.message,
+      },
+    };
+  }
+
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(DELEGATE_COMMAND);
   const repoDir = resolveRepoDir(deps, env, cwd);
@@ -274,6 +324,7 @@ export async function delegate(
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
+      ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
     },
   );
 
@@ -303,12 +354,13 @@ export async function delegate(
       capture,
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
+    if (outcome.approval !== undefined) ok.approval = outcome.approval;
     return ok;
   }
 
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   const message =
-    outcome.kind === "agent-mismatch"
+    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
       ? outcome.reason
       : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
@@ -325,6 +377,7 @@ export async function delegate(
     capture,
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
+  if (outcome.approval !== undefined) fail.approval = outcome.approval;
   return fail;
 }
 
@@ -469,12 +522,14 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
     };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
     if (r.activity) structured.activity = r.activity;
+    if (r.approval) structured.approval = r.approval;
     return { content: [{ type: "text", text: r.report }], structuredContent: structured };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.capture) structured.capture = r.capture;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.activity) structured.activity = r.activity;
+  if (r.approval) structured.approval = r.approval;
   return {
     content: [{ type: "text", text: r.error.message }],
     structuredContent: structured,

@@ -236,7 +236,7 @@ jobs:
           echo "  lifecycle, orphan, mcp-client — see job comment; run them locally."
           echo
           rc=0
-          for suite in client activity log policy config consult panel research delegate models init doctor; do
+          for suite in client activity approve log policy config consult panel research delegate models init doctor; do
             echo "=== test/${suite}.test.ts ==="
             npx tsx "test/${suite}.test.ts" || rc=1
             echo
