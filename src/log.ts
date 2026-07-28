@@ -960,6 +960,79 @@ export class EvidenceLog {
     }
   }
 
+  /**
+   * Record that a delegate capture produced NO patch artifact at all — the patch-less
+   * `delegate-diff` entry (issue #74, 2026-07-28).
+   *
+   * WHY THIS EXISTS. `diff()` above requires an existing patch file, because its whole job is
+   * to hash one into the integrity contract. But the write path has a case where there IS no
+   * patch to hash: the capture machinery itself threw (`capture-crashed` — an unwritable run
+   * dir, a patch path that is not a writable file, a git plumbing call that blew up mid-diff).
+   * Before this method the delegate `catch` simply returned, so **no `delegate-diff` entry was
+   * written at all** and the run verified CLEAN — a crashed capture was indistinguishable in
+   * the log from a delegation that changed nothing. That is the one failure the evidence layer
+   * exists to prevent, and it is the opposite of the six snapshot incomplete-reasons, which do
+   * reach `diff()` with `complete:false` and fail integrity loudly.
+   *
+   * ENTRY SHAPE — deliberately the SAME field set as `diff()`, so a reader sees one entry
+   * shape, with the artifact fields emptied: `patch: null`, `patch_bytes: 0`,
+   * `files_changed: 0`, `after_tree: ""`, and **no `response_hash`** (null). That last one is
+   * load-bearing in both directions under `verify()`:
+   *   - `capture_complete: false` trips the capture-completeness check ⇒ the run FAILS with
+   *     code 7. That is the POINT: a crashed capture must not verify clean.
+   *   - the referenced-artifact check is gated on a non-empty `response_hash`, so a null hash
+   *     means verify never resolves `patch` and never reports a MISSING artifact. The entry
+   *     fails for the true reason (capture incomplete), not for a patch it never claimed to
+   *     have. A half-written `diff-<call_id>.patch` may still be on disk from the crash; it is
+   *     deliberately NOT referenced (its bytes are not a record of anything) and deliberately
+   *     NOT deleted (deleting evidence during a failure is worse than leaving it).
+   *
+   * `reason` is REQUIRED: a patch-less entry with no reason is uninterpretable. `detail` is the
+   * optional crash text (bounded and sanitized by `boundedDetail` — see the C25 scar it exists
+   * to avoid), included ONLY when it survives as non-empty, the same optional-field pattern as
+   * `scaffold_changed`. Exactly two shapes exist: the field absent, or a non-empty string.
+   */
+  async diffUncaptured(args: {
+    callId: string;
+    base?: string;
+    /** Why there is no patch — the `incompleteReason` the tool result also carries. */
+    reason: string;
+    /** Bounded free text (the crash message). Optional; omitted from the payload when absent. */
+    detail?: string;
+    run?: string;
+    scaffoldChanged?: boolean;
+  }): Promise<WriteResult> {
+    if (!args.reason || args.reason.length === 0) {
+      return fail("diffUncaptured: reason is required (a patch-less entry must say why)");
+    }
+    if (this.#disabled()) return { ok: true };
+    try {
+      const rid = this.#resolveRun(args.run);
+      const rd = this.#ensureRun(rid);
+      const detail = args.detail === undefined ? "" : boundedDetail(args.detail);
+      const payload = {
+        ...this.#base(rid, "delegate-diff", null),
+        call_id: args.callId ?? "",
+        patch: null,
+        base_tree: args.base ?? "",
+        after_tree: "",
+        files_changed: 0,
+        patch_bytes: 0,
+        claim: false,
+        capture_complete: false,
+        incomplete_reason: args.reason,
+        ...(detail === "" ? {} : { incomplete_detail: detail }),
+        ...(args.scaffoldChanged === undefined ? {} : { scaffold_changed: args.scaffoldChanged }),
+        response_hash: null,
+      };
+      const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, false);
+      return { ok: r.ok };
+    } catch (err) {
+      warn("diffUncaptured", err);
+      return { ok: false, error: String(err) };
+    }
+  }
+
   // =========================================================================
   // verify — the integrity contract (C24/C27/C28). Returns a result; never throws
   // for an integrity failure (code 7) — that is data, not an exception.
@@ -1416,6 +1489,36 @@ function containsLoneSurrogate(value: JsonValue): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Bound and SANITIZE a synthesized free-text evidence field (`incomplete_detail`) to at most
+ * `max` CODE POINTS, dropping any unpaired surrogate.
+ *
+ * This is the C25/jq scar pointed at our own writes. A naive `s.slice(0, max)` cuts UTF-16
+ * code UNITS, so a text whose astral character straddles the boundary is truncated INTO a lone
+ * high surrogate. `verify` would then fail the run with "is not clean JSONL" instead of the
+ * capture-completeness failure the entry exists to raise — and worse, `jq` errors the ENTIRE
+ * `calls.jsonl` stream on a lone surrogate, so a field added to protect the receipts would
+ * have damaged the file holding them. Iterating with the spread operator walks code points, so
+ * a surrogate PAIR is never split; the explicit unpaired-surrogate drop covers one that was
+ * already unpaired in the input (a crash message quoting a path with an invalid name).
+ *
+ * SANITIZING IS ONLY LEGITIMATE BECAUSE THIS FIELD IS OURS. `raw_response` / `claimed_response`
+ * are receipts of another party's words and are recorded byte-exact precisely so verify can
+ * catch what they contain (test 2b pins that a lone surrogate in a model reply FAILS). This
+ * field is a diagnostic string this process composes from an Error; nothing is lost by making
+ * it well-formed, and a mangled one would misreport why the run failed.
+ */
+function boundedDetail(s: string, max = 1000): string {
+  const out: string[] = [];
+  for (const cp of s) {
+    if (out.length >= max) break;
+    const c = cp.codePointAt(0) as number;
+    if (c >= 0xd800 && c <= 0xdfff) continue; // unpaired surrogate (a pair yields one cp > 0xFFFF)
+    out.push(cp);
+  }
+  return out.join("");
 }
 
 function fail(msg: string): WriteResult {

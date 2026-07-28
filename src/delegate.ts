@@ -124,6 +124,17 @@ export interface DelegateCapture {
    * `recoveryHint` is the way back). */
   captureComplete: boolean;
   incompleteReason: string;
+  /**
+   * true ⇒ THE EVIDENCE WRITE ITSELF FAILED (issue #74 review, F2). The `delegate-diff` entry
+   * this call should have appended — patch-ful or patch-less — did not land, so the log holds
+   * only the three lifecycle entries and the run VERIFIES CLEAN. No cardinality rule requires a
+   * `delegate-diff` (C24 covers only expected/started/completed), so `verify` cannot see the
+   * gap: this flag is the ONLY witness of it, which is why it rides on the tool result rather
+   * than in the log it is reporting the absence from. The correlation is the point — an ENOSPC
+   * or a lock timeout is exactly the condition that crashes a capture AND then swallows the
+   * record of the crash. When true, treat the worktree as unrecorded and inspect it yourself.
+   */
+  recordFailed: boolean;
   /** `git checkout <preTree> -- <path>` template, surfaced when the worktree was dirty. */
   recoveryHint: string | null;
   /** TAMPER SIGNAL (M8): the serve-runtime scaffolding (`.opencode/node_modules/**` + its
@@ -387,6 +398,18 @@ export async function delegate(
 /**
  * Run the AFTER capture, write the patch into the run dir, and log the delegate-diff entry.
  * Best-effort like every log hook (C31): a capture/log failure never throws into the caller.
+ *
+ * EVERY path that ran the model and found a git worktree leaves a durable record: a normal or
+ * INCOMPLETE capture logs `log.diff` (patch hashed, `complete` flag), and a capture that THREW
+ * logs the patch-less `log.diffUncaptured` (issue #74). The one path that deliberately logs
+ * nothing is "nothing to review" — an empty patch over fully-representable state, which is a
+ * true statement that the model changed nothing, not a gap.
+ *
+ * RESIDUAL, and the reason `capture.recordFailed` exists: when the evidence APPEND itself fails
+ * (a lock timeout; ENOSPC — which correlates with the very conditions that crash a capture),
+ * the entry never lands and the run verifies CLEAN, because no cardinality rule requires a
+ * `delegate-diff`. C31's "a lost entry surfaces as a verify gap" holds for the three lifecycle
+ * entries, NOT for this one. The flag is the only witness, so it is set on both write paths.
  */
 async function captureAndLog(
   before: ReturnType<typeof snapshotWorktree>,
@@ -407,6 +430,7 @@ async function captureAndLog(
       filesChanged: 0,
       captureComplete: true,
       incompleteReason: "",
+      recordFailed: false, // nothing was owed to the log, so nothing was lost
       recoveryHint: null,
       scaffoldChanged: false,
       scaffoldWarning: null,
@@ -445,6 +469,7 @@ async function captureAndLog(
       filesChanged: 0,
       captureComplete: false,
       incompleteReason: "logging-off",
+      recordFailed: false, // logging off owes the log no entry, so none was lost (cf. "nothing to review")
       recoveryHint,
       scaffoldChanged,
       scaffoldWarning,
@@ -471,8 +496,32 @@ async function captureAndLog(
       submodulesBefore: before.submodules,
       patchPath,
     });
-  } catch {
-    // A snapshot/diff crash must not sink the whole call; record a null capture.
+  } catch (err) {
+    // A snapshot/diff crash must not sink the whole call — but it must not pass SILENTLY
+    // either (issue #74). Until this write existed the crash path returned here without
+    // logging anything, so the run held only the three lifecycle entries and `verify()`
+    // passed it CLEAN: a crashed capture looked exactly like a delegation that changed
+    // nothing, while the six snapshot incomplete-reasons below reached `log.diff` with
+    // complete:false and failed integrity loudly. The record is patch-less (there is no
+    // patch to hash) and carries capture_complete:false, so the run fails integrity for the
+    // true reason. Guarded and best-effort per C31: the log write must never mask the
+    // original crash nor sink the call, so its own failure only warns (inside log.ts).
+    let recordFailed = true;
+    try {
+      const w = await ctx.log.diffUncaptured({
+        callId: ctx.callId,
+        base: before.tree ?? "",
+        reason: "capture-crashed",
+        detail: err instanceof Error ? err.message : String(err),
+        run: ctx.runId,
+        scaffoldChanged,
+      });
+      recordFailed = !w.ok;
+    } catch {
+      /* belt-and-braces: diffUncaptured returns failures as data, but nothing in this
+         catch block may become a second, louder failure than the one being recorded.
+         `recordFailed` stays true — a throw here means no entry landed either. */
+    }
     return {
       gitWorktree: true,
       patchPath: null,
@@ -481,6 +530,7 @@ async function captureAndLog(
       filesChanged: 0,
       captureComplete: false,
       incompleteReason: "capture-crashed",
+      recordFailed,
       recoveryHint,
       scaffoldChanged,
       scaffoldWarning,
@@ -500,6 +550,7 @@ async function captureAndLog(
       filesChanged: 0,
       captureComplete: true,
       incompleteReason: "",
+      recordFailed: false, // "nothing to review" owes the log no entry (see the note above)
       recoveryHint,
       scaffoldChanged,
       scaffoldWarning,
@@ -509,16 +560,25 @@ async function captureAndLog(
   // Log the delegate-diff entry (claim:false, patch hashed, folded into integrity — C29/C39).
   // An INCOMPLETE capture is logged with complete:false so the run fails integrity loudly.
   // The scaffold tamper flag rides along as an optional, non-asserted evidence field.
-  await ctx.log.diff({
-    callId: ctx.callId,
-    patchFile: patchPath,
-    base: before.tree ?? "",
-    after: cap.afterTree ?? "",
-    complete: cap.captureComplete,
-    reason: cap.reason,
-    run: ctx.runId,
-    scaffoldChanged,
-  });
+  // `recordFailed` is watched HERE TOO, not only on the crash path (issue #74 review, F2): a
+  // failed append leaves the same clean-verifying run whichever entry it was, and a flag that
+  // only told the truth on one of two paths would be its own trap.
+  let recordFailed = true;
+  try {
+    const w = await ctx.log.diff({
+      callId: ctx.callId,
+      patchFile: patchPath,
+      base: before.tree ?? "",
+      after: cap.afterTree ?? "",
+      complete: cap.captureComplete,
+      reason: cap.reason,
+      run: ctx.runId,
+      scaffoldChanged,
+    });
+    recordFailed = !w.ok;
+  } catch {
+    /* C31: a log failure never sinks the call it records — but it is reported, not swallowed. */
+  }
 
   return {
     gitWorktree: true,
@@ -528,6 +588,7 @@ async function captureAndLog(
     filesChanged: cap.filesChanged,
     captureComplete: cap.captureComplete,
     incompleteReason: cap.reason,
+    recordFailed,
     recoveryHint,
     scaffoldChanged,
     scaffoldWarning,
