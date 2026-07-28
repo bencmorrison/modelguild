@@ -199,8 +199,9 @@ jobs:
     # the orphan flagship, no-process-leak). This CI is credential-free and
     # opencode-free by decision (see header) and never installs or authenticates
     # opencode, so those three cannot run honestly here — and they have NO graceful
-    # skip when the binary is absent (verified: `spawn opencode ENOENT` crashes the
-    # process rather than reporting skipped). So this job runs the OFFLINE suites
+    # skip when the binary is absent (they FAIL: a missing opencode is now a clean
+    # `failed to spawn` rejection rather than the uncaught 'error' crash it used to be
+    # — issue #75 — but a failure either way, never a skip). So this job runs the OFFLINE suites
     # individually BY NAME (each supports standalone `tsx test/<name>.test.ts`) and
     # states which three are excluded and why, so a green run here always means
     # those suites actually executed — never a skipped-everything pass. The loop's
@@ -236,7 +237,7 @@ jobs:
           echo "  lifecycle, orphan, mcp-client — see job comment; run them locally."
           echo
           rc=0
-          for suite in client activity approve log policy config consult panel research delegate models init doctor; do
+          for suite in serve-stderr client activity approve log policy config consult panel research delegate models init doctor; do
             echo "=== test/${suite}.test.ts ==="
             npx tsx "test/${suite}.test.ts" || rc=1
             echo
