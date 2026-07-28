@@ -35,7 +35,7 @@ import {
 } from "./init.js";
 import { layeredRoots, readLayeredConfContents } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
-import { EvidenceLog, DEFAULT_RETENTION_DAYS } from "./log.js";
+import { EvidenceLog, DEFAULT_RETENTION_DAYS, parseRunId } from "./log.js";
 import {
   approvalDoctorInfo,
   APPROVALS_FILE,
@@ -727,6 +727,20 @@ function watchValue(flag: string, raw: string | undefined): string {
   return raw;
 }
 
+/** `--run`'s value is the ONE run id a human types by hand, and it is joined onto the logs
+ * root to build the file this tails — so it goes through the same grammar the evidence
+ * layer enforces (issue #73). A usage error, consistent with every other bad argument
+ * here, rather than a silent tail of a path outside the logs root. */
+function watchRunValue(raw: string | undefined): string {
+  // TRIMMED first: this is the one surface a run id gets PASTED into, and a trailing
+  // newline off a copied log line would otherwise be rejected as an invisible charset
+  // error (review finding F8). Whitespace is still refused *inside* the id.
+  const value = watchValue("--run", raw).trim();
+  const parsed = parseRunId(value);
+  if (!parsed.ok) throw new Error(`watch: --run ${parsed.error}`);
+  return parsed.value;
+}
+
 function parseWatchArgs(argv: string[]): WatchArgs {
   let run: string | undefined;
   let targetDir = process.cwd();
@@ -739,8 +753,8 @@ function parseWatchArgs(argv: string[]): WatchArgs {
     else if (a === "--follow" || a === "-f") follow = true;
     else if (a === "--json") json = true;
     else if (a === "--approve") approve = true;
-    else if (a === "--run") run = watchValue("--run", argv[++i]);
-    else if (a.startsWith("--run=")) run = watchValue("--run", a.slice("--run=".length));
+    else if (a === "--run") run = watchRunValue(argv[++i]);
+    else if (a.startsWith("--run=")) run = watchRunValue(a.slice("--run=".length));
     else if (a === "--dir") targetDir = watchValue("--dir", argv[++i]);
     else if (a.startsWith("--dir=")) targetDir = watchValue("--dir", a.slice("--dir=".length));
     else throw new Error(`watch: unknown argument '${a}'`);

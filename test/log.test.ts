@@ -23,8 +23,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   EvidenceLog,
+  assertRunId,
   confGet,
   enforceRetentionOnStart,
+  isRunId,
+  parseRunId,
+  resolveRunIdArg,
   type PromptMode,
 } from "../src/log.js";
 import { runLogsClean } from "../src/cli.js";
@@ -984,6 +988,219 @@ export async function run(): Promise<number> {
     c.check(turns.size === 3, "C34: concurrent started entries get 3 DISTINCT turns (turn counted inside the lock)");
     c.check(new EvidenceLog({ env: envFor(dir) }).verify(runId).ok, "C34: the concurrent run verifies");
     console.log(`    [overlap evidence] spans: ${spans.map((s) => `${s.start % 100000}..${s.end % 100000}`).join(", ")} → latestStart ${latestStart % 100000} < earliestEnd ${earliestEnd % 100000}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // 19. Issue #73 — a runId is a DIRECTORY NAME under the logs root, so it is validated
+  //     at the single choke point (`#resolveRun`) on BOTH supplied paths: the caller's
+  //     argument and `$GUILD_RUN_ID`. Before this it was used verbatim, so `../../..`
+  //     wrote calls.jsonl / activity.jsonl / delegate patches outside the root.
+  //
+  //     The posture is fail-LOUD, never a silent fresh-run fallback: a caller that thinks
+  //     it threaded a run must not quietly be handed a different one.
+  // -------------------------------------------------------------------------
+  {
+    // --- the grammar itself ------------------------------------------------
+    const minted = new EvidenceLog({ env: envFor(tmp()) }).newRun("/guild:consult");
+    const good = [
+      minted,
+      "20260728T055956Z-7526f9dd",
+      "r",
+      "run-1",
+      "run_b",
+      "a.b",
+      "20260727T000000Z-threaded",
+      "A".repeat(128),
+    ];
+    c.check(good.every((g) => isRunId(g)), "#73: the minted shape and conservative segments are ACCEPTED");
+    const bad: unknown[] = [
+      "../escape",
+      "../../../../tmp/pwn",
+      "/etc/passwd",
+      "a/b",
+      "a\\b",
+      "..",
+      ".",
+      ".hidden",
+      "a..b",
+      "a\0b",
+      "a\nb",
+      "a b",
+      // Reserved: something else in the SAME logs root already owns these names (F4).
+      "latest", // the symlink `#ensureRun` maintains beside the run dirs
+      "LATEST", // aliases it on a case-insensitive filesystem — macOS APFS, a CI platform
+      "Latest",
+      "watchers", // the approval bridge's presence dir (`watcherDirFor`)
+      "WATCHERS",
+      "A".repeat(129),
+      "",
+      42,
+      null,
+      { toString: () => "ok" },
+    ];
+    const rejected = bad.filter((v) => !isRunId(v));
+    c.check(rejected.length === bad.length,
+      `#73: every unsafe/ill-formed run id is REJECTED (${rejected.length}/${bad.length})`);
+
+    // --- the argument path: nothing is written, inside or outside the root ---
+    const dir = tmp();
+    const escapeName = `mg73-escape-${process.pid}-${Date.now()}`;
+    const escapeTarget = path.join(tmpdir(), escapeName);
+    const traversal = `${"../".repeat(dir.split(path.sep).length + 3)}${path.basename(tmpdir())}/${escapeName}`;
+    const log = new EvidenceLog({ env: envFor(dir) });
+    let argThrew = false;
+    let argRes;
+    try {
+      argRes = await log.expect({ callId: "call-x", command: "/guild:consult", run: traversal });
+    } catch {
+      argThrew = true;
+    }
+    c.check(!argThrew && argRes !== undefined && argRes.ok === false,
+      "#73: a traversing runId argument returns ok:false (C31: never throws into the call)");
+    c.check(!existsSync(escapeTarget),
+      "#73: NOTHING is written outside the logs root (the pre-fix repro wrote calls.jsonl there)");
+    // The escape is refused, not silently redirected into a fresh run inside the root:
+    // a fallback would leave the caller's entries in a run it was never told about.
+    c.check(!existsSync(path.join(dir, "latest")),
+      "#73: the refused call mints NO fallback run (no `latest`, no run dir)");
+
+    // The read-only path helpers refuse too, rather than handing back an escaping path.
+    let dirThrew = false;
+    try { log.dir(traversal); } catch { dirThrew = true; }
+    let pathThrew = false;
+    try { log.path(traversal); } catch { pathThrew = true; }
+    c.check(dirThrew && pathThrew, "#73: dir()/path() refuse an invalid runId instead of returning an escaping path");
+
+    // --- the env path: same refusal, and the error NAMES the env var --------
+    const envLog = new EvidenceLog({ env: envFor(dir, { GUILD_RUN_ID: traversal }) });
+    let envThrew = false;
+    let envRes;
+    try {
+      envRes = await envLog.started({ callId: "call-y", model: "m/x", agent: "guild-read", prompt: "p" });
+    } catch {
+      envThrew = true;
+    }
+    c.check(!envThrew && envRes !== undefined && envRes.ok === false,
+      "#73: a traversing $GUILD_RUN_ID returns ok:false rather than writing outside the root");
+    c.check(!existsSync(escapeTarget),
+      "#73: the env path writes nothing outside the logs root either");
+    let envMsg = "";
+    try { assertRunId(traversal, "GUILD_RUN_ID"); } catch (err) { envMsg = String(err); }
+    c.check(envMsg.includes("GUILD_RUN_ID"),
+      "#73: the env-path error NAMES GUILD_RUN_ID (a bare 'runId' would send the operator to the wrong knob)");
+
+    // --- verify(): data, not an exception (the 13b posture) ----------------
+    let verifyThrew = false;
+    let v;
+    try { v = log.verify(traversal); } catch { verifyThrew = true; }
+    c.check(!verifyThrew && v !== undefined && !v.ok && v.code === 7,
+      "#73: verify() on an invalid runId returns code 7, never throws");
+
+    // --- the tool-INPUT surface (what an MCP handler returns) ---------------
+    const absent = resolveRunIdArg("guild_consult", undefined);
+    const empty = resolveRunIdArg("guild_consult", "");
+    const ok = resolveRunIdArg("guild_consult", minted);
+    const nope = resolveRunIdArg("guild_consult", traversal);
+    const nonString = resolveRunIdArg("guild_delegate", 7);
+    c.check("value" in absent && absent.value === undefined, "#73: resolveRunIdArg: an ABSENT runId is undefined (fresh run)");
+    c.check("value" in empty && empty.value === undefined, "#73: resolveRunIdArg: an EMPTY runId keeps its 'absent' meaning");
+    c.check("value" in ok && ok.value === minted, "#73: resolveRunIdArg: a valid runId passes through verbatim");
+    c.check("error" in nope && nope.error.startsWith("guild_consult: runId ") && nope.error.includes("single path segment"),
+      "#73: resolveRunIdArg: an invalid runId is a TOOL INPUT ERROR naming the tool, the field and the rule");
+    c.check("error" in nonString && nonString.error.startsWith("guild_delegate: runId "),
+      "#73: resolveRunIdArg: a non-string runId is an input error, NOT a silent fall to a fresh run");
+
+    // --- and the good path is untouched end-to-end -------------------------
+    const okDir = tmp();
+    const okLog = new EvidenceLog({ env: envFor(okDir) });
+    const rid = okLog.newRun("/guild:consult");
+    await okLog.expect({ callId: "call-ok", command: "/guild:consult", run: rid });
+    await okLog.started({ callId: "call-ok", model: "m/x", agent: "guild-read", prompt: "p", run: rid });
+    await okLog.completed({ callId: "call-ok", model: "m/x", agent: "guild-read", response: "hi", captureState: "complete", run: rid });
+    c.check(existsSync(path.join(okDir, rid, "calls.jsonl")) && okLog.verify(rid).ok,
+      "#73: a minted run id still writes inside the root and verifies clean");
+  }
+
+  // -------------------------------------------------------------------------
+  // 19b. Issue #73 review findings — the other places a path COMPONENT is read from
+  //      somewhere other than the caller: the `latest` symlink's target (F5), a
+  //      delegate-diff entry's `patch` field (F6), and hostile input reaching the error
+  //      renderer (F7). All are the same join-a-component shape #73 fixed.
+  // -------------------------------------------------------------------------
+  {
+    // --- F5: `latest` is data on disk, and `runWatch` joins it WITHOUT going through
+    //     dir(), so a symlink pointing at `..` would tail one level above the logs root.
+    const dir = tmp();
+    const log = new EvidenceLog({ env: envFor(dir) });
+    const real = log.newRun("/guild:consult");
+    c.check(log.latest() === real, "F5: latest() returns a well-formed run id normally");
+    const latestLink = path.join(dir, "latest");
+    rmSync(latestLink, { force: true });
+    symlinkSync("..", latestLink);
+    c.check(log.latest() === undefined,
+      "F5: a `latest` symlink pointing OUTSIDE the root reads as no-latest, not as a path");
+    // A DEEPER target is confined by the basename rather than refused — honest statement of
+    // what the check buys: `../../etc` reads as the (nonexistent) run `etc`, never as a
+    // path above the root. The property that matters is confinement, so assert THAT.
+    rmSync(latestLink, { force: true });
+    symlinkSync("../../etc", latestLink);
+    const deep = log.latest();
+    const confined =
+      deep === undefined || !path.relative(dir, path.join(dir, deep)).startsWith("..");
+    c.check(confined && deep !== "../../etc",
+      "F5: a deeper traversal target cannot name a path above the logs root");
+
+    // --- F6: verify() joins the entry's `patch` field, which comes from the FILE. diff()
+    //     basenames on write; the read side must too, or a doctored entry points the audit
+    //     at an arbitrary file. Built with a CORRECTLY re-hashed line so the chain does not
+    //     fail first and mask the behaviour under test.
+    const d2 = tmp();
+    const env2 = envFor(d2, { GUILD_RUN_ID: "f6" });
+    const log2 = new EvidenceLog({ env: env2 });
+    await log2.expect({ callId: "d1", model: "m/x", agent: "guild-build" });
+    const st2 = await log2.started({ callId: "d1", model: "m/x", agent: "guild-build", prompt: "p" });
+    await log2.completed({ callId: "d1", exit: 0, turn: st2.turn, captureState: "complete", response: "did work" });
+    const rd2 = log2.dir("f6");
+    const patchBody = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-o\n+n\n";
+    const patch2 = path.join(rd2, "diff-d1.patch");
+    writeFileSync(patch2, patchBody);
+    await log2.diff({ callId: "d1", patchFile: patch2, base: "bt", after: "at" });
+    c.check(log2.verify("f6").ok, "F6: the honest run verifies first");
+    // Now point the entry OUTSIDE the run dir, at a byte-identical file that would
+    // hash-match — the only interesting case, since a mismatch fails anyway.
+    const outside = path.join(d2, "outside.patch");
+    writeFileSync(outside, patchBody);
+    rmSync(patch2);
+    const callsFile = path.join(rd2, "calls.jsonl");
+    const allLines = lines(callsFile);
+    const lastEntry = JSON.parse(allLines[allLines.length - 1]) as Parameters<typeof buildEntryLine>[0];
+    delete lastEntry.entry_hash;
+    lastEntry.patch = "../outside.patch";
+    allLines[allLines.length - 1] = buildEntryLine(lastEntry).line;
+    writeFileSync(callsFile, allLines.join("\n") + "\n");
+    const v6 = log2.verify("f6");
+    c.check(v6.code === 7 && v6.message.includes("outside.patch"),
+      "F6: a `patch` field pointing outside the run dir is basenamed on READ ⇒ MISSING, not followed");
+
+    // --- F7: the error renderer handles hostile input, so it must not throw itself.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const hostile: unknown[] = [
+      circular,
+      BigInt(7),
+      { toJSON: () => { throw new Error("nope"); } },
+      { toString: () => { throw new Error("nope"); } },
+    ];
+    let renderThrew = false;
+    for (const h of hostile) {
+      try {
+        const r7 = parseRunId(h);
+        if (r7.ok) renderThrew = true; // must not be accepted either
+      } catch {
+        renderThrew = true;
+      }
+    }
+    c.check(!renderThrew, "F7: rendering a circular/BigInt/throwing value in the error never throws (and never accepts)");
   }
 
   // cleanup

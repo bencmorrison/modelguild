@@ -223,6 +223,131 @@ export function confGet(contents: string, key: string): string {
  * key files use spaces/tabs; the `\r` a CRLF file would carry is handled by splitting
  * lines and trimming trailing whitespace, which covers the realistic cases. */
 
+// ---------------------------------------------------------------------------
+// Run-id grammar (issue #73)
+//
+// A run id is a DIRECTORY NAME under the resolved logs root — `#runDir` joins it, and
+// `#ensureRun` mkdirs it and writes calls.jsonl / activity.jsonl / approvals.jsonl /
+// delegate patches inside. Before this it was taken verbatim from the caller (an MCP
+// tool's `runId` input) or from `$GUILD_RUN_ID`, so `../../..` wrote outside the root.
+//
+// The grammar is deliberately STRICT rather than merely traversal-proof: every run id in
+// the wild was minted by `newRun()` (`<UTC stamp>-<hex>`), so a conservative
+// single-segment shape costs nothing real, and an allowlist does not have to enumerate
+// what a filesystem finds special. Anything outside it is an ERROR, never a fresh-run
+// fallback — a caller who believes it threaded a run must not silently get a different one.
+// ---------------------------------------------------------------------------
+
+/** Max run-id length. The minted shape is 25 chars; 128 leaves room for a hand-written
+ * label while keeping the joined component clear of any filesystem's name limit. */
+export const RUN_ID_MAX_LENGTH = 128;
+
+/** A run id is ONE conservative path segment: an alphanumeric first character, then
+ * alphanumerics, `.`, `_` or `-`. That excludes — by construction, not by blocklist —
+ * `/` and `\`, NUL and every other control character, a leading `.` (so `.`, `..` and
+ * hidden dirs are out), and whitespace. */
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Names already taken by something else in the SAME logs root, so a run dir by one of
+ * them collides: `latest` is the symlink `#ensureRun` maintains (the unlink and the symlink
+ * both fail against a directory, leaving the pointer permanently broken), and `watchers` is
+ * the approval bridge's presence dir (`watcherDirFor` in `src/approve.ts`) — a run there
+ * would sit among the watcher heartbeat files (review finding F4).
+ *
+ * Compared **case-insensitively**: macOS's default APFS is case-insensitive, so `LATEST`
+ * aliases `latest` there — and macOS is a platform this repo's CI covers explicitly. */
+const RUN_ID_RESERVED = new Set(["latest", "watchers"]);
+
+/** Render an offending value for an error message: echoed so the caller can see what it
+ * sent, with control characters neutralized and the length capped.
+ *
+ * Rendering HOSTILE input is its whole job, so it must not throw (review finding F7):
+ * `JSON.stringify` rejects a BigInt and a circular object, and a caller-controlled
+ * `toString`/`toJSON` can throw as well. */
+function showRunId(value: unknown): string {
+  let s: string;
+  try {
+    s =
+      typeof value === "string"
+        ? value
+        : value === null || value === undefined
+          ? String(value)
+          : (JSON.stringify(value) ?? String(value));
+  } catch {
+    try {
+      s = String(value);
+    } catch {
+      s = `<unprintable ${typeof value}>`;
+    }
+  }
+  // Escaped explicitly: control characters must never appear RAW in source.
+  const flat = s.replace(/[\u0000-\u001f\u007f]/g, "?");
+  return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
+}
+
+const RUN_ID_RULE =
+  "a run id is a single path segment: letters/digits/'.'/'_'/'-', starting with a letter " +
+  `or digit, no '/', '\\', '..' or leading '.', at most ${RUN_ID_MAX_LENGTH} characters, ` +
+  "and not the reserved names 'latest'/'watchers' (in any case) " +
+  "(run ids are minted by the tools, e.g. 20260728T055956Z-7526f9dd — pass one back " +
+  "verbatim, or omit it for a fresh run)";
+
+/** Whether `value` is a usable run id. The single predicate every check goes through. */
+export function isRunId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (value.length === 0 || value.length > RUN_ID_MAX_LENGTH) return false;
+  if (!RUN_ID_RE.test(value)) return false;
+  // `a..b` cannot traverse, but `..` is never something we mint and is what the report
+  // names — refusing it outright keeps the rule to one sentence.
+  if (value.includes("..")) return false;
+  // Case-INSENSITIVE: see RUN_ID_RESERVED (a case-insensitive filesystem aliases them).
+  return !RUN_ID_RESERVED.has(value.toLowerCase());
+}
+
+/**
+ * Validate a run id supplied as tool INPUT, returning a result rather than throwing —
+ * the same shape (and the same posture) as `parsePerCallTimeoutMs` in `config.ts`, so an
+ * MCP handler turns it into a clear tool input error instead of an exception.
+ */
+export function parseRunId(
+  value: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (isRunId(value)) return { ok: true, value };
+  return { ok: false, error: `runId '${showRunId(value)}' is invalid — ${RUN_ID_RULE}.` };
+}
+
+/** Throwing form, for the internal choke point. `source` names where the bad value came
+ * from (the `runId` argument vs the `GUILD_RUN_ID` env var) so the failure is diagnosable. */
+export function assertRunId(value: unknown, source: string): string {
+  if (isRunId(value)) return value;
+  throw new Error(`modelguild: ${source} '${showRunId(value)}' is invalid — ${RUN_ID_RULE}.`);
+}
+
+/**
+ * Resolve an MCP tool's optional `runId` argument: `undefined` when absent, the id when
+ * usable, an error message (prefixed with the tool name) when present-but-invalid — the
+ * `runId` counterpart of `config.ts`'s `parsePerCallTimeoutMs` + `resolveTimeoutArg`.
+ *
+ * FAIL LOUD, NEVER FALL BACK (issue #73). The handlers previously read
+ * `typeof a.runId === "string" ? a.runId : undefined`, which both let a traversing id
+ * (`../../..`) reach the evidence layer as a directory name AND silently turned a
+ * non-string one into "mint a fresh run" — a caller that believes it threaded a run must
+ * not quietly be given a different one. An EMPTY string keeps its existing meaning of
+ * "absent" (it is not a run id anyone was ever handed), which is how every tool module
+ * already treated it.
+ *
+ * It lives here rather than in `src/server.ts` so it is unit-testable: importing that
+ * file constructs the MCP server and connects the stdio transport at module top level.
+ */
+export function resolveRunIdArg(
+  tool: string,
+  raw: unknown,
+): { value: string | undefined } | { error: string } {
+  if (raw === undefined || raw === "") return { value: undefined };
+  const parsed = parseRunId(raw);
+  return parsed.ok ? { value: parsed.value } : { error: `${tool}: ${parsed.error}` };
+}
+
 export class EvidenceLog {
   readonly #env: NodeJS.ProcessEnv;
   readonly #cwd: string;
@@ -339,14 +464,40 @@ export class EvidenceLog {
   }
 
   // --- run resolution ------------------------------------------------------
+  /**
+   * The run directory for an ALREADY-VALIDATED run id (everything reaches here through
+   * `#resolveRun`). The containment assertion is belt-and-braces, not the guarantee: the
+   * grammar in `#resolveRun` is what makes escape impossible, and this only catches a
+   * future caller that found a way around it (issue #73).
+   */
   #runDir(runId: string): string {
-    return path.join(this.#logDir(), runId);
+    const base = this.#logDir();
+    const rd = path.join(base, runId);
+    const rel = path.relative(base, rd);
+    if (rel.length === 0 || rel.startsWith("..") || path.isAbsolute(rel)) {
+      throw new Error(
+        `modelguild: refusing a run directory outside the logs root (run id '${showRunId(runId)}', root ${base}).`,
+      );
+    }
+    return rd;
   }
 
+  /**
+   * Resolve the run id to use: the caller's, else `$GUILD_RUN_ID`, else a fresh minted one.
+   *
+   * THE CHOKE POINT (issue #73). Both supplied paths are validated here, and an invalid
+   * one THROWS rather than falling back to a fresh run: this value becomes a directory
+   * name under the logs root, and a caller who believes it threaded a run must never
+   * silently be given a different one (nor write outside the root). Write methods still
+   * honour C31 — their own try/catch turns the throw into an `ok:false` + stderr warning,
+   * never an exception into the tool call — and the MCP layer refuses an invalid `runId`
+   * as a tool INPUT error before it ever gets here (`resolveRunIdArg`, used by every tool
+   * handler in `src/server.ts`).
+   */
   #resolveRun(runId?: string): string {
-    if (runId) return runId;
+    if (runId) return assertRunId(runId, "runId");
     const ambient = this.#env.GUILD_RUN_ID;
-    if (ambient) return ambient;
+    if (ambient) return assertRunId(ambient, "GUILD_RUN_ID");
     return `${nowStamp()}-${randHex()}`;
   }
 
@@ -476,7 +627,12 @@ export class EvidenceLog {
     const l = path.join(this.#logDir(), "latest");
     if (!isSymlink(l)) return undefined;
     try {
-      return path.basename(readlinkSync(l));
+      const name = path.basename(readlinkSync(l));
+      // The symlink's TARGET is data on disk, not something we minted this process — and
+      // `runWatch` joins this straight onto the logs root without going through `dir()`,
+      // so a `latest` pointing at `..` would make the watcher tail above the root (review
+      // finding F5). Anything that is not a run id is "no latest run", not a path.
+      return isRunId(name) ? name : undefined;
     } catch {
       return undefined;
     }
@@ -809,8 +965,16 @@ export class EvidenceLog {
   // for an integrity failure (code 7) — that is data, not an exception.
   // =========================================================================
   verify(runId?: string): VerifyResult {
-    const rid = this.#resolveRun(runId);
-    const rd = this.#runDir(rid);
+    // An unusable run id (issue #73) is an integrity FAILURE reported as data, not an
+    // exception — same posture as the read error below, and it names the rule broken.
+    let rid: string;
+    let rd: string;
+    try {
+      rid = this.#resolveRun(runId);
+      rd = this.#runDir(rid);
+    } catch (err) {
+      return { ok: false, code: 7, message: `verify: ${String(err)}` };
+    }
     const file = path.join(rd, "calls.jsonl");
     if (!existsSync(file)) {
       return { ok: false, code: 7, message: `verify: no log at ${file}` };
@@ -961,7 +1125,12 @@ export class EvidenceLog {
       const rh = typeof e.response_hash === "string" ? e.response_hash : "";
       if (rh !== "") {
         if (e.type === "delegate-diff") {
-          const pf = path.join(rd, typeof e.patch === "string" ? e.patch : "");
+          // `basename` on the READ side too (review finding F6): `diff()` stores a basename,
+          // but the value being joined here comes from the FILE, so an edited entry could
+          // otherwise point the audit at an arbitrary path. Same join-a-component shape as
+          // issue #73; the hash chain would flag the edit, but the audit must not read
+          // outside the run dir on its way to saying so.
+          const pf = path.join(rd, path.basename(typeof e.patch === "string" ? e.patch : ""));
           if (!existsSync(pf)) {
             return fail7Raw(`INTEGRITY FAIL: line ${i} references patch '${path.basename(pf)}' which is MISSING — the record points at evidence that no longer exists.`);
           }

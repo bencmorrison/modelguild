@@ -25,7 +25,7 @@ import { research, researchToToolResult } from "./research.js";
 import { delegate, delegateToToolResult } from "./delegate.js";
 import { models, modelsToToolResult } from "./models.js";
 import { parsePerCallTimeoutMs, layeredRoots } from "./config.js";
-import { enforceRetentionOnStart } from "./log.js";
+import { enforceRetentionOnStart, resolveRunIdArg } from "./log.js";
 // The progress channel lives in its own module so it can be tested: importing THIS file
 // constructs the MCP server and connects the stdio transport at module top level.
 import { withProgress, type ProgressCapableExtra } from "./progress.js";
@@ -67,6 +67,18 @@ function resolveTimeoutArg(
   const parsed = parsePerCallTimeoutMs(raw);
   return parsed.ok ? { value: parsed.value } : { error: `${tool}: ${parsed.error}` };
 }
+
+/** Appended to every tool's `runId` description: a run id NAMES A DIRECTORY under the
+ * logs root, so the accepted shape is part of the tool's input contract (issue #73). */
+const RUN_ID_RULE_DESC =
+  " Pass back a run id the tools minted (e.g. '20260728T055956Z-7526f9dd') verbatim: it " +
+  "names a directory under the evidence-log root, so it must be a single path segment " +
+  "(letters/digits/'.'/'_'/'-', no '/', '\\' or '..'). Anything else is a tool input " +
+  "error, not a silent fresh run.";
+
+/* `resolveRunIdArg` — the `runId` counterpart of `resolveTimeoutArg` — lives in
+ * `src/log.ts` beside the grammar it enforces, so it can be unit-tested: importing THIS
+ * file constructs the MCP server and connects the stdio transport at module top level. */
 
 const lifecycle = new OpencodeLifecycle();
 
@@ -171,7 +183,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional evidence-log run id to thread this call into an existing run " +
-              "(e.g. a multi-call workflow). Omit to start a fresh run.",
+              "(e.g. a multi-call workflow). Omit to start a fresh run." +
+              RUN_ID_RULE_DESC,
           },
           confirmed: {
             type: "boolean",
@@ -233,7 +246,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional evidence-log run id to thread this panel into an existing run. " +
-              "Omit to mint one fresh run for the whole panel.",
+              "Omit to mint one fresh run for the whole panel." +
+              RUN_ID_RULE_DESC,
           },
           confirmed: {
             type: "boolean",
@@ -288,7 +302,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional evidence-log run id to thread this call into an existing run. " +
-              "Omit to start a fresh run.",
+              "Omit to start a fresh run." +
+              RUN_ID_RULE_DESC,
           },
           confirmed: {
             type: "boolean",
@@ -344,7 +359,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description:
               "Optional evidence-log run id to thread this delegation into an existing run. " +
-              "Omit to start a fresh run.",
+              "Omit to start a fresh run." +
+              RUN_ID_RULE_DESC,
           },
           confirmed: {
             type: "boolean",
@@ -437,12 +453,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
+    const rid = resolveRunIdArg(CONSULT_TOOL, a.runId);
+    if ("error" in rid) {
+      return { content: [{ type: "text", text: rid.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, CONSULT_TOOL, (onActivity) =>
       consult(
         {
           question,
           model: typeof a.model === "string" ? a.model : undefined,
-          runId: typeof a.runId === "string" ? a.runId : undefined,
+          runId: rid.value,
           confirmed: a.confirmed === true,
           sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
           keepSession: a.keepSession === true,
@@ -479,12 +499,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
+    const rid = resolveRunIdArg(PANEL_TOOL, a.runId);
+    if ("error" in rid) {
+      return { content: [{ type: "text", text: rid.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, PANEL_TOOL, (onActivity) =>
       panel(
         {
           question,
           models,
-          runId: typeof a.runId === "string" ? a.runId : undefined,
+          runId: rid.value,
           confirmed: a.confirmed === true,
           keepSessions: a.keepSessions === true,
           timeoutMs: tmo.value,
@@ -508,12 +532,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
+    const rid = resolveRunIdArg(RESEARCH_TOOL, a.runId);
+    if ("error" in rid) {
+      return { content: [{ type: "text", text: rid.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, RESEARCH_TOOL, (onActivity) =>
       research(
         {
           question,
           model: typeof a.model === "string" ? a.model : undefined,
-          runId: typeof a.runId === "string" ? a.runId : undefined,
+          runId: rid.value,
           confirmed: a.confirmed === true,
           timeoutMs: tmo.value,
         },
@@ -536,12 +564,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in tmo) {
       return { content: [{ type: "text", text: tmo.error }], isError: true };
     }
+    const rid = resolveRunIdArg(DELEGATE_TOOL, a.runId);
+    if ("error" in rid) {
+      return { content: [{ type: "text", text: rid.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, DELEGATE_TOOL, (onActivity) =>
       delegate(
         {
           task,
           model: typeof a.model === "string" ? a.model : undefined,
-          runId: typeof a.runId === "string" ? a.runId : undefined,
+          runId: rid.value,
           confirmed: a.confirmed === true,
           timeoutMs: tmo.value,
         },
