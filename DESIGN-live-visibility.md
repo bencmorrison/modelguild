@@ -1,6 +1,15 @@
 # DESIGN — Live visibility into external-agent activity (issue #20)
 
-**Status:** design only. Nothing here is implemented; no code changed in this pass.
+**Status (updated 2026-07-28): IMPLEMENTED — this document is retained as the design RECORD, not as a
+description of current behavior.** The design shipped as the live-activity layer (`src/activity.ts`,
+`modelguild watch`, `structuredContent.activity`, MCP `notifications/progress`) and the opt-in,
+default-off approval bridge (`src/approve.ts`); it is specified in `CONTRACT.md` — C59–C64 for live
+activity, C65–C69 for the approval bridge — and described in `AGENTS.md`. **Those two documents own
+current behavior; read them first.** Everything below is the design as it was written, preserved
+unchanged, including the Slice 0 probe addendum and the dated shipped/correction notes appended to it —
+which is where this document's remaining value lies: why each choice was made, what was probed, and what
+the implementation later refuted. *(The original status line read: "design only. Nothing here is
+implemented; no code changed in this pass.")*
 **Provenance:** the ask is the **maintainer's** day-one request recorded in issue #20 (live visibility
 instead of log-everything-and-audit-after, plus an opt-in write-path approval bridge). The permission-API
 facts were **banked prior investigation** (issue #20). The opencode API shapes quoted below were
