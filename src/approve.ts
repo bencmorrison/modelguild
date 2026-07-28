@@ -787,9 +787,38 @@ export type ElicitationAction = "accept" | "decline" | "cancel";
  * Build an `ElicitationRequester` over an MCP server's raw request function.
  *
  * `send` is supplied by `src/server.ts` (it closes over `server.request(...)` with
- * `ElicitResultSchema`), so the SDK dependency stays there. Every failure — a client that
- * went away, a timeout, a shape we do not understand — maps to `"cancel"`, i.e. REJECT:
- * fail-closed is the only defensible mapping for a channel whose whole job is consent.
+ * `ElicitResultSchema`), so the SDK dependency stays there.
+ *
+ * THE FORM HAS NO FIELDS, AND THAT IS THE UX FIX (maintainer feedback from a live
+ * interactive test, 2026-07-28). The first version asked for a single boolean `approve`
+ * field, which Claude Code's TUI renders as a **checkbox you must space-select and then
+ * submit** — two non-obvious steps to say yes to a prompt whose whole value is being
+ * answerable in one keypress. With an EMPTY `requestedSchema`, the client's own
+ * **Accept / Decline** buttons ARE the decision. Everything the developer needs to read
+ * therefore moves into the `message` (see `elicitationMessage`), because there are no
+ * fields left to carry it.
+ *
+ * PROBED, not assumed (2026-07-28, this worktree, `claude -p` + a raw
+ * `elicitation/create`, the same method as the Slice 0 P4 probe): an empty
+ * `{type:"object", properties:{}}` is **accepted and answered** by Claude Code exactly like
+ * the boolean and enum forms — all three returned `{"action":"cancel"}` headlessly, none
+ * errored. It is also valid per the SDK's own `ElicitRequestFormParamsSchema`, whose
+ * `properties` is a `z.record` (an empty record is a record) with `required` optional. The
+ * single-enum fallback was therefore not needed.
+ *
+ * THE ACCEPT RULE CHANGED WITH THE SHAPE. The old code demanded `content.approve === true`
+ * and treated an `accept` without it as a DECLINE — correct then, because a checkbox left
+ * unchecked and submitted was a real "accept the form, say no". **That case cannot exist
+ * now:** there is no field to leave unset, so an `accept` is unambiguously the Accept
+ * button. Keeping the rule would have turned every real approval into a rejection. It is
+ * removed, and this paragraph is why.
+ *
+ * WHAT DID NOT CHANGE — the fail-closed property, which is now stated as a positive rule:
+ * **ONLY the literal action `"accept"` approves.** `"decline"` rejects; `"cancel"` (which
+ * headless clients auto-answer within milliseconds) keeps its abstain-or-reject handling in
+ * the bridge; and **any other value — an unknown action string, a missing action, a
+ * malformed result, a transport failure, a timeout — is treated as `"cancel"`**, never as
+ * consent. A channel whose entire job is consent must never infer it.
  */
 export function makeElicitationRequester(opts: {
   capabilities: { elicitation?: unknown } | undefined;
@@ -807,32 +836,73 @@ export function makeElicitationRequester(opts: {
         const res = await opts.send(
           {
             message,
-            requestedSchema: {
-              type: "object",
-              properties: {
-                approve: {
-                  type: "boolean",
-                  title: "Approve this tool call?",
-                  description:
-                    "Yes runs it once. No rejects it — the model is told, and continues.",
-                },
-              },
-              required: ["approve"],
-            },
+            // NO FIELDS: the client's Accept/Decline buttons are the decision. See the
+            // block comment — this shape is probed-accepted, and it is what makes the
+            // prompt answerable in one keypress.
+            requestedSchema: { type: "object", properties: {} },
           },
           timeoutMs,
         );
-        if (res.action !== "accept") return res.action === "decline" ? "decline" : "cancel";
-        const content = (res.content ?? {}) as Record<string, unknown>;
-        // An `accept` whose payload does not clearly say yes is treated as a DECLINE. A
-        // client that accepts the form but omits the field has told us nothing, and
-        // "nothing" must never read as consent.
-        return content.approve === true ? "accept" : "decline";
+        // Positive matching ONLY. Written as an explicit allowlist rather than
+        // `!== "accept" ? ... : ...` so that adding a future action to the protocol cannot
+        // accidentally fall into the approving branch.
+        if (res.action === "accept") return "accept";
+        if (res.action === "decline") return "decline";
+        return "cancel";
       } catch {
         return "cancel";
       }
     },
   };
+}
+
+/**
+ * The text the developer actually reads before pressing Accept or Decline.
+ *
+ * IT CARRIES EVERYTHING, because the form has no fields to carry anything (see
+ * `makeElicitationRequester`): what is about to run, on whose behalf, the sanitized detail,
+ * the honest bound, and — where they apply — the two scope notes that would otherwise
+ * mislead. Exported so the tests pin the wording; a prompt that reads like a containment
+ * guarantee is the one way this feature can actively mislead someone.
+ *
+ * Every model-controlled fragment (`tool`, `detail`) is sanitized by its caller before it
+ * reaches here, and sanitized again here, because this string is rendered in a terminal UI.
+ */
+export function elicitationMessage(opts: {
+  command: string;
+  model: string;
+  tool: string;
+  detail: string;
+  timeoutMs: number;
+}): string {
+  const tool = oneLine(opts.tool, 40);
+  const detail = oneLine(opts.detail, 300);
+  const lines: string[] = [];
+  lines.push(`ModelGuild approval — ${oneLine(opts.command, 40)} (${oneLine(opts.model, 60)})`);
+  lines.push("");
+  lines.push(`Run ${tool}${detail ? `: ${detail}` : ""}?`);
+  lines.push("");
+  if (tool === "bash") {
+    // The single most misleading thing this prompt could imply, said at the point of decision.
+    lines.push(
+      "Approving bash approves a SHELL for this call: it can read any file (including " +
+        "credentials), reach the network, and spawn processes that raise no further prompts.",
+    );
+  } else if (tool === "edit") {
+    // Probed on opencode 1.18.7: the `write` permission key is inert and `edit` gates the
+    // whole write/patch family, so "edit" understates what one approval covers.
+    lines.push("Approving 'edit' covers this agent's write/patch family, not a single file op.");
+  }
+  lines.push(
+    "This is visibility and an interrupt, NOT containment — the diff review is still the " +
+      "review point.",
+  );
+  lines.push("");
+  lines.push(
+    `Accept = run it once. Decline = reject it (the model is told, and continues). ` +
+      `No answer within ~${Math.round(opts.timeoutMs / 1000)}s = rejected, fail-closed.`,
+  );
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,9 +1283,15 @@ export class ApprovalBridge {
     // Channel 1: elicitation. Fire-and-forget — its answer races the watch terminal and the
     // timeout, and `#settle` makes whoever lands first the winner.
     if (this.#elicitation?.available === true) {
-      const message =
-        `ModelGuild — ${this.#ctx.command} (${this.#ctx.model}) wants to run ${tool}` +
-        `${detail ? `: ${detail}` : ""}\n\n${HONEST_BOUND}`;
+      // ALL the context lives in the message: the form deliberately has no fields, so the
+      // client's Accept/Decline buttons are the decision (see `makeElicitationRequester`).
+      const message = elicitationMessage({
+        command: this.#ctx.command,
+        model: this.#ctx.model,
+        tool,
+        detail,
+        timeoutMs: this.#settings.timeoutMs,
+      });
       void this.#elicitation
         .ask({ message, timeoutMs: this.#settings.timeoutMs })
         .then((action) => {

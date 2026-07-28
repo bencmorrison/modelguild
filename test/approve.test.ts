@@ -48,6 +48,7 @@ import {
   approvalDoctorInfo,
   checkStoredRuleset,
   effectiveGatedFamily,
+  elicitationMessage,
   makeElicitationRequester,
   parseAgentPermissions,
   resolveAgentAllowSet,
@@ -836,27 +837,98 @@ export async function run(): Promise<number> {
     }
   }
 
-  // A DECLINE maps to reject too, and an `accept` that does not actually say yes is a
-  // decline — "nothing" must never read as consent.
+  // -------------------------------------------------------------------------
+  // The elicitation channel: an EMPTY-FIELD form, so the client's own Accept/Decline
+  // buttons ARE the decision (maintainer feedback, 2026-07-28 — the previous boolean
+  // `approve` field rendered in Claude Code's TUI as a checkbox you had to space-select
+  // and then submit: two non-obvious steps to answer a one-keypress question).
+  //
+  // PROBED before this shape shipped (`claude -p` + a raw `elicitation/create`, the Slice 0
+  // P4 method): Claude Code ACCEPTS and answers `{type:"object", properties:{}}` exactly as
+  // it does the boolean and enum forms — all three returned `{"action":"cancel"}` headlessly.
+  // -------------------------------------------------------------------------
   {
-    const seen: string[] = [];
-    const requester = makeElicitationRequester({
-      capabilities: { elicitation: {} },
-      send: async () => {
-        seen.push("sent");
-        return { action: "accept", content: {} };
-      },
-    });
-    c.check(requester.available, "elicit: a BARE `elicitation: {}` capability counts as available");
+    const sent: Array<{ message: string; requestedSchema: unknown }> = [];
+    const mk = (res: { action?: unknown; content?: unknown }) =>
+      makeElicitationRequester({
+        capabilities: { elicitation: {} },
+        send: async (params) => {
+          sent.push(params);
+          return res;
+        },
+      });
+
+    // THE SHAPE. No fields — that is the whole UX fix, so it is pinned.
+    const probe = mk({ action: "decline" });
+    c.check(probe.available, "elicit: a BARE `elicitation: {}` capability counts as available");
+    await probe.ask({ message: "m", timeoutMs: 100 });
+    c.check(sent.length === 1, "elicit: the request was actually issued");
+    const schema = sent[0].requestedSchema as { type?: string; properties?: Record<string, unknown> };
+    c.check(schema.type === "object", "elicit: the requestedSchema is an object schema");
     c.check(
-      (await requester.ask({ message: "m", timeoutMs: 100 })) === "decline",
-      "elicit: an accept whose payload does not say yes is treated as a DECLINE",
+      schema.properties !== undefined && Object.keys(schema.properties).length === 0,
+      `elicit: it declares NO fields, so Accept/Decline is the decision (got ${JSON.stringify(schema.properties)})`,
     );
-    const yes = makeElicitationRequester({
-      capabilities: { elicitation: {} },
-      send: async () => ({ action: "accept", content: { approve: true } }),
-    });
-    c.check((await yes.ask({ message: "m", timeoutMs: 100 })) === "accept", "elicit: approve:true accepts");
+    c.check(
+      !Object.prototype.hasOwnProperty.call(sent[0].requestedSchema as object, "required"),
+      "elicit: and no `required` list, which would be meaningless with no fields",
+    );
+
+    // THE MAPPING. Only the literal "accept" approves.
+    c.check(
+      (await mk({ action: "accept" }).ask({ message: "m", timeoutMs: 100 })) === "accept",
+      "elicit: action 'accept' approves — with no field to leave unset it is unambiguous",
+    );
+    c.check(
+      (await mk({ action: "accept", content: {} }).ask({ message: "m", timeoutMs: 100 })) === "accept",
+      "elicit: an accept with an EMPTY content still approves (the old approve:true rule is gone)",
+    );
+    c.check(
+      (await mk({ action: "decline" }).ask({ message: "m", timeoutMs: 100 })) === "decline",
+      "elicit: action 'decline' rejects",
+    );
+    c.check(
+      (await mk({ action: "cancel" }).ask({ message: "m", timeoutMs: 100 })) === "cancel",
+      "elicit: action 'cancel' is unchanged (the bridge abstains or rejects on it)",
+    );
+
+    // THE FAIL-CLOSED PROPERTY, stated positively: NOTHING but "accept" ever approves.
+    const notConsent: Array<{ action?: unknown; content?: unknown }> = [
+      {},
+      { action: undefined },
+      { action: null },
+      { action: "" },
+      { action: "Accept" },
+      { action: "ACCEPT" },
+      { action: "accepted" },
+      { action: "approve" },
+      { action: "ok" },
+      { action: "some-future-action" },
+      { action: 1 },
+      { action: true },
+      { action: ["accept"] },
+      { action: { action: "accept" } },
+      { action: "decline", content: { approve: true } },
+      { action: "cancel", content: { approve: true } },
+    ];
+    let approvedSomething = "";
+    for (const res of notConsent) {
+      if ((await mk(res).ask({ message: "m", timeoutMs: 100 })) === "accept") {
+        approvedSomething = JSON.stringify(res);
+        break;
+      }
+    }
+    c.check(
+      approvedSomething === "",
+      `elicit: ONLY the literal "accept" approves — no unknown/odd action ever does (leaked on ${approvedSomething})`,
+    );
+    // And the same values must not be silently re-read as a decline either: everything that
+    // is not accept/decline is a cancel, which the bridge handles as abstain-or-reject.
+    c.check(
+      (await mk({ action: "some-future-action" }).ask({ message: "m", timeoutMs: 100 })) === "cancel",
+      "elicit: an unknown action is a CANCEL, so the bridge's fail-closed handling applies",
+    );
+
     const boom = makeElicitationRequester({
       capabilities: { elicitation: {} },
       send: async () => {
@@ -869,7 +941,59 @@ export async function run(): Promise<number> {
     );
     const none = makeElicitationRequester({ capabilities: {}, send: async () => ({}) });
     c.check(!none.available, "elicit: a client without the capability is unavailable");
-    c.check(seen.length === 1, "elicit: the request was actually issued");
+    c.check(
+      (await none.ask({ message: "m", timeoutMs: 100 })) === "cancel",
+      "elicit: and asking an unavailable channel never approves",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // The MESSAGE now carries everything, because the form has no fields to carry it.
+  // -------------------------------------------------------------------------
+  {
+    const msg = (tool: string, detail = "npm test") =>
+      elicitationMessage({
+        command: "/guild:delegate",
+        model: "openai/gpt-5.5",
+        tool,
+        detail,
+        timeoutMs: 120_000,
+      });
+
+    const bash = msg("bash");
+    c.check(bash.includes("/guild:delegate"), "message: names the command");
+    c.check(bash.includes("openai/gpt-5.5"), "message: names the model");
+    c.check(bash.includes("bash") && bash.includes("npm test"), "message: names the tool and what it would run");
+    c.check(
+      bash.includes("approves a SHELL"),
+      "message: a bash request states the shell bound AT THE POINT OF DECISION",
+    );
+    c.check(
+      bash.toLowerCase().includes("not containment"),
+      "message: and never reads as a containment guarantee",
+    );
+    c.check(
+      bash.includes("Accept") && bash.includes("Decline"),
+      "message: it tells you the buttons are the decision (there is no field to fill)",
+    );
+    c.check(bash.includes("120s"), "message: and states the fail-closed deadline");
+
+    const edit = msg("edit", "src/foo.ts");
+    c.check(
+      edit.includes("write/patch family"),
+      "message: an 'edit' request says what one approval actually covers (the write key is inert)",
+    );
+    c.check(!edit.includes("approves a SHELL"), "message: and does not claim the shell bound for edit");
+    const web = msg("webfetch", "https://example.com");
+    c.check(
+      !web.includes("approves a SHELL") && !web.includes("write/patch family"),
+      "message: a tool with neither caveat gets neither",
+    );
+
+    // Model-controlled fragments are sanitized here too — this string goes to a TUI.
+    const ESC = "\u001b";
+    const spoofed = msg(`bash${ESC}[2K`, `npm test${ESC}[1A${ESC}[2K`);
+    c.check(!spoofed.includes(ESC), "message: control characters never reach the prompt");
   }
 
   // -------------------------------------------------------------------------
