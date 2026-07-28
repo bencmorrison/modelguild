@@ -66,6 +66,33 @@ const STDERR_DRAIN_GRACE_MS = 250;
 /** Bounded wait for the ChildProcess 'error' that explains a pidless spawn. Node reports
  * it asynchronously (~3ms measured); without the wait the failure is a bare "no pid". */
 const SPAWN_ERROR_GRACE_MS = 500;
+/** How many times the negotiate→spawn→ready sequence is attempted when the child dies
+ * with a port-conflict signature (issue #79). Each attempt negotiates a FRESH port. */
+const PORT_RETRY_ATTEMPTS = 3;
+
+/**
+ * A startup failure whose stderr says the port was taken — the TOCTOU loser (issue #79).
+ * The only failure class `#start` retries, because it is the only one a different port
+ * can fix: a missing binary, a bad config or an auth failure would fail identically three
+ * times and just triple the wait.
+ */
+class PortTakenError extends Error {}
+
+/**
+ * Does this startup stderr read as a bind conflict?
+ *
+ * `ServeError` is in the set because on opencode 1.18.7 it is the ONLY signal: a probe
+ * against a port held by another listener printed exactly `Error: Unexpected error` +
+ * `ServeError` — no errno, no port number (the same probe issue #75 quotes). That makes
+ * the match imprecise in one stated direction: another serve-startup failure that also
+ * raises `ServeError` will be retried up to PORT_RETRY_ATTEMPTS times. The cost is three
+ * fast exits, and the alternative — matching nothing on the version we actually ship
+ * against — would make the retry decorative. The errno forms are kept for other builds
+ * and for a future opencode that surfaces the OS error.
+ */
+function looksLikePortConflict(stderr: string): boolean {
+  return /\bEADDRINUSE\b|address already in use|is port \d+ in use|\bServeError\b/i.test(stderr);
+}
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -77,11 +104,26 @@ function envInt(name: string, fallback: number): number {
 /**
  * Ask the OS for a free loopback TCP port by binding to :0 and reading it back.
  *
- * Accepted TOCTOU: this probe listener closes before `opencode serve` binds the
- * same port, leaving a gap another process could win. There's no way to close it —
- * opencode has no `--port 0` readback that would let us hand it an already-bound
- * socket. A racer landing in that gap surfaces loudly, as `opencode serve` exiting
- * before becoming ready (see the readiness poll in `#start`), never as a silent hang.
+ * TOCTOU, and what is done about it (issue #79): this probe listener closes before
+ * `opencode serve` binds the same port, leaving a gap another process can win. The gap
+ * cannot be closed — opencode takes a port number, not an inherited socket — so it is
+ * SURVIVED instead: the loser is loud (the child exits before becoming ready, never a
+ * silent hang), and `#start` retries the whole negotiate→spawn→ready sequence on a fresh
+ * port, bounded by PORT_RETRY_ATTEMPTS.
+ *
+ * Why not let opencode pick (`--port 0`), probed on 1.18.7 (2026-07-28) and rejected:
+ *   - `--port 0` is opencode's own default, and it is NOT ephemeral-first. With 4096
+ *     free it binds 4096 — the well-known opencode port — and only falls back to an
+ *     ephemeral one when 4096 is taken (observed: 4096, then 39329 for a second serve).
+ *     A supervised child that silently claims the user's default port is a worse problem
+ *     than the race it would fix.
+ *   - The chosen port is discoverable ONLY by scraping a human-readable STDOUT line
+ *     (`opencode server listening on http://127.0.0.1:39329`). There is no machine
+ *     readable readback: no flag prints it, and the only other copy is the debug log.
+ *     That would mean piping and parsing stdout — reversing issue #75's deliberate
+ *     stdout-ignored decision — and pinning startup to a log string, on a dependency
+ *     this repo deliberately tracks unpinned. A wording change would then break startup
+ *     outright, trading a rare intermittent failure for a total one.
  */
 function pickFreePort(host: string): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -476,11 +518,18 @@ export class OpencodeLifecycle {
     return stderrSuffix(h.stderr);
   }
 
-  async #exitedBeforeReady(h: InternalHandle): Promise<string> {
-    return (
+  /**
+   * The error for a child that died during startup. Typed as `PortTakenError` when the
+   * captured stderr reads as a bind conflict, which is what `#start` retries on (issue
+   * #79) — the classification lives here because this is the one place that has both the
+   * exit and the stderr tail.
+   */
+  async #exitedBeforeReady(h: InternalHandle): Promise<Error> {
+    const report = await this.#stderrReport(h);
+    const msg =
       `opencode serve exited before becoming ready ` +
-      `(cwd=${this.#projectDir}, ${exitDesc(h)})${await this.#stderrReport(h)}`
-    );
+      `(cwd=${this.#projectDir}, ${exitDesc(h)})${report}`;
+    return looksLikePortConflict(report) ? new PortTakenError(msg) : new Error(msg);
   }
 
   #clearIdleTimer(): void {
@@ -519,7 +568,35 @@ export class OpencodeLifecycle {
     }
   }
 
+  /**
+   * Start a serve child, retrying the whole negotiate→spawn→ready sequence when the
+   * child dies having lost the port race (issue #79).
+   *
+   * Narrow on purpose. Only a `PortTakenError` is retried — a spawn failure (opencode
+   * not on PATH), an auth/config failure and a readiness TIMEOUT all propagate on the
+   * first attempt, the last of them because retrying it would triple a 30s wait for a
+   * child that was alive and merely slow.
+   */
   async #start(): Promise<InternalHandle> {
+    for (let attempt = 1; ; attempt++) {
+      // The generation #startOnce claims synchronously at its top; if it no longer holds
+      // after a failure, a shutdown() landed and this start must not spawn again.
+      const gen = this.#startGen + 1;
+      try {
+        return await this.#startOnce();
+      } catch (err) {
+        if (!(err instanceof PortTakenError) || this.#startGen !== gen) throw err;
+        if (attempt >= PORT_RETRY_ATTEMPTS) {
+          throw new Error(
+            `${err.message}\n(gave up after ${PORT_RETRY_ATTEMPTS} attempts, ` +
+              `each on a freshly negotiated port)`,
+          );
+        }
+      }
+    }
+  }
+
+  async #startOnce(): Promise<InternalHandle> {
     this.#installBackstop();
     // Claim a generation; shutdown() bumps #startGen to abandon this start. Every
     // checkpoint below re-checks it so a shutdown() arriving anywhere in the
@@ -643,7 +720,7 @@ export class OpencodeLifecycle {
           );
         }
         if (handle.exited) {
-          throw new Error(await this.#exitedBeforeReady(handle));
+          throw await this.#exitedBeforeReady(handle);
         }
         try {
           const res = await fetch(`${baseUrl}/doc`, { signal: AbortSignal.timeout(READY_HTTP_MS) });
@@ -677,7 +754,7 @@ export class OpencodeLifecycle {
       // and now, /doc may have been answered by an unrelated process that rebound
       // the freed port, so treat readiness as invalid.
       if (handle.exited) {
-        throw new Error(await this.#exitedBeforeReady(handle));
+        throw await this.#exitedBeforeReady(handle);
       }
       this.#handle = handle;
       return handle;
