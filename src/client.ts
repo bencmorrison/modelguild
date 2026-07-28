@@ -97,6 +97,9 @@ interface RequestCtx {
   sessionId?: string;
   signal?: AbortSignal;
   body?: unknown;
+  /** Test seam only (the approval bridge already carries one for its reply path). Production
+   * callers omit it and get the global `fetch`. */
+  fetchImpl?: typeof fetch;
 }
 
 /** Issue one bounded request, throwing an `OpencodeHttpError` with context on any
@@ -111,7 +114,7 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
 
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}${path}`, init);
+    res = await (ctx.fetchImpl ?? fetch)(`${baseUrl}${path}`, init);
   } catch (err) {
     // Timeout aborts and connection failures both land here — annotate the DURATION only
     // when the failure was actually the timeout firing, so a too-small configured value
@@ -301,6 +304,120 @@ export async function fetchSession(opts: FetchSessionOpts): Promise<{ permission
     signal: opts.signal,
   })) as { permission?: unknown };
   return raw;
+}
+
+// --- pending permission requests (issue #91) -------------------------------
+/**
+ * One entry of `GET /permission` — a permission request opencode is still holding open,
+ * waiting for a reply.
+ *
+ * PROBED LIVE on opencode 1.18.7 (2026-07-28, this worktree, against a real `opencode serve`
+ * with a genuinely blocked `bash` tool call): the endpoint's own `/doc` summary is "List
+ * pending permissions" and its description is **"Get all pending permission requests across
+ * all sessions"** — it is GLOBAL to the serve child, which is why `listPendingPermissions`
+ * takes the session id as a REQUIRED argument rather than an optional filter (see there).
+ * An empty list is `[]` with a 200, so there is no error path to special-case, and a request
+ * that has been replied to leaves the list at once (a second reply to it is a 404).
+ *
+ * The fields are exactly the `PermissionRequest` schema — and, verified from a capture of the
+ * same serve, field-for-field IDENTICAL to the `properties` payload of a `permission.asked`
+ * SSE frame. That identity is load-bearing for the approval bridge: it routes a re-listed
+ * request through the SAME normalizer as a streamed one instead of inventing a second shape
+ * that could drift from the one the stream path is tested against.
+ */
+export interface PendingPermission {
+  id: string;
+  sessionID: string;
+  /** The TOOL the request is about (`bash`, `edit`, …) — opencode's `permission` field. */
+  permission?: string;
+  patterns?: unknown;
+  metadata?: unknown;
+  always?: unknown;
+  tool?: unknown;
+  /** Anything a future opencode adds: carried through untouched, never interpreted here. */
+  [key: string]: unknown;
+}
+
+export interface ListPendingPermissionsResult {
+  /** Requests open for the session that was asked about, in the order opencode listed them. */
+  pending: PendingPermission[];
+  /** Entries dropped for want of a usable `id`/`sessionID`. REPORTED rather than silently
+   * skipped: a caller deciding "have I now seen everything?" must not read a silent drop as
+   * an empty list. */
+  malformed: number;
+  /** Open requests belonging to OTHER sessions on this serve child — counted, never returned.
+   * Visible so the global-ness of the endpoint is a fact on the result, not folklore. */
+  otherSessions: number;
+}
+
+export interface ListPendingPermissionsOpts {
+  baseUrl: string;
+  /**
+   * REQUIRED, and required on purpose. `GET /permission` is global to the serve child, so on
+   * a panel sharing one child it returns other members' requests too; answering one of those
+   * would be this process replying on behalf of a session it does not own. Making the filter
+   * a mandatory argument rather than an optional one means a caller cannot forget it — there
+   * is no unfiltered form of this function to reach for.
+   */
+  sessionId: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * `GET /permission` — the requests opencode is still holding open, narrowed to one session.
+ *
+ * A CONTROL-PLANE call, so it uses `SHORT_HTTP_MS`, never the model-turn budget: it must
+ * answer promptly or fail, since the only caller runs it on a stream re-attach while a turn
+ * is already blocked.
+ *
+ * It THROWS on a transport failure, a non-2xx, or a body that is not an array — the caller
+ * (`src/approve.ts`) turns that into a degradation, never into a call failure.
+ */
+export async function listPendingPermissions(
+  opts: ListPendingPermissionsOpts,
+): Promise<ListPendingPermissionsResult> {
+  const ctx: RequestCtx = {
+    baseUrl: opts.baseUrl,
+    path: "/permission",
+    method: "GET",
+    timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
+  };
+  if (opts.signal !== undefined) ctx.signal = opts.signal;
+  if (opts.fetchImpl !== undefined) ctx.fetchImpl = opts.fetchImpl;
+  const raw = await requestJson(ctx);
+  if (!Array.isArray(raw)) {
+    throw new OpencodeHttpError(
+      `GET /permission did not return an array (got ${typeof raw}) — refusing to guess what ` +
+        `is still pending`,
+      { method: "GET", path: "/permission" },
+    );
+  }
+  const pending: PendingPermission[] = [];
+  let malformed = 0;
+  let otherSessions = 0;
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      malformed += 1;
+      continue;
+    }
+    const rec = entry as Record<string, unknown>;
+    const id = typeof rec.id === "string" ? rec.id : "";
+    const sessionID = typeof rec.sessionID === "string" ? rec.sessionID : "";
+    // Both are required by opencode's own schema. Without either there is nothing a caller
+    // could do with the entry — it cannot be replied to, or cannot be attributed.
+    if (id.length === 0 || sessionID.length === 0) {
+      malformed += 1;
+      continue;
+    }
+    if (sessionID !== opts.sessionId) {
+      otherSessions += 1;
+      continue;
+    }
+    pending.push(rec as PendingPermission);
+  }
+  return { pending, malformed, otherSessions };
 }
 
 // --- sendMessage ----------------------------------------------------------

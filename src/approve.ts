@@ -64,6 +64,18 @@
  *      (a second reply to a settled permission id is a 404 — verified on 1.18.7), and the
  *      loser is recorded, not retried.
  *
+ * THE BLIND WINDOW, AND WHAT SHRINKING IT DOES AND DOES NOT BUY (issue #91). This bridge
+ * answers requests off the event stream, so losing that stream makes it blind: requests still
+ * OPEN are rejected fail-closed (`#onDegraded`), but one raised WHILE blind was never seen at
+ * all, and SSE has no replay — so it used to wait on `GUILD_MESSAGE_TIMEOUT_MS` (15 min) with
+ * nothing prompted, rather than on `GUILD_APPROVE_TIMEOUT_MS` (120 s). On re-attach the bridge
+ * now asks opencode what is still open (`GET /permission`, probed live on 1.18.7) and routes
+ * its own session's requests as if the event had arrived, which makes the window the reconnect
+ * backoff instead of the turn's backstop. **The guarantee is "recovered on reconnect", NEVER
+ * "never missed":** the list is a snapshot of what is still OPEN, so a request raised and
+ * settled by somebody else while this bridge was blind leaves nothing behind to recover, and
+ * this bridge will never have seen it. `blindWindows` stays on the summary saying exactly that.
+ *
  * NOTHING HERE MAY BE SELF-APPROVED BY THE DRIVER. There is deliberately **no tool input**
  * that pre-approves a permission request: a decision is only ever accepted from a channel
  * above. `test/approve.test.ts` asserts no tool's input schema carries an approval field.
@@ -79,9 +91,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { SHORT_HTTP_MS } from "./client.js";
+import { listPendingPermissions, SHORT_HTTP_MS } from "./client.js";
 import { confGet, coerceTimeoutMs } from "./config.js";
-import { ServeEventBus, type ActivityEvent, type BusHandlers } from "./activity.js";
+import {
+  normalizeServeEvent,
+  ServeEventBus,
+  type ActivityEvent,
+  type BusHandlers,
+} from "./activity.js";
 
 // ---------------------------------------------------------------------------
 // Knobs
@@ -964,12 +981,36 @@ export interface ApprovalSummary {
   /** Outcome counts by settler — `{elicitation: 1, timeout: 2, external: 1}`. */
   decidedBy: Record<string, number>;
   /**
-   * The event stream was lost while armed. A degraded bridge cannot SEE new requests, so a
-   * quiet `requests: 0` under `degraded: true` means "we went blind", never "the model asked
-   * for nothing" — the same rule `activity.degraded` states for the visibility layer.
+   * The bridge is blind RIGHT NOW: the event stream was lost and has not been recovered. A
+   * degraded bridge cannot SEE new requests, so a quiet `requests: 0` under `degraded: true`
+   * means "we went blind", never "the model asked for nothing" — the same rule
+   * `activity.degraded` states for the visibility layer.
+   *
+   * IT CAN NOW CLEAR (issue #91), and only on evidence: the bus re-attached, `GET /permission`
+   * answered, everything it listed for this session was routed, and nothing this bridge had
+   * already answered was still sitting open. Until then it stays set — a failed re-list leaves
+   * it exactly where it was. Before #91 it latched for the life of the call, so every run that
+   * survived a transport blip reported itself blind at the end when it could see perfectly
+   * well.
    */
   degraded: boolean;
+  /** Why the most recent blind window opened. RETAINED after recovery (it is the record of
+   * what happened), so read it together with `degraded`, not instead of it. */
   degradedReason: string | null;
+  /**
+   * How many times the stream was lost during this call. LATCHED — a re-list can clear
+   * `degraded`, it cannot make the window not have happened.
+   *
+   * `degraded: false` with `blindWindows > 0` means the stream dropped and recovered — and it
+   * is also the honest caveat on every counter above: a request raised AND settled by another
+   * channel during a blind window leaves nothing open for the re-list to find, so the counts
+   * can under-report that window. "Recovered on reconnect" is the guarantee; "never missed"
+   * is not.
+   */
+  blindWindows: number;
+  /** Requests recovered by re-listing opencode's open requests on re-attach rather than seen
+   * on the stream (issue #91) — i.e. raised while this bridge was blind, and prompted anyway. */
+  recovered: number;
   /** Where the request/decision record was written; null when nothing was written. */
   file: string | null;
   /** The honest bound, on the wire, so a reader of `structuredContent` cannot miss it. */
@@ -1039,6 +1080,10 @@ export class ApprovalBridge {
   #decidedBy: Record<string, number> = {};
   #degraded = false;
   #degradedReason: string | null = null;
+  /** Blind windows opened so far. Doubles as the GENERATION for `#relist`: a snapshot taken
+   * during window N must not clear a flag that window N+1 has since re-raised. */
+  #blindWindows = 0;
+  #recovered = 0;
 
   constructor(opts: {
     settings: ApprovalSettings;
@@ -1089,6 +1134,15 @@ export class ApprovalBridge {
         onEvent: (e) => this.handleEvent(e),
         // A bridge that goes blind must SAY so and reject what is open (review finding M6).
         onDegraded: (reason) => this.degrade(reason),
+        // …and when it can see again, go and find what it missed (issue #91). Fire-and-forget
+        // by construction, with the rejection swallowed explicitly: the bus does not await
+        // this, so an escape would be an unhandled rejection in a process that must stay up.
+        // `#relist` already turns every failure it can name into a recorded degradation.
+        onReattached: () => {
+          void this.reattached().catch(() => {
+            /* nothing a re-list can fail at may reach the call */
+          });
+        },
       };
       this.#unsubscribe = bus.subscribe(sessionId, handlers);
       // The activity recorder normally awaits this first (they share one refcounted bus), so
@@ -1168,6 +1222,8 @@ export class ApprovalBridge {
       decidedBy: { ...this.#decidedBy },
       degraded: this.#degraded,
       degradedReason: this.#degradedReason,
+      blindWindows: this.#blindWindows,
+      recovered: this.#recovered,
       file: this.#wrote ? (this.#file ?? null) : null,
       note: HONEST_BOUND,
     };
@@ -1191,6 +1247,15 @@ export class ApprovalBridge {
     this.#onDegraded(reason);
   }
 
+  /**
+   * The bus's re-attach signal (issue #91), public for the same reason as `handleEvent`, and
+   * returning the in-flight re-list so a test can await it deterministically. Production
+   * callers (the bus handler) ignore the promise — see `#relist` for why that is safe.
+   */
+  reattached(): Promise<void> {
+    return this.#relist();
+  }
+
   // --- internals ----------------------------------------------------------
 
   /**
@@ -1204,15 +1269,23 @@ export class ApprovalBridge {
    * went blind". The same rule the visibility layer states for `activity.degraded`.
    *
    * WHAT THIS DELIBERATELY DOES NOT DO: kill the turn. A stream drop is not evidence that the
-   * model is doing anything wrong, the bus reconnects on its own, and `GUILD_MESSAGE_TIMEOUT_MS`
-   * already bounds the worst case (a request raised while blind blocks until that backstop).
-   * Aborting on a transport blip would trade a bounded delay for a lost turn.
+   * model is doing anything wrong, the bus reconnects on its own, and (issue #91) the bridge
+   * re-lists opencode's open requests when it does — so the window a request can be raised in
+   * unseen is the reconnect backoff, with `GUILD_MESSAGE_TIMEOUT_MS` still the backstop behind
+   * that. Aborting on a transport blip would trade a bounded delay for a lost turn.
    */
   #onDegraded(reason: string): void {
     if (this.#closed) return;
-    this.#degraded = true;
-    // Keep the FIRST reason: it names what was actually lost, not the latest retry.
-    if (this.#degradedReason === null) this.#degradedReason = reason;
+    // A TRANSITION opens a new blind window; a repeat inside one (the bus degrades on every
+    // failed reconnect attempt) does not. The count is what survives a later recovery, and it
+    // is also `#relist`'s generation guard.
+    if (!this.#degraded) {
+      this.#degraded = true;
+      this.#blindWindows += 1;
+      // The reason belongs to THIS window: it names what was actually lost, not the latest
+      // retry — and not a previous window that has since been recovered from.
+      this.#degradedReason = reason;
+    }
     for (const [permissionId, timer] of [...this.#pending]) {
       clearTimeout(timer);
       this.#pending.delete(permissionId);
@@ -1223,6 +1296,156 @@ export class ApprovalBridge {
         `ModelGuild lost opencode's event stream while this request was open (${reason}), so ` +
           `it could no longer be routed to a human — rejected, fail-closed`,
       );
+    }
+  }
+
+  /**
+   * THE RE-LIST (issue #91). The stream is back; ask opencode what it is still holding open
+   * and route this session's requests as if their events had arrived.
+   *
+   * WHY IT IS NEEDED AT ALL. SSE has no replay. A request raised while this bridge was blind
+   * is not in the reconnected stream, so before this it was never prompted, never recorded and
+   * never rejected on the approval clock — it simply waited on `GUILD_MESSAGE_TIMEOUT_MS`
+   * (15 min) instead of `GUILD_APPROVE_TIMEOUT_MS` (120 s). Nothing ran ungated meanwhile
+   * (opencode holds the call at its `ask`), so the cost was a stall — but a silent 15-minute
+   * stall in the one mode whose purpose is keeping a human in the loop is how a feature gets
+   * switched off.
+   *
+   * WHAT IT DOES NOT PROMISE. `GET /permission` lists what is still OPEN. A request raised and
+   * settled by another answerer during the blind window is gone from it, and this bridge will
+   * never have seen it. **"Recovered on reconnect", never "never missed"** — which is why
+   * `blindWindows` is latched on the summary even after `degraded` clears.
+   *
+   * THE SESSION FILTER IS LOAD-BEARING, NOT TIDINESS. The endpoint is global to the serve
+   * child (its own `/doc`: "across all sessions"), and a `guild_panel` runs several sessions
+   * on one child. Answering another member's request would be this bridge deciding on behalf
+   * of a session it does not own. `listPendingPermissions` takes the session id as a required
+   * argument so the filter cannot be forgotten, and the normalized event's own session id is
+   * checked again here.
+   *
+   * IT MAY NOT THROW, EVER. It runs from a bus callback and from a promise the bus does not
+   * await, so an escape would be an unhandled rejection in a process that must stay up — and
+   * a stream failure must never become a call failure. A failed `GET /permission` is recorded
+   * and leaves the bridge degraded, which is the truthful state: we still cannot say we can
+   * see. It also NARROWS nothing and WIDENS nothing: every decision still goes through
+   * `#onAsked` → the channels → `#settle`, so both mechanical invariants (never emit `allow`,
+   * never gate a tool the def denies) are untouched — this path decides nothing at all.
+   */
+  async #relist(): Promise<void> {
+    if (this.#closed || this.#baseUrl.length === 0 || this.#sessionId.length === 0) return;
+    // The window this snapshot answers. If another one opens while the GET is in flight the
+    // snapshot is already stale, and must not be used to clear a flag that has been re-raised.
+    const window = this.#blindWindows;
+    let listed: Awaited<ReturnType<typeof listPendingPermissions>>;
+    try {
+      listed = await listPendingPermissions({
+        baseUrl: this.#baseUrl,
+        sessionId: this.#sessionId,
+        fetchImpl: this.#fetchImpl,
+      });
+    } catch (err) {
+      this.#write({
+        kind: "relist-failed",
+        error: (err as Error).message,
+        note:
+          "the event stream re-attached but opencode's open-request list could not be read, " +
+          "so a request raised while blind may still be unseen — this bridge stays degraded, " +
+          "and such a request waits on the model-turn timeout",
+      });
+      return;
+    }
+    if (this.#closed) return;
+
+    let recovered = 0;
+    let unsettled = 0;
+    let unusable = 0;
+    for (const req of listed.pending) {
+      const permissionId = req.id;
+      if (this.#outcome.has(permissionId) || this.#claimed.has(permissionId)) {
+        // WE ALREADY ANSWERED THIS ONE — typically the reject `#onDegraded` sent — and
+        // opencode is still holding it, so that reply did not take effect. It is NOT
+        // re-prompted: putting a request the developer has already answered back in front of
+        // them is exactly the bug the dedup exists to prevent. Recorded instead, and it keeps
+        // the bridge degraded, because a decision of ours is demonstrably unresolved.
+        unsettled += 1;
+        this.#write({
+          kind: "relist-unsettled",
+          permission_id: permissionId,
+          note:
+            "this request was already answered by this bridge but opencode still lists it as " +
+            "open — the reply did not take effect. NOT re-prompted (it has been decided once " +
+            "already); it will settle on opencode's side or expire with the turn",
+        });
+        continue;
+      }
+      // Already open here: it is on the approval clock and has been prompted. Nothing to do.
+      if (this.#pending.has(permissionId)) continue;
+
+      // ONE NORMALIZER, NOT TWO. A `GET /permission` entry is field-for-field the `properties`
+      // payload of a `permission.asked` frame (both captured from opencode 1.18.7), so it is
+      // fed through the same function the stream path uses rather than hand-mapped into a
+      // second shape that could drift from the one the tests pin.
+      const e = normalizeServeEvent({ type: "permission.asked", properties: req });
+      if (
+        e === undefined ||
+        e.kind !== "permission-asked" ||
+        e.permissionId !== permissionId ||
+        e.sessionId !== this.#sessionId
+      ) {
+        unusable += 1;
+        this.#write({
+          kind: "relist-unusable",
+          permission_id: permissionId,
+          note: "opencode listed this request in a shape this build could not route",
+        });
+        continue;
+      }
+      recovered += 1;
+      this.#write({
+        kind: "relisted",
+        permission_id: permissionId,
+        note:
+          "raised while this bridge was blind and recovered from opencode's open-request list " +
+          "on re-attach; the approval timeout starts NOW, from when it was seen — not from " +
+          "when opencode raised it",
+      });
+      // `detail` mirrors what the bus attaches to a streamed event, so the prompt the
+      // developer reads is assembled from the same fields either way.
+      this.handleEvent({ ...e, detail: req });
+    }
+    this.#recovered += recovered;
+
+    // CLEARING `degraded` IS A CLAIM, so it is made only on evidence (issue #91): the stream
+    // is attached again, opencode answered, everything it listed for this session is now
+    // routed, and nothing we had already decided is still sitting open. Any of those missing
+    // and the flag stays — an over-reported degradation costs a caveat, an under-reported one
+    // costs the caller's trust in every counter beside it.
+    const clean =
+      listed.malformed === 0 &&
+      unsettled === 0 &&
+      unusable === 0 &&
+      this.#blindWindows === window &&
+      this.#bus?.connected === true;
+    this.#write({
+      kind: "relist",
+      pending: listed.pending.length,
+      recovered,
+      other_sessions: listed.otherSessions,
+      malformed: listed.malformed,
+      unsettled,
+      unusable,
+      clean,
+    });
+    if (clean && this.#degraded) {
+      this.#degraded = false;
+      this.#write({
+        kind: "stream-recovered",
+        blind_windows: this.#blindWindows,
+        note:
+          "the event stream re-attached and opencode's open requests were re-listed clean, so " +
+          "this bridge can see again. It does NOT mean nothing was missed: a request raised " +
+          "AND settled by another answerer while blind leaves nothing to recover",
+      });
     }
   }
 

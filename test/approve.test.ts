@@ -62,7 +62,12 @@ import {
   type ApprovalTier,
   type ElicitationRequester,
 } from "../src/approve.js";
-import { assertAskOnlyRuleset, createSession, type ServeProvider } from "../src/client.js";
+import {
+  assertAskOnlyRuleset,
+  createSession,
+  listPendingPermissions,
+  type ServeProvider,
+} from "../src/client.js";
 import { closeAllBuses } from "../src/activity.js";
 import { consult } from "../src/consult.js";
 import { delegate } from "../src/delegate.js";
@@ -1901,6 +1906,289 @@ export async function run(): Promise<number> {
     bridge.close();
     closeAllBuses();
     await m6Fake.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // #91 — RE-LIST ON RE-ATTACH. M6 covers requests that were already OPEN when the stream
+  //       died. This covers the ones raised WHILE blind, which the stream can never deliver
+  //       (SSE has no replay) and which therefore used to wait on GUILD_MESSAGE_TIMEOUT_MS
+  //       with nothing prompted at all.
+  //
+  //       The guarantee under test is "recovered on re-attach", NOT "never missed" — the
+  //       endpoint lists what is still OPEN, so a request settled by somebody else during the
+  //       blind window leaves nothing to find. That is why `blindWindows` is latched even
+  //       when `degraded` clears, and it is asserted below.
+  // -------------------------------------------------------------------------
+  {
+    /** A bridge wired to a fake, whose replies go to a stub (so the fake never learns of them
+     * and the request stays OPEN in its list — which is exactly the state a dedup test needs)
+     * while GETs still reach the fake for real. */
+    const relistBridge = async (
+      fake: FakeOpencode,
+      sessionId: string,
+      opts: { prompts?: string[]; file?: string; stubReplies?: boolean } = {},
+    ): Promise<{ bridge: ApprovalBridge; posted: string[] }> => {
+      const posted: string[] = [];
+      const fetchImpl = (async (url: unknown, init: unknown) => {
+        const method = String((init as { method?: unknown })?.method ?? "GET");
+        if (method === "POST") {
+          posted.push(String(url));
+          if (opts.stubReplies === true) return { status: 200 } as Response;
+        }
+        return fetch(url as string, init as RequestInit);
+      }) as unknown as typeof fetch;
+      const bridgeOpts: ConstructorParameters<typeof ApprovalBridge>[0] = {
+        settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+        gatedTools: ["bash"],
+        channels: ["elicitation"],
+        context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+        armed: true,
+        elicitation: stubElicitation("accept", opts.prompts),
+        fetchImpl,
+      };
+      if (opts.file !== undefined) bridgeOpts.file = opts.file;
+      const bridge = new ApprovalBridge(bridgeOpts);
+      await bridge.attach(fake.baseUrl, sessionId);
+      return { bridge, posted };
+    };
+
+    // (a) THE WIRING: the BUS calls back on re-attach, and the bridge recovers the request.
+    //     Driven through a real stream drop rather than by poking the bridge, so the seam
+    //     added to `ServeEventBus` is what is under test, not a hand-called method.
+    {
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91a" });
+      const prompts: string[] = [];
+      const { bridge } = await relistBridge(fake, "ses_91a", { prompts });
+      fake.addPendingPermission({
+        id: "per_blindraised",
+        sessionID: "ses_91a",
+        permission: "bash",
+        metadata: { command: "npm run build" },
+      });
+      fake.dropEventClients();
+      const ok = await waitFor(() => bridge.summary().recovered === 1, 6_000, 50);
+      const s = bridge.summary();
+      c.check(ok, `#91a: a request raised while blind is RECOVERED on re-attach (${JSON.stringify(s)})`);
+      c.check(s.requests === 1, "#91a: and counted as a request, not silently absorbed");
+      c.check(
+        prompts.length === 1 && prompts[0].includes("npm run build"),
+        `#91a: the developer is PROMPTED with the real command (${JSON.stringify(prompts)})`,
+      );
+      c.check(s.blindWindows === 1, `#91a: the blind window is latched (${s.blindWindows})`);
+      await waitFor(() => bridge.summary().approved === 1, 3_000, 50);
+      c.check(
+        bridge.summary().approved === 1,
+        `#91a: and the recovered request is answered, unblocking the model (${JSON.stringify(bridge.summary())})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (b) A REQUEST THIS BRIDGE ALREADY REJECTED ON THE DEGRADED PATH IS NOT RE-PROMPTED.
+    //     The stub swallows the reject, so opencode still lists the request as open — the
+    //     hardest version of this case, and the one where a naive re-list double-prompts.
+    {
+      const dir = tmp("apr-91b-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91b" });
+      const prompts: string[] = [];
+      const { bridge } = await relistBridge(fake, "ses_91b", { prompts, file, stubReplies: true });
+      fake.addPendingPermission({ id: "per_alreadyrejected", sessionID: "ses_91b" });
+      // Seen on the stream, then the stream dies with it open ⇒ rejected fail-closed (M6).
+      // `degrade` runs in the SAME synchronous block as `handleEvent`, so it settles the
+      // request before the stub elicitation's answer can be delivered on a microtask — the
+      // late `accept` is then correctly dropped by the already-claimed guard, which is why
+      // `decidedBy` below is the degraded reject and not an approval.
+      bridge.handleEvent({
+        ts: Date.now(),
+        sessionId: "ses_91b",
+        kind: "permission-asked",
+        summary: "permission asked: bash",
+        permissionId: "per_alreadyrejected",
+        permissionTool: "bash",
+        detail: { metadata: { command: "rm -rf /" } },
+      });
+      bridge.degrade("event stream dropped: socket hang up");
+      await waitFor(() => bridge.summary().rejected === 1, 2_000, 25);
+      const promptsAfterReject = prompts.length;
+      await bridge.reattached();
+      const s = bridge.summary();
+      c.check(
+        prompts.length === promptsAfterReject,
+        `#91b: a request already answered is NOT put to the developer a second time (${prompts.length} vs ${promptsAfterReject})`,
+      );
+      c.check(s.recovered === 0, "#91b: and it is not counted as recovered");
+      c.check(s.rejected === 1 && s.approved === 0, `#91b: its outcome is unchanged (${JSON.stringify(s)})`);
+      c.check(
+        s.degraded === true,
+        "#91b: degraded STAYS set — our reply demonstrably did not take effect, so we cannot claim to be fine",
+      );
+      const lines = readApprovals(dir);
+      c.check(
+        lines.some((l) => l.kind === "relist-unsettled" && l.permission_id === "per_alreadyrejected"),
+        `#91b: and the unresolved decision is RECORDED, not hidden (${JSON.stringify(lines.map((l) => l.kind))})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (c) ANOTHER SESSION'S REQUEST IS NOT TOUCHED. `GET /permission` is global to the serve
+    //     child, so on a panel this filter is the only thing stopping one member's bridge
+    //     answering another member's request.
+    {
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91c" });
+      const prompts: string[] = [];
+      const { bridge, posted } = await relistBridge(fake, "ses_91c", { prompts });
+      fake.addPendingPermission({ id: "per_mine", sessionID: "ses_91c", metadata: { command: "mine" } });
+      fake.addPendingPermission({ id: "per_theirs", sessionID: "ses_other", metadata: { command: "theirs" } });
+      bridge.degrade("event stream dropped: socket hang up");
+      await bridge.reattached();
+      await waitFor(() => bridge.summary().approved === 1, 3_000, 25);
+      const s = bridge.summary();
+      c.check(s.recovered === 1 && s.requests === 1, `#91c: only OUR session's request is recovered (${JSON.stringify(s)})`);
+      c.check(
+        prompts.length === 1 && prompts[0].includes("mine") && !prompts[0].includes("theirs"),
+        `#91c: and only ours is put to the developer (${JSON.stringify(prompts)})`,
+      );
+      c.check(
+        !posted.some((u) => u.includes("per_theirs")),
+        `#91c: no reply is ever sent for another session's request (${JSON.stringify(posted)})`,
+      );
+      c.check(
+        fake.pendingPermissions().includes("per_theirs"),
+        "#91c: it is left open for the bridge that owns it",
+      );
+      // The client's own accounting of the endpoint being global, asserted directly.
+      const listed = await listPendingPermissions({ baseUrl: fake.baseUrl, sessionId: "ses_91c" });
+      c.check(
+        listed.otherSessions === 1 && listed.pending.every((p) => p.sessionID === "ses_91c"),
+        `#91c: listPendingPermissions filters and COUNTS the rest (${JSON.stringify(listed)})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (d) A CLEAN RE-LIST CLEARS `degraded`; nothing else does. The flag was latched for the
+    //     life of the call before #91, so every run that survived a blip lied at the end.
+    {
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_91d" });
+      const { bridge } = await relistBridge(fake, "ses_91d");
+      bridge.degrade("event stream dropped: socket hang up");
+      c.check(bridge.summary().degraded === true, "#91d: degraded while the stream is down");
+      await bridge.reattached();
+      const s = bridge.summary();
+      c.check(s.degraded === false, `#91d: a clean re-list clears it (${JSON.stringify(s)})`);
+      c.check(
+        s.blindWindows === 1 && s.degradedReason !== null,
+        `#91d: but the window and its reason are LATCHED — recovered is not the same as never happened (${JSON.stringify(s)})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (e) A FAILED RE-LIST DEGRADES; IT NEVER THROWS INTO THE CALL. Both failure shapes: a
+    //     500, and a 200 whose body is not the array the contract promises.
+    for (const [label, fakeOpts] of [
+      ["a 500", { failListPermissions: true }],
+      ["a non-array body", { listPermissionsGarbage: true }],
+    ] as const) {
+      const dir = tmp("apr-91e-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_91e",
+        ...fakeOpts,
+      });
+      const { bridge } = await relistBridge(fake, "ses_91e", { file });
+      bridge.degrade("event stream dropped: socket hang up");
+      let threw = false;
+      try {
+        await bridge.reattached();
+      } catch {
+        threw = true;
+      }
+      const s = bridge.summary();
+      c.check(!threw, `#91e (${label}): the re-list does not throw — a stream failure is never a call failure`);
+      c.check(
+        s.degraded === true,
+        `#91e (${label}): and the bridge stays degraded, because it still cannot say it can see`,
+      );
+      const lines = readApprovals(dir);
+      c.check(
+        lines.some((l) => l.kind === "relist-failed"),
+        `#91e (${label}): the failure is recorded (${JSON.stringify(lines.map((l) => l.kind))})`,
+      );
+      bridge.close();
+      closeAllBuses();
+      await fake.close();
+    }
+
+    // (f) END TO END: the fake raises its gated request while NOBODY is attached, and blocks
+    //     the turn on it. The only route to that request is the re-list, so a completed turn
+    //     with the tool approved is proof the recovery works against the full stack.
+    {
+      const root = tmp("apr-91f-");
+      const logDir = tmp("apr-91flogs-");
+      const repo = tmp("apr-91frepo-");
+      const env = envWith({
+        GUILD_ROOT: root,
+        GUILD_LOG_DIR: logDir,
+        GUILD_AGENT_DIR: defDirWith("guild-build"),
+        GUILD_APPROVE: "all",
+      });
+      const prompts: string[] = [];
+      const fake = await startFakeOpencode({
+        historyText: "I built it",
+        sessionId: "ses_91f",
+        gateTool: "bash",
+        gateMetadata: { command: "npm run build" },
+        gateBlind: true,
+        gateTimeoutMs: 20_000,
+      });
+      try {
+        const r = await delegate(
+          { task: "build it", model: "openai/allowed" },
+          {
+            serve: fakeServe(fake),
+            env,
+            messageTimeoutMs: 30_000,
+            repoDir: repo,
+            elicitation: stubElicitation("accept", prompts),
+          },
+        );
+        c.check(r.ok, `#91f: the turn COMPLETED (${!r.ok ? r.error.message : ""})`);
+        c.check(
+          fake.gateOutcomes()[0] === "once",
+          `#91f: the gated tool was raised while blind and still got its answer (${JSON.stringify(fake.gateOutcomes())})`,
+        );
+        c.check(
+          prompts.length === 1 && prompts[0].includes("npm run build"),
+          `#91f: the developer saw the real command (${JSON.stringify(prompts)})`,
+        );
+        if (r.ok) {
+          c.check(
+            r.approval?.recovered === 1 && r.approval?.approved === 1,
+            `#91f: the result attributes it to the re-list (${JSON.stringify(r.approval)})`,
+          );
+          c.check(
+            r.approval?.blindWindows === 1 && r.approval?.degraded === false,
+            `#91f: recovered, and honest that a window happened (${JSON.stringify(r.approval)})`,
+          );
+          const lines = readApprovals(path.join(logDir, r.attribution.runId));
+          c.check(
+            lines.some((l) => l.kind === "relisted") && lines.some((l) => l.kind === "stream-recovered"),
+            `#91f: approvals.jsonl records the recovery (${JSON.stringify(lines.map((l) => l.kind))})`,
+          );
+        }
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
