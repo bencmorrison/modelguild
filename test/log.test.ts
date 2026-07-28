@@ -414,6 +414,119 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 11b. issue #74 — the PATCH-LESS delegate-diff (`diffUncaptured`). `diff()` above needs a
+  //      patch file to hash; a CRASHED capture has none, and before this entry existed the
+  //      write path logged nothing at all on that route, so the run verified CLEAN. The entry
+  //      must (a) fail verify LOUDLY on capture completeness — that is the point — and (b) NOT
+  //      trip the referenced-artifact branch for a patch it never claimed to have.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "r" });
+    const log = new EvidenceLog({ env });
+    await log.expect({ callId: "u1", model: "m/x", agent: "guild-build" });
+    const st = await log.started({ callId: "u1", model: "m/x", agent: "guild-build", prompt: "p" });
+    await log.completed({ callId: "u1", exit: 0, turn: st.turn, captureState: "complete", response: "did work" });
+
+    const bad = await log.diffUncaptured({ callId: "u1", reason: "" });
+    c.check(!bad.ok, "#74: diffUncaptured REFUSES an empty reason (a patch-less entry must say why), no throw");
+
+    const ur = await log.diffUncaptured({
+      callId: "u1",
+      base: "bt",
+      reason: "capture-crashed",
+      detail: "EISDIR: illegal operation on a directory, open '…/diff-u1.patch'",
+      scaffoldChanged: false,
+    });
+    const file = path.join(dir, "r", "calls.jsonl");
+    const e = parsed(file).find((x) => x.type === "delegate-diff")!;
+    c.check(ur.ok, "#74: diffUncaptured writes a delegate-diff entry with no patch artifact");
+    c.check(
+      e.claim === false && e.capture_complete === false && e.incomplete_reason === "capture-crashed" &&
+        e.patch === null && e.patch_bytes === 0 && e.files_changed === 0 &&
+        e.after_tree === "" && e.base_tree === "bt" && e.response_hash === null,
+      "#74: entry shape — claim:false, capture_complete:false, patch/patch_bytes/files_changed empty, no response_hash",
+    );
+    c.check(e.call_id === "u1" && e.scaffold_changed === false, "#74: paired to the call_id; the optional scaffold signal rides along");
+    c.check(typeof e.incomplete_detail === "string", "#74: the crash text is recorded when supplied");
+
+    // The bash canonicalization quirk still holds for the new shape: entry_hash appended LAST.
+    const last = lines(file).pop() as string;
+    c.check(last.endsWith(`"entry_hash":"${e.entry_hash as string}"}`), "#74: entry_hash is still appended LAST (bash quirk) on the new shape");
+
+    // (a) fails loudly, and (b) for the RIGHT reason — the capture-completeness check, reached
+    // only after this entry's prev_hash/entry_hash both verified, and NOT the artifact branch.
+    const v = log.verify("r");
+    c.check(v.code === 7, "#74: a patch-less delegate-diff FAILS verify (7) — a crashed capture never passes clean");
+    c.check(/incomplete evidence capture/.test(v.message), "#74: verify fails on capture completeness (its hashes passed)");
+    c.check(!/MISSING/.test(v.message), "#74: verify does NOT report a missing artifact (response_hash is null, so nothing is chased)");
+
+    // An entry written when a detail was omitted carries no such field at all (optional-field
+    // pattern: an entry without one stays shape-identical to a bash-era/no-detail write).
+    // An EMPTY detail is that same case, not a third `incomplete_detail: null` shape (F8):
+    // C29 describes exactly two — the field absent, or a non-empty string.
+    const dir2 = tmp();
+    const log2 = new EvidenceLog({ env: envFor(dir2, { GUILD_RUN_ID: "r2" }) });
+    await log2.subagentVoice({ model: "m/x", response: "keeps the run non-empty" });
+    await log2.diffUncaptured({ callId: "u2", reason: "capture-crashed" });
+    await log2.diffUncaptured({ callId: "u3", reason: "capture-crashed", detail: "" });
+    const dd2 = parsed(path.join(dir2, "r2", "calls.jsonl")).filter((x) => x.type === "delegate-diff");
+    c.check(!("incomplete_detail" in dd2[0]) && !("scaffold_changed" in dd2[0]), "#74: optional fields are omitted, not nulled, when unsupplied");
+    c.check(!("incomplete_detail" in dd2[1]), "#74 (F8): an EMPTY detail omits the field too — never a third `incomplete_detail: null` shape");
+  }
+
+  // -------------------------------------------------------------------------
+  // 11c. issue #74 review F1 — `incomplete_detail` truncation must be CODE-POINT safe.
+  //
+  //      The C25/jq scar aimed at our OWN writes: a naive `slice(0, 1000)` cuts UTF-16 code
+  //      UNITS, so an astral character straddling the boundary is truncated INTO a lone high
+  //      surrogate. The write still succeeds, but `verify` then fails with "not clean JSONL"
+  //      instead of the capture-completeness failure the entry exists to raise — and `jq`
+  //      errors the ENTIRE calls.jsonl stream on a lone surrogate, so a field added to protect
+  //      the receipts would have damaged the file holding them.
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "r" });
+    const log = new EvidenceLog({ env });
+    await log.expect({ callId: "t1", model: "m/x", agent: "guild-build" });
+    const st = await log.started({ callId: "t1", model: "m/x", agent: "guild-build", prompt: "p" });
+    await log.completed({ callId: "t1", exit: 0, turn: st.turn, captureState: "complete", response: "did work" });
+
+    // 999 BMP chars, then an astral char occupying UTF-16 units 999 AND 1000 — a code-unit
+    // slice at 1000 keeps its HIGH surrogate and drops the low one.
+    const straddling = "E".repeat(999) + "\u{1F4C1}" + "TAIL".repeat(60);
+    c.check(straddling.slice(0, 1000) !== [...straddling].slice(0, 1000).join(""), "#74 F1 setup: a code-unit slice at 1000 really does split this input");
+    await log.diffUncaptured({ callId: "t1", reason: "capture-crashed", detail: straddling });
+
+    const file = path.join(dir, "r", "calls.jsonl");
+    const e = parsed(file).find((x) => x.type === "delegate-diff")!;
+    const detail = e.incomplete_detail as string;
+    c.check([...detail].length === 1000, "#74 F1: the detail is bounded to 1000 CODE POINTS");
+    c.check([...detail].pop() === "\u{1F4C1}", "#74 F1: the straddling astral char survives WHOLE at the boundary (never half of it)");
+    c.check(Buffer.from(detail, "utf8").toString("utf8") === detail, "#74 F1: the stored detail carries NO lone surrogate");
+    c.check(!/\\ud[89ab][0-9a-f]{2}/i.test(readFileSync(file, "utf8")), "#74 F1: the raw JSONL line carries no lone-surrogate escape (jq would error the whole stream)");
+
+    // The run must fail for the RIGHT reason: capture completeness, not JSONL cleanliness.
+    const v = log.verify("r");
+    c.check(v.code === 7 && /incomplete evidence capture/.test(v.message), "#74 F1: verify fails on capture completeness, NOT 'not clean JSONL'");
+
+    // An ALREADY-unpaired surrogate in the input (a crash message quoting a badly-named path)
+    // is dropped too — this field is ours to sanitize, unlike a receipt of a model's words
+    // (test 2b pins that a lone surrogate in a model REPLY must still fail the run).
+    const dir2 = tmp();
+    const log2 = new EvidenceLog({ env: envFor(dir2, { GUILD_RUN_ID: "r2" }) });
+    await log2.expect({ callId: "t2", model: "m/x", agent: "guild-build" });
+    const st2 = await log2.started({ callId: "t2", model: "m/x", agent: "guild-build", prompt: "p" });
+    await log2.completed({ callId: "t2", exit: 0, turn: st2.turn, captureState: "complete", response: "did work" });
+    await log2.diffUncaptured({ callId: "t2", reason: "capture-crashed", detail: "EISDIR open '\ud800bad'" });
+    const e2 = parsed(path.join(dir2, "r2", "calls.jsonl")).find((x) => x.type === "delegate-diff")!;
+    c.check(e2.incomplete_detail === "EISDIR open 'bad'", "#74 F1: a pre-existing unpaired surrogate is dropped, the rest of the message kept");
+    const v2 = log2.verify("r2");
+    c.check(v2.code === 7 && /incomplete evidence capture/.test(v2.message), "#74 F1: and that run still fails for capture completeness");
+  }
+
+  // -------------------------------------------------------------------------
   // 12. C30 — a subagent-voice-only run verifies (all-Anthropic exchange); a
   //     claude-final-only run does NOT.
   // -------------------------------------------------------------------------

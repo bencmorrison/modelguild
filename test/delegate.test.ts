@@ -305,6 +305,146 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 6b. issue #74 — a CRASHED capture leaves a DURABLE record and FAILS verify.
+  //
+  //     The defect: the crash `catch` in captureAndLog returned before ever reaching
+  //     `log.diff`, so the run held only the three lifecycle entries and verified CLEAN — a
+  //     crashed capture was indistinguishable from a delegation that changed nothing, while
+  //     the six snapshot incomplete-reasons (section 6) did fail integrity loudly.
+  //
+  //     Forcing the crash WITHOUT a production test seam: the model turn (which runs after
+  //     `expected-call`/`started` are on disk) reads the minted call_id out of calls.jsonl and
+  //     puts a DIRECTORY where the patch file must go. captureDelegateDiff's `openSync(patch,
+  //     "w")` then throws EISDIR — a real "the patch could not be written" failure, on the real
+  //     code path, with the run dir itself still writable so the log entry can land.
+  // -------------------------------------------------------------------------
+  {
+    const repo = initRepo({ "a.txt": "A0\n" });
+    const logDir = tmp("m8-logs-");
+    const runId = "run-capture-crash";
+    const runDir = path.join(logDir, runId);
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const fake = await startFakeOpencode({ historyText: "edited a, then the capture blew up" });
+    let blockedPatchPath = "";
+    try {
+      const r = await delegate(
+        { task: "edit", model: "openai/m", runId },
+        {
+          serve: mutatingServe(fake, () => {
+            writeFileSync(path.join(repo, "a.txt"), "A1\n"); // a real model change to capture
+            const entries = readFileSync(path.join(runDir, "calls.jsonl"), "utf8")
+              .split("\n")
+              .filter((l) => l.length > 0)
+              .map((l) => JSON.parse(l) as Record<string, unknown>);
+            const callId = entries.find((e) => e.type === "expected-call")?.call_id as string;
+            blockedPatchPath = path.join(runDir, `diff-${callId}.patch`);
+            mkdirSync(blockedPatchPath); // the patch path is now un-writable as a file
+          }),
+          env,
+          repoDir: repo,
+          messageTimeoutMs: 5_000,
+        },
+      );
+      c.check(r.ok, "crash: delegate still returns ok (the CALL succeeded; only the capture died)");
+      if (r.ok) {
+        c.check(blockedPatchPath !== "" && existsSync(blockedPatchPath), "crash setup: the patch path was blocked");
+        // 3. The tool result is UNCHANGED by the fix.
+        c.check(r.capture.captureComplete === false, "crash: captureComplete is false");
+        c.check(r.capture.incompleteReason === "capture-crashed", "crash: reason is capture-crashed");
+        c.check(r.capture.patchPath === null, "crash: patchPath is null (there is no patch)");
+        c.check(r.capture.recordFailed === false, "crash: recordFailed is false — the evidence write itself SUCCEEDED here");
+
+        // 1./2. The durable record: a patch-less delegate-diff entry paired to the same call.
+        const entries = readFileSync(path.join(runDir, "calls.jsonl"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        const dd = entries.filter((e) => e.type === "delegate-diff");
+        c.check(dd.length === 1, "crash: a delegate-diff entry EXISTS on the crash path (issue #74 regression guard)");
+        if (dd.length === 1) {
+          const e = dd[0];
+          c.check(e.capture_complete === false, "crash: the entry records capture_complete:false");
+          c.check(e.incomplete_reason === "capture-crashed", "crash: the entry names capture-crashed");
+          c.check(e.call_id === r.attribution.callId, "crash: the entry is paired to the lifecycle call_id");
+          c.check(e.claim === false, "crash: the entry is claim:false (machine evidence)");
+          c.check(e.patch === null && e.patch_bytes === 0 && e.files_changed === 0, "crash: no patch artifact is claimed");
+          c.check(e.response_hash === null, "crash: no response_hash, so verify never chases a patch that was never written");
+          c.check(typeof e.incomplete_detail === "string" && (e.incomplete_detail as string).length > 0, "crash: the crash text is recorded as evidence");
+        }
+
+        // 4. verify() now FAILS the run with the integrity code (the 7-analogue).
+        const v = new EvidenceLog({ env }).verify(runId);
+        c.check(v.code === 7, "crash: TS verify() reports integrity failure (7) — the run no longer passes clean");
+        c.check(/incomplete evidence capture/.test(v.message), "crash: verify names the incomplete capture, not a missing artifact");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 6c. issue #74 review F2 — when the EVIDENCE WRITE ITSELF fails, the run verifies CLEAN
+  //     again and `capture.recordFailed` is the ONLY witness.
+  //
+  //     This is the residual C40/C31 now state outright: no cardinality rule requires a
+  //     `delegate-diff` (C24 covers only expected/started/completed), so a lost one is a
+  //     silent clean — and the losing conditions (lock timeout, ENOSPC) CORRELATE with the
+  //     conditions that crash a capture in the first place. The test asserts the honest
+  //     outcome, including the part that is still a false clean, rather than pretending
+  //     `verify` can see it.
+  // -------------------------------------------------------------------------
+  {
+    const repo = initRepo({ "a.txt": "A0\n" });
+    const logDir = tmp("m8-logs-");
+    const runId = "run-record-failed";
+    const runDir = path.join(logDir, runId);
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    // A log whose delegate-diff append FAILS the way a lock timeout / ENOSPC would: the
+    // method's own contract is to return the failure as data, so this is the real shape the
+    // caller sees, not an invented one. Every other entry is written normally.
+    class LosesTheDiff extends EvidenceLog {
+      override async diffUncaptured(): Promise<{ ok: boolean; error?: string }> {
+        return { ok: false, error: "forced append failure (ENOSPC analogue)" };
+      }
+    }
+    const fake = await startFakeOpencode({ historyText: "edited a; capture died; so did its record" });
+    try {
+      const r = await delegate(
+        { task: "edit", model: "openai/m", runId },
+        {
+          serve: mutatingServe(fake, () => {
+            writeFileSync(path.join(repo, "a.txt"), "A1\n");
+            const entries = readFileSync(path.join(runDir, "calls.jsonl"), "utf8")
+              .split("\n")
+              .filter((l) => l.length > 0)
+              .map((l) => JSON.parse(l) as Record<string, unknown>);
+            const callId = entries.find((e) => e.type === "expected-call")?.call_id as string;
+            mkdirSync(path.join(runDir, `diff-${callId}.patch`)); // force the capture crash
+          }),
+          env,
+          repoDir: repo,
+          log: new LosesTheDiff({ env }),
+          messageTimeoutMs: 5_000,
+        },
+      );
+      c.check(r.ok, "recordFailed: delegate still returns ok");
+      if (r.ok) {
+        c.check(r.capture.recordFailed === true, "recordFailed: the tool result reports that the evidence write FAILED");
+        c.check(r.capture.captureComplete === false && r.capture.incompleteReason === "capture-crashed", "recordFailed: the capture fields are unchanged by the reporting");
+        const entries = readFileSync(path.join(runDir, "calls.jsonl"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        c.check(entries.filter((e) => e.type === "delegate-diff").length === 0, "recordFailed: NO delegate-diff landed (the append failed)");
+        c.check(new EvidenceLog({ env }).verify(runId).code === 0, "recordFailed: the run verifies CLEAN — the residual C40/C31 name, which is why the flag exists");
+        c.check(delegateToToolResult(r).structuredContent?.capture !== undefined, "recordFailed: the capture (carrying the flag) reaches the MCP tool result");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 7. C39 NEGATIVE: a CORRUPTED patch file fails verify (the diff was altered).
   // -------------------------------------------------------------------------
   {
