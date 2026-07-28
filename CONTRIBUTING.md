@@ -11,13 +11,13 @@ Thanks for helping out. This is a small, security-sensitive tool — a local MCP
 
 ## Setup
 
-Use the dev container (`.devcontainer/`) — it has Claude Code and opencode preinstalled. Log in once inside it (`claude` → `/login`, and `opencode auth login`); state persists in `~/.modelguild/` on your host. See the README for details. No API keys are stored anywhere in this repo.
+Use the dev container (`.devcontainer/`) — its `postCreate` step installs Claude Code and opencode (both `@latest`) each time the container is created. Log in once inside it (`claude` → `/login`, and `opencode auth login`); state persists in `~/.modelguild/` on your host. See the README for details. No API keys are stored anywhere in this repo.
 
 ## Dev container (for working *on* ModelGuild)
 
 **To *use* ModelGuild you don't need this** — the Setup above (opencode authenticated in your own environment) is all it takes. The dev container is for **developing ModelGuild itself**: it brings the whole development environment — Claude Code, opencode, and the test tooling — into one reproducible box so contributors get an identical setup. If you're just running the slash commands in your own repo, skip this section.
 
-The container (`.devcontainer/`) has **Claude Code and opencode both preinstalled**. You log in **once inside the container**; login state persists across rebuilds in host directories bind-mounted from `~/.modelguild/{claude,opencode,gh}`. No API keys or host credentials are baked into the image.
+The container (`.devcontainer/`) installs **Claude Code and opencode** at creation time — `postCreate.sh` pulls `@latest` for each on every container create, so a rebuild picks up the current release instead of a cached image layer. That install is deliberately **non-fatal**: a registry hiccup must not fail container creation, so a failure is *reported* (the version report prints `MISSING`, and the run ends in a `!! missing tooling:` summary) rather than thrown — check that report before assuming a tool is there. You log in **once inside the container**; login state persists across rebuilds in host directories bind-mounted from `~/.modelguild/{claude,opencode,gh}`. No API keys or host credentials are baked into the image.
 
 > Why in-container login and not host-credential mounts? On macOS, the host credential files are mode `600` and appear `root`-owned through Docker's mount layer, so the non-root `node` user the agents run as can't read them. In-container login sidesteps that and lets the agents refresh their own tokens. Bind-mounting `~/.modelguild/` is not a reversal of that: the container **writes its own** credentials into an initially-empty directory it owns, rather than reading a pre-existing host secret.
 
@@ -48,7 +48,7 @@ Run the checks (all are fast; only the last two need a model / opencode auth):
 
 ```bash
 npx tsc --noEmit                             # typecheck the TypeScript
-npm test                                     # the TS suite (13 suites; spawning opencode serve is free, no model call)
+npm test                                     # the TS suite — every test/*.test.ts (see test/run.ts); spawning opencode serve is free, no model call
 bash modelguild/tests/check-frontmatter.sh       # command/agent frontmatter structure
 bash modelguild/tests/check-docs.sh --self-test  # command names + MCP-grant lint (+ its self-test)
 bash .devcontainer/test-prepare-host-config.sh # host symlink confinement
@@ -61,7 +61,7 @@ bash modelguild/verify-guild-read.sh            # resolved-config + runtime proo
 bash modelguild/verify-guild-build.sh           # same, for the write agent
 ```
 
-CI runs the opencode-free subset on every push/PR: three jobs — `shell` (`bash -n`, ShellCheck, the surviving lints + their `--self-test`s, host-config confinement), `macos` (the same lints on stock bash 3.2 + BSD userland), and `node` (`tsc --noEmit` + the ten offline TS suites). It never installs or authenticates opencode, so the resolved-config `verify-guild-*.sh` proofs run locally.
+CI runs the opencode-free subset on every push/PR: three jobs — `shell` (`bash -n`, ShellCheck, the surviving lints + their `--self-test`s, host-config confinement), `macos` (the same lints on stock bash 3.2 + BSD userland), and `node` (`tsc --noEmit` + the offline TS suites, run individually by name — the workflow's name list in `.github/workflows/ci.yml` is the source of truth for which, and the suites that need the real opencode binary are named there as excluded). Suite counts are deliberately not stated in prose: they drift the moment a suite is added. It never installs or authenticates opencode, so the resolved-config `verify-guild-*.sh` proofs run locally.
 
 ## Conventions that matter
 
