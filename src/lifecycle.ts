@@ -367,6 +367,17 @@ export class OpencodeLifecycle {
   #idleTimer: NodeJS.Timeout | undefined;
   #backstopInstalled = false;
   #triggersAttached = false;
+  /**
+   * Callbacks run at the top of `shutdown()` (issue #96). The ONE reason this exists: a
+   * review targeting a sibling worktree needs a SECOND supervised serve child rooted there
+   * (`src/servepool.ts`), and the stdin-EOF / transport-close teardown this class owns is
+   * the only trigger that reliably fires under Claude Code. Rather than duplicating that
+   * wiring — the part the M1 orphan proof rests on — the pool registers itself here so its
+   * children die with the primary one.
+   *
+   * Guarded at the call site: a throwing companion must never stop this child being killed.
+   */
+  readonly #companions = new Set<() => void>();
 
   constructor(opts: LifecycleOptions = {}) {
     this.#projectDir = opts.projectDir ?? process.env.GUILD_PROJECT_DIR ?? process.cwd();
@@ -395,6 +406,21 @@ export class OpencodeLifecycle {
   }
   get idleMs(): number {
     return this.#idleMs;
+  }
+  /** The directory this child is (or will be) spawned from — the read root opencode's
+   * `external_directory` rule fences its tools inside (issue #96). */
+  get projectDir(): string {
+    return this.#projectDir;
+  }
+
+  /**
+   * Register a callback to run when this lifecycle shuts down (issue #96). Returns an
+   * unregister function. See `#companions` for why this is not a general event bus: it has
+   * exactly one production caller, the serve pool.
+   */
+  onShutdown(fn: () => void): () => void {
+    this.#companions.add(fn);
+    return () => this.#companions.delete(fn);
   }
 
   /** Lazily spawn (or crash-revive) the serve child and return its live endpoint. */
@@ -446,6 +472,16 @@ export class OpencodeLifecycle {
 
   /** Kill the serve child and clear all timers. Idempotent. */
   shutdown(_reason?: string): void {
+    // Companions FIRST and individually guarded (issue #96): the extra serve children a
+    // worktree-targeted review spawned must be torn down on the same trigger, and one that
+    // throws must not leave this child — the one the orphan proof is about — alive.
+    for (const fn of this.#companions) {
+      try {
+        fn();
+      } catch {
+        /* a companion's failure is never this child's problem */
+      }
+    }
     this.#clearIdleTimer();
     // Invalidate any in-flight #start() so it aborts at its next checkpoint
     // instead of assigning a handle nothing will kill.

@@ -19,6 +19,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { OpencodeLifecycle, type ServeHandle } from "./lifecycle.js";
+import { ServePool } from "./servepool.js";
 import { consult, consultToToolResult, guildDoctorSeed, type GuildDoctorSeed } from "./consult.js";
 import { panel, panelToToolResult } from "./panel.js";
 import { research, researchToToolResult } from "./research.js";
@@ -76,11 +77,40 @@ const RUN_ID_RULE_DESC =
   "(letters/digits/'.'/'_'/'-', no '/', '\\' or '..'). Anything else is a tool input " +
   "error, not a silent fresh run.";
 
+/** Type-check the optional `worktree` tool argument (issue #96). Only the SHAPE is checked
+ * here — whether the path is actually a worktree of this repository is decided at the one
+ * choke point (`resolveWorktreeTarget`, via `resolveReadRoot`), so this never becomes a
+ * second, drifting copy of the fence. Present-but-not-a-string is a tool input error rather
+ * than a silent ignore: a caller that asked for a different read root and quietly got the
+ * project root would get a fluent review of the wrong tree. */
+function resolveWorktreeArg(
+  tool: string,
+  raw: unknown,
+): { value: string | undefined } | { error: string } {
+  if (raw === undefined) return { value: undefined };
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return {
+      error:
+        `${tool}: 'worktree' must be a non-empty path to a git worktree of this repository ` +
+        `(see \`git worktree list\`), or omitted to read the project the server was launched in.`,
+    };
+  }
+  return { value: raw };
+}
+
 /* `resolveRunIdArg` — the `runId` counterpart of `resolveTimeoutArg` — lives in
  * `src/log.ts` beside the grammar it enforces, so it can be unit-tested: importing THIS
  * file constructs the MCP server and connects the stdio transport at module top level. */
 
 const lifecycle = new OpencodeLifecycle();
+/**
+ * The read-root router (issue #96). `lifecycle` stays the primary child and every existing
+ * path still runs on it; the pool only ever mints a SECOND supervised child when a read
+ * tool names a git worktree of this repository other than the project root. It registers
+ * itself on the primary's shutdown, so the stdin-EOF / transport-close teardown that the
+ * orphan proof rests on takes the extra children with it.
+ */
+const servePool = new ServePool(lifecycle);
 
 // ---------------------------------------------------------------------------
 // guild_status — diagnostics + the M4 doctor-seed checks.
@@ -208,6 +238,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "structuredContent.sessionId) so you can thread a follow-up. Omit to delete " +
               "the session after answering (the default single-shot behaviour).",
           },
+          worktree: {
+            type: "string",
+            description:
+              "Optional: the directory of a git WORKTREE of this repository to read " +
+              "against, so the model can see a branch that has not merged (issue #96). " +
+              "opencode fences the read tools inside the serve's directory, so without " +
+              "this a sibling worktree is unreadable — every read is denied and the review " +
+              "silently covers only the main checkout. The path is validated against `git " +
+              "worktree list`: a path that is not a worktree of THIS repository (including " +
+              "a worktree of a different repo) is a tool error naming the path, never a " +
+              "silent fall back to the project root. Omit for the project the server was " +
+              "launched in. It widens what the external model can read — and therefore what " +
+              "can reach a third-party provider — by exactly that worktree.",
+          },
           timeoutMs: TIMEOUT_MS_PROP,
         },
         required: ["question"],
@@ -264,6 +308,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "continue each member's OWN session with guild_consult({ sessionId, runId }) — " +
               "do NOT re-transmit any model's words. Omit to delete sessions after answering.",
           },
+          worktree: {
+            type: "string",
+            description:
+              "Optional: the directory of a git WORKTREE of this repository to read " +
+              "against, so the model can see a branch that has not merged (issue #96). " +
+              "opencode fences the read tools inside the serve's directory, so without " +
+              "this a sibling worktree is unreadable — every read is denied and the review " +
+              "silently covers only the main checkout. The path is validated against `git " +
+              "worktree list`: a path that is not a worktree of THIS repository (including " +
+              "a worktree of a different repo) is a tool error naming the path, never a " +
+              "silent fall back to the project root. Applies to EVERY member. Omit for the project the " +
+              "server was launched in. It widens what the external model can read — and therefore what " +
+              "can reach a third-party provider — by exactly that worktree.",
+          },
           timeoutMs: TIMEOUT_MS_PROP,
         },
         required: ["question"],
@@ -310,6 +368,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Set true ONLY after the human user has explicitly approved researching with " +
               "an ask-gated model. Represents the user's approval, not the assistant's.",
+          },
+          worktree: {
+            type: "string",
+            description:
+              "Optional: the directory of a git WORKTREE of this repository to read " +
+              "against, so the model can see a branch that has not merged (issue #96). " +
+              "opencode fences the read tools inside the serve's directory, so without " +
+              "this a sibling worktree is unreadable — every read is denied and the review " +
+              "silently covers only the main checkout. The path is validated against `git " +
+              "worktree list`: a path that is not a worktree of THIS repository (including " +
+              "a worktree of a different repo) is a tool error naming the path, never a " +
+              "silent fall back to the project root. Omit for the project the server was " +
+              "launched in. It widens what the external model can read — and therefore what " +
+              "can reach a third-party provider — by exactly that worktree.",
           },
           timeoutMs: TIMEOUT_MS_PROP,
         },
@@ -463,6 +535,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in rid) {
       return { content: [{ type: "text", text: rid.error }], isError: true };
     }
+    const wt = resolveWorktreeArg(CONSULT_TOOL, a.worktree);
+    if ("error" in wt) {
+      return { content: [{ type: "text", text: wt.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, CONSULT_TOOL, (onActivity) =>
       consult(
         {
@@ -472,9 +548,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           confirmed: a.confirmed === true,
           sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
           keepSession: a.keepSession === true,
+          worktree: wt.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, onActivity, elicitation },
       ),
     );
     return consultToToolResult(result);
@@ -509,6 +586,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in rid) {
       return { content: [{ type: "text", text: rid.error }], isError: true };
     }
+    const wt = resolveWorktreeArg(PANEL_TOOL, a.worktree);
+    if ("error" in wt) {
+      return { content: [{ type: "text", text: wt.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, PANEL_TOOL, (onActivity) =>
       panel(
         {
@@ -517,9 +598,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           runId: rid.value,
           confirmed: a.confirmed === true,
           keepSessions: a.keepSessions === true,
+          worktree: wt.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, onActivity, elicitation },
       ),
     );
     return panelToToolResult(result);
@@ -542,6 +624,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in rid) {
       return { content: [{ type: "text", text: rid.error }], isError: true };
     }
+    const wt = resolveWorktreeArg(RESEARCH_TOOL, a.worktree);
+    if ("error" in wt) {
+      return { content: [{ type: "text", text: wt.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, RESEARCH_TOOL, (onActivity) =>
       research(
         {
@@ -549,9 +635,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           model: typeof a.model === "string" ? a.model : undefined,
           runId: rid.value,
           confirmed: a.confirmed === true,
+          worktree: wt.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, onActivity, elicitation },
       ),
     );
     return researchToToolResult(result);

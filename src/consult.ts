@@ -36,7 +36,9 @@ import {
   AgentMismatchError,
   SessionPermissionMismatchError,
   type ServeProvider,
+  type ServeRouter,
 } from "./client.js";
+import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
 import { EvidenceLog } from "./log.js";
 import {
   candidateRoots,
@@ -199,6 +201,9 @@ export function guildDoctorSeed(
 // --- Result / error shapes -------------------------------------------------
 export type ConsultErrorKind =
   | "agent-def-missing"
+  // The review target named a directory that is not a worktree of this repository
+  // (issue #96). Refused before any log write, like every other pre-call refusal.
+  | "worktree-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -222,6 +227,10 @@ export interface ConsultAttribution {
   agent: string;
   runId: string;
   callId: string;
+  /** The read root this call actually ran against, present ONLY when the caller targeted a
+   * worktree (issue #96). Reported so a review can state which tree it read — a review of
+   * the wrong tree is the failure the target exists to prevent. */
+  worktree?: string;
 }
 
 export interface ConsultError {
@@ -294,6 +303,13 @@ export interface ConsultParams {
   /** Keep the session alive after this turn and return its id (for a further turn). */
   keepSession?: boolean;
   /**
+   * REVIEW TARGET (issue #96): a git worktree of THIS repository to root the read at, so the
+   * consulted model can read a branch that has not merged. Validated against
+   * `git worktree list`; anything else is refused by name, never silently swapped for the
+   * project root. Omit for the project the server was launched in.
+   */
+  worktree?: string;
+  /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`): a positive number capped at `TIMER_MAX_MS`, or the ceiling
    * for `"max"`. When set it takes precedence over `GUILD_MESSAGE_TIMEOUT_MS` env/conf/
@@ -305,6 +321,13 @@ export interface ConsultParams {
 export interface ConsultDeps {
   /** A ready-serve provider (the M1 lifecycle in production; a fake in tests). */
   serve: ServeProvider;
+  /**
+   * Serve providers keyed by read root (issue #96). Wired to the `ServePool` in production;
+   * required only when `params.worktree` names a root other than the project's own.
+   */
+  router?: ServeRouter;
+  /** Test seam for the `git worktree list` enumeration (issue #96). */
+  git?: GitRunner;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -425,6 +448,103 @@ export function gateModel(
     };
   }
   return { ok: true, tier: decision.tier, confirmed: confirmed === true };
+}
+
+// --- READ ROOT: the optional worktree target (issue #96) -------------------
+/**
+ * What a read tool resolved for this call: the serve provider to run the turn on, and the
+ * agent-def dirs whose presence pre-check must match where that provider's child will look.
+ * The two travel together on purpose — a re-rooted child changes BOTH, and opencode
+ * resolves agents from the serve's cwd (probed; see `resolveAgentDefDir`), so resolving one
+ * without the other is exactly how this feature would break silently.
+ */
+export interface ReadRootOk {
+  serve: ServeProvider;
+  agentDefDirs: string[];
+  /** The validated worktree root, present only when the caller named one. */
+  worktree?: string;
+}
+
+/**
+ * Resolve the read root for one call, from the optional caller-supplied `worktree`.
+ *
+ * WITHOUT `worktree` this is a no-op that returns exactly what every tool computed before
+ * issue #96 — same provider, same agent-def dirs. WITH it, the target is validated against
+ * `git worktree list` (`src/worktree.ts` — the single choke point, C33a's discipline) and,
+ * when it is not the project root, the call is routed to a serve child rooted THERE.
+ *
+ * A target that does not validate is a REFUSAL, never a fall back to the project root:
+ * a review silently run against the wrong tree reads exactly like a review run against the
+ * right one, which is the failure this whole feature exists to remove.
+ *
+ * The `worktree`-without-a-router case THROWS rather than degrading. It is unreachable in
+ * production (`src/server.ts` always passes the pool) and is therefore a wiring bug, not a
+ * user error — and the honest response to "I cannot honour the root you asked for" is to
+ * fail loudly, not to answer about a different one.
+ */
+export function resolveReadRoot(opts: {
+  worktree?: string;
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  confContents: string;
+  serve: ServeProvider;
+  router?: ServeRouter;
+  /** Test seam: the git runner `resolveWorktreeTarget` uses. */
+  git?: GitRunner;
+}): { ok: true; value: ReadRootOk } | { ok: false; message: string } {
+  const { env, cwd, confContents } = opts;
+  const target = opts.worktree?.trim() ?? "";
+  if (target.length === 0) {
+    return {
+      ok: true,
+      value: { serve: opts.serve, agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }) },
+    };
+  }
+  // The repository the server itself resolved — never an arbitrary one. The router knows the
+  // primary child's cwd; without a router (tests that only exercise validation) fall back to
+  // the same value `OpencodeLifecycle` would have used.
+  const projectDir =
+    opts.router?.projectDir ??
+    (env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0 ? env.GUILD_PROJECT_DIR : cwd);
+  const resolved = resolveWorktreeTarget(target, {
+    projectDir,
+    ...(opts.git !== undefined ? { git: opts.git } : {}),
+  });
+  if (!resolved.ok) return { ok: false, message: resolved.message };
+
+  if (resolved.isDefault) {
+    // The target IS the project root: honour it by doing nothing special. No second child,
+    // no second port — the ordinary path, with the root reported back so the caller can see
+    // what it actually got.
+    return {
+      ok: true,
+      value: {
+        serve: opts.serve,
+        agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }),
+        worktree: resolved.root,
+      },
+    };
+  }
+  if (opts.router === undefined) {
+    throw new Error(
+      `internal: a worktree read root ('${resolved.root}') was requested but no ServeRouter ` +
+        `was wired, so the call cannot be routed to a serve child rooted there. Refusing to ` +
+        `run it against the project root instead.`,
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      serve: opts.router.forRoot(resolved.root),
+      // The def must be resolvable FROM THE WORKTREE: opencode looks in the serve cwd's
+      // `.opencode/agent/` plus the global dir, and does NOT fall back to the repository's
+      // main checkout (probed live, 1.18.7). A worktree whose `.opencode/agent/` is absent
+      // — e.g. a repo that never committed the payload — therefore refuses up front rather
+      // than dying on an HTTP 500 mid-turn.
+      agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents, projectDir: resolved.root }),
+      worktree: resolved.root,
+    },
+  };
 }
 
 export interface LifecycleParams {
@@ -717,6 +837,35 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
 
+  // 1b. READ ROOT (issue #96). Optional: without `worktree` this is exactly the pre-#96
+  //     path. With it, the target is validated against `git worktree list` and the call is
+  //     routed to a serve child rooted there — and the agent-def dirs move with it, because
+  //     opencode resolves agents from the serve's cwd. Refused BEFORE any log write.
+  const readRoot = resolveReadRoot({
+    ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
+    env,
+    cwd,
+    confContents,
+    serve: deps.serve,
+    ...(deps.router !== undefined ? { router: deps.router } : {}),
+    ...(deps.git !== undefined ? { git: deps.git } : {}),
+  });
+  if (!readRoot.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "worktree-invalid",
+        model: "",
+        // No bash counterpart (the wrapper had no review target), so null rather than a
+        // number that would collide with the area-H table.
+        exitAnalogue: null,
+        message: readRoot.message,
+      },
+    };
+  }
+  const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+
   // 2. NO-FALLBACK def gate (deviation from bash C16, mirroring guild_research/guild_delegate).
   //    If the hardened guild-read def is not present in the resolved agent-def dir(s), REFUSE
   //    loudly — never silently run the consult on whatever opencode resolves in its place (a
@@ -724,7 +873,6 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   //    guarantee; the pre-flight is version-independent and fail-closed). Refused BEFORE any
   //    log write (gap parity) and BEFORE any session/model work, so a `sessionId` continuation
   //    is governed identically — the def governs the agent regardless of session reuse.
-  const agentDefDirs = resolveAgentDefDirs({ env, cwd, confContents });
   if (!hardenedDefPresentIn(CONSULT_AGENT, agentDefDirs).present) {
     return {
       ok: false,
@@ -824,7 +972,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       keepSession: params.keepSession === true,
     },
     {
-      serve: deps.serve,
+      serve,
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
@@ -844,6 +992,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
         agent: CONSULT_AGENT,
         runId,
         callId: outcome.callId,
+        ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       },
     };
     // Only expose the session id when the caller asked to keep it — otherwise the

@@ -27,7 +27,8 @@
  */
 
 import os from "node:os";
-import { type ServeProvider } from "./client.js";
+import { type ServeProvider, type ServeRouter } from "./client.js";
+import { type GitRunner } from "./worktree.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -35,6 +36,7 @@ import {
   runAgentLifecycle,
   activityLayerFor,
   approvalFor,
+  resolveReadRoot,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
@@ -61,6 +63,11 @@ export interface ResearchParams {
   runId?: string;
   confirmed?: boolean;
   /**
+   * READ ROOT (issue #96): a git worktree of THIS repository to root the investigation's
+   * local reads at. Validated against `git worktree list`; anything else is refused by name.
+   */
+  worktree?: string;
+  /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Precedence over `GUILD_MESSAGE_TIMEOUT_MS` env/conf/default;
    * the test seam `deps.messageTimeoutMs` wins.
@@ -70,6 +77,10 @@ export interface ResearchParams {
 
 export interface ResearchDeps {
   serve: ServeProvider;
+  /** Serve providers keyed by read root (issue #96); wired to the `ServePool` in production. */
+  router?: ServeRouter;
+  /** Test seam for the `git worktree list` enumeration (issue #96). */
+  git?: GitRunner;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -88,6 +99,8 @@ export interface ResearchDeps {
 // --- Result / error shapes -------------------------------------------------
 export type ResearchErrorKind =
   | "agent-def-missing"
+  /** The named read root is not a worktree of this repository (issue #96). */
+  | "worktree-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -109,6 +122,8 @@ export interface ResearchAttribution {
   agent: string;
   runId: string;
   callId: string;
+  /** The read root this call ran against; present only when a worktree was targeted (#96). */
+  worktree?: string;
 }
 
 export interface ResearchError {
@@ -164,10 +179,33 @@ export async function research(
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
 
+  // 1b. READ ROOT (issue #96) — see `resolveReadRoot`. A no-op without `worktree`.
+  const readRoot = resolveReadRoot({
+    ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
+    env,
+    cwd,
+    confContents,
+    serve: deps.serve,
+    ...(deps.router !== undefined ? { router: deps.router } : {}),
+    ...(deps.git !== undefined ? { git: deps.git } : {}),
+  });
+  if (!readRoot.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "worktree-invalid",
+        model: "",
+        exitAnalogue: null,
+        message: readRoot.message,
+      },
+    };
+  }
+  const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
   //    never silently degrade to a weaker agent. Refused before any log write (gap parity).
-  const agentDefDirs = resolveAgentDefDirs({ env, cwd, confContents });
   if (!hardenedDefPresentIn(RESEARCH_AGENT, agentDefDirs).present) {
     return {
       ok: false,
@@ -248,7 +286,7 @@ export async function research(
       confirmed: gate.confirmed,
     },
     {
-      serve: deps.serve,
+      serve,
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
@@ -268,6 +306,7 @@ export async function research(
         agent: RESEARCH_AGENT,
         runId,
         callId: outcome.callId,
+        ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       },
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;

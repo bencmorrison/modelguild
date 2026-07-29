@@ -835,6 +835,23 @@ export interface ServeProvider {
 }
 
 /**
+ * A source of serve providers keyed by READ ROOT (issue #96).
+ *
+ * `opencode serve` fixes its cwd at spawn and opencode's `external_directory` rule fences
+ * the read tools inside it, so reviewing a sibling git worktree needs a child rooted there.
+ * The tools depend on this two-method interface rather than on `src/servepool.ts` so a test
+ * can hand them a spy — and so this module keeps its "no lifecycle import" shape.
+ *
+ * `forRoot` is the MECHANISM only. Which roots are permissible is decided in exactly one
+ * place, `resolveWorktreeTarget` in `src/worktree.ts`; nothing here re-checks it.
+ */
+export interface ServeRouter {
+  /** The default root — the project the server itself was launched in. */
+  readonly projectDir: string;
+  forRoot(root: string): ServeProvider;
+}
+
+/**
  * LIVE-ACTIVITY ATTACHMENT (issue #20). The one seam this module gains: something that
  * can attach itself to a session's event stream for the duration of the turn.
  *
