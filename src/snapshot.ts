@@ -49,12 +49,18 @@ interface GitResult {
   stderr: string;
 }
 
-function git(repoDir: string, args: string[], extraEnv?: NodeJS.ProcessEnv): GitResult {
+function git(
+  repoDir: string,
+  args: string[],
+  extraEnv?: NodeJS.ProcessEnv,
+  input?: string,
+): GitResult {
   const r = spawnSync("git", args, {
     cwd: repoDir,
     env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     encoding: "utf8",
     maxBuffer: GIT_MAX_BUFFER,
+    ...(input !== undefined ? { input } : {}),
   });
   return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -69,7 +75,11 @@ function splitZ(s: string): string[] {
 
 /**
  * True iff `rel` (a git-style, forward-slash repo-relative path) is `opencode serve`'s own
- * runtime scaffolding, excluded from the ignored-file fingerprint.
+ * runtime scaffolding, excluded from the ignored-file fingerprint — and, since issue #108, from
+ * the throwaway-index STAGING as well when the path is not tracked in HEAD
+ * (`unstageUntrackedScaffold`). One predicate, both exclusions: `.gitignore` was doing the
+ * staging half by accident, and only in repos that had not committed their own
+ * `.opencode/.gitignore`.
  *
  * NAMED HARNESS DIFFERENCE — serve scaffolds the project dir; `opencode run` does not.
  * RATIFIED by the maintainer on 2026-07-22, CONDITIONAL ON the scaffoldDigest tamper signal
@@ -111,6 +121,58 @@ function isServeScaffold(rel: string): boolean {
   );
 }
 
+/**
+ * Drop from the THROWAWAY INDEX every `isServeScaffold` path that `git add -A` just staged and
+ * that is **not tracked in HEAD** (issue #108, maintainer decision 2026-07-29).
+ *
+ * WHY THE STAGING NEEDED IT AT ALL. `git add -A` honours `.gitignore`, and the scaffolding is
+ * normally ignored — because opencode writes its own `.opencode/.gitignore` covering everything
+ * it materializes. But it **does not overwrite an existing one** (probed), so a repo that COMMITS
+ * its own `.opencode/.gitignore` never receives opencode's: the scaffolding is then
+ * untracked-but-not-ignored, `git add -A` stages every path of it, and — when it appears BETWEEN
+ * the before and after snapshots, which is the first delegation into a tree whose runtime is not
+ * yet materialized — thousands of paths land in the recorded patch. That patch is what the human
+ * diff review reads, and that review is the write path's only trust boundary (SECURITY.md), so
+ * the artifact was defeated by the target repo's ignore rules.
+ *
+ * This makes the STAGING consistent with an exclusion the project already ratified rather than
+ * inventing a new one: `isServeScaffold` defines exactly this path set, and the ignored-file
+ * fingerprint has excluded it since 2026-07-22. It applies to BOTH snapshots through the one
+ * `snapshotTree` — an asymmetry here would manufacture phantom diff entries.
+ *
+ * SCOPED TO UNTRACKED-IN-HEAD, deliberately. Pollution is by definition newly created files; a
+ * repo that commits `.opencode/package.json` owns it, and the model's edit to it belongs in the
+ * diff like any other tracked file. HEAD is the right comparison because the throwaway index is
+ * seeded from it (an unborn branch tracks nothing, so everything scaffolded is dropped).
+ *
+ * COST, STATED: a write into `.opencode/node_modules/**` or the untracked manifests is now absent
+ * from the patch in EVERY repo, where a repo with a committed ignore file used to show it by
+ * accident. `scaffoldDigest`'s before/after tamper signal is untouched and remains the thing that
+ * reports such a write — the exclusion is ratified WITH that signal as its condition, and the
+ * signal must never be suppressed to make this quieter. `.opencode/agent/**` is not in the set
+ * and stays fully in the patch.
+ */
+function unstageUntrackedScaffold(repoDir: string, env: NodeJS.ProcessEnv): void {
+  // Both listings are scoped to `.opencode` — every path `isServeScaffold` matches lives there.
+  const staged = splitZ(git(repoDir, ["ls-files", "-z", "--", ".opencode"], env).stdout).filter(
+    (p) => p.length > 0 && isServeScaffold(p),
+  );
+  if (staged.length === 0) return;
+  const head = git(repoDir, ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", ".opencode"]);
+  const tracked = new Set(head.status === 0 ? splitZ(head.stdout) : []);
+  const drop = staged.filter((p) => !tracked.has(p));
+  if (drop.length === 0) return;
+  // NUL-delimited on stdin, not argv: a materialized `node_modules` is tens of thousands of
+  // paths and would blow ARG_MAX. `--force-remove` drops the entry whether or not the file
+  // still exists on disk.
+  git(
+    repoDir,
+    ["update-index", "--force-remove", "-z", "--stdin"],
+    env,
+    drop.map((p) => `${p}\0`).join(""),
+  );
+}
+
 /** True iff `repoDir` is inside a git worktree (mirrors ask.sh's `--is-inside-work-tree`
  * guard: a non-git dir gets no snapshot and no recorded diff). */
 export function isGitWorktree(repoDir: string): boolean {
@@ -126,9 +188,15 @@ export function worktreeDirty(repoDir: string): boolean {
 /**
  * Snapshot the worktree as a git tree object via a THROWAWAY index (`GIT_INDEX_FILE` at a
  * temp path). Seed it from HEAD (or empty for an unborn branch), `git add -A` (which honors
- * .gitignore, so .env / logs stay out — C37), then `git write-tree`. The caller's real
- * index and worktree are never touched (C36). Returns the tree sha, or null if not a git
- * worktree / the write failed.
+ * .gitignore, so .env / logs stay out — C37), drop the newly-scaffolded serve runtime
+ * (`unstageUntrackedScaffold`, issue #108 — `.gitignore` alone does not keep it out of the
+ * patch in a repo that commits its own `.opencode/.gitignore`), then `git write-tree`. The
+ * caller's real index and worktree are never touched (C36). Returns the tree sha, or null if
+ * not a git worktree / the write failed.
+ *
+ * BOTH the before- and after-snapshot go through here, which is what keeps their staging
+ * identical; staging the two trees differently would manufacture diff entries that no model
+ * produced.
  */
 export function snapshotTree(repoDir: string): string | null {
   if (!isGitWorktree(repoDir)) return null;
@@ -139,6 +207,7 @@ export function snapshotTree(repoDir: string): string | null {
       git(repoDir, ["read-tree", "--empty"], env);
     }
     git(repoDir, ["add", "-A"], env);
+    unstageUntrackedScaffold(repoDir, env);
     const tree = git(repoDir, ["write-tree"], env).stdout.trim();
     return tree.length > 0 ? tree : null;
   } finally {
