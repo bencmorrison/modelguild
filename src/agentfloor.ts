@@ -113,10 +113,21 @@ export function parseResolvedPermissions(
         reason: `resolved permission rule #${i} has no string 'permission'/'action' pair`,
       };
     }
-    // A missing pattern is read as the general one. Every entry on 1.18.7 carries `pattern`,
-    // so this is a tolerance for a future shape, not an observed case.
-    const pattern = typeof rec.pattern === "string" ? rec.pattern : "*";
-    rules.push({ permission: rec.permission, pattern, action: rec.action });
+    // A MISSING PATTERN IS UNREADABLE, NOT A UNIVERSAL ONE (review, 2026-07-29). The first
+    // cut coerced it to `"*"`, which was this parser's ONE place where the strictness ran
+    // toward ACCEPTING — and it accepted in the dangerous direction, since a patternless rule
+    // read as `"*"` is read as a FLOOR. Every entry on 1.18.7 carries `pattern`, so nothing
+    // reachable today changes; a future shape that drops it now reads as "I cannot tell"
+    // (proceed, and say so) rather than as a floor nobody verified.
+    if (typeof rec.pattern !== "string") {
+      return {
+        ok: false,
+        reason:
+          `resolved permission rule #${i} has no string 'pattern' — refusing to read a ` +
+          `patternless rule as the universal one`,
+      };
+    }
+    rules.push({ permission: rec.permission, pattern: rec.pattern, action: rec.action });
   }
   return { ok: true, rules };
 }
@@ -175,19 +186,53 @@ export interface AgentFloorCheckerOpts {
 }
 
 /**
- * The check, with a cache PER SERVE CHILD.
+ * The check, with a cache that retains ONE verdict and keys it on ONE thing. Both halves were
+ * wrong in the first cut and both were found by review (2026-07-29); they are recorded here
+ * because either mistake makes this feature quietly stop working.
  *
- * THE CACHE KEY IS THE CHILD'S BASE URL, and getting that wrong would be worse than not
- * caching at all. Since issue #96 there can be more than one `opencode serve` child (one per
- * read/write root, `ServePool`), and opencode resolves agents from the SERVE'S CWD — probed:
- * a serve rooted at a worktree of a repo whose main checkout holds `guild-read.md` does not
- * list that agent at all. So "is `guild-read` hardened?" is genuinely a per-child question,
- * and a cache keyed on the agent name alone would answer one child's question with another
- * child's evidence. The base URL is the child (its negotiated loopback port); a child that
- * dies and is revived on a fresh port therefore gets a fresh check.
+ * WHAT IS CACHED: `verified`, AND NOTHING ELSE.
+ * The first cut cached whatever came back, forever, with no TTL and no invalidation. That
+ * turned both failure verdicts into permanent states of the process:
+ *   - one transient `GET /agent` failure DISABLED VERIFICATION for that child+agent for the
+ *     rest of the process — and because the stderr warning is emitted once per cached
+ *     computation, every later call then proceeded unverified AND silent, defeating the
+ *     "never silently" rule that warning exists for and making the description of cannot-ask
+ *     as a *transient* condition false, since the cache is what made it stick;
+ *   - and a user who FIXED their def stayed refused on every call until the MCP server was
+ *     restarted. A correct def being permanently rejected is a worse failure than the extra
+ *     GET that avoids it.
+ * So a non-`verified` verdict is dropped and re-computed on the next call. The cost is one
+ * control-plane GET per call while something is actually wrong — the state where the extra
+ * check is wanted anyway — and the warning then repeats per call, which is the correct
+ * behaviour for "never silently", not a regression. The drop happens BEFORE the promise
+ * resolves, so no awaiter can observe a settled failure verdict still sitting in the map.
+ *
+ * WHAT IT IS KEYED ON: THE CHILD INSTANCE (`ServeHandle.instanceId`), NOT THE URL.
+ * Since issue #96 there can be more than one `opencode serve` child (one per read/write root,
+ * `ServePool`), and opencode resolves agents from the SERVE'S CWD — probed: a serve rooted at
+ * a worktree of a repo whose main checkout holds `guild-read.md` does not list that agent at
+ * all. So "is `guild-read` hardened?" is a per-child question, and the same agent name is
+ * legitimately hardened at one root and voided at another. The first cut keyed on `baseUrl`
+ * and called that per-child. **A base URL is a reusable loopback port, not an identity.**
+ * `src/lifecycle.ts` negotiates the port by bind-and-close without reserving it, children are
+ * retired by the idle timer and by `GUILD_SERVE_PER_CALL=1`, and this cache is never cleared
+ * when one dies — so a LATER child, at a DIFFERENT root with a different def, can bind the
+ * same port and inherit the earlier child's verdict. `instanceId` is a per-process monotonic
+ * counter minted per spawn: two handles carry it iff they are the same child, so a dead
+ * child's answer cannot be inherited. `pid` was the cheaper option and was rejected — pids
+ * wrap too, so it would narrow the window rather than close it, and it still names no
+ * lifecycle. The URL stays in the key as a second component, which can only ever make the key
+ * STRICTER (an extra component causes a miss, never a stale hit).
+ *
+ * WHAT IS STILL NOT CLAIMED: freshness. A `verified` verdict is retained for the life of that
+ * child, and opencode re-reads agent defs — so a def edited to REMOVE its floor mid-session,
+ * on a child already verified, is not re-checked until that child is replaced. That is the
+ * cost of caching at all, it runs in the same direction as every other pre-flight here (a
+ * check happens before the turn, not continuously), and it is not dressed up as more.
  *
  * The cached value is the PROMISE, so a panel's concurrent members share one in-flight request
- * rather than racing three identical ones.
+ * rather than racing three identical ones — including on the failure path, where the re-check
+ * is therefore per CALL, not per member.
  *
  * NOTHING HERE THROWS. Every failure becomes an `unverified` verdict; C31's posture, applied
  * to a verification path — a control-plane hiccup must not become a failed call.
@@ -212,10 +257,34 @@ export class AgentFloorChecker {
     agentDefDirs: readonly string[] = [],
   ): Promise<AgentFloorVerdict> {
     return serve.withServe(async (h) => {
-      const key = `${h.baseUrl} ${agent}`;
+      // The child INSTANCE first, then the URL, then the agent. See the class doc for why the
+      // instance id is the load-bearing component and the URL is only belt-and-braces.
+      const key = `${h.instanceId}|${h.baseUrl}|${agent}`;
       const hit = this.#cache.get(key);
       if (hit !== undefined) return hit;
-      const pending = this.#compute(h.baseUrl, agent, agentDefDirs);
+      // The entry is installed BEFORE the first await inside `#compute` (this async IIFE runs
+      // synchronously up to that point), so concurrent panel members share one request; and a
+      // non-`verified` verdict is dropped BEFORE this promise resolves, so nobody can await it
+      // and then still find the failure cached.
+      const pending = (async (): Promise<AgentFloorVerdict> => {
+        try {
+          const verdict = await this.#compute(h.baseUrl, agent, agentDefDirs);
+          if (verdict.state !== "verified") this.#cache.delete(key);
+          return verdict;
+        } catch (err) {
+          // `#compute` is guarded and does not throw; this is the belt-and-braces arm, and it
+          // must still not throw INTO the call (C31) — an unexpected failure is "cannot tell".
+          this.#cache.delete(key);
+          const reason = err instanceof Error ? err.message : String(err);
+          const verdict: AgentFloorVerdict = {
+            state: "unverified",
+            agent,
+            note: unverifiedNote(agent, reason),
+          };
+          this.#warn(`modelguild: ${verdict.note}`);
+          return verdict;
+        }
+      })();
       this.#cache.set(key, pending);
       return pending;
     });
@@ -230,8 +299,10 @@ export class AgentFloorChecker {
     if (verdict.state === "unverified") {
       // The maintainer's constraint on this direction: proceed, but NEVER silently. This line
       // is the unconditional half — the structured note on the tool result can be ignored by a
-      // driver, a stderr line cannot be un-written. Emitted once per (child, agent) because the
-      // cache holds the computation, not just the answer.
+      // driver, a stderr line cannot be un-written. It repeats PER CALL, because an unverified
+      // verdict is NOT retained (see the class doc): the first cut cached it and so warned
+      // once while every later call proceeded unverified in silence — precisely the failure
+      // this line exists to prevent.
       this.#warn(`modelguild: ${verdict.note}`);
     }
     return verdict;

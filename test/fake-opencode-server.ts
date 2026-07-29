@@ -141,6 +141,16 @@ export interface FakeOpencodeOpts {
   failAgentList?: boolean | number;
   /** Answer `GET /agent` 200 with a body that is not an array — an opencode whose shape moved. */
   agentListGarbage?: boolean;
+  /**
+   * Listen on a SPECIFIC port instead of an ephemeral one (issue #111, review C2).
+   *
+   * The only reason this exists: a loopback port is reusable, so a dead serve child's base URL
+   * can be taken by a later one at a different root with a different agent def. Reproducing
+   * that needs a second fake on the FIRST fake's port after it has closed — which two
+   * concurrently-listening fakes can never model, and which is the shape that actually bites a
+   * cache keyed on a URL.
+   */
+  port?: number;
 }
 
 /** The shape `GET /agent` serves per agent (loosely typed, like the real schema read). */
@@ -687,7 +697,7 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   });
 
   return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(opts.port ?? 0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
       resolve({
         baseUrl: `http://127.0.0.1:${port}`,

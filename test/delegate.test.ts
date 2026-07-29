@@ -44,8 +44,7 @@ import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker, fixtureGitEnv } from "./harness.js";
+import { Checker, fixtureGitEnv, fakeServeHandle } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m8-"): string {
@@ -105,14 +104,14 @@ function read(dir: string, rel: string): string {
  * after the snapshot) is precisely what C73 forbids. Hooking the message POST makes the fixture
  * independent of how many control-plane calls a tool makes. */
 function mutatingServe(fake: FakeOpencode, mutate: () => void): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   fake.setOnMessage(mutate);
   return { withServe: (fn) => fn(handle) };
 }
 
 /** A plain (non-mutating) ServeProvider for gate/refusal cases. */
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 

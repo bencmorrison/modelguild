@@ -20,14 +20,13 @@ import {
   AgentMismatchError,
   type ServeProvider,
 } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
-import { Checker } from "./harness.js";
+import { Checker, fakeServeHandle } from "./harness.js";
 
 /** A `ServeProvider` that points `withServe` at an already-running fake — the M1
  * lifecycle contract exercised without spawning opencode. */
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 

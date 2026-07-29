@@ -38,7 +38,29 @@ export interface ServeHandle {
   baseUrl: string;
   port: number;
   pid: number;
+  /**
+   * IDENTITY OF THIS CHILD, unique for the life of THIS PROCESS (issue #111, review C2).
+   *
+   * Added because a caller that wants to remember something about "the serve it just talked
+   * to" has, until now, had only `baseUrl`/`port`/`pid` to key on, and **none of those is an
+   * identity**. The port is negotiated by bind-and-close and is not reserved, children are
+   * retired by the idle timer and by `GUILD_SERVE_PER_CALL=1`, and a crash-revive respawns at
+   * a freshly negotiated port — so a LATER child, at a DIFFERENT root with a different agent
+   * def, can perfectly well arrive on the port an earlier one used. `pid` narrows that but
+   * does not close it (pids wrap too), and neither says which lifecycle the child belongs to.
+   *
+   * This is a plain monotonic counter, so within a process it can never repeat: two handles
+   * carry the same id **iff they are the same child**. A cache keyed on it therefore cannot
+   * inherit a dead child's answer. It claims nothing beyond that — in particular it is NOT a
+   * freshness token: the same child's configuration can still change under it (opencode
+   * re-reads agent defs), which is why anything keyed on it must also decide what it is
+   * willing to retain.
+   */
+  instanceId: number;
 }
+
+/** Source of `ServeHandle.instanceId`. Per PROCESS, never reset, never reused. */
+let nextInstanceId = 1;
 
 interface InternalHandle extends ServeHandle {
   proc: ChildProcess;
@@ -599,7 +621,7 @@ export class OpencodeLifecycle {
 
   // --- internals ------------------------------------------------------------
   #public(h: InternalHandle): ServeHandle {
-    return { baseUrl: h.baseUrl, port: h.port, pid: h.pid };
+    return { baseUrl: h.baseUrl, port: h.port, pid: h.pid, instanceId: h.instanceId };
   }
 
   /**
@@ -820,6 +842,8 @@ export class OpencodeLifecycle {
       baseUrl,
       port,
       pid: proc.pid,
+      // Minted per SPAWN, so a crash-revive is a different child to anything keyed on it.
+      instanceId: nextInstanceId++,
       exited: false,
       exitCode: null,
       exitSignal: null,

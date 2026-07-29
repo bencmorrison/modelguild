@@ -79,11 +79,10 @@ import {
   formatApprovalNotice,
 } from "../src/cli.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker, waitFor } from "./harness.js";
+import { Checker, waitFor, fakeServeHandle } from "./harness.js";
 
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 

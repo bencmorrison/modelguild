@@ -7,11 +7,28 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ServeHandle } from "../src/lifecycle.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const repoRoot = path.resolve(__dirname, "..");
 export const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx");
 export const serverEntry = path.join(repoRoot, "src", "server.ts");
+
+/**
+ * A `ServeHandle` for a test fake, with a DISTINCT `instanceId` every time (issue #111).
+ *
+ * The counter matters, and hand-written literals are what it replaces: `instanceId` is a
+ * child IDENTITY, so a fixture that hard-coded one value would make two different fakes look
+ * like the same child to anything keyed on it — and the cache this field exists for would
+ * then be tested against a fixture that cannot exhibit the bug. Minting per handle means a
+ * fake behaves like what it stands in for: a distinct child. To model a REUSED port (a dead
+ * child's URL taken by a new one) start a second fake on the same port and take a second
+ * handle — different id, same URL, which is exactly the shape that bites.
+ */
+let nextFakeInstanceId = 1;
+export function fakeServeHandle(baseUrl: string, pid = 0): ServeHandle {
+  return { baseUrl, port: 0, pid, instanceId: nextFakeInstanceId++ };
+}
 
 /** A single test file's pass/fail accounting. */
 export class Checker {

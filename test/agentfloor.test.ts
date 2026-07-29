@@ -40,8 +40,7 @@ import {
   type FakeOpencode,
 } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker, fixtureGitEnv } from "./harness.js";
+import { Checker, fixtureGitEnv, fakeServeHandle } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m111-"): string {
@@ -51,13 +50,13 @@ function tmp(prefix = "m111-"): string {
 }
 
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 
 /** A serve provider on an arbitrary base url — used to prove the cache is keyed per CHILD. */
 function serveAt(baseUrl: string): ServeProvider {
-  const handle: ServeHandle = { baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 
@@ -167,12 +166,19 @@ export async function run(): Promise<number> {
   {
     const good = parseResolvedPermissions([
       { permission: "*", pattern: "*", action: "deny" },
-      { permission: "read", action: "allow" }, // no pattern ⇒ read as the general one
+      { permission: "read", pattern: "*", action: "allow" },
     ]);
     c.check(good.ok, "parse: a well-formed array parses");
-    if (good.ok) {
-      c.check(good.rules[1].pattern === "*", "parse: a missing pattern reads as the general '*'");
-    }
+
+    // A MISSING PATTERN IS UNREADABLE (review, low finding). The first cut coerced it to `"*"`,
+    // i.e. treated a patternless rule as a universal one — the only place this parser's
+    // strictness ran toward ACCEPTING, and it accepted toward "this is a floor". Nothing on
+    // 1.18.7 exercises it; the change is about which way an unknown shape falls.
+    const patternless = parseResolvedPermissions([{ permission: "*", action: "deny" }]);
+    c.check(
+      !patternless.ok,
+      "parse: a rule with NO pattern is unreadable, not silently promoted to the universal one",
+    );
 
     c.check(!parseResolvedPermissions(undefined).ok, "parse: an ABSENT permission field is unreadable");
     c.check(!parseResolvedPermissions({ a: 1 }).ok, "parse: a non-array permission field is unreadable");
@@ -205,20 +211,31 @@ export async function run(): Promise<number> {
     });
     try {
       const { checker } = collectingChecker();
-      const a1 = await checker.verify(fakeServe(hardenedFake), "guild-read");
-      const b1 = await checker.verify(fakeServe(voidedFake), "guild-read");
+      // ONE provider per fake, taken once — a real child is one handle for its whole life, and
+      // `fakeServe` mints a fresh instance id per call precisely so it cannot pretend otherwise.
+      const hardenedServe = fakeServe(hardenedFake);
+      const voidedServe = fakeServe(voidedFake);
+      const a1 = await checker.verify(hardenedServe, "guild-read");
+      const b1 = await checker.verify(voidedServe, "guild-read");
       c.check(a1.state === "verified", "cache: the hardened child verifies");
       c.check(
         b1.state === "unhardened",
         "cache: the OTHER child's voided answer is NOT satisfied by the first child's verdict",
       );
       // And the reverse order, on the same checker, to prove neither direction leaks.
-      const b2 = await checker.verify(fakeServe(voidedFake), "guild-read");
-      const a2 = await checker.verify(fakeServe(hardenedFake), "guild-read");
+      const b2 = await checker.verify(voidedServe, "guild-read");
+      const a2 = await checker.verify(hardenedServe, "guild-read");
       c.check(b2.state === "unhardened" && a2.state === "verified", "cache: no leak in either direction");
+      // The two counts differ ON PURPOSE, and the difference is C1: a `verified` verdict is
+      // retained (one GET for two verifies), an `unhardened` one is not (two GETs for two),
+      // so a def fixed between calls is picked up.
       c.check(
-        hardenedFake.recorded.agentGets === 1 && voidedFake.recorded.agentGets === 1,
-        "cache: each child was asked exactly ONCE across four verifies",
+        hardenedFake.recorded.agentGets === 1,
+        `cache: the VERIFIED child was asked once across two verifies (got ${hardenedFake.recorded.agentGets})`,
+      );
+      c.check(
+        voidedFake.recorded.agentGets === 2,
+        `cache: the UNHARDENED child was RE-asked on the second verify (got ${voidedFake.recorded.agentGets})`,
       );
     } finally {
       await hardenedFake.close();
@@ -233,6 +250,129 @@ export async function run(): Promise<number> {
     const v = await checker.verify(serveAt("http://127.0.0.1:1"), "guild-read");
     c.check(v.state === "unverified", "unreachable: an unreachable child is 'unverified', never a throw");
     c.check(lines.length === 1, "unreachable: and it is announced on stderr exactly once");
+  }
+
+  // =========================================================================
+  // 3a. ONLY `verified` IS RETAINED (review C1). The first cut cached every verdict forever,
+  //     which turned a transient failure into permanent silent non-verification and left a
+  //     user who FIXED their def refused until the server restarted. Both directions here.
+  // =========================================================================
+  {
+    // A TRANSIENT `GET /agent` failure must be RE-TRIED on the next call — and must keep
+    // warning while it persists, because the warning is the whole of "never silently".
+    let fail = true;
+    const lines: string[] = [];
+    const checker = new AgentFloorChecker({
+      warn: (l) => lines.push(l),
+      list: async () => {
+        if (fail) throw new Error("transient control-plane failure");
+        return [hardenedAgent("guild-read", ["read"])];
+      },
+    });
+    const serve = serveAt("http://127.0.0.1:9/a");
+    const v1 = await checker.verify(serve, "guild-read");
+    const v2 = await checker.verify(serve, "guild-read");
+    c.check(v1.state === "unverified" && v2.state === "unverified", "C1: an unverified verdict is not sticky by luck — it repeats while the failure does");
+    c.check(
+      lines.length === 2,
+      `C1: and it warns on EVERY such call, not once (got ${lines.length}) — a cached failure warned once and then proceeded unverified in silence`,
+    );
+    fail = false;
+    const v3 = await checker.verify(serve, "guild-read");
+    c.check(
+      v3.state === "verified",
+      "C1: once opencode ANSWERS again the check recovers — the failure was not cached",
+    );
+    c.check(lines.length === 2, "C1: and a recovered check adds no further warning");
+    // ...and the now-`verified` verdict IS retained: a fourth call must not re-ask.
+    let listCalls = 0;
+    const counting = new AgentFloorChecker({
+      warn: () => {},
+      list: async () => {
+        listCalls += 1;
+        return [hardenedAgent("guild-read", ["read"])];
+      },
+    });
+    await counting.verify(serve, "guild-read");
+    await counting.verify(serve, "guild-read");
+    c.check(listCalls === 1, "C1: a VERIFIED verdict is still cached — the cache did not become a no-op");
+  }
+
+  {
+    // A FIXED def must be accepted on the very next call. This is the user-facing half of C1:
+    // add a duplicate key, get refused, fix the file — and stay refused forever was the bug.
+    let voided = true;
+    const checker = new AgentFloorChecker({
+      warn: () => {},
+      list: async () => [voided ? voidedAgent("guild-read") : hardenedAgent("guild-read", ["read"])],
+    });
+    const serve = serveAt("http://127.0.0.1:9/b");
+    const before = await checker.verify(serve, "guild-read");
+    c.check(before.state === "unhardened", "C1: a voided def refuses");
+    voided = false;
+    const after = await checker.verify(serve, "guild-read");
+    c.check(
+      after.state === "verified",
+      "C1: FIXING the def is accepted on the NEXT call — a cached refusal outlived the defect it described",
+    );
+  }
+
+  // =========================================================================
+  // 3b. THE KEY IS A CHILD INSTANCE, NOT A URL (review C2). A loopback port is reusable:
+  //     lifecycle.ts negotiates it by bind-and-close without reserving it, and children are
+  //     retired by the idle timer and by GUILD_SERVE_PER_CALL=1. So a LATER child at a
+  //     DIFFERENT root can arrive on a dead one's port. Two live fakes cannot model that —
+  //     this is the sequence that actually bites, and C1 does not close it, because a stale
+  //     `verified` is exactly the direction that is retained.
+  // =========================================================================
+  {
+    const first = await startFakeOpencode({
+      historyText: "unused",
+      agents: [hardenedAgent("guild-read", ["read"])],
+    });
+    const reusedPort = Number(new URL(first.baseUrl).port);
+    const { checker } = collectingChecker();
+    const handleA = fakeServeHandle(first.baseUrl);
+    const v1 = await checker.verify({ withServe: (fn) => fn(handleA) }, "guild-read");
+    c.check(v1.state === "verified", "C2: the first child verifies");
+    await first.close();
+
+    // A DIFFERENT child — different root, voided def — binds the very same port.
+    const second = await startFakeOpencode({
+      historyText: "unused",
+      port: reusedPort,
+      agents: [voidedAgent("guild-read")],
+    });
+    try {
+      c.check(second.baseUrl === first.baseUrl, "C2: fixture — the second child really did reuse the URL");
+      const handleB = fakeServeHandle(second.baseUrl);
+      c.check(handleB.instanceId !== handleA.instanceId, "C2: fixture — and it is a different child instance");
+      const v2 = await checker.verify({ withServe: (fn) => fn(handleB) }, "guild-read");
+      c.check(
+        v2.state === "unhardened",
+        "C2: the new child is CHECKED — it does not inherit the dead child's verified verdict off a reused port",
+      );
+    } finally {
+      await second.close();
+    }
+  }
+
+  // The same child asked twice is still one GET — the instance id did not turn the cache off.
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      agents: [hardenedAgent("guild-read", ["read"])],
+    });
+    try {
+      const { checker } = collectingChecker();
+      const handle = fakeServeHandle(fake.baseUrl);
+      const serve = { withServe: (fn: (h: typeof handle) => Promise<unknown>) => fn(handle) };
+      await checker.verify(serve as never, "guild-read");
+      await checker.verify(serve as never, "guild-read");
+      c.check(fake.recorded.agentGets === 1, "C2: one CHILD, one GET — the same handle still hits the cache");
+    } finally {
+      await fake.close();
+    }
   }
 
   // =========================================================================
