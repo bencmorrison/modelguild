@@ -464,6 +464,20 @@ export function gateModel(
 export interface ReadRootOk {
   serve: ServeProvider;
   agentDefDirs: string[];
+  /**
+   * THE ROOT THIS CALL RUNS AGAINST — the directory `serve`'s child is (or will be) rooted
+   * at. ALWAYS set: the project dir when nothing was targeted, the validated worktree when
+   * something was.
+   *
+   * `worktree` below says whether a root was ASKED FOR; this says WHICH ROOT WON. The read
+   * tools only ever needed the former (a `read_root` receipt is meaningful precisely when it
+   * is non-default). The WRITE path needs the latter, because issue #107's whole failure mode
+   * is a capture layer that computes its own root independently of the serve child's: with
+   * this field there is exactly ONE root value in scope after resolution, and
+   * `snapshotWorktree`/`captureDelegateDiff`/`scaffoldDigest` all take it. Do not add a second
+   * way to reach the project dir on that path.
+   */
+  root: string;
   /** The validated worktree root, present only when the caller named one. */
   worktree?: string;
 }
@@ -524,6 +538,20 @@ export async function resolveReadRoot(opts: {
   confContents: string;
   serve: ServeProvider;
   router?: ServeRouter;
+  /**
+   * The repository this resolution is anchored to — the default root, and the repo whose
+   * `git worktree list` is the fence. WINS over `router.projectDir` and the
+   * `$GUILD_PROJECT_DIR`/cwd fallback when supplied.
+   *
+   * It exists for `guild_delegate` (issue #107), which already owns a resolved project dir
+   * (`resolveRepoDir` — `deps.repoDir` else `$GUILD_PROJECT_DIR` else cwd) that its capture
+   * layer was rooted at. Feeding THAT value in here is what makes the serve child and the
+   * capture provably share one root: the write path resolves its root once and hands the
+   * result to both, instead of each deriving one. In production the two agree by
+   * construction (`OpencodeLifecycle` defaults its own `projectDir` to the identical
+   * expression); the parameter matters where they are injected, i.e. tests.
+   */
+  projectDir?: string;
   /** Test seam: the git runner `resolveWorktreeTarget` uses. */
   git?: GitRunner;
   /** Test seam: how a continuation's session record is fetched (default: the real client). */
@@ -537,8 +565,10 @@ export async function resolveReadRoot(opts: {
   // primary child's cwd; without a router (tests that only exercise validation) fall back to
   // the same value `OpencodeLifecycle` would have used.
   const projectDir =
-    opts.router?.projectDir ??
-    (env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0 ? env.GUILD_PROJECT_DIR : cwd);
+    opts.projectDir && opts.projectDir.length > 0
+      ? opts.projectDir
+      : (opts.router?.projectDir ??
+        (env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0 ? env.GUILD_PROJECT_DIR : cwd));
 
   // Whatever THIS call asked for, validated. `undefined` = it asked for nothing.
   let asked: { root: string; isDefault: boolean } | undefined;
@@ -571,7 +601,7 @@ export async function resolveReadRoot(opts: {
       lookupError = err instanceof Error ? err.message : String(err);
     }
     if (lookupError !== undefined) {
-      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve);
+      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve, projectDir);
       return {
         ok: false,
         message:
@@ -583,7 +613,7 @@ export async function resolveReadRoot(opts: {
       };
     }
     if (dir === undefined || dir.length === 0) {
-      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve);
+      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve, projectDir);
       return {
         ok: false,
         message:
@@ -621,7 +651,7 @@ export async function resolveReadRoot(opts: {
 
   if (effective === undefined) {
     // Neither a target nor a resolvable session root: the pre-#96 path, byte-identical.
-    return unrooted(env, cwd, confContents, opts.serve);
+    return unrooted(env, cwd, confContents, opts.serve, projectDir);
   }
   if (effective.isDefault) {
     // The root IS the project root: honour it by doing nothing special. No second child, no
@@ -632,6 +662,7 @@ export async function resolveReadRoot(opts: {
       value: {
         serve: opts.serve,
         agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }),
+        root: effective.root,
         worktree: effective.root,
       },
     };
@@ -653,21 +684,30 @@ export async function resolveReadRoot(opts: {
       // — e.g. a repo that never committed the payload — therefore refuses up front rather
       // than dying on an HTTP 500 mid-turn.
       agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents, projectDir: effective.root }),
+      root: effective.root,
       worktree: effective.root,
     },
   };
 }
 
-/** The pre-#96 answer: the primary provider, project-resolved def dirs, no read root. */
+/** The pre-#96 answer: the primary provider, project-resolved def dirs, no read root — plus
+ * `root`, which is the project dir itself. `worktree` stays ABSENT here, and that distinction
+ * is load-bearing: it is what keeps an untargeted call's evidence entry and tool result
+ * byte-identical to one written before either issue existed. */
 function unrooted(
   env: NodeJS.ProcessEnv,
   cwd: string,
   confContents: string,
   serve: ServeProvider,
+  projectDir: string,
 ): { ok: true; value: ReadRootOk } {
   return {
     ok: true,
-    value: { serve, agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }) },
+    value: {
+      serve,
+      agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }),
+      root: projectDir,
+    },
   };
 }
 
@@ -704,6 +744,9 @@ export interface LifecycleParams {
   /** The non-default read root this turn ran against (issue #96), recorded on the `started`
    * evidence entry so the receipts say WHICH TREE the answer describes. Absent otherwise. */
   readRoot?: string;
+  /** The non-default WRITE root this turn edited (issue #107) — the write-path counterpart,
+   * deliberately its own field rather than a reuse of `readRoot`; see `log.started`. */
+  writeRoot?: string;
 }
 
 /** Every tool's approval plumbing, resolved once by `armApproval` and threaded through the
@@ -863,6 +906,7 @@ export async function runAgentLifecycle(
     session: p.sessionId,
     prompt: p.question,
     ...(p.readRoot !== undefined ? { readRoot: p.readRoot } : {}),
+    ...(p.writeRoot !== undefined ? { writeRoot: p.writeRoot } : {}),
   });
   // One recorder per call. Undefined when the activity layer is absent or `off`, in which
   // case `askViaAgent` opens no subscription at all and nothing below changes.

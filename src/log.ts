@@ -784,6 +784,27 @@ export class EvidenceLog {
      * field existed, so no existing run, fixture or `verify()` branch changes shape.
      */
     readRoot?: string;
+    /**
+     * THE WRITE ROOT the turn actually EDITED (issue #107) — the tree `guild_delegate`'s
+     * snapshot, both trees, the recorded patch and the recovery hint are all anchored at,
+     * which is by construction the same directory the serve child was rooted at.
+     *
+     * ITS OWN FIELD, NOT A REUSE OF `read_root`, and the reason is what a receipt is FOR.
+     * `read_root` is the claim "the answer describes this tree"; `write_root` is the claim
+     * "this tree was MUTATED". Folding them together would make the honest question a reader
+     * of the log asks — *which trees did a model change?* — return every read-only consult
+     * that ever named a worktree, and would leave the two claims indistinguishable in exactly
+     * the archive you consult when Claude's account of an exchange is in doubt. They are also
+     * not always the same shape of thing: a read root widens what can egress, a write root
+     * widens what can be destroyed, and SECURITY.md treats them separately.
+     *
+     * Same optional-field rule as `read_root` (C29): written ONLY when a target was resolved,
+     * so an untargeted delegation's entry is byte-identical to one written before this field
+     * existed, and no `verify()` branch changes. It rides on `started` for the same reason
+     * `read_root` does — that is the entry recording what was asked — and the `delegate-diff`
+     * entry is paired to it by `call_id`, so the tree and the patch are read together.
+     */
+    writeRoot?: string;
     run?: string;
   }): Promise<StartedResult> {
     if (this.#disabled()) return { ok: true };
@@ -809,6 +830,10 @@ export class EvidenceLog {
         // Absent unless a non-default read root was actually used — see `readRoot` above.
         ...(args.readRoot !== undefined && args.readRoot.length > 0
           ? { read_root: args.readRoot }
+          : {}),
+        // Absent unless a non-default WRITE root was actually used — see `writeRoot` above.
+        ...(args.writeRoot !== undefined && args.writeRoot.length > 0
+          ? { write_root: args.writeRoot }
           : {}),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, true);

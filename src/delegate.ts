@@ -31,6 +31,15 @@
  * at <runDir>/diff-<callId>.patch, logged as a `delegate-diff` entry (claim:false, patch
  * hashed). The pre-tree sha is the recovery hint (`git checkout <tree> -- <path>`).
  *
+ * ONE ROOT PER CALL (issue #107). The tree may be the project the server was launched in or a
+ * validated sibling git worktree of the same repository. Whichever it is, it is resolved ONCE
+ * — through the same `resolveWorktreeTarget` choke point the read tools use — and the single
+ * resulting `writeRoot` is what the serve child is rooted at AND what every capture consumer
+ * takes. That coupling is the entire point of the issue: a serve child re-rooted without the
+ * capture would let the model edit one tree while the evidence layer snapshotted, diffed and
+ * hashed another, and then reported `captureComplete:true`. Do not add a second way to reach
+ * the project dir below the resolution; `deps.repoDir` is an input to it, not a fallback.
+ *
  * Everything else mirrors guild_research: gate (leading-dash → policy tier) BEFORE any log
  * write so a refusal logs nothing (C24 gap parity), then the shared expect→started→completed
  * lifecycle spine (src/consult.ts runAgentLifecycle), reused not forked.
@@ -39,10 +48,12 @@
 import os from "node:os";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { type ServeProvider } from "./client.js";
+import { type ServeProvider, type ServeRouter } from "./client.js";
+import { type GitRunner } from "./worktree.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
+  resolveReadRoot,
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
@@ -56,11 +67,15 @@ import {
   readLayeredConfContents,
   resolveModel,
   resolveMessageTimeoutMs,
-  resolveAgentDefDirs,
   hardenedDefPresentIn,
 } from "./config.js";
 import { type PolicyTier } from "./policy.js";
-import { snapshotWorktree, captureDelegateDiff, scaffoldDigest } from "./snapshot.js";
+import {
+  snapshotWorktree,
+  captureDelegateDiff,
+  scaffoldDigest,
+  EMPTY_SCAFFOLD_DIGEST,
+} from "./snapshot.js";
 
 /** The write-capable, hardened agent this tool ALWAYS uses, unmodified (C15/C47/C48). */
 export const DELEGATE_AGENT = "guild-build";
@@ -74,6 +89,16 @@ export interface DelegateParams {
   runId?: string;
   confirmed?: boolean;
   /**
+   * THE TREE TO EDIT (issue #107): a git worktree of THIS repository. Validated at the same
+   * single choke point the read tools use (`resolveWorktreeTarget`); anything else — an
+   * arbitrary path, a worktree of a different repository, a typo — is refused BY NAME, never
+   * silently swapped for the project root. Omit to edit the project the server was launched
+   * in, which behaves exactly as it did before this parameter existed.
+   *
+   * The serve child AND the capture layer are rooted here together — see `delegate()`.
+   */
+  worktree?: string;
+  /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Precedence over `GUILD_MESSAGE_TIMEOUT_MS` env/conf/default;
    * the test seam `deps.messageTimeoutMs` wins.
@@ -83,6 +108,16 @@ export interface DelegateParams {
 
 export interface DelegateDeps {
   serve: ServeProvider;
+  /**
+   * Serve providers keyed by root (issue #96's `ServePool`, reused unchanged by #107). Wired
+   * to the pool in production; required only when `params.worktree` names a root other than
+   * the project's own — a `worktree` with no router THROWS rather than degrading, because
+   * running the edit against the project root instead is the exact silent-wrong-tree failure
+   * this feature exists to remove.
+   */
+  router?: ServeRouter;
+  /** Test seam for the `git worktree list` enumeration (issue #96). */
+  git?: GitRunner;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -101,9 +136,15 @@ export interface DelegateDeps {
    */
   elicitation?: ElicitationRequester;
   /**
-   * The worktree the model edits — the project dir the serve was spawned from. Defaults to
-   * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default so the snapshot
-   * targets the SAME tree opencode mutates. Injected in tests to point at a disposable repo.
+   * The DEFAULT root — the project dir the primary serve child is spawned from. Defaults to
+   * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default. Injected in tests to
+   * point at a disposable repo.
+   *
+   * SINCE #107 THIS IS AN INPUT TO ROOT RESOLUTION, NOT THE CAPTURE ROOT ITSELF. It is read
+   * exactly once, fed into `resolveReadRoot` as the repository the `worktree` target is
+   * validated against, and never consulted again; the capture is anchored at whatever that
+   * resolution returns. Reaching for it after that point would reintroduce the second,
+   * independent root this issue exists to remove.
    */
   repoDir?: string;
 }
@@ -150,6 +191,10 @@ export interface DelegateCapture {
 // --- Result / error shapes -------------------------------------------------
 export type DelegateErrorKind =
   | "agent-def-missing"
+  // The target named a directory that is not a worktree of this repository (issue #107,
+  // reusing #96's kind and refusal shape verbatim). Refused before any log write AND before
+  // any snapshot.
+  | "worktree-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -169,6 +214,10 @@ export interface DelegateAttribution {
   agent: string;
   runId: string;
   callId: string;
+  /** The tree this delegation EDITED, present ONLY when the caller targeted a worktree
+   * (issue #107). Reported so a review can state which tree the patch is of — a diff review
+   * of the wrong tree is the failure the target exists to prevent. */
+  worktree?: string;
 }
 
 export interface DelegateError {
@@ -209,6 +258,11 @@ export interface DelegateFail {
    * before failing is still captured and surfaced so the human can review/recover it. */
   capture?: DelegateCapture;
   rootConflict?: string;
+  /** The tree that was targeted, present whenever one was — including on a refusal that
+   * happened before anything ran. A failed delegation is exactly the case where "which tree
+   * do I go and look at?" is urgent, and `attribution` (which carries it on success) does not
+   * exist here. Absent on a `worktree-invalid` refusal: nothing was resolved. */
+  worktree?: string;
   /** Present when the turn RAN: the action trace up to the failure. */
   activity?: ActivitySummary;
   /** Present when the bridge was armed and the turn ran — e.g. every gated call timed out. */
@@ -216,7 +270,14 @@ export interface DelegateFail {
 }
 export type DelegateResult = DelegateOk | DelegateFail;
 
-/** Resolve the worktree the model edits, matching OpencodeLifecycle's default. */
+/**
+ * The DEFAULT root, matching OpencodeLifecycle's own default (`$GUILD_PROJECT_DIR` else cwd).
+ *
+ * Since #107 this is an INPUT to root resolution, not the answer: it names the repository the
+ * `worktree` target is validated against and the root used when none was named. Called from
+ * exactly one place — inline, inside the `resolveReadRoot` argument — so its value is never
+ * bound to a local that a capture consumer could pick up instead of `writeRoot`.
+ */
 function resolveRepoDir(deps: DelegateDeps, env: NodeJS.ProcessEnv, cwd: string): string {
   if (deps.repoDir && deps.repoDir.length > 0) return deps.repoDir;
   if (env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0) return env.GUILD_PROJECT_DIR;
@@ -242,26 +303,78 @@ export async function delegate(
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
 
-  // NO `worktree` READ ROOT ON THIS PATH (issue #96, deliberate and scoped). The READ tools
-  // can be re-rooted at a validated sibling worktree; the WRITE path cannot, and is not.
-  // Everything downstream of here — `snapshotWorktree`, the throwaway-index baseline, the
-  // after-tree, the ignored-file fingerprint, the submodule state, the recovery hint and the
-  // recorded patch (C37–C40) — is rooted at THIS project dir, and the delegate result's whole
-  // value is that the patch faithfully records what the model changed. Re-rooting the serve
-  // child without re-rooting the snapshot would capture the wrong tree while still LOOKING
-  // complete, which is worse than not offering the feature. Doing it properly is a larger
-  // change (snapshot against the target repo, recovery hints that name it, and the
-  // `.opencode/` scaffolding tamper signal in someone else's worktree) and belongs in its
-  // own issue.
+  // 1b. THE ROOT — RESOLVED ONCE, HERE, AND NOWHERE ELSE (issue #107).
   //
+  //     #96 gave the READ tools a validated `worktree` target and moved the serve child's cwd.
+  //     It deliberately did NOT give one to this path, because moving the child without moving
+  //     the CAPTURE would let the model edit one tree while the evidence layer snapshotted,
+  //     diffed and reported another — and reported itself COMPLETE while doing it. A patch that
+  //     is wrong while claiming to be right is worse than no feature at all.
+  //
+  //     So the root is resolved exactly once, by the SAME `resolveReadRoot`/`resolveWorktreeTarget`
+  //     choke point the read tools use (no second validation path, no second refusal shape), and
+  //     the ONE value it returns is threaded to BOTH consumers:
+  //       - the serve child (`serve`, from the ServePool) and its agent-def dirs, and
+  //       - every capture consumer — `snapshotWorktree`, the throwaway-index baseline and
+  //         after-tree, the ignored-file fingerprint, the submodule state, `scaffoldDigest`,
+  //         the recovery hint and the recorded patch (C37–C40).
+  //     `resolveRepoDir` is consumed INLINE as the repository the target is validated against
+  //     and is never bound to a local, so after this statement there is no variable in scope
+  //     holding the project dir: the only root a consumer can reach is `writeRoot`.
+  //
+  //     NO SESSION-AUTHORITY LOOKUP, deliberately. #96 made `GET /session/{id}`'s `directory`
+  //     the authority for a read CONTINUATION, because opencode serves a session from any child
+  //     of the same project and a continuation that omitted `worktree` would otherwise carry one
+  //     conversation into another tree. `guild_delegate` has no continuation: it takes no
+  //     `sessionId`, mints a fresh session every call and does not keep it. There is no earlier
+  //     turn whose root could disagree with this call's, so the lookup would decide nothing and
+  //     would only add a control-plane round-trip. Machinery not needed is machinery not copied.
+  //     (If a `sessionId` input is ever added here, this comment is the pointer: it must be
+  //     routed through `resolveReadRoot`'s `sessionId`, which already implements the rule.)
+  const readRoot = await resolveReadRoot({
+    ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
+    env,
+    cwd,
+    confContents,
+    serve: deps.serve,
+    projectDir: resolveRepoDir(deps, env, cwd),
+    ...(deps.router !== undefined ? { router: deps.router } : {}),
+    ...(deps.git !== undefined ? { git: deps.git } : {}),
+  });
+  if (!readRoot.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "worktree-invalid",
+        model: "",
+        // No bash counterpart (the wrapper had no target), so null rather than a number that
+        // would collide with the area-H table. Same choice #96 made for the read tools.
+        exitAnalogue: null,
+        message: readRoot.message,
+      },
+    };
+  }
+  /** THE root for this call: the serve child's cwd AND the capture root. One value, one
+   * source. Every consumer below takes this and nothing else. */
+  const writeRoot = readRoot.value.root;
+  const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+
   // 2. NO-FALLBACK def gate (deviation from bash C16). A missing guild-build def REFUSES
   //    loudly — never silently degrades to the UNRESTRICTED `build`. Refused before any log
   //    write (gap parity) and before any snapshot (nothing ran).
-  const agentDefDirs = resolveAgentDefDirs({ env, cwd, confContents });
+  //
+  //    THE DIRS MOVED WITH THE CHILD (#96's finding, and it binds harder here). opencode
+  //    resolves agents from the SERVE's cwd, not from the git repository — so a worktree whose
+  //    `.opencode/agent/` lacks `guild-build.md` must refuse naming THAT worktree's dir. The
+  //    write path's ordering has one step the read paths do not: this refusal lands before
+  //    `log.expect()` AND before `snapshotWorktree`, so a refused delegation leaves no run and
+  //    takes no snapshot of a tree it was never going to touch.
   if (!hardenedDefPresentIn(DELEGATE_AGENT, agentDefDirs).present) {
     return {
       ok: false,
       rootConflict,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: "agent-def-missing",
         model: "",
@@ -286,6 +399,7 @@ export async function delegate(
     return {
       ok: false,
       rootConflict,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: gate.refusal.kind,
         message: gate.refusal.message,
@@ -316,6 +430,7 @@ export async function delegate(
     return {
       ok: false,
       rootConflict,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -327,11 +442,12 @@ export async function delegate(
 
   const runId =
     params.runId && params.runId.length > 0 ? params.runId : log.newRun(DELEGATE_COMMAND);
-  const repoDir = resolveRepoDir(deps, env, cwd);
 
-  // 5. Snapshot the worktree BEFORE the model runs (throwaway index; caller's index and
-  //    worktree untouched — C36/C37). Nothing has been edited yet, so this is the baseline.
-  const before = snapshotWorktree(repoDir);
+  // 5. Snapshot the RESOLVED root BEFORE the model runs (throwaway index; caller's index and
+  //    worktree untouched — C36/C37). Nothing has been edited yet, so this is the baseline —
+  //    of `writeRoot`, which is by construction the same directory the serve child below is
+  //    rooted at.
+  const before = snapshotWorktree(writeRoot);
 
   // 6. The model turn, via the UNMODIFIED guild-build agent (shared spine + agent-mismatch).
   const outcome = await runAgentLifecycle(
@@ -344,9 +460,12 @@ export async function delegate(
       runId,
       tier: gate.tier,
       confirmed: gate.confirmed,
+      // The receipts say WHICH TREE was edited (issue #107). Its own field, not `readRoot`:
+      // "this tree was mutated" is a different claim from "the answer describes this tree".
+      ...(worktreeRoot !== undefined ? { writeRoot: worktreeRoot } : {}),
     },
     {
-      serve: deps.serve,
+      serve,
       log,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
@@ -360,7 +479,10 @@ export async function delegate(
   //    log_complete regardless of opencode's exit). The callId is the lifecycle's; using it
   //    keeps the delegate-diff entry paired to the same call (verify cardinality, C24).
   const capture = await captureAndLog(before, {
-    repoDir,
+    writeRoot,
+    // Present ONLY for a targeted call: it is what turns the recovery hint into one that
+    // names the tree. Absent ⇒ the hint stays byte-identical to the pre-#107 one.
+    ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     log,
     runId,
     callId: outcome.callId,
@@ -377,6 +499,7 @@ export async function delegate(
         agent: DELEGATE_AGENT,
         runId,
         callId: outcome.callId,
+        ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       },
       capture,
     };
@@ -402,6 +525,7 @@ export async function delegate(
     },
     // Surface the partial capture even on failure so the human can review/recover.
     capture,
+    ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
@@ -426,11 +550,30 @@ export async function delegate(
  */
 async function captureAndLog(
   before: ReturnType<typeof snapshotWorktree>,
-  ctx: { repoDir: string; log: EvidenceLog; runId: string; callId: string },
+  ctx: {
+    /** THE resolved root (issue #107) — the only directory this function may touch. Named
+     * `writeRoot`, not `repoDir`, so a future edit that reaches for "the project dir" has
+     * nothing here to reach for. */
+    writeRoot: string;
+    /** Set only when the caller targeted a worktree; drives the `-C` in the recovery hint. */
+    worktreeRoot?: string;
+    log: EvidenceLog;
+    runId: string;
+    callId: string;
+  },
 ): Promise<DelegateCapture> {
+  // THE HINT NAMES THE TREE WHEN IT IS NOT THE ONE YOU ARE STANDING IN (issue #107). A bare
+  // `git checkout <tree> -- <path>` pasted into the project root after a worktree-targeted
+  // delegation would restore into the WRONG tree — silently, and from a tree sha that does
+  // resolve there, because a worktree and its main checkout share one object database. So a
+  // targeted call gets the `-C` form. An UNTARGETED call's hint is left byte-identical to the
+  // pre-#107 string (C39's `git checkout <tree> -- <path>`): nothing about it was ambiguous,
+  // and changing it would churn the contract, the docs and the fixtures for no gain.
   const recoveryHint =
     before.gitWorktree && before.dirty && before.tree
-      ? `git checkout ${before.tree} -- <path>`
+      ? ctx.worktreeRoot !== undefined
+        ? `git -C ${ctx.worktreeRoot} checkout ${before.tree} -- <path>`
+        : `git checkout ${before.tree} -- <path>`
       : null;
 
   if (!before.gitWorktree) {
@@ -454,10 +597,25 @@ async function captureAndLog(
   // turn? Computed AFTER the model turn against the before-snapshot's digest. Independent of
   // captureComplete — a scaffolding write is invisible to the fingerprint by design, so this
   // is the ONLY place it surfaces.
-  const scaffoldChanged = before.gitWorktree && scaffoldDigest(ctx.repoDir) !== before.scaffold;
-  const scaffoldWarning = scaffoldChanged
-    ? "the transport's plugin directory (.opencode/node_modules + manifests) changed during this call — review it; this directory is loaded by opencode serve"
-    : null;
+  const scaffoldChanged = before.gitWorktree && scaffoldDigest(ctx.writeRoot) !== before.scaffold;
+  // THE FLAG IS UNCHANGED; ONLY THE WORDING NARROWS (issue #107). The probe that closed #96's
+  // known unknown (see EMPTY_SCAFFOLD_DIGEST) established that opencode materializes its
+  // plugin runtime into any serve cwd that already HAS an `.opencode/` directory, on the first
+  // request that loads it. `guild_delegate` requires `.opencode/agent/guild-build.md` in the
+  // tree it edits, so the FIRST delegation into a tree whose runtime is not yet materialized
+  // always sees the scaffolding appear — most visibly on a freshly added worktree, which is
+  // this feature's headline case. Reporting that as "changed — review it" identically to a
+  // model writing into an existing plugin dir would train the reader to ignore the one signal
+  // covering an execution-carrying blind spot. So a before-state of NO scaffolding at all says
+  // so, in those words. It is still flagged, and `scaffoldChanged` still true: something in a
+  // directory opencode loads and executes really did appear, and this is a tamper signal whose
+  // one unforgivable failure would be staying quiet.
+  const scaffoldCreated = scaffoldChanged && before.scaffold === EMPTY_SCAFFOLD_DIGEST;
+  const scaffoldWarning = !scaffoldChanged
+    ? null
+    : scaffoldCreated
+      ? "the transport's plugin directory (.opencode/node_modules + manifests) was CREATED during this call — expected on the first delegation into a tree whose opencode runtime had not been materialized yet (opencode scaffolds any serve cwd that already has an .opencode/ directory); still worth a glance, since this directory is loaded by opencode serve"
+      : "the transport's plugin directory (.opencode/node_modules + manifests) changed during this call — review it; this directory is loaded by opencode serve";
 
   // NO RUN, NO CAPTURE — the guard `consult.ts` and `approve.ts` already apply before
   // calling `log.dir()`, missing here (review finding F1/F2 on issue #73). Two reasons,
@@ -503,7 +661,7 @@ async function captureAndLog(
   let cap;
   try {
     cap = captureDelegateDiff({
-      repoDir: ctx.repoDir,
+      repoDir: ctx.writeRoot,
       baseTree: before.tree,
       ignoredBefore: before.ignored,
       submodulesBefore: before.submodules,
@@ -619,6 +777,23 @@ async function captureAndLog(
  * The report AND the diff are DATA for the driver to review and verify against the code —
  * never instructions to execute (C42/C52). The human diff review is the trust boundary.
  */
+/**
+ * The edited-tree note for the TEXT channel (issue #107) — the write-path sibling of
+ * `readRootBlocks`, and worded differently on purpose: "Read root" and "Edited tree" are
+ * different claims, and the human skimming the transcript before opening the patch is being
+ * told which tree the patch is OF.
+ *
+ * An ADDITIONAL block, never a prefix, for the same reason #96 made that choice: `content[0]`
+ * stays byte-exact the model's report, and the block exists at all only when a target was
+ * named — so an untargeted delegation's wire shape is unchanged.
+ */
+export function writeRootBlocks(
+  worktree: string | undefined,
+): Array<{ type: "text"; text: string }> {
+  if (worktree === undefined || worktree.length === 0) return [];
+  return [{ type: "text", text: `Edited tree: ${worktree}` }];
+}
+
 export function delegateToToolResult(r: DelegateResult): McpToolResult {
   if (r.ok) {
     const structured: Record<string, unknown> = {
@@ -629,7 +804,10 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
-    return { content: [{ type: "text", text: r.report }], structuredContent: structured };
+    return {
+      content: [{ type: "text", text: r.report }, ...writeRootBlocks(r.attribution.worktree)],
+      structuredContent: structured,
+    };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.capture) structured.capture = r.capture;

@@ -434,6 +434,39 @@ export function scaffoldDigest(repoDir: string): string {
   return createHash("sha256").update(payload).digest("hex");
 }
 
+/**
+ * The digest `scaffoldDigest` returns for a tree with NO serve scaffolding at all — no
+ * `.opencode/node_modules`, none of the four excluded manifests. Derived from the same payload
+ * construction above (no entries, not truncated ⇒ the empty string), and pinned by a test that
+ * calls `scaffoldDigest` on a scaffolding-free directory so the two cannot drift apart.
+ *
+ * WHY IT IS NEEDED (issue #107, and the known unknown #96 left open). The trigger for opencode
+ * materializing its plugin runtime into a serve's cwd is now CHARACTERISED — probed on 1.18.7,
+ * 2026-07-29, five configurations:
+ *   - The condition is an **existing `.opencode/` DIRECTORY** in that cwd. A dir with no
+ *     `.opencode/` is never scaffolded, not on serve start and not after a session is created.
+ *     A dir with an EMPTY `.opencode/` is scaffolded, so it is the directory's existence that
+ *     decides, not what is in it.
+ *   - The moment is **the first request that loads the project's plugin runtime** — `GET /agent`
+ *     and `POST /session` both do it — NOT serve startup, which is lazy: a serve that answered
+ *     `/doc` and then sat idle for 25s wrote nothing.
+ * `guild_delegate` requires `.opencode/agent/guild-build.md` in the tree it edits (it refuses
+ * otherwise), so the condition is ALWAYS met on the write path. Consequence: the FIRST
+ * delegation into a tree whose runtime has not been materialized yet will see the scaffolding
+ * appear during the turn, and the before/after digests differ for a reason that is opencode's
+ * own housekeeping rather than anything the model did.
+ *
+ * WHAT THE WRITE PATH DOES WITH THAT, and what it deliberately does NOT do: the
+ * `scaffoldChanged` FLAG is unchanged — it still fires, because something in an
+ * execution-carrying directory really did change and suppressing it would be the tamper
+ * signal's one unforgivable failure. Only the WARNING TEXT is narrowed, to say the scaffolding
+ * was CREATED rather than modified. Pre-emptively warming the child before the baseline
+ * snapshot was considered and rejected: it would pin the write path's evidence baseline to an
+ * undocumented lazy-load ordering in a dependency this repo tracks unpinned, and buy only the
+ * suppression of a first-call-per-tree warning.
+ */
+export const EMPTY_SCAFFOLD_DIGEST = createHash("sha256").update("").digest("hex");
+
 /** The BEFORE snapshot: everything the AFTER capture needs to attribute the model's diff
  * and judge representability. Taken immediately before the model turn. */
 export interface WorktreeSnapshot {

@@ -77,12 +77,13 @@ const RUN_ID_RULE_DESC =
   "(letters/digits/'.'/'_'/'-', no '/', '\\' or '..'). Anything else is a tool input " +
   "error, not a silent fresh run.";
 
-/** Type-check the optional `worktree` tool argument (issue #96). Only the SHAPE is checked
- * here — whether the path is actually a worktree of this repository is decided at the one
- * choke point (`resolveWorktreeTarget`, via `resolveReadRoot`), so this never becomes a
- * second, drifting copy of the fence. Present-but-not-a-string is a tool input error rather
- * than a silent ignore: a caller that asked for a different read root and quietly got the
- * project root would get a fluent review of the wrong tree. */
+/** Type-check the optional `worktree` tool argument (issue #96; also `guild_delegate`'s since
+ * issue #107). Only the SHAPE is checked here — whether the path is actually a worktree of
+ * this repository is decided at the one choke point (`resolveWorktreeTarget`, via
+ * `resolveReadRoot`), so this never becomes a second, drifting copy of the fence.
+ * Present-but-not-a-string is a tool input error rather than a silent ignore: a caller that
+ * asked for a different root and quietly got the project root would get a fluent review of
+ * the wrong tree — or, on the write path, a patch of one. */
 function resolveWorktreeArg(
   tool: string,
   raw: unknown,
@@ -92,7 +93,7 @@ function resolveWorktreeArg(
     return {
       error:
         `${tool}: 'worktree' must be a non-empty path to a git worktree of this repository ` +
-        `(see \`git worktree list\`), or omitted to read the project the server was launched in.`,
+        `(see \`git worktree list\`), or omitted to use the project the server was launched in.`,
     };
   }
   return { value: raw };
@@ -445,6 +446,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "Set true ONLY after the human user has explicitly approved delegating to an " +
               "ask-gated model. Represents the user's approval, not the assistant's.",
           },
+          worktree: {
+            type: "string",
+            description:
+              "Optional absolute path of a git worktree of THIS repository for the model to " +
+              "EDIT and run commands in, instead of the project the server was launched in — " +
+              "use it to delegate work on a branch that lives in a sibling worktree. The " +
+              "serve child AND the change-capture (snapshot, patch, recovery hint) are rooted " +
+              "there together, so structuredContent.capture.patchPath is a patch OF THAT TREE " +
+              "and structuredContent.worktree names it. Validated against `git worktree " +
+              "list`: a path that is not a worktree of THIS repository (including a worktree " +
+              "of a different repo) is a tool error naming the path, never a silent edit of " +
+              "the project root; a worktree without the hardened guild-build def refuses up " +
+              "front naming that worktree's agent dir. COST: the model can edit files and run " +
+              "bash in the tree you name, so the trusted-repo exposure extends there. Omit to " +
+              "edit the project root.",
+          },
           timeoutMs: TIMEOUT_MS_PROP,
         },
         required: ["task"],
@@ -665,6 +682,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in rid) {
       return { content: [{ type: "text", text: rid.error }], isError: true };
     }
+    const wt = resolveWorktreeArg(DELEGATE_TOOL, a.worktree);
+    if ("error" in wt) {
+      return { content: [{ type: "text", text: wt.error }], isError: true };
+    }
     const result = await withProgress(progressExtra, DELEGATE_TOOL, (onActivity) =>
       delegate(
         {
@@ -672,9 +693,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           model: typeof a.model === "string" ? a.model : undefined,
           runId: rid.value,
           confirmed: a.confirmed === true,
+          worktree: wt.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, onActivity, elicitation },
+        // The pool is the SAME one the read tools use (issue #96), reused unchanged: a
+        // delegation into a worktree gets a supervised child rooted there, and the capture
+        // is rooted at the identical directory (issue #107).
+        { serve: lifecycle, router: servePool, onActivity, elicitation },
       ),
     );
     return delegateToToolResult(result);
