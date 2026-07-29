@@ -7,6 +7,7 @@
 #
 # It asserts the default-deny-allowlist invariants, computed the way opencode
 # resolves them (LAST-MATCH-WINS), on the FRONTMATTER ONLY:
+#   - NO duplicate top-level frontmatter key (issue #100)
 #   - `mode: all` (a `mode: subagent` def silently falls back to full-access build)
 #   - the effective floor is deny (an un-listed tool resolves to deny)
 #   - every tool's EFFECTIVE action (last rule matching the tool name OR `*`) is
@@ -46,6 +47,25 @@ KNOWN_TOOLS="bash edit write patch grep glob task todowrite webfetch websearch l
 # in the markdown body (after the closing fence) is ignored — a look-alike block
 # there must not influence the result.
 frontmatter() { awk 'NR==1 && $0=="---"{f=1;next} f && $0=="---"{exit} f' "$1"; }
+
+# dup_top_keys  (stdin = frontmatter) : each top-level key that appears more than
+# once, printed once. Top level = column 0 (a folded scalar's continuation lines and
+# the permission map's entries are indented, so they cannot be mistaken for keys);
+# `#` comment lines and lines carrying no `:` are skipped.
+dup_top_keys() {
+  awk '
+    /^[ \t]/{next}
+    /^#/{next}
+    {
+      i=index($0,":"); if(!i) next
+      k=substr($0,1,i-1)
+      gsub(/^[ \t]+|[ \t]+$/,"",k)
+      gsub(/"/,"",k); gsub(/\047/,"",k)
+      if(k=="") next
+      n[k]++
+      if(n[k]==2) print k
+    }'
+}
 
 # top_perms  (stdin = frontmatter) : "key|value" for each 2-space-indented entry in
 # the permission: block (top level; the 4-space read sub-map is skipped). Quotes
@@ -106,6 +126,29 @@ check_agent() {
   local fm; fm="$(frontmatter "$f")"
   [ -n "$fm" ] || { bad "$label" "no YAML frontmatter block (first line must be '---', closed by '---')"; return; }
 
+  # No duplicate top-level key (issue #100). A DUPLICATE IS THE DEFECT, whichever way
+  # it resolves — deliberately not a last-match rule. A last-match check would have to
+  # assert which of the two values opencode's frontmatter parser honours, and asserting
+  # that from assumption is how the hole below got here: `mode: all` was checked by
+  # PRESENCE, so a def carrying `mode: all` followed by `mode: subagent` passed while
+  # (per this file's own failure text) silently falling back to full-access `build`.
+  # Rejecting the duplicate outright means the lint never has to know.
+  #
+  # PROBED on opencode 1.18.7 (2026-07-29, `opencode agent list` — the resolved config
+  # the tool layer enforces, the same source verify-guild-*.sh calls authoritative):
+  # a duplicated top-level key is worse than ambiguous. ANY of them — `mode`,
+  # `permission`, even `description` — makes opencode apply NONE of the frontmatter:
+  # `mode` falls back to its default and the def's permission rules are absent
+  # entirely, so the agent resolves with opencode's built-in `"*": allow` and the
+  # default-deny floor is simply not there. An otherwise-identical control def with no
+  # duplicate resolved with its rules intact. No warning is printed. That is invisible
+  # to every other check here, which reads the SOURCE file (where the floor still is).
+  local dups; dups="$(printf '%s\n' "$fm" | dup_top_keys)"
+  [ -z "$dups" ] \
+    || bad "$label" "duplicate top-level frontmatter key(s): $(printf '%s\n' "$dups" | tr '\n' ' ')— opencode 1.18.7 applies NO frontmatter from such a def (probed): the permission map is dropped and the agent resolves to the built-in '\"*\": allow'"
+
+  # With duplicates rejected above, a matching `mode: all` line is the ONLY top-level
+  # `mode` there is, so presence is sufficient here — the two checks compose.
   printf '%s\n' "$fm" | grep -qx 'mode: all' \
     || bad "$label" "frontmatter missing 'mode: all' (a subagent def silently falls back to full-access build)"
 
@@ -212,6 +255,39 @@ if [ "${1:-}" = "--self-test" ]; then
   seed
   awk '{print} /^  bash: allow$/{print "  webfetch: allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
   run_variant "$d/agent" && st_no "MISSED webfetch added to guild-build's allow-set" || st_ok "catches an unintended capability added to the allow-set"
+
+  # S8. `mode: subagent` appended AFTER `mode: all` on guild-read -> FAIL. The issue-#100
+  # hole itself: the mode check was by PRESENCE, so `mode: all` still matched and every
+  # other invariant still held, leaving nothing to fail the def. A duplicate key is a
+  # plausible MERGE ARTIFACT (two branches touching frontmatter, a conflict resolved by
+  # keeping both sides) — the "a human edited an agent .md and weakened it" class this
+  # lint exists for, with CI green. Only the duplicate-key check can catch this one.
+  seed
+  awk '{print} /^mode: all$/{print "mode: subagent"}' "$REAL/guild-read.md" > "$d/agent/guild-read.md"
+  run_variant "$d/agent" && st_no "MISSED 'mode: subagent' duplicated after 'mode: all'" || st_ok "catches a duplicate mode: key overriding 'mode: all'"
+
+  # S9. The SAME duplicate in the reverse order — `mode: subagent` first, `mode: all`
+  # second — also FAILs. A last-match rule would call this file fine; the invariant here
+  # is that the def is unambiguous, not that the winning value reads `all`. Which of the
+  # two opencode honours is exactly what this lint declines to assume (see check_agent).
+  seed
+  awk '{ if ($0=="mode: all") { print "mode: subagent"; print "mode: all" } else print }' \
+    "$REAL/guild-read.md" > "$d/agent/guild-read.md"
+  run_variant "$d/agent" && st_no "MISSED a duplicate mode: key in the 'subagent then all' order" || st_ok "catches a duplicate mode: key in either order"
+
+  # S10. A duplicated `permission:` key -> FAIL. Same hole, worse payoff, which is why
+  # the check covers every top-level key rather than `mode` alone: the two blocks here
+  # are IDENTICAL, so every effective-action check still passes and only the duplicate
+  # catches it — while opencode (probed, 1.18.7) applies neither block and drops the
+  # default-deny floor. A second block that differed would be a wide-open agent.
+  seed
+  printf '%s\n' '---' 'description: x' 'mode: all' \
+    'permission:' '  "*": deny' '  read: allow' '  grep: allow' '  glob: allow' \
+    '  webfetch: allow' '  websearch: allow' \
+    'permission:' '  "*": deny' '  read: allow' '  grep: allow' '  glob: allow' \
+    '  webfetch: allow' '  websearch: allow' \
+    '---' 'body' > "$d/agent/guild-read.md"
+  run_variant "$d/agent" && st_no "MISSED a duplicate permission: key" || st_ok "catches a duplicate permission: key (whole frontmatter voided)"
 
   rm -rf "$d"
   echo
