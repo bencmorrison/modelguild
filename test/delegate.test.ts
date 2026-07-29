@@ -43,7 +43,7 @@ import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
 import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker } from "./harness.js";
+import { Checker, fixtureGitEnv } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m8-"): string {
@@ -52,17 +52,14 @@ function tmp(prefix = "m8-"): string {
   return d;
 }
 
+/** Every fixture git runs under `fixtureGitEnv()` — scrubbed identity AND signing forced
+ * off, so a developer's `commit.gpgsign=true` + `gpg.format=ssh` cannot hang the suite
+ * (issue #98). See the helper's comment for why it is env-form rather than `-c` on argv. */
 function git(dir: string, args: string[]): { status: number; stdout: string } {
   const r = spawnSync("git", args, {
     cwd: dir,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "t",
-      GIT_AUTHOR_EMAIL: "t@t",
-      GIT_COMMITTER_NAME: "t",
-      GIT_COMMITTER_EMAIL: "t@t",
-    },
+    env: fixtureGitEnv(),
   });
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }
@@ -79,7 +76,14 @@ function initRepo(files: Record<string, string>, prefix = "m8-repo-"): string {
     writeFileSync(full, content);
   }
   git(dir, ["add", "-A"]);
-  git(dir, ["commit", "-q", "-m", "init"]);
+  // The status is CHECKED, not discarded (issue #98, adjacent finding). The signing hang has
+  // a quiet sibling: on a signing box with no reachable agent `git commit` exits 128 instead
+  // of blocking, and an ignored status left every fixture repo with NO HEAD — the tests then
+  // silently exercised the unborn-branch path while believing they had a baseline commit.
+  const committed = git(dir, ["commit", "-q", "-m", "init"]);
+  if (committed.status !== 0) {
+    throw new Error(`initRepo: fixture commit failed (status ${committed.status}) in ${dir}`);
+  }
   return dir;
 }
 
@@ -833,6 +837,53 @@ export async function run(): Promise<number> {
     c.check(r2 !== undefined && r2.ok, "F2: a GUILD_LOG=off delegation succeeds");
     c.check(existsSync(logDir2) && readdirSync(logDir2).length === 0,
       "F2: GUILD_LOG=off mints NO run dir and writes NO patch (the documented claim, now true)");
+  }
+
+  // --- G. FIXTURE GIT IS IMMUNE TO THE DEVELOPER'S SIGNING CONFIG (issue #98) -----------
+  // The bug this pins was a SILENT HANG, not a failure: with `commit.gpgsign=true` and
+  // `gpg.format=ssh`, `initRepo`'s `git commit` blocked in `ssh-keygen -Y sign` forever and
+  // `npm test` produced no output at all. A hang cannot be asserted by "the suite passed" on
+  // a box where signing happens to be off, so these ask git ITSELF what it resolves under
+  // the fixture env — which is true regardless of how the developer's config is set.
+  {
+    console.log("-- G. fixture git ignores the developer's signing config (#98) --");
+    const probe = initRepo({ "g.txt": "G\n" }, "m8-sign-");
+
+    const resolved = (key: string, extra: NodeJS.ProcessEnv = {}) =>
+      spawnSync("git", ["config", "--get", key], {
+        cwd: probe,
+        encoding: "utf8",
+        env: { ...fixtureGitEnv({ ...process.env, ...extra }) },
+      }).stdout.trim();
+
+    c.check(resolved("commit.gpgsign") === "false",
+      "G1: commit.gpgsign resolves false under the fixture env (whatever the user configured)");
+    c.check(resolved("tag.gpgsign") === "false",
+      "G1: tag.gpgsign resolves false too (the next fixture that tags is immune for free)");
+
+    // The COMMIT itself is the real proof: initRepo already ran one to build `probe`, and on
+    // a signing box the pre-#98 fixture never returned from it. Reaching here at all means it
+    // completed — assert the repo actually has the commit rather than an empty HEAD.
+    c.check(spawnSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: probe, encoding: "utf8" })
+      .status === 0,
+      "G2: initRepo's commit COMPLETED (pre-#98 this hung forever on a gpg.format=ssh box)");
+
+    // COMPOSITION: an inherited GIT_CONFIG_COUNT must survive. This is not hypothetical —
+    // the documented #98 workaround is itself GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=..., so a
+    // developer still using it would have had index 0 silently overwritten by a naive fix.
+    const withInherited = {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "guild.probe",
+      GIT_CONFIG_VALUE_0: "kept",
+    };
+    c.check(resolved("guild.probe", withInherited) === "kept",
+      "G3: an inherited GIT_CONFIG_COUNT entry is APPENDED TO, not clobbered");
+    c.check(resolved("commit.gpgsign", withInherited) === "false",
+      "G3: ...and signing is still forced off alongside it");
+
+    // A hostile/garbage inherited count must not make git fatal on every fixture call.
+    c.check(resolved("commit.gpgsign", { GIT_CONFIG_COUNT: "not-a-number" }) === "false",
+      "G4: an unparseable inherited GIT_CONFIG_COUNT is ignored, not propagated into a fatal");
   }
 
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });

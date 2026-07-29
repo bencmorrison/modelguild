@@ -21,18 +21,20 @@ import path from "node:path";
 import { OpencodeLifecycle } from "../src/lifecycle.js";
 import { delegate, delegateToToolResult } from "../src/delegate.js";
 import { EvidenceLog } from "../src/log.js";
-import { Checker, repoRoot, withTimeout, waitFor, pidAlive } from "./harness.js";
+import { Checker, repoRoot, withTimeout, waitFor, pidAlive, fixtureGitEnv } from "./harness.js";
 
 const FREE_MODEL = "opencode/deepseek-v4-flash-free";
 const ASK_MS = 180_000;
 const TARGET = "GREETING.txt";
 const MARKER = "OTTER-CANYON-4821";
 
+/** Identity scrubbed and signing forced off — see `fixtureGitEnv` (issue #98): this file
+ * makes an initial commit too, so it hangs on a signing box exactly as delegate.test did. */
 function git(dir: string, args: string[]): { status: number; stdout: string } {
   const r = spawnSync("git", args, {
     cwd: dir,
     encoding: "utf8",
-    env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+    env: fixtureGitEnv(),
   });
   return { status: r.status ?? 1, stdout: r.stdout ?? "" };
 }

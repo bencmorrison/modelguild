@@ -34,7 +34,7 @@ import {
 } from "../src/log.js";
 import { runLogsClean } from "../src/cli.js";
 import { canonicalStringify, buildEntryLine } from "../src/canonical.js";
-import { Checker, repoRoot, tsxBin, sleep } from "./harness.js";
+import { Checker, repoRoot, tsxBin, sleep, fixtureGitEnv } from "./harness.js";
 
 const CHILD = path.join(repoRoot, "test", "log-writer-child.ts");
 /** The issue-#80 actor: one whole SESSION (own run + own retention passes). */
@@ -1528,8 +1528,11 @@ function cleanEnv(): NodeJS.ProcessEnv {
 function envForNoLogDir(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return { ...cleanEnv(), ...extra } as NodeJS.ProcessEnv;
 }
+/** `git init` alone never signs, but this runs under `fixtureGitEnv()` anyway so the whole
+ * suite's fixture-git surface is uniformly immune (issue #98) — the next line added here
+ * that DOES commit must not have to rediscover the hang. */
 function gitInit(dir: string): void {
-  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["init", "-q"], { cwd: dir, env: fixtureGitEnv() });
 }
 
 /** Drive `modelguild logs clean` in-process (the doctor.test idiom) with stdout/stderr
