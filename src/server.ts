@@ -171,12 +171,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "and the ordered config/policy LAYERS in effect — project over global baseline — " +
         "the model-policy layer chain with each file's presence, whether an explicit " +
         "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir), the " +
-        "approval-bridge state, and the INSTALLED PAYLOAD measured against this server's " +
-        "(structuredContent.payload: files that are behind this release — `skewed` = ours and " +
-        "untouched, fixed by `npx modelguild init`; `drifted` = ours and edited, reported " +
-        "never overwritten; `unknown` = no ownership record, unjudgeable). The server updates " +
-        "itself via npx while the commands/agent defs in the repo do not, so a skewed payload " +
-        "means the /guild:* commands running are from an older release. Takes no arguments.",
+        "approval-bridge state, and the INSTALLED PAYLOAD compared against the payload this " +
+        "server ships (structuredContent.payload — files whose bytes DIFFER: `skewed` = ours " +
+        "and unedited, `drifted` = ours and edited (reported, never overwritten), `unknown` = " +
+        "no ownership record, unjudgeable). Do NOT report a direction: hashes carry no " +
+        "ordering and the ownership record holds no version. Normally the payload is BEHIND " +
+        "the server (the server updates itself via npx on every launch, the files in the repo " +
+        "do not), but a deliberately pinned older server puts it ahead instead, and this tool " +
+        "cannot tell those apart. Say the files are out of sync with what the server ships, " +
+        "and give the version-pinned fix `npx modelguild@<payload.serverVersion> init`, which " +
+        "converges either way (plain `npx modelguild init` installs the LATEST payload and " +
+        "does not converge on a pinned older server). Takes no arguments.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -522,7 +527,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === STATUS_TOOL) {
     const status = await guildStatus();
-    return { content: [{ type: "text", text: JSON.stringify(status) }] };
+    // `structuredContent` AS WELL AS the text blob (issue #94). The tool description names
+    // `structuredContent.payload`, but the data only ever rode in `content[0].text` as JSON —
+    // so a caller following the description read a field that did not exist. Every other tool
+    // here that promises structured data actually sets it (`models.ts`, `delegate.ts`).
+    //
+    // NO `outputSchema` is declared, matching every tool in this server: the MCP spec makes
+    // `outputSchema` a validation contract for `structuredContent`, and `GuildDoctorSeed` is a
+    // diagnostic shape that has grown with every feature (roots, policy layers, logging,
+    // approval, now payload) — a schema would be a second definition of it to keep in sync,
+    // which is exactly the drift shape this repo avoids elsewhere.
+    return {
+      content: [{ type: "text", text: JSON.stringify(status) }],
+      structuredContent: status as unknown as Record<string, unknown>,
+    };
   }
 
   if (name === MODELS_TOOL) {

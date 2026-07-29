@@ -61,17 +61,24 @@
 # last release's commands and agent defs without ever being told.
 #
 # When the server starts and finds installed files that are ours, UNEDITED, and DIFFERENT from
-# what this release ships, it writes one notice to stderr naming them. Fix it with
-# `npx modelguild init` — those files are unedited, so init rewrites them in place (it still
-# never overwrites anything you changed; an EDITED file that fell behind is reported as
-# upgrade drift instead, and is never touched).
+# what this release ships, it writes one notice to stderr naming them. The fix it prints is
+# VERSION-PINNED — `npx modelguild@<that version> init` — because plain `npx modelguild init`
+# installs the LATEST payload, which does NOT converge if you are deliberately running an older
+# server. Those files are unedited, so init rewrites them in place; it still never overwrites
+# anything you changed (an EDITED file that fell behind is reported as upgrade drift instead,
+# and is never touched).
 #
 # The notice does not claim WHICH side is older, because two hashes cannot say: normally your
 # payload is behind (the server moves, it does not), but a deliberately pinned older server
-# puts it ahead. `init` makes them match either way.
+# puts it ahead. The pinned command above converges either way.
 #
 # The notice appears ONCE PER SERVER VERSION, not once per session: after you have seen it,
-# acting on it or deciding to stay put both leave you in silence until the next release.
+# acting on it or deciding to stay put both leave you in silence until the next release. What
+# it has already told you is recorded OUTSIDE your repo — in ~/.claude/modelguild/, or in
+# $GUILD_ROOT if you pinned one — so nothing untracked ever appears in your working tree;
+# delete that file to be told again. One known limit of keying on the version: a republished
+# version, a moving dist-tag, or running from a source checkout can move the payload without
+# moving the version, and the notice then stays quiet. `npx modelguild doctor` still reports it.
 # GUILD_PAYLOAD_NOTICE=off        # on (default) | off. Turns off the START-UP notice only.
 #                                 # `npx modelguild doctor` and the guild_status tool keep
 #                                 # reporting skew regardless — you asked those a question,

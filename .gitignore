@@ -7,12 +7,6 @@
 modelguild/models.policy.local
 modelguild/modelguild.conf.local
 
-# Per-user, per-machine runtime state: which payload-skew notice this machine has already
-# been shown (src/notice.ts, issue #94). Written by the server, never by hand, and kept OUT
-# of the ownership record on purpose. `init` writes the same line into projects it installs
-# into; this repo is one of its own install targets, so it needs it too.
-modelguild/.modelguild-notice.json
-
 # This repo registers the modelguild MCP server per-user (see README "Register the
 # server"), so our own .mcp.json is a private local registration with a machine-specific
 # launch path — never commit it. NOTE: this is a THIS-REPO choice, not the installer's:

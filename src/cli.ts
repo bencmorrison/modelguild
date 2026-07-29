@@ -34,7 +34,7 @@ import {
   type PayloadFileState,
   type ServerLaunch,
 } from "./init.js";
-import { formatSkewNote } from "./notice.js";
+import { formatSkewNote, noticeStatePath } from "./notice.js";
 import { layeredRoots, readLayeredConfContents } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
 import { EvidenceLog, DEFAULT_RETENTION_DAYS, parseRunId } from "./log.js";
@@ -271,6 +271,24 @@ export async function runDoctor(
   }
   targetDir = path.resolve(targetDir);
   const gdirs = resolveGlobalDirs({ homeDir: inject?.homeDir, xdgConfigHome: inject?.xdgConfigHome });
+  // THE ONE INPUT `doctor` RESOLVES DIFFERENTLY FROM THE IN-SERVER SURFACES, SURFACED RATHER
+  // THAN HIDDEN (review finding L7). `guild_status` and the start-up notice scan
+  // `resolveProjectDir` = `$GUILD_PROJECT_DIR` else cwd (what `.mcp.json` sets, and what the
+  // serve child is rooted at); `doctor` scans `--dir` else the cwd, because an explicit CLI
+  // argument must beat an inherited env var and a stale exported `$GUILD_PROJECT_DIR` must not
+  // silently redirect a health check run in a different repo. They converge in every normal
+  // setup and can disagree under a `--write-mcp` install, so when they do, say so — a divergent
+  // report nobody can explain is worse than either rule.
+  {
+    const serverDir = process.env.GUILD_PROJECT_DIR;
+    if (serverDir && serverDir.length > 0 && path.resolve(serverDir) !== targetDir) {
+      console.warn(
+        `! \$GUILD_PROJECT_DIR is ${path.resolve(serverDir)}, but this check ran against ` +
+          `${targetDir}. The MCP server scans the former; doctor scans --dir (else the cwd). ` +
+          `Re-run with --dir "${path.resolve(serverDir)}" to check what the server sees.`,
+      );
+    }
+  }
   let ok = true;
   const line = (good: boolean, msg: string) => {
     console.log(`${good ? "✓" : "✗"} ${msg}`);
@@ -475,6 +493,13 @@ export async function runDoctor(
     for (const l of formatSkewNote({ skewed: drift.skewed, version: packageVersion(PACKAGE_ROOT) })) {
       console.warn(l);
     }
+    // Where the start-up notice records what it has already said (review finding L6). Printed
+    // only alongside a finding, so a healthy run stays quiet — but printed, because there was
+    // otherwise nowhere to look to inspect or reset it.
+    console.warn(
+      `  The start-up notice files what it has announced in ${noticeStatePath({})} — delete ` +
+        `that to be told again. GUILD_PAYLOAD_NOTICE=off stops that notice, not this report.`,
+    );
   }
   if (drift.drifted.length > 0) {
     printDriftNote(drift.drifted, "");

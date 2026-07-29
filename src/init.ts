@@ -277,8 +277,10 @@ const GITIGNORE_BODY = [
   "# Per-user config written by /guild:configure — never commit personal prefs.",
   "modelguild/models.policy.local",
   "modelguild/modelguild.conf.local",
-  "# Per-user, per-machine runtime state (which payload-skew notice you have already seen).",
-  "modelguild/.modelguild-notice.json",
+  // NOTE (issue #94): the payload-skew notice's suppression state is deliberately NOT listed
+  // here, because it is deliberately not written into a project at all — see `src/notice.ts`.
+  // An ignore line added here would only reach projects that RE-RAN `init`, which is exactly
+  // the population that no longer needs it.
   "# The evidence layer: raw prompts/responses of every model call (modelguild/logs).",
   "modelguild/logs/",
   GITIGNORE_END,
@@ -494,6 +496,13 @@ export interface PayloadFileState {
   installedHash: string;
   /** sha256 of the bytes this release ships. */
   shippedHash: string;
+  /**
+   * The ownership record this file was JUDGED AGAINST — project or global, whichever location
+   * it was found in. Carried because it is the only value that identifies *which install* the
+   * verdict is about: `src/notice.ts` keys its per-version suppression on it, so a global-only
+   * payload is announced once across every project that shares it rather than once per project.
+   */
+  recordPath: string;
 }
 
 /** True when the installed copy is ours, EDITED, and behind the shipped payload (issue #22). */
@@ -595,6 +604,7 @@ export function scanPayload(packageRoot: string, entries: PayloadScanEntry[]): P
       shippedPath,
       installedHash: current,
       shippedHash: shipped,
+      recordPath: e.recordPath,
     };
     if (!recorded) unknown.push(entry);
     else if (isSkewed(recorded, current, shipped)) skewed.push(entry);
@@ -660,6 +670,26 @@ export function payloadScanEntries(opts: PayloadLocateOptions): PayloadScanEntry
     });
   }
   return out;
+}
+
+/**
+ * The project directory an IN-SERVER surface scans: `$GUILD_PROJECT_DIR` (what `.mcp.json`
+ * sets, and what `lifecycle.ts` spawns `opencode serve` from) else the cwd — the same rule
+ * `resolveAgentDefDir` uses, so the skew check and the agent-def refusal look at one directory.
+ *
+ * Shared by `src/notice.ts` and `guildDoctorSeed` (review finding L7: they had derived it
+ * separately). **`doctor` deliberately does NOT use it** — its target is `--dir` else the cwd,
+ * because an explicit CLI argument must beat an inherited env var, and a stale exported
+ * `$GUILD_PROJECT_DIR` must not silently redirect a health check run in another repo. That
+ * split is real and is SURFACED rather than hidden: `doctor` prints a note when the two
+ * disagree, so nobody has to discover it from a divergent report.
+ */
+export function resolveProjectDir(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+): string {
+  const fromEnv = env.GUILD_PROJECT_DIR;
+  return fromEnv && fromEnv.length > 0 ? fromEnv : cwd;
 }
 
 /** The one entry point the surfaces call: locate every payload file, then classify it.
@@ -897,6 +927,7 @@ export function init(opts: InitOptions): InitResult {
             shippedPath: srcAbs,
             installedHash: current,
             shippedHash: payloadHash,
+            recordPath: plan.recordPath,
           });
           result.warnings.push(
             `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +

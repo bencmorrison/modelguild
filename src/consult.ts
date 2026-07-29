@@ -62,9 +62,11 @@ import {
   PACKAGE_ROOT,
   packageVersion,
   resolveGlobalDirs,
+  resolveProjectDir,
   scanInstalledPayload,
   type PayloadFileState,
 } from "./init.js";
+import { noticeStatePath } from "./notice.js";
 import {
   policyTierAcross,
   resolvePolicyLayers,
@@ -192,6 +194,9 @@ export interface PayloadDoctorInfo {
   /** Whether the START-UP notice is enabled. `doctor`/`guild_status` report skew either way —
    * the knob governs the unsolicited surface only. */
   noticeEnabled: boolean;
+  /** Where the notice's per-version suppression state lives (review finding L6: nothing
+   * reported it, so a user who wanted to reset or inspect it had nowhere to look). */
+  noticeStatePath: string;
 }
 
 export interface PayloadFileReport {
@@ -201,6 +206,9 @@ export interface PayloadFileReport {
    * `installedHash` vs `shippedHash` is exactly the "recorded vs shipped" comparison. */
   installedHash: string;
   shippedHash: string;
+  /** The ownership record this verdict was made against — project or global, whichever the
+   * file was found in. Names WHICH install the row is about on a mixed setup. */
+  recordPath: string;
 }
 
 const payloadReport = (f: PayloadFileState): PayloadFileReport => ({
@@ -208,6 +216,7 @@ const payloadReport = (f: PayloadFileState): PayloadFileReport => ({
   installedPath: f.installedPath,
   installedHash: f.installedHash,
   shippedHash: f.shippedHash,
+  recordPath: f.recordPath,
 });
 
 /**
@@ -236,12 +245,12 @@ export function guildDoctorSeed(
   const confContents = readLayeredConfContents(guildDirs, env);
   // Payload skew/drift (issue #94). Resolved from the same (env, cwd, home) this function is
   // already injected with — `resolveGlobalDirs` derives the XDG dir from `env`, and the project
-  // dir is `$GUILD_PROJECT_DIR` else the cwd, matching `resolveAgentDefDir` — so `guild_status`
-  // and its test drive the same code with no new parameters and never touch the real `~`.
+  // dir comes from the SHARED `resolveProjectDir` that `src/notice.ts` uses (review finding L7:
+  // the two had derived it separately) — so `guild_status` and its test drive the same code with
+  // no new parameters and never touch the real `~`.
   const payloadScan = scanInstalledPayload({
     packageRoot: PACKAGE_ROOT,
-    targetDir:
-      env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0 ? env.GUILD_PROJECT_DIR : cwd,
+    targetDir: resolveProjectDir(env, cwd),
     global_dirs: resolveGlobalDirs({ homeDir: home, env }),
   });
   return {
@@ -262,6 +271,7 @@ export function guildDoctorSeed(
       // Reported, never CONSULTED here: `guild_status` was asked for, so it answers whatever
       // the knob says (issue #23's `logs clean`-under-`GUILD_LOG=off` precedent).
       noticeEnabled: resolvePayloadNoticeSettings({ env, confContents }).enabled,
+      noticeStatePath: noticeStatePath({ env, home }),
     },
   };
 }
