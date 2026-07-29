@@ -1660,12 +1660,13 @@ export async function run(): Promise<number> {
   {
     console.log("-- I. serve scaffolding never reaches the patch (#108) --");
 
-    /** opencode's own materialization, applied DURING the turn. */
+    /** opencode's own materialization — every path in the excluded set, `bun.lock` included. */
     const scaffoldInto = (root: string): void => {
       mkdirSync(path.join(root, ".opencode", "node_modules", "pkg"), { recursive: true });
       writeFileSync(path.join(root, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
       writeFileSync(path.join(root, ".opencode", "package.json"), '{"scaffold":true}\n');
       writeFileSync(path.join(root, ".opencode", "package-lock.json"), '{"lock":true}\n');
+      writeFileSync(path.join(root, ".opencode", "bun.lock"), "bunlock\n");
     };
 
     // (a) THE REPRODUCTION: a committed `.opencode/.gitignore` with unrelated content, so
@@ -1718,8 +1719,10 @@ export async function run(): Promise<number> {
           "#108(a): .opencode/node_modules is NOT in the patch (pre-fix it was)",
         );
         c.check(
-          !patch.includes("package-lock.json") && !patch.includes(".opencode/package.json"),
-          "#108(a): the .opencode manifests are NOT in the patch either",
+          !patch.includes("package-lock.json") &&
+            !patch.includes(".opencode/package.json") &&
+            !patch.includes("bun.lock"),
+          "#108(a): the .opencode manifests are NOT in the patch either (bun.lock included)",
         );
         c.check(
           patch.includes("+A1") && /diff --git a\/a\.txt b\/a\.txt/.test(patch),
@@ -1853,6 +1856,126 @@ export async function run(): Promise<number> {
         c.check(
           r.ok && r.capture.scaffoldChanged === true && r.capture.scaffoldWarning !== null,
           "#108(c): ...and the tamper signal is the thing that still reports it",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (d) HEAD MOVES MID-TURN — the regression the first cut of this fix shipped, found by
+    //     review and reproduced. `guild-build` allows `bash`, so a delegated model running
+    //     `git add -A && git commit` moves HEAD between the two snapshots. With "tracked" read
+    //     separately per snapshot, scaffolding that existed AT BASELINE was untracked at the
+    //     before-tree (dropped) and tracked at the after-tree (kept) — landing in the patch as
+    //     NEW FILES the model never created, at node_modules scale. The tracked set is now
+    //     pinned once at the baseline and carried, which is what this case asserts.
+    {
+      const repo = initRepo(
+        { ".opencode/.gitignore": "*.log\n", "a.txt": "A0\n" },
+        "m108-headmove-",
+      );
+      // Scaffolding present BEFORE the baseline snapshot (opencode materialized it earlier).
+      scaffoldInto(repo);
+      const logDir = tmp("m108-logs-");
+      const env = envWith({
+        GUILD_ROOT: tmp("m108-guild-"),
+        GUILD_LOG_DIR: logDir,
+        GUILD_AGENT_DIR: defDirWithBuild(),
+      });
+      const fake = await startFakeOpencode({ historyText: "edited and committed" });
+      try {
+        const r = await delegate(
+          { task: "edit", model: "openai/m" },
+          {
+            serve: mutatingServe(fake, () => {
+              writeFileSync(path.join(repo, "a.txt"), "A1\n");
+              git(repo, ["add", "-A"]);
+              const done = git(repo, ["commit", "-q", "-m", "model commit"]);
+              if (done.status !== 0) throw new Error("fixture: mid-turn commit failed");
+            }),
+            env,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(r.ok, "#108(d): delegate ok");
+        c.check(
+          git(repo, ["rev-list", "--count", "HEAD"]).stdout.trim() === "2",
+          "#108(d): fixture — the model really did move HEAD mid-turn",
+        );
+        const patch = r.ok && r.capture.patchPath ? readFileSync(r.capture.patchPath, "utf8") : "";
+        c.check(
+          !patch.includes("node_modules") &&
+            !patch.includes(".opencode/package.json") &&
+            !patch.includes("package-lock.json") &&
+            !patch.includes("bun.lock"),
+          "#108(d): scaffolding that existed at baseline does NOT appear as new files",
+        );
+        c.check(
+          patch.includes("+A1") && r.ok && r.capture.filesChanged === 1,
+          "#108(d): only the model's real edit is in the patch",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (e) THE MIRROR: a scaffold path the repo TRACKS at baseline, which the model untracks and
+    //     commits mid-turn. Re-deriving "tracked" per snapshot reported a DELETION for a file
+    //     still sitting on disk. The baseline says the repository owned it, so it stays in both
+    //     trees and no phantom `D` is produced.
+    {
+      const repo = initRepo(
+        {
+          ".opencode/.gitignore": "*.log\n",
+          ".opencode/package.json": '{"name":"tracked"}\n',
+          ".opencode/node_modules/pkg/index.js": "x\n",
+          "a.txt": "A0\n",
+        },
+        "m108-untrack-",
+      );
+      const logDir = tmp("m108-logs-");
+      const env = envWith({
+        GUILD_ROOT: tmp("m108-guild-"),
+        GUILD_LOG_DIR: logDir,
+        GUILD_AGENT_DIR: defDirWithBuild(),
+      });
+      const fake = await startFakeOpencode({ historyText: "untracked the scaffolding" });
+      try {
+        const r = await delegate(
+          { task: "edit", model: "openai/m" },
+          {
+            serve: mutatingServe(fake, () => {
+              writeFileSync(path.join(repo, "a.txt"), "A1\n");
+              git(repo, [
+                "rm",
+                "-q",
+                "--cached",
+                "-r",
+                ".opencode/node_modules",
+                ".opencode/package.json",
+              ]);
+              const done = git(repo, ["commit", "-q", "-m", "model untracks scaffolding"]);
+              if (done.status !== 0) throw new Error("fixture: mid-turn commit failed");
+            }),
+            env,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(r.ok, "#108(e): delegate ok");
+        const patch = r.ok && r.capture.patchPath ? readFileSync(r.capture.patchPath, "utf8") : "";
+        c.check(
+          !patch.includes("deleted file"),
+          "#108(e): no phantom DELETION for files still on disk",
+        );
+        c.check(
+          !patch.includes("node_modules") && !patch.includes(".opencode/package.json"),
+          "#108(e): ...the scaffold paths are absent from the patch entirely",
+        );
+        c.check(
+          patch.includes("+A1") && r.ok && r.capture.filesChanged === 1,
+          "#108(e): only the model's real edit is in the patch",
         );
       } finally {
         await fake.close();

@@ -122,8 +122,34 @@ function isServeScaffold(rel: string): boolean {
 }
 
 /**
+ * The `isServeScaffold` paths the repository TRACKS — the reference set the staging exclusion
+ * subtracts (issue #108). `null` means **could not determine**, which callers must read as
+ * "exclude nothing".
+ *
+ * THREE OUTCOMES, AND THE DIRECTIONS ARE NOT THE SAME (review finding L1):
+ *   - HEAD does not resolve ⇒ an **unborn branch**, the intended case: nothing is tracked, so
+ *     `[]` is the true answer and every staged scaffold path is dropped. `isGitWorktree` has
+ *     already said this is a work tree, so an unresolvable HEAD is that and not a broken repo.
+ *   - HEAD resolves and `ls-tree` answers ⇒ the tracked subset.
+ *   - HEAD resolves and `ls-tree` FAILS ⇒ `null`. Folding this into `[]` would have dropped
+ *     every staged scaffold path INCLUDING ones the repo genuinely tracks — a phantom deletion
+ *     in the patch with `captureComplete` still true. `null` restores the pre-#108 behaviour
+ *     (nothing excluded) for that call, which is noisy but never fabricates a change. No
+ *     reachable non-unborn failure is claimed; the direction is chosen because it is the safe
+ *     one, not because a route to it is known.
+ */
+function trackedScaffoldPaths(repoDir: string): string[] | null {
+  const head = git(repoDir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+  if (head.status !== 0 || head.stdout.trim() === "") return []; // unborn: nothing is tracked
+  const ls = git(repoDir, ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", ".opencode"]);
+  if (ls.status !== 0) return null; // cannot answer ⇒ exclude nothing
+  return splitZ(ls.stdout).filter((p) => p.length > 0 && isServeScaffold(p));
+}
+
+/**
  * Drop from the THROWAWAY INDEX every `isServeScaffold` path that `git add -A` just staged and
- * that is **not tracked in HEAD** (issue #108, maintainer decision 2026-07-29).
+ * that the repository does not track (issue #108, maintainer decision 2026-07-29). `tracked` is
+ * the reference set — see `trackedScaffoldPaths`; `null` excludes nothing.
  *
  * WHY THE STAGING NEEDED IT AT ALL. `git add -A` honours `.gitignore`, and the scaffolding is
  * normally ignored — because opencode writes its own `.opencode/.gitignore` covering everything
@@ -137,13 +163,21 @@ function isServeScaffold(rel: string): boolean {
  *
  * This makes the STAGING consistent with an exclusion the project already ratified rather than
  * inventing a new one: `isServeScaffold` defines exactly this path set, and the ignored-file
- * fingerprint has excluded it since 2026-07-22. It applies to BOTH snapshots through the one
- * `snapshotTree` — an asymmetry here would manufacture phantom diff entries.
+ * fingerprint has excluded it since 2026-07-22.
  *
- * SCOPED TO UNTRACKED-IN-HEAD, deliberately. Pollution is by definition newly created files; a
- * repo that commits `.opencode/package.json` owns it, and the model's edit to it belongs in the
- * diff like any other tracked file. HEAD is the right comparison because the throwaway index is
- * seeded from it (an unborn branch tracks nothing, so everything scaffolded is dropped).
+ * SCOPED TO UNTRACKED, deliberately. Pollution is by definition newly created files; a repo that
+ * commits `.opencode/package.json` owns it, and the model's edit to it belongs in the diff like
+ * any other tracked file.
+ *
+ * **THE REFERENCE SET IS PINNED AT THE BASELINE AND PASSED IN — DO NOT RE-DERIVE IT PER
+ * SNAPSHOT.** The first cut read HEAD separately inside each snapshot, and that is a REGRESSION
+ * with a one-command route to it: `guild-build` allows `bash`, so a delegated model running
+ * `git add -A && git commit` moves HEAD mid-turn. Scaffolding that existed at baseline was then
+ * untracked at the before-snapshot (dropped) and tracked at the after-snapshot (kept), landing in
+ * the patch as `A` entries for files the model never created — at `node_modules` scale, and
+ * reproduced. The mirror is a phantom `D`: a scaffold path tracked at baseline that the model
+ * `git rm --cached`s and commits. The question the predicate is really asking is **"did the
+ * repository own this file BEFORE the turn"**, which has exactly one answer per call.
  *
  * COST, STATED: a write into `.opencode/node_modules/**` or the untracked manifests is now absent
  * from the patch in EVERY repo, where a repo with a committed ignore file used to show it by
@@ -151,16 +185,27 @@ function isServeScaffold(rel: string): boolean {
  * reports such a write — the exclusion is ratified WITH that signal as its condition, and the
  * signal must never be suppressed to make this quieter. `.opencode/agent/**` is not in the set
  * and stays fully in the patch.
+ *
+ * TWO KNOWN LIMITS, named rather than engineered around (review findings L2/L3):
+ *   - `update-index`'s exit status is not checked. A failure leaves the paths staged, i.e. the
+ *     pre-#108 noisy patch — the safe direction — but it is silent.
+ *   - A REGULAR FILE or SYMLINK at `.opencode/node_modules` is dropped from the index by the
+ *     same predicate, while `scaffoldDigest` walks it as a directory and records only an error
+ *     marker. A modification to such a path is therefore invisible in both surfaces.
  */
-function unstageUntrackedScaffold(repoDir: string, env: NodeJS.ProcessEnv): void {
-  // Both listings are scoped to `.opencode` — every path `isServeScaffold` matches lives there.
+function unstageUntrackedScaffold(
+  repoDir: string,
+  env: NodeJS.ProcessEnv,
+  tracked: readonly string[] | null,
+): void {
+  if (tracked === null) return; // reference set unknown ⇒ exclude nothing (see above)
+  // The listing is scoped to `.opencode` — every path `isServeScaffold` matches lives there.
   const staged = splitZ(git(repoDir, ["ls-files", "-z", "--", ".opencode"], env).stdout).filter(
     (p) => p.length > 0 && isServeScaffold(p),
   );
   if (staged.length === 0) return;
-  const head = git(repoDir, ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", ".opencode"]);
-  const tracked = new Set(head.status === 0 ? splitZ(head.stdout) : []);
-  const drop = staged.filter((p) => !tracked.has(p));
+  const trackedSet = new Set(tracked);
+  const drop = staged.filter((p) => !trackedSet.has(p));
   if (drop.length === 0) return;
   // NUL-delimited on stdin, not argv: a materialized `node_modules` is tens of thousands of
   // paths and would blow ARG_MAX. `--force-remove` drops the entry whether or not the file
@@ -188,26 +233,37 @@ export function worktreeDirty(repoDir: string): boolean {
 /**
  * Snapshot the worktree as a git tree object via a THROWAWAY index (`GIT_INDEX_FILE` at a
  * temp path). Seed it from HEAD (or empty for an unborn branch), `git add -A` (which honors
- * .gitignore, so .env / logs stay out — C37), drop the newly-scaffolded serve runtime
+ * .gitignore, so .env / logs stay out — C37), drop the untracked serve runtime
  * (`unstageUntrackedScaffold`, issue #108 — `.gitignore` alone does not keep it out of the
  * patch in a repo that commits its own `.opencode/.gitignore`), then `git write-tree`. The
  * caller's real index and worktree are never touched (C36). Returns the tree sha, or null if
  * not a git worktree / the write failed.
  *
- * BOTH the before- and after-snapshot go through here, which is what keeps their staging
- * identical; staging the two trees differently would manufacture diff entries that no model
- * produced.
+ * `trackedScaffold` is the BASELINE reference set for that exclusion, threaded in by the caller
+ * so both snapshots of a turn subtract the SAME set. Omit it and this call derives its own from
+ * the current HEAD — correct for a one-off caller, and wrong for a before/after pair, because a
+ * delegated model can move HEAD mid-turn with a `git commit` (see `unstageUntrackedScaffold`).
+ * `null` means the set could not be determined: exclude nothing.
+ *
+ * ONE CODE PATH IS NOT ONE RESULT, and the honest statement is the second half: both snapshots
+ * going through this function is necessary but was NOT sufficient — the predicate's second input
+ * was read twice and diverged. What holds the property is that plus the caller pinning
+ * `trackedScaffold` once at the baseline.
  */
-export function snapshotTree(repoDir: string): string | null {
+export function snapshotTree(
+  repoDir: string,
+  trackedScaffold?: readonly string[] | null,
+): string | null {
   if (!isGitWorktree(repoDir)) return null;
   const idx = path.join(os.tmpdir(), `guild-index-${randomBytes(8).toString("hex")}`);
   const env: NodeJS.ProcessEnv = { GIT_INDEX_FILE: idx };
+  const tracked = trackedScaffold !== undefined ? trackedScaffold : trackedScaffoldPaths(repoDir);
   try {
     if (git(repoDir, ["read-tree", "HEAD"], env).status !== 0) {
       git(repoDir, ["read-tree", "--empty"], env);
     }
     git(repoDir, ["add", "-A"], env);
-    unstageUntrackedScaffold(repoDir, env);
+    unstageUntrackedScaffold(repoDir, env, tracked);
     const tree = git(repoDir, ["write-tree"], env).stdout.trim();
     return tree.length > 0 ? tree : null;
   } finally {
@@ -555,6 +611,17 @@ export interface WorktreeSnapshot {
   /** Tamper-signal digest of the excluded serve scaffolding (see scaffoldDigest). */
   scaffold: string;
   /**
+   * The `isServeScaffold` paths the repository tracked **before the turn** — the reference set
+   * the staging exclusion subtracts, pinned HERE so the after-snapshot subtracts the same one
+   * (issue #108). `null` ⇒ undetermined, exclude nothing.
+   *
+   * IT MUST BE CARRIED, NOT RE-DERIVED. `guild-build` allows `bash`, so a `git commit` inside
+   * the turn moves HEAD and a per-snapshot re-derivation flips paths between the two trees —
+   * fabricating `A` entries for scaffolding the model never created, or `D` entries for files
+   * still on disk. Reproduced; it is why this field exists rather than a second HEAD read.
+   */
+  trackedScaffold: string[] | null;
+  /**
    * Did an `.opencode/` DIRECTORY exist in this root **before** the model turn? (issue #107,
    * review finding M1.)
    *
@@ -597,10 +664,14 @@ export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
       ignored: "",
       submodules: "clean",
       scaffold: "",
+      trackedScaffold: null,
       opencodeDir: hasOpencodeDir(repoDir),
     };
   }
-  const tree = snapshotTree(repoDir);
+  // Resolved ONCE, before the baseline tree, and carried on the snapshot: the after-snapshot
+  // must subtract this exact set even if the model commits mid-turn (issue #108).
+  const trackedScaffold = trackedScaffoldPaths(repoDir);
+  const tree = snapshotTree(repoDir, trackedScaffold);
   return {
     gitWorktree: true,
     dirty: worktreeDirty(repoDir),
@@ -608,6 +679,7 @@ export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
     ignored: ignoredFingerprint(repoDir),
     submodules: submoduleState(repoDir),
     scaffold: scaffoldDigest(repoDir),
+    trackedScaffold,
     opencodeDir: hasOpencodeDir(repoDir),
   };
 }
@@ -617,6 +689,13 @@ export interface CaptureInput {
   baseTree: string | null;
   ignoredBefore: string;
   submodulesBefore: string;
+  /**
+   * `WorktreeSnapshot.trackedScaffold` from the BEFORE snapshot (issue #108). Passing it is what
+   * makes the after-tree's staging exclusion identical to the baseline's; omitting it re-derives
+   * from the CURRENT HEAD, which a mid-turn `git commit` moves. Omission is supported only for
+   * callers with no baseline to speak of.
+   */
+  trackedScaffold?: readonly string[] | null;
   /** Where to write the patch (must be inside the run dir; log.diff stores its basename). */
   patchPath: string;
 }
@@ -654,7 +733,8 @@ export function captureDelegateDiff(input: CaptureInput): CaptureResult {
     complete = false;
     reason = "baseline-tree-unavailable";
   } else {
-    afterTree = snapshotTree(repoDir);
+    // The BASELINE's tracked set, not a fresh one — the model may have committed mid-turn.
+    afterTree = snapshotTree(repoDir, input.trackedScaffold);
     if (!afterTree) {
       complete = false;
       reason = "after-tree-unavailable";

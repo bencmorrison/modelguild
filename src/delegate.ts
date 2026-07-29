@@ -683,6 +683,10 @@ async function captureAndLog(
       baseTree: before.tree,
       ignoredBefore: before.ignored,
       submodulesBefore: before.submodules,
+      // The BASELINE's tracked-scaffold set (issue #108). The after-snapshot must subtract this
+      // exact set: `guild-build` allows `bash`, so the model can `git commit` mid-turn and move
+      // HEAD, and a re-derived set would flip scaffold paths between the two trees.
+      trackedScaffold: before.trackedScaffold,
       patchPath,
     });
   } catch (err) {
