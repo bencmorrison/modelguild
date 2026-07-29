@@ -459,6 +459,70 @@ export async function fetchSession(
   return raw;
 }
 
+// --- resolved agents (issue #111) ------------------------------------------
+/**
+ * One entry of `GET /agent` — an agent as opencode RESOLVED it, not as its def file reads.
+ *
+ * `permission` is the resolved rule ARRAY, in declaration order, evaluated last-match-wins.
+ * PROBED on opencode 1.18.7 (2026-07-29, live serve + `opencode agent list`, which prints the
+ * same structure): a hardened `guild-read` ends
+ * `[…builtins…, '*:*:deny', 'read:*:allow', 'grep:*:allow', 'glob:*:allow',
+ * 'webfetch:*:allow', 'websearch:*:allow', …]`, while the same def with ONE unparseable
+ * frontmatter defect resolves to the built-ins alone — no `*:deny` anywhere, so the last `*`
+ * rule is opencode's own `*:allow`. `description` comes back `null` on such a def and `mode`
+ * falls back to `all`, which is why neither field can be used as the tell.
+ *
+ * The fields are typed loosely on purpose: this is a diagnostic read of another project's
+ * schema, and the one consumer (`src/agentfloor.ts`) must be able to say "opencode answered
+ * in a shape I do not understand" rather than crash on it.
+ */
+export interface ResolvedAgent {
+  name?: unknown;
+  mode?: unknown;
+  description?: unknown;
+  permission?: unknown;
+}
+
+export interface ListAgentsOpts {
+  baseUrl: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * `GET /agent` — every agent opencode resolved for this serve child, with its resolved
+ * permission array.
+ *
+ * A CONTROL-PLANE call (`SHORT_HTTP_MS`, never the model-turn budget). It THROWS on a
+ * transport failure, a non-2xx, or a body that is not an array; the caller turns that into an
+ * "unverified" note, never into a call failure (see `src/agentfloor.ts` for why that
+ * direction).
+ *
+ * PER SERVE CHILD, and that is load-bearing: opencode resolves agents from the serve's CWD
+ * (probed for issue #96), so the answer for a worktree-rooted child is genuinely a different
+ * answer than the project-rooted one. Anything that caches this must key on the child.
+ */
+export async function listAgents(opts: ListAgentsOpts): Promise<ResolvedAgent[]> {
+  const ctx: RequestCtx = {
+    baseUrl: opts.baseUrl,
+    path: "/agent",
+    method: "GET",
+    timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
+  };
+  if (opts.signal !== undefined) ctx.signal = opts.signal;
+  if (opts.fetchImpl !== undefined) ctx.fetchImpl = opts.fetchImpl;
+  const raw = await requestJson(ctx);
+  if (!Array.isArray(raw)) {
+    throw new OpencodeHttpError(
+      `GET /agent did not return an array (got ${typeof raw}) — refusing to guess what opencode ` +
+        `resolved`,
+      { method: "GET", path: "/agent" },
+    );
+  }
+  return raw as ResolvedAgent[];
+}
+
 // --- pending permission requests (issue #91) -------------------------------
 /**
  * One entry of `GET /permission` — a permission request opencode is still holding open,

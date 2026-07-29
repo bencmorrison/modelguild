@@ -29,6 +29,7 @@
 import os from "node:os";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
+import { type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -37,6 +38,7 @@ import {
   activityLayerFor,
   approvalFor,
   resolveReadRoot,
+  gateAgentFloor,
   readRootBlocks,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
@@ -97,11 +99,16 @@ export interface ResearchDeps {
    * bridge is armed, which on this read path needs `GUILD_APPROVE_EGRESS=ask`.
    */
   elicitation?: ElicitationRequester;
+  /** The resolved-agent floor check (issue #111); injected in tests. */
+  agentFloor?: AgentFloorChecker;
 }
 
 // --- Result / error shapes -------------------------------------------------
 export type ResearchErrorKind =
   | "agent-def-missing"
+  // The def FILE is present but opencode is not applying it (issue #111, C73). exitAnalogue
+  // null — no bash counterpart, and NOT a reuse of C57's 5 ("the def is missing").
+  | "agent-unhardened"
   /** The named read root is not a worktree of this repository (issue #96). */
   | "worktree-invalid"
   | "model-id"
@@ -147,6 +154,9 @@ export interface ResearchOk {
   answer: string;
   attribution: ResearchAttribution;
   rootConflict?: string;
+  /** Present ONLY when the issue-#111 resolved-agent check could not be made; the call
+   * PROCEEDED and this is the "never silently" half of that decision (C73). */
+  agentUnverified?: string;
   /** Bounded live-activity summary (issue #20); absent when the layer is off. */
   activity?: ActivitySummary;
   /** Present only when the approval bridge was ARMED for this call (issue #20 slice 4). */
@@ -156,6 +166,8 @@ export interface ResearchFail {
   ok: false;
   error: ResearchError;
   rootConflict?: string;
+  /** See `ResearchOk.agentUnverified`. */
+  agentUnverified?: string;
   /** Present when the call actually RAN (call-failed / agent-mismatch). */
   activity?: ActivitySummary;
   /** Present when the bridge was armed and the turn ran. */
@@ -250,10 +262,29 @@ export async function research(
     };
   }
 
+  // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check: the file exists,
+  //     but is opencode APPLYING it? Before any log write and before the approval pre-flight
+  //     (which reads the def SOURCE and would otherwise arm against a map that is not in
+  //     force). See `gateAgentFloor`.
+  const floor = await gateAgentFloor({
+    serve,
+    agent: RESEARCH_AGENT,
+    agentDefDirs,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: { kind: "agent-unhardened", model: "", exitAnalogue: null, message: floor.message },
+    };
+  }
+  const unverified = floor.unverified;
+
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
 
-  // 4b. APPROVAL BRIDGE pre-flight (issue #20 slice 4). On the read paths this only arms
+  // 4c. APPROVAL BRIDGE pre-flight (issue #20 slice 4). On the read paths this only arms
   //     under the separate, opt-in `GUILD_APPROVE_EGRESS=ask`; `GUILD_APPROVE` alone gates
   //     nothing here, because guild-research holds none of edit/write/patch/bash.
   const armed = approvalFor({
@@ -268,6 +299,7 @@ export async function research(
     return {
       ok: false,
       rootConflict,
+      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -318,6 +350,7 @@ export async function research(
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
+    if (unverified !== undefined) ok.agentUnverified = unverified;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
@@ -339,6 +372,7 @@ export async function research(
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
+  if (unverified !== undefined) fail.agentUnverified = unverified;
   return fail;
 }
 
@@ -353,6 +387,7 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
   if (r.ok) {
     const structured: Record<string, unknown> = { answer: r.answer, ...r.attribution };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
     // The read-root note rides as a SECOND text block, never a prefix — `content[0]` must
@@ -364,6 +399,7 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {

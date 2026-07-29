@@ -44,6 +44,7 @@
 import os from "node:os";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
+import { type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -52,6 +53,7 @@ import {
   activityLayerFor,
   approvalFor,
   resolveReadRoot,
+  gateAgentFloor,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
@@ -137,6 +139,8 @@ export interface PanelDeps {
    * so its requests and decisions stay attributable to that member.
    */
   elicitation?: ElicitationRequester;
+  /** The resolved-agent floor check (issue #111); injected in tests. */
+  agentFloor?: AgentFloorChecker;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -188,6 +192,10 @@ export interface PanelOk {
   /** resolvePanelModels warnings (dedup, <2 models, single-provider) — surfaced, C14. */
   warnings: string[];
   rootConflict?: string;
+  /** Present ONLY when the issue-#111 resolved-agent check could not be made; the panel
+   * PROCEEDED and this is the "never silently" half of that decision (C73). Panel-WIDE, like
+   * the def check itself — every member runs the same agent on the same serve child. */
+  agentUnverified?: string;
   /** The read root every member ran against; present only when one was targeted (#96). */
   worktree?: string;
 }
@@ -211,9 +219,16 @@ export interface PanelFail {
     // knob or a missing answering channel refuses the WHOLE panel up front — before any log
     // write, and before a single member is dispatched.
     | { kind: "approval-config"; message: string; exitAnalogue: null }
-    | { kind: "approval-channel-missing"; message: string; exitAnalogue: null };
+    | { kind: "approval-channel-missing"; message: string; exitAnalogue: null }
+    // The guild-read def FILE is present but opencode is not applying it — no default-deny
+    // floor in the resolved config (issue #111, C73). Panel-wide, like the presence check,
+    // and refused before any member runs. exitAnalogue null: no bash counterpart, and NOT a
+    // reuse of C57's 5 ("the def is missing").
+    | { kind: "agent-unhardened"; message: string; exitAnalogue: null };
   warnings: string[];
   rootConflict?: string;
+  /** See `PanelOk.agentUnverified`. */
+  agentUnverified?: string;
 }
 
 export type PanelResult = PanelOk | PanelFail;
@@ -302,6 +317,28 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
 
+  // 3b. RESOLVED-AGENT GATE for the WHOLE panel (issue #111, C73) — stage two of the def
+  //     check, and ONE check for every member exactly as the presence check is: they all run
+  //     `guild-read` on one serve child, so the answer is identical for all of them (and the
+  //     checker's per-child cache would collapse N identical asks anyway). Placed after the
+  //     model-set resolution so an empty set stays a cheap `no-models` refusal, and before the
+  //     approval pre-flight, `newRun` and any member dispatch. See `gateAgentFloor`.
+  const floor = await gateAgentFloor({
+    serve,
+    agent: PANEL_AGENT,
+    agentDefDirs,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      warnings: panelRes.warnings,
+      rootConflict,
+      error: { kind: "agent-unhardened", message: floor.message, exitAnalogue: null },
+    };
+  }
+  const unverified = floor.unverified;
+
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -322,6 +359,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       ok: false,
       warnings: panelRes.warnings,
       rootConflict,
+      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
       error: {
         kind: armed.refusal.kind,
         message: armed.refusal.message,
@@ -421,6 +459,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     results,
     warnings: panelRes.warnings,
     rootConflict,
+    ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
     ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
   };
 }
@@ -461,6 +500,7 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
   if (!r.ok) {
     const structured: Record<string, unknown> = { error: r.error, warnings: r.warnings };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     return {
       content: [{ type: "text", text: r.error.message }],
       structuredContent: structured,
@@ -473,6 +513,7 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
     warnings: r.warnings,
   };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.worktree) structured.worktree = r.worktree;
   return { content: [{ type: "text", text: renderPanelText(r) }], structuredContent: structured };
 }

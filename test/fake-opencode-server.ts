@@ -126,6 +126,85 @@ export interface FakeOpencodeOpts {
    * models an opencode build that silently ignores the field, which must be caught rather
    * than run ungated. */
   ignoreSessionPermission?: boolean;
+  /**
+   * RESOLVED AGENTS (issue #111) — what `GET /agent` serves. Default: all three hardened defs
+   * resolved WITH their default-deny floor, so every pre-existing suite behaves exactly as it
+   * did before the resolved-agent check existed.
+   *
+   * Build the entries with `hardenedAgent()` / `voidedAgent()` so a test states which
+   * RESOLUTION it is fixturing rather than hand-assembling rule arrays — the voided shape is
+   * the probed one (opencode's built-ins alone, no `*:deny` anywhere), not an invention.
+   */
+  agents?: ResolvedAgentFixture[];
+  /** Answer `GET /agent` with a non-2xx (`true` = 500, a number is sent verbatim) — the
+   * "opencode cannot be asked" direction. */
+  failAgentList?: boolean | number;
+  /** Answer `GET /agent` 200 with a body that is not an array — an opencode whose shape moved. */
+  agentListGarbage?: boolean;
+}
+
+/** The shape `GET /agent` serves per agent (loosely typed, like the real schema read). */
+export interface ResolvedAgentFixture {
+  name: string;
+  mode?: unknown;
+  description?: unknown;
+  permission?: unknown;
+}
+
+/**
+ * opencode's own built-in permission rules, as captured from a live 1.18.7 `GET /agent`
+ * (2026-07-29). They are what a VOIDED def resolves to on its own — note the array ENDS with
+ * a general `"*": allow`, which is precisely why a def whose frontmatter opencode cannot parse
+ * runs with no floor.
+ */
+const OPENCODE_BUILTINS: Array<{ permission: string; pattern: string; action: string }> = [
+  { permission: "*", pattern: "*", action: "allow" },
+  { permission: "doom_loop", pattern: "*", action: "ask" },
+  { permission: "external_directory", pattern: "*", action: "ask" },
+  { permission: "question", pattern: "*", action: "deny" },
+  { permission: "plan_enter", pattern: "*", action: "deny" },
+  { permission: "plan_exit", pattern: "*", action: "deny" },
+  { permission: "read", pattern: "*", action: "allow" },
+  { permission: "read", pattern: "*.env", action: "ask" },
+];
+
+/**
+ * A HARDENED resolution: the built-ins, then the def's `"*": deny` floor, then its allow-set —
+ * the exact ordering a control def produced on the live probe.
+ */
+export function hardenedAgent(name: string, allow: string[]): ResolvedAgentFixture {
+  return {
+    name,
+    mode: "all",
+    description: `fixture ${name}`,
+    permission: [
+      ...OPENCODE_BUILTINS,
+      { permission: "*", pattern: "*", action: "deny" },
+      ...allow.map((t) => ({ permission: t, pattern: "*", action: "allow" })),
+    ],
+  };
+}
+
+/**
+ * A VOIDED resolution — the def's frontmatter applied in NO part. The built-ins alone, and
+ * `description: null` / `mode: "all"`, exactly as the live probe reported for a def carrying a
+ * duplicate nested key or a tab-indented line. `mode` reading `all` here is deliberate: it is
+ * opencode's default, which is why `mode` cannot be used as the tell.
+ */
+export function voidedAgent(name: string): ResolvedAgentFixture {
+  return { name, mode: "all", description: null, permission: [...OPENCODE_BUILTINS] };
+}
+
+/** The default `GET /agent` payload: every hardened def, resolved correctly. */
+export function defaultResolvedAgents(): ResolvedAgentFixture[] {
+  return [
+    hardenedAgent("guild-read", ["read", "grep", "glob", "webfetch", "websearch"]),
+    hardenedAgent("guild-research", ["read", "grep", "glob", "webfetch", "websearch"]),
+    hardenedAgent("guild-build", ["read", "edit", "write", "patch", "bash"]),
+    // opencode's own unrestricted agent is always listed too; it has no floor, and nothing
+    // should ever consult it — its presence here is what keeps "find the named agent" honest.
+    { name: "build", mode: "primary", permission: [...OPENCODE_BUILTINS] },
+  ];
 }
 
 export interface FakeOpencode {
@@ -139,6 +218,9 @@ export interface FakeOpencode {
     /** How many times `GET /event` was subscribed — proves the ONE-bus-per-serve-child
      * refcounting, and proves `GUILD_ACTIVITY=off` opens no subscription at all. */
     eventSubscribes: number;
+    /** How many times `GET /agent` was read (issue #111) — proves the resolved-agent check is
+     * cached per serve child, so a 3-model panel asks ONCE, not three times. */
+    agentGets: number;
   };
   /** Push one raw SSE frame to every attached client. */
   emit(event: unknown): void;
@@ -170,6 +252,21 @@ export interface FakeOpencode {
     permission?: string;
     metadata?: Record<string, unknown>;
   }): void;
+  /**
+   * Run `fn` at the START of the next and every `POST /session/{id}/message` — i.e. AT THE
+   * TURN, which is where a real model's file edits happen (issue #111).
+   *
+   * It exists because the write-path fixtures used to model the model's edits by hooking
+   * `ServeProvider.withServe`, and a tool may legitimately enter `withServe` more than once
+   * per call — the resolved-agent check does, before the baseline snapshot. Mutating on every
+   * ENTRY therefore applied the "model's" edits before the snapshot and the diff came out
+   * empty: a fixture artifact, not a product defect, but one that would have been "fixed" by
+   * moving the product's check after the snapshot, which is exactly where it must not go.
+   * Hooking the message POST makes the fixture independent of how many control-plane calls a
+   * tool makes. It fires BEFORE any failure/delay branch, so "even a failing turn leaves the
+   * mutation on disk" (the partial-capture contract) still holds.
+   */
+  setOnMessage(fn: (() => void) | undefined): void;
   /** For each gated turn, the reply the blocked tool actually observed — `"once"`,
    * `"reject"`, or the sentinel `"(never answered)"`. This is what proves the gate BLOCKED,
    * not merely that a reply was sent somewhere. */
@@ -195,10 +292,13 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
     deletes: [],
     historyGets: [],
     eventSubscribes: 0,
+    agentGets: 0,
   };
 
   let createCount = 0;
   let permCount = 0;
+  /** Fired at the start of every message POST — see `FakeOpencode.setOnMessage`. */
+  let onMessage: (() => void) | undefined;
   const eventClients = new Set<import("node:http").ServerResponse>();
   /** Permission requests awaiting a reply, keyed by id → the resolver that unblocks the
    * gated tool. This is the fake's whole model of probe P3: an `ask` blocks the turn. */
@@ -269,6 +369,23 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         res.write(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`);
         eventClients.add(res);
         req.on("close", () => eventClients.delete(res));
+        return;
+      }
+
+      // GET /agent — the RESOLVED agents (issue #111). This is the endpoint the floor check
+      // reads: the def SOURCE is irrelevant to it, so a suite fixtures the RESOLUTION here.
+      if (method === "GET" && (url === "/agent" || url.startsWith("/agent?"))) {
+        recorded.agentGets += 1;
+        if (opts.failAgentList) {
+          const status = typeof opts.failAgentList === "number" ? opts.failAgentList : 500;
+          send(status, { error: "forced agent-list failure" });
+          return;
+        }
+        if (opts.agentListGarbage) {
+          send(200, { not: "an array" });
+          return;
+        }
+        send(200, opts.agents ?? defaultResolvedAgents());
         return;
       }
 
@@ -399,6 +516,9 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       if (method === "POST" && msgMatch) {
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         recorded.messageBodies.push(body);
+        // THE TURN ITSELF. Anything modelling what the model DOES (file edits on the write
+        // path) runs here, before every failure/delay branch below.
+        if (onMessage !== undefined) onMessage();
         // Play the scripted activity BEFORE answering, exactly as a real turn does: the
         // events stream while the message POST is still blocking.
         const script =
@@ -584,6 +704,9 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
           eventClients.clear();
         },
         attachedEventClients: () => eventClients.size,
+        setOnMessage: (fn) => {
+          onMessage = fn;
+        },
         permissionReplies: () => [...replies],
         pendingPermissions: () => [...pendingPerms.keys()],
         addPendingPermission: (req) => {

@@ -40,6 +40,7 @@ import {
   type ServeRouter,
 } from "./client.js";
 import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   candidateRoots,
@@ -279,6 +280,11 @@ export function guildDoctorSeed(
 // --- Result / error shapes -------------------------------------------------
 export type ConsultErrorKind =
   | "agent-def-missing"
+  // The def FILE is present but opencode is not applying it: the resolved config carries no
+  // default-deny floor, so the hardened agent is not hardened (issue #111, C73). Exit-analogue
+  // null — no bash counterpart, and deliberately NOT a reuse of C57's 5, which is specifically
+  // "the def is missing".
+  | "agent-unhardened"
   // The review target named a directory that is not a worktree of this repository
   // (issue #96). Refused before any log write, like every other pre-call refusal.
   | "worktree-invalid"
@@ -335,6 +341,13 @@ export interface ConsultOk {
   /** Multi-root conflict note, if any (surfaced, never fatal). */
   rootConflict?: string;
   /**
+   * Present ONLY when the issue-#111 resolved-agent check could not be made (opencode
+   * unreachable, or an answer this cannot read). The call PROCEEDED — that is the decided
+   * direction — and this is the "never silently" half of it (C73). Absent on every call where
+   * the floor was verified, so a result is byte-identical to a pre-#111 one in the normal case.
+   */
+  agentUnverified?: string;
+  /**
    * The opencode session id, returned ONLY when `keepSession` was requested (a deleted
    * session's id is useless). This is the sole way a caller threads a follow-up turn:
    * pass it back as `sessionId`. There is deliberately NO parameter for handing back the
@@ -356,6 +369,9 @@ export interface ConsultFail {
   error: ConsultError;
   /** Even on a refusal, tell the caller which root's policy did the refusing. */
   rootConflict?: string;
+  /** See `ConsultOk.agentUnverified` — carried on a failure too, because "the call failed AND
+   * we could not confirm the agent was hardened" is exactly when it matters most. */
+  agentUnverified?: string;
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
    * of a failed call is exactly what makes the failure diagnosable. */
   activity?: ActivitySummary;
@@ -427,6 +443,12 @@ export interface ConsultDeps {
    * the watch terminal is the only way to answer.
    */
   elicitation?: ElicitationRequester;
+  /**
+   * The resolved-agent floor check (issue #111). Defaults to the process-wide checker, whose
+   * per-serve-child cache is the point; injected in tests so one suite's cache never decides
+   * another's assertion.
+   */
+  agentFloor?: AgentFloorChecker;
 }
 
 /** A fresh, non-empty call id (the pairing key for a call's three lifecycle entries). */
@@ -528,6 +550,48 @@ export function gateModel(
     };
   }
   return { ok: true, tier: decision.tier, confirmed: confirmed === true };
+}
+
+// --- RESOLVED-AGENT GATE: is the hardened def actually IN FORCE? (issue #111) ----
+/**
+ * The second stage of the def check, shared by all four model-calling tools.
+ *
+ * STAGE ONE IS THE FILESYSTEM PRESENCE CHECK ABOVE (`hardenedDefPresentIn`, C16) and it stays
+ * exactly where it is, unchanged: it is cheap, fail-closed, and needs no serve. This is
+ * ADDITIONAL, not a replacement — presence says the file exists, this says opencode is
+ * actually applying it. A def whose frontmatter opencode cannot parse passes the first and
+ * fails the second, which is the whole of issue #111 (see `src/agentfloor.ts` for the probe).
+ *
+ * PLACEMENT, and it is deliberate in both directions:
+ *   - AFTER the model-policy gate, so a call naming a denied model is still refused without
+ *     ever contacting opencode. (C70 already accepted that cost for a *continuation*; there
+ *     was no reason to extend it to every call.)
+ *   - BEFORE the approval pre-flight, before `log.newRun()`, and — on the write path — before
+ *     the worktree snapshot. Gap parity (C24): a refusal here routes nothing and writes no
+ *     evidence run. Ordering it ahead of the approval pre-flight is what closes issue #111's
+ *     first consequence: the bridge computes its never-widen intersection from the def SOURCE,
+ *     so on a voided def it would compute the narrow written allow-set while opencode allowed
+ *     everything — armed, and gating nothing it thinks it is gating.
+ *
+ * The verdict is three-valued and the third value is the interesting one; see
+ * `AgentFloorChecker` for why "opencode could not be asked" proceeds rather than refuses.
+ */
+export type AgentFloorGate =
+  | { ok: true; unverified?: string }
+  | { ok: false; message: string };
+
+export async function gateAgentFloor(opts: {
+  serve: ServeProvider;
+  agent: string;
+  agentDefDirs: readonly string[];
+  /** Injected in tests so one suite's per-child cache never decides another's assertion. */
+  checker?: AgentFloorChecker;
+}): Promise<AgentFloorGate> {
+  const checker = opts.checker ?? defaultAgentFloorChecker;
+  const verdict = await checker.verify(opts.serve, opts.agent, opts.agentDefDirs);
+  if (verdict.state === "unhardened") return { ok: false, message: verdict.message };
+  if (verdict.state === "unverified") return { ok: true, unverified: verdict.note };
+  return { ok: true };
 }
 
 // --- READ ROOT: the optional worktree target (issue #96) -------------------
@@ -1194,6 +1258,30 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
 
+  // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check. Step 2 proved the
+  //     file exists; this proves opencode is APPLYING it. Before any log write and before the
+  //     approval pre-flight; see `gateAgentFloor` for why it sits exactly here.
+  const floor = await gateAgentFloor({
+    serve,
+    agent: CONSULT_AGENT,
+    agentDefDirs,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "agent-unhardened",
+        model: "",
+        exitAnalogue: null,
+        message: floor.message,
+      },
+    };
+  }
+  /** Carried onto every result below — see `ConsultOk.agentUnverified`. */
+  const unverified = floor.unverified;
+
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does), so the
   //     approval pre-flight below still happens before any log entry exists. ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -1214,6 +1302,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     return {
       ok: false,
       rootConflict,
+      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -1271,6 +1360,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     if (params.keepSession === true) ok.sessionId = outcome.sessionId;
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
+    if (unverified !== undefined) ok.agentUnverified = unverified;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
@@ -1296,6 +1386,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
+  if (unverified !== undefined) fail.agentUnverified = unverified;
   return fail;
 }
 
@@ -1339,6 +1430,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   if (r.ok) {
     const structured: Record<string, unknown> = { answer: r.answer, ...r.attribution };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     // Surface the kept session id so the driver can thread a follow-up turn by id.
     if (r.sessionId) structured.sessionId = r.sessionId;
     if (r.activity) structured.activity = r.activity;
@@ -1350,6 +1442,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {

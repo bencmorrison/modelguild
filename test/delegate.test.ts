@@ -93,16 +93,21 @@ function read(dir: string, rel: string): string {
   return readFileSync(path.join(dir, rel), "utf8");
 }
 
-/** A ServeProvider whose "model turn" applies `mutate` to the repo, THEN runs the fake HTTP
- * turn — so even a failing turn leaves the mutation on disk (partial-capture contract). */
+/** A ServeProvider whose "model turn" applies `mutate` to the repo, at the START of the fake's
+ * message POST — so even a failing turn leaves the mutation on disk (partial-capture contract).
+ *
+ * IT HOOKS THE TURN, NOT `withServe` (changed for issue #111). It used to mutate on every
+ * `withServe` entry, which was fine only while a delegation entered the provider exactly once.
+ * It no longer does: the resolved-agent check reads `GET /agent` off the same child BEFORE the
+ * baseline snapshot, so an entry-keyed mutation applied the "model's" edits pre-snapshot and
+ * every diff came out empty. That was the FIXTURE being wrong about when a model edits files —
+ * a real model edits during the turn — and the tempting alternative (move the product's check
+ * after the snapshot) is precisely what C73 forbids. Hooking the message POST makes the fixture
+ * independent of how many control-plane calls a tool makes. */
 function mutatingServe(fake: FakeOpencode, mutate: () => void): ServeProvider {
   const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
-  return {
-    withServe: async (fn) => {
-      mutate();
-      return fn(handle);
-    },
-  };
+  fake.setOnMessage(mutate);
+  return { withServe: (fn) => fn(handle) };
 }
 
 /** A plain (non-mutating) ServeProvider for gate/refusal cases. */

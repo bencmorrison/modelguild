@@ -50,10 +50,12 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
+import { type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
   resolveReadRoot,
+  gateAgentFloor,
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
@@ -135,6 +137,8 @@ export interface DelegateDeps {
    * only when the approval bridge is armed.
    */
   elicitation?: ElicitationRequester;
+  /** The resolved-agent floor check (issue #111); injected in tests. */
+  agentFloor?: AgentFloorChecker;
   /**
    * The DEFAULT root — the project dir the primary serve child is spawned from. Defaults to
    * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default. Injected in tests to
@@ -191,6 +195,13 @@ export interface DelegateCapture {
 // --- Result / error shapes -------------------------------------------------
 export type DelegateErrorKind =
   | "agent-def-missing"
+  // The def FILE is present but opencode is not applying it — the resolved config carries no
+  // default-deny floor (issue #111, C73). Worst here of anywhere: without the floor,
+  // `guild-build` resolves on opencode's built-in `"*": allow`, i.e. the UNRESTRICTED tool
+  // set, which is exactly what the def-missing refusal exists to prevent. Refused before the
+  // snapshot and before any log write. exitAnalogue null (no bash counterpart; NOT a reuse of
+  // C57's 5, which is specifically "the def is missing").
+  | "agent-unhardened"
   // The target named a directory that is not a worktree of this repository (issue #107,
   // reusing #96's kind and refusal shape verbatim). Refused before any log write AND before
   // any snapshot.
@@ -237,6 +248,9 @@ export interface DelegateOk {
   attribution: DelegateAttribution;
   capture: DelegateCapture;
   rootConflict?: string;
+  /** Present ONLY when the issue-#111 resolved-agent check could not be made; the delegation
+   * PROCEEDED and this is the "never silently" half of that decision (C73). */
+  agentUnverified?: string;
   /**
    * Bounded live-activity summary (issue #20); absent when the layer is off. It is a
    * READING AID, not a substitute for the diff review: it says what opencode reported the
@@ -258,6 +272,8 @@ export interface DelegateFail {
    * before failing is still captured and surfaced so the human can review/recover it. */
   capture?: DelegateCapture;
   rootConflict?: string;
+  /** See `DelegateOk.agentUnverified`. */
+  agentUnverified?: string;
   /** The tree that was targeted, present whenever one was — including on a refusal that
    * happened before anything ran. A failed delegation is exactly the case where "which tree
    * do I go and look at?" is urgent, and `attribution` (which carries it on success) does not
@@ -418,10 +434,34 @@ export async function delegate(
     };
   }
 
+  // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check, and the highest
+  //     stakes copy of it: step 2 proved `guild-build.md` exists, this proves opencode is
+  //     APPLYING it. Without the floor, `guild-build` resolves on opencode's built-in
+  //     `"*": allow` — the unrestricted tool set the def-missing refusal exists to keep this
+  //     path off. Placed before the approval pre-flight (which reads the def SOURCE and would
+  //     otherwise arm against a map that is not in force), before `newRun`, and before
+  //     `snapshotWorktree`: a refusal here leaves no run and takes no snapshot of a tree it
+  //     was never going to touch. See `gateAgentFloor`.
+  const floor = await gateAgentFloor({
+    serve,
+    agent: DELEGATE_AGENT,
+    agentDefDirs,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+      error: { kind: "agent-unhardened", model: "", exitAnalogue: null, message: floor.message },
+    };
+  }
+  const unverified = floor.unverified;
+
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
 
-  // 4b. APPROVAL BRIDGE pre-flight (issue #20 slice 4). This is THE path the bridge exists
+  // 4c. APPROVAL BRIDGE pre-flight (issue #20 slice 4). This is THE path the bridge exists
   //     for. Refused here — before any log write AND before the worktree snapshot — so a
   //     refusal leaves nothing behind at all. Arming with no answering channel would
   //     DEADLOCK the turn rather than fail closed (probe P3), which is why this is a
@@ -438,6 +478,7 @@ export async function delegate(
     return {
       ok: false,
       rootConflict,
+      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
       ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: armed.refusal.kind,
@@ -513,6 +554,7 @@ export async function delegate(
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
+    if (unverified !== undefined) ok.agentUnverified = unverified;
     return ok;
   }
 
@@ -537,6 +579,7 @@ export async function delegate(
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
+  if (unverified !== undefined) fail.agentUnverified = unverified;
   return fail;
 }
 
@@ -824,6 +867,7 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
       capture: r.capture,
     };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
     return {
@@ -843,6 +887,7 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
   // the tree that was actually mutated.
   if (r.worktree) structured.worktree = r.worktree;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {
