@@ -72,6 +72,19 @@ CI runs the opencode-free subset on every push/PR: three jobs — `shell` (`bash
 - **Tests travel with behavior.** A behavior change needs a `test/*.test.ts` case; a permission change needs a `verify-guild-*.sh` / `check-agent-permissions.sh` assertion. A security fix ships with the assertion that keeps the hole closed.
 - **Commit messages** are descriptive; note *why*, not just *what*.
 
+## Filing an issue
+
+Severity and type are **labels, not title text.** Write the title as a plain statement of the problem — `runId is an unvalidated path component`, not `[HIGH] runId is an unvalidated path component`. A prefix looks like metadata but is invisible to every filter, so a `[HIGH]` sitting in a title is a severity nobody can query and a label nobody applied.
+
+- **Type** — `bug`, `documentation`, `enhancement`, `question` (plus `duplicate` / `invalid` / `wontfix` on close). More than one is fine when a change is genuinely both.
+- **Severity** — `severity: high` / `severity: medium` / `severity: low`, on anything that is a defect. They are described as bug severities, so an `enhancement` usually carries none.
+
+```bash
+gh issue create --title "<plain statement>" --label bug --label "severity: medium" --body ...
+```
+
+Two things worth putting in the body, because they are what makes an issue actionable later: **how you know** (the probe output, the failing command, the file and line — not "seems wrong"), and **what you could not determine**. An honestly-recorded uncertainty saves the next person from re-deriving it; a confident guess costs them a day. If the finding came from a model, say which, and say whether it was verified against the code before filing.
+
 ## Style
 
 Match the surrounding code — comment density, naming, and idiom. Explain non-obvious decisions inline (this codebase does, deliberately). Prefer a clear guard over a clever one-liner in anything security-relevant.
