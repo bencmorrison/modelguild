@@ -392,6 +392,17 @@ export interface BusHandlers {
   onEvent: (e: ActivityEvent) => void;
   /** Called when the stream is not (or is no longer) attached, with a short reason. */
   onDegraded?: (reason: string) => void;
+  /**
+   * Called when the stream has been RE-attached after a drop — never on the first connect,
+   * because a subscriber that attached at that connect missed nothing.
+   *
+   * It exists for the approval bridge (issue #91). SSE has no replay, so everything opencode
+   * emitted while the stream was down is simply gone; a subscriber that must not miss a
+   * permission request uses this as the point to go and ask opencode what is still open.
+   * The bus itself replays nothing and knows nothing about what was missed — this is a
+   * "you were blind, and now you are not" edge, and no more than that.
+   */
+  onReattached?: () => void;
 }
 
 const RECONNECT_BACKOFF_MS = [250, 500, 1000, 2000];
@@ -570,6 +581,20 @@ export class ServeEventBus {
     }
   }
 
+  /** Tell every subscriber the stream is back (issue #91). Same never-break-the-bus rule as
+   * `#degrade`: a subscriber's handler throwing must not take the read loop down with it. */
+  #reattach(): void {
+    for (const set of this.#subs.values()) {
+      for (const h of set) {
+        try {
+          h.onReattached?.();
+        } catch {
+          /* a subscriber's handler must never break the bus */
+        }
+      }
+    }
+  }
+
   #deliver(set: Iterable<BusHandlers>, e: ActivityEvent): void {
     for (const h of set) {
       try {
@@ -607,6 +632,10 @@ export class ServeEventBus {
   async #run(): Promise<void> {
     let attempt = 0;
     let first = true;
+    /** Have we EVER been attached? A connect with this false is a first attachment — the
+     * subscriber saw everything from that point, so there is nothing to re-attach FROM. Only
+     * a connect after a previous one is a re-attach, and only that fires `onReattached`. */
+    let everAttached = false;
     while (!this.#closed) {
       // The first iteration uses the deferred `#ensureRunning` already published; every
       // reconnect publishes a fresh one so `ready()` always describes the CURRENT attempt.
@@ -640,6 +669,11 @@ export class ServeEventBus {
         this.#connected = true;
         attempt = 0;
         this.#settleAttempt(true);
+        // AFTER `#connected` and the settled attempt, so a handler that immediately asks the
+        // bus whether it is connected is told the truth rather than the state we just left.
+        const reattach = everAttached;
+        everAttached = true;
+        if (reattach) this.#reattach();
         await this.#readStream(res.body);
         // A clean end of stream is still a disconnect (serve restarted, idle-killed, …).
         this.#degrade("event stream ended");

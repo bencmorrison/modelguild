@@ -82,6 +82,22 @@ export interface FakeOpencodeOpts {
   /** Give up waiting for a reply after this long, so a wedged test cannot hang forever.
    * Default 5000ms. The PRODUCT has no such fallback — that is the point of P3. */
   gateTimeoutMs?: number;
+  /**
+   * RAISE THE GATED REQUEST WHILE THE SUBSCRIBER IS BLIND (issue #91). Before emitting
+   * `permission.asked`, drop every attached `GET /event` client and wait until none is
+   * attached — so the `permission.asked` frame is emitted to nobody, exactly as it is when a
+   * real serve raises a request during a stream outage. The request is still registered and
+   * the turn still BLOCKS on it, so the only way the turn can complete is if the bridge finds
+   * it another way: `GET /permission` on re-attach.
+   *
+   * Deterministic on purpose: the alternative (the test racing a `dropEventClients()` against
+   * the turn) would make a timing accident look like a passing recovery.
+   */
+  gateBlind?: boolean;
+  /** Serve `GET /permission` with a 500 (or, with `listPermissionsGarbage`, with a body that
+   * is not an array) — drives "a failed re-list DEGRADES, it does not throw into the call". */
+  failListPermissions?: boolean;
+  listPermissionsGarbage?: boolean;
   /** Reject session-create when a `permission` ruleset is present, and echo NOTHING back —
    * models an opencode build that silently ignores the field, which must be caught rather
    * than run ungated. */
@@ -118,6 +134,18 @@ export interface FakeOpencode {
   }>;
   /** The permission ids currently awaiting a reply (a gated tool is blocking on each). */
   pendingPermissions(): string[];
+  /**
+   * Register an open permission request with NO turn blocked on it, so it appears in
+   * `GET /permission` (issue #91). Used to plant a request belonging to ANOTHER session on
+   * the same serve child, and to plant one this bridge has already answered. Emits no event:
+   * these exist precisely to be found by a re-list, not seen on the stream.
+   */
+  addPendingPermission(req: {
+    id: string;
+    sessionID: string;
+    permission?: string;
+    metadata?: Record<string, unknown>;
+  }): void;
   /** For each gated turn, the reply the blocked tool actually observed — `"once"`,
    * `"reject"`, or the sentinel `"(never answered)"`. This is what proves the gate BLOCKED,
    * not merely that a reply was sent somewhere. */
@@ -151,6 +179,16 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   /** Permission requests awaiting a reply, keyed by id → the resolver that unblocks the
    * gated tool. This is the fake's whole model of probe P3: an `ask` blocks the turn. */
   const pendingPerms = new Map<string, (reply: string) => void>();
+  /**
+   * The REQUEST RECORD for each open id, so `GET /permission` can serve it (issue #91).
+   *
+   * The shape is the one captured from a live opencode 1.18.7 (`{id, sessionID, permission,
+   * patterns, metadata, always, tool}`) — and it is the SAME object the fake emits as the
+   * `permission.asked` frame's `properties`, because on the real server those two payloads
+   * are field-for-field identical. Serving a different shape here would let the product's
+   * re-list path pass against a fixture the real endpoint would not satisfy.
+   */
+  const permRequests = new Map<string, Record<string, unknown>>();
   const replies: Array<{
     permissionId: string;
     via: "session" | "global";
@@ -207,6 +245,23 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         res.write(`data: ${JSON.stringify({ type: "server.connected", properties: {} })}\n\n`);
         eventClients.add(res);
         req.on("close", () => eventClients.delete(res));
+        return;
+      }
+
+      // GET /permission — every request still awaiting a reply, ACROSS ALL SESSIONS, exactly
+      // as the real endpoint documents itself ("Get all pending permission requests across all
+      // sessions", probed on 1.18.7). The fake serves other sessions' requests too, on purpose:
+      // it is what makes the bridge's session filter testable rather than assumed.
+      if (method === "GET" && (url === "/permission" || url.startsWith("/permission?"))) {
+        if (opts.failListPermissions) {
+          send(500, { error: "forced permission-list failure" });
+          return;
+        }
+        if (opts.listPermissionsGarbage) {
+          send(200, { not: "an array" });
+          return;
+        }
+        send(200, [...pendingPerms.keys()].map((id) => permRequests.get(id) ?? { id }));
         return;
       }
 
@@ -324,19 +379,36 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
             }, opts.gateTimeoutMs ?? 5_000);
             if (typeof t.unref === "function") t.unref();
           });
-          emit({
-            type: "permission.asked",
-            properties: {
-              id: permId,
-              sessionID: turnSession,
-              permission: opts.gateTool,
-              patterns: ["*"],
-              metadata: opts.gateMetadata ?? {},
-              always: [],
-              tool: { messageID: "msg_asst", callID: "call_gated" },
-            },
-          });
-          gateOutcomes.push(await waited);
+          const request: Record<string, unknown> = {
+            id: permId,
+            sessionID: turnSession,
+            permission: opts.gateTool,
+            patterns: ["*"],
+            metadata: opts.gateMetadata ?? {},
+            always: [],
+            tool: { messageID: "msg_asst", callID: "call_gated" },
+          };
+          permRequests.set(permId, request);
+          // BLIND MODE (issue #91): make sure nobody is listening before raising it, so the
+          // frame below is emitted into the void exactly as it is during a real outage. The
+          // request is still open and the turn still blocks — the only route to it is the
+          // re-list.
+          if (opts.gateBlind) {
+            for (const res of eventClients) {
+              try {
+                res.destroy();
+              } catch {
+                /* best-effort */
+              }
+            }
+            eventClients.clear();
+          }
+          // The frame's `properties` IS the request record — identical payloads on a real
+          // serve, so a fixture must not let them diverge.
+          emit({ type: "permission.asked", properties: request });
+          const outcome = await waited;
+          permRequests.delete(permId);
+          gateOutcomes.push(outcome);
         }
         // Yield once so the client's stream reader drains before the POST resolves.
         await new Promise((r) => setTimeout(r, 10));
@@ -468,6 +540,21 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         attachedEventClients: () => eventClients.size,
         permissionReplies: () => [...replies],
         pendingPermissions: () => [...pendingPerms.keys()],
+        addPendingPermission: (req) => {
+          permSessions.set(req.id, req.sessionID);
+          permRequests.set(req.id, {
+            id: req.id,
+            sessionID: req.sessionID,
+            permission: req.permission ?? "bash",
+            patterns: ["*"],
+            metadata: req.metadata ?? {},
+            always: [],
+          });
+          // No turn is blocked on it, so the resolver is a no-op — but it must still be in
+          // `pendingPerms`, because that is the map `GET /permission` and the reply endpoints
+          // both read: an open request must be listable AND repliable.
+          pendingPerms.set(req.id, () => {});
+        },
         gateOutcomes: () => [...gateOutcomes],
         close: () =>
           new Promise<void>((r) => {
