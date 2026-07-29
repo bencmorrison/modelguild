@@ -34,9 +34,11 @@ permission:
   #     credential denies that used to sit here were REMOVED on 2026-07-29
   #     (maintainer decision, issue #29). They were defense-in-depth on the read
   #     TOOL only and `bash` — allowed right above, by design — bypassed them with
-  #     `cat`, so what they actually bought was the appearance of a credential
-  #     boundary this agent has never had. Removing them takes no layer that held;
-  #     it makes the map state what is true. This agent CAN read any repo file,
+  #     `cat`, so they were never a boundary against a DETERMINED model. Removing
+  #     them still costs something, and the cost is stated rather than waved off:
+  #     a COMPLIANT model was refused by the read tool and no longer is — the
+  #     tool-native route to a credential file is open where it was closed. What
+  #     it buys is a map that states what is true. This agent CAN read any repo file,
   #     credentials included, so delegate only on repos whose secrets you would
   #     accept a third-party model seeing. task/grep/glob/webfetch/websearch stay
   #     denied by the `"*": deny` floor above. ---

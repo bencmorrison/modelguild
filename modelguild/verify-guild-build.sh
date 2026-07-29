@@ -14,9 +14,10 @@
 # it now checks the opposite, that no such fence has come back. Be clear about the
 # direction: this REMOVES a layer. It was defense-in-depth on the read TOOL only, and
 # `bash` — allowed on this agent by design, since a delegated coding task must run
-# builds and tests — walked straight through it with `cat`. What the fence bought was
-# the appearance of a credential boundary this path has never had. Nothing here got
-# safer; the def and this proof now state what is actually true.
+# builds and tests — walked straight through it with `cat`, so it was never a boundary
+# against a determined model, only the appearance of one. It DID refuse a compliant model,
+# and that refusal is the cost of removing it (SECURITY.md states it in full). Nothing here
+# got safer; the def and this proof now state what is actually true.
 #
 # What this script therefore does NOT claim, and never could: secret/egress *by
 # construction*. bash can `cat .env` or `curl` regardless of the permission map. The

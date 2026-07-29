@@ -115,10 +115,16 @@ done
 # (issue #35). The read paths — guild-read (consult/panel/review/collaborate/workshop) and
 # guild-research (research) — ALLOW read+grep+glob+web and are explicitly NOT confidentiality
 # boundaries: they no longer deny grep/glob nor carve secret reads out of `read`. So these
-# docs must not resurrect the retired fencing wording. delegate.md is EXCLUDED on purpose —
-# it describes guild-build, which really does deny grep/glob and block secret reads, so those
-# phrases are TRUE there. This is a NARROW phrase tripwire on unambiguous refuted wording, not
-# a semantic proof of every claim against the YAML (that would be brittle — see issue #35).
+# docs must not resurrect the retired fencing wording. This is a NARROW phrase tripwire on
+# unambiguous refuted wording, not a semantic proof of every claim against the YAML (that
+# would be brittle — see issue #35).
+#
+# delegate.md is checked SEPARATELY, below, against a NARROWER pattern — not excluded. It
+# describes guild-build, where the two halves of this tripwire now have different answers:
+# `grep`/`glob` really are denied (that wording stays TRUE and permitted), but the secret-read
+# carve-outs are GONE (2026-07-29, issue #29 — `bash` bypassed them), so the secret half
+# applies there too. It was excluded outright while both halves were true, which left the one
+# command doc that documents guild-build unwatched by the very lint meant to catch this wording.
 read_path_docs=(
   .claude/commands/guild/consult.md
   .claude/commands/guild/panel.md
@@ -131,6 +137,15 @@ stale_perm_matches="$(grep -RInE 'non-secret|cannot [`]?grep|denied under [`]?re
 if [ -n "$stale_perm_matches" ]; then
   printf '%s\n' "$stale_perm_matches" >&2
   bad "stale read-path permission claim (issue #35): guild-read/guild-research allow grep/glob and can read any file — they do not deny grep/glob or fence secrets"
+fi
+
+# delegate.md / guild-build: the SECRET half of the same tripwire, without the grep half.
+# guild-build still denies grep/glob, so "cannot grep" is deliberately NOT in this pattern —
+# it is true there and must not be flagged. What it no longer does is fence secret reads.
+delegate_stale_matches="$(grep -InE 'non-secret|denied under [`]?read' "$delegate" || true)"
+if [ -n "$delegate_stale_matches" ]; then
+  printf '%s\n' "$delegate_stale_matches" >&2
+  bad "stale secret-read claim in delegate.md (issue #29): guild-build's secret-glob read-denies were removed 2026-07-29 — it can read any repo file, credentials included. (Its grep/glob denies remain true; that wording is permitted.)"
 fi
 
 [ "$failed" -eq 0 ] || exit 1
@@ -221,6 +236,34 @@ EOF
   printf '\nCredential paths are denied under `read`.\n' \
     >> "$fixture/.claude/commands/guild/research.md"
   expect_rejected "stale read-path claim: denied under read (issue #35)" "$fixture"
+
+  # delegate.md (guild-build): BOTH secret phrases must bite there now that the carve-outs
+  # are gone (issue #29) — this doc was unwatched by the tripwire while it was excluded.
+  fixture="$tmp/stale-delegate-denied-read"
+  cp -a "$baseline" "$fixture"
+  printf '\nCredential paths are denied under `read`.\n' \
+    >> "$fixture/.claude/commands/guild/delegate.md"
+  expect_rejected "stale secret-read claim in delegate.md: denied under read (issue #29)" "$fixture"
+
+  fixture="$tmp/stale-delegate-nonsecret"
+  cp -a "$baseline" "$fixture"
+  printf '\nThe editor can only read non-secret files.\n' \
+    >> "$fixture/.claude/commands/guild/delegate.md"
+  expect_rejected "stale secret-read claim in delegate.md: non-secret (issue #29)" "$fixture"
+
+  # …and the grep half must NOT bite there: guild-build really does deny grep/glob, so that
+  # wording is TRUE in delegate.md. A pattern copied wholesale from the read paths would
+  # false-positive here, which is why delegate.md gets the narrower one.
+  fixture="$tmp/delegate-grep-wording-is-true"
+  cp -a "$baseline" "$fixture"
+  printf '\nThe delegated editor cannot `grep` the tree; use bash.\n' \
+    >> "$fixture/.claude/commands/guild/delegate.md"
+  if DOCS_LINT_ROOT="$fixture" bash "$script_path" >/dev/null 2>&1; then
+    printf 'PASS: allows the still-true "cannot grep" wording in delegate.md (guild-build)\n'
+  else
+    printf 'FAIL: self-test rejected the still-true "cannot grep" wording in delegate.md\n' >&2
+    self_test_failed=1
+  fi
 
   if ! DOCS_LINT_ROOT="$baseline" bash "$script_path" >/dev/null 2>&1; then
     printf 'FAIL: self-test rejected intentional historical passages\n' >&2

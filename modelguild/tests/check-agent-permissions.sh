@@ -191,8 +191,9 @@ if [ "${1:-}" = "--self-test" ]; then
   # inverse of the one it replaces (which asserted a glob was PRESENT): the canonical
   # set was dropped on 2026-07-29 (issue #29) because bash `cat` walked through it, so
   # re-fencing the read tool is now the regression — it re-implies a credential boundary
-  # bash does not have. Nothing here says the removal made anything safer; it removed a
-  # layer that never held.
+  # bash does not have. Nothing here says the removal made anything safer: it took a layer
+  # off, and the layer did refuse a COMPLIANT model (SECURITY.md states that cost). What it
+  # never was is a boundary against a determined one.
   seed
   awk '{ if ($0=="  read: allow") { print "  read:"; print "    \"*\": allow"; print "    \"*.env\": deny" } else print }' \
     "$REAL/guild-build.md" > "$d/agent/guild-build.md"
@@ -226,8 +227,9 @@ echo "== guild-read (allowlist: read/grep/glob/webfetch/websearch) =="
 check_agent "$AGENT_DIR/guild-read.md" "grep glob webfetch websearch"
 
 # guild-build: the write path. edit/write/patch/bash + a plain read. Its secret-glob
-# read-denies were dropped 2026-07-29 (issue #29) — bash bypassed them, so they were a
-# fence that never held; the def now states what is true. grep/glob/web/task stay denied.
+# read-denies were dropped 2026-07-29 (issue #29) — bash bypassed them, so they never bound
+# a determined model, though they did refuse a compliant one (the stated cost, SECURITY.md).
+# The def now states what is true. grep/glob/web/task stay denied.
 echo "== guild-build (allowlist: edit/write/patch/bash) =="
 check_agent "$AGENT_DIR/guild-build.md" "edit write patch bash"
 
