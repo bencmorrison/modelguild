@@ -162,10 +162,21 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
  * deprecated operation in the entire document (verified: one hit across every path and
  * method). That is not an argument for migrating: a deprecated endpoint that WORKS beats a
  * live one that silently gates nothing. But it is a real **expiry condition** on this pin, and
- * a reader of this record is entitled to know it. **When that endpoint is removed** — a 404 on
- * every approval while rejections still work — the bridge does not quietly degrade into
- * "approvals never land": `#settle` would book each approval as `contested`/`undelivered`, so
- * the failure is at least recorded. The correct response at that point is to move the APPROVE
+ * a reader of this record is entitled to know it. **When that endpoint is removed** — every
+ * approval refused while rejections still work — the bridge does not quietly degrade into
+ * "approvals never land". **Since issue #97 it DETECTS it rather than merely recording it:**
+ * ANY non-2xx opencode answers, deliberately not the 404 alone (a removed route can equally
+ * give 405/410/501, and keying on 404 would have let those fall into the transport counter), is
+ * followed by `GET /permission` — this file's `listPendingPermissions`, the same v1 snapshot the
+ * #91 re-list reads — and a request still open after a refused reply is counted under
+ * **`unsettled`**: distinct from `contested` (a 404 race the bridge went and looked for), from
+ * `refused` (any other refusal that left nothing open), and from `undelivered` (nothing came
+ * back at all). An `unsettledReason` names this deprecation and the status observed **whenever
+ * the detection came from an approve-path refusal** — the field keeps the most informative
+ * reason rather than the first, precisely so a weaker detection cannot hold it while this
+ * condition goes unreported. The removal therefore reads as a diagnosis rather than a rise in a
+ * quiet counter, whatever status it presents as.
+ * The correct response at that point is to move the APPROVE
  * reply to whatever opencode offers then, re-verify with the probe script below, and update
  * this record and C69a together — NOT to take that removal as licence to move the ruleset
  * itself onto v2, which is a separate question this pin answers on its own evidence.
@@ -207,10 +218,15 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
  *     request: `POST /permission/{id}/reply` and `POST /session/{id}/permissions/{id}` both
  *     404, while `POST /api/session/{id}/permission/{id}/reply` answers 400 on body shape —
  *     i.e. the request genuinely exists, in the other store. A human decision would therefore
- *     be taken and silently dropped: `#settle` books the 404 as **`contested`**, whose note
- *     says opencode "had already settled this request", which would be FALSE here — it is
- *     still open — and the turn then blocks to `GUILD_MESSAGE_TIMEOUT_MS` (15 min) rather
- *     than the 120 s approval deadline. **An earlier version of this record claimed the event
+ *     be taken and dropped, and the turn would then block to `GUILD_MESSAGE_TIMEOUT_MS`
+ *     (15 min) rather than the 120 s approval deadline. It would no longer be dropped
+ *     *silently*: since issue #97 `#settle` re-checks a 404 against `GET /permission` and books
+ *     a still-open request as **`unsettled`**, not as the race `contested` means. (The v1 list
+ *     is the wrong store for a v2 request, so it would answer "not open" — and the entry lands
+ *     in `contested` with `still_open: false`. The detection this record relies on is therefore
+ *     the DEPRECATION shape above, where the request really is on the v1 list; a half-migration
+ *     is caught by C69's stored-ruleset check and this pin, not by that counter.) **An earlier
+ *     version of this record claimed the event
  *     was dropped as an unknown type. That was WRONG** — refutable from `src/activity.ts:325`
  *     in seconds — and is corrected here rather than quietly deleted, because a false claim
  *     in a record whose whole purpose is to be trusted later is the worst thing it can carry.

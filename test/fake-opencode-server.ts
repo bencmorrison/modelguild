@@ -95,9 +95,33 @@ export interface FakeOpencodeOpts {
    */
   gateBlind?: boolean;
   /** Serve `GET /permission` with a 500 (or, with `listPermissionsGarbage`, with a body that
-   * is not an array) — drives "a failed re-list DEGRADES, it does not throw into the call". */
+   * is not an array) — drives "a failed re-list DEGRADES, it does not throw into the call".
+   * It ALSO drives issue #97's third shape: a 404 whose still-open check cannot be made, which
+   * must be recorded as unconfirmed rather than classified as a race. */
   failListPermissions?: boolean;
   listPermissionsGarbage?: boolean;
+  /**
+   * THE APPROVE ENDPOINT IS GONE (issue #97). `POST /session/{id}/permissions/{permId}` answers
+   * a refusal and leaves the request OPEN — the shape the deprecation of `permission.respond`
+   * will eventually produce, byte-identical at the reply to a lost race and distinguishable
+   * only by re-listing. Rejections (`POST /permission/{id}/reply`) keep working, so this
+   * reproduces an APPROVAL-ONLY outage rather than a dead server.
+   *
+   * **The STATUS is parameterized on purpose** (review, 2026-07-29): a removed route need not
+   * answer 404 — a path that still matches the method table gives 405, a retired endpoint 410,
+   * a proxy or rewritten API 501 — and the product has to reach the same verdict for all of
+   * them. `true` means 404; a number is sent verbatim.
+   */
+  approveEndpointGone?: boolean | number;
+  /** The same for `POST /permission/{id}/reply` — the REJECT endpoint, which opencode does NOT
+   * mark deprecated. It exists so the product's "the check is not restricted to the approve
+   * path" claim is ASSERTED rather than merely written down: a refused reject that leaves the
+   * request open blocks the model in exactly the same way. `true` means 404. */
+  rejectEndpointGone?: boolean | number;
+  /** Delay (ms) before the two reply endpoints answer — with the request left OPEN until they
+   * do, exactly as a slow serve behaves. Drives the in-flight window a re-list must NOT read as
+   * a dropped decision (review, 2026-07-29). */
+  replyDelayMs?: number;
   /** Reject session-create when a `permission` ruleset is present, and echo NOTHING back —
    * models an opencode build that silently ignores the field, which must be caught rather
    * than run ungated. */
@@ -299,6 +323,19 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       if (method === "POST" && sessPermMatch) {
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         const permId = sessPermMatch[2];
+        // A SLOW reply, with the request left OPEN while it is in flight — the real shape of a
+        // wedged serve, and the window a concurrent re-list must not read as a dropped decision.
+        if (opts.replyDelayMs) await new Promise((r) => setTimeout(r, opts.replyDelayMs));
+        if (opts.approveEndpointGone) {
+          // The endpoint no longer exists — and, the whole point, the request is NOT settled,
+          // so `GET /permission` still lists it. Indistinguishable from a lost race at the
+          // reply; distinguishable only by asking what is still open (issue #97). The status is
+          // whatever the caller asked for, defaulting to 404.
+          const status =
+            typeof opts.approveEndpointGone === "number" ? opts.approveEndpointGone : 404;
+          send(status, { error: "no longer available" });
+          return;
+        }
         const resolve = pendingPerms.get(permId);
         if (resolve === undefined) {
           // Verified against opencode 1.18.7: an unknown/already-settled id is a 404. That is
@@ -324,6 +361,15 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       if (method === "POST" && globalPermMatch) {
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         const permId = globalPermMatch[1];
+        if (opts.replyDelayMs) await new Promise((r) => setTimeout(r, opts.replyDelayMs));
+        if (opts.rejectEndpointGone) {
+          // Same shape as `approveEndpointGone`, on the endpoint opencode does NOT deprecate —
+          // so "the check is not restricted to the approve path" is asserted, not assumed.
+          const status =
+            typeof opts.rejectEndpointGone === "number" ? opts.rejectEndpointGone : 404;
+          send(status, { error: "no longer available" });
+          return;
+        }
         const resolve = pendingPerms.get(permId);
         if (resolve === undefined) {
           send(404, { error: `no pending permission ${permId}` });
