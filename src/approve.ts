@@ -23,6 +23,15 @@
  * The hardened defs therefore stay byte-identical — `check-agent-permissions.sh` and
  * `verify-guild-*.sh` keep asserting exactly what they assert today.
  *
+ * THAT FIELD IS opencode's **v1** PERMISSION SURFACE, AND THIS BRIDGE IS PINNED TO v1 BY
+ * DECISION (issue #93; maintainer, 2026-07-29) — do NOT move it onto the v2 endpoints, which
+ * do not consult the ruleset stored on the session. **The evidence, the expiry condition and
+ * the revisit preconditions live in ONE place: the `V1 PIN` block in `src/client.ts`**, next
+ * to the endpoints themselves. They are deliberately not restated here — this record having
+ * been copied around is precisely how one wrong claim about it reached five files at once
+ * (see the correction noted in that block). The re-probe is runnable:
+ * `bash modelguild/verify-permission-surface.sh`.
+ *
  * TWO INVARIANTS, BOTH MECHANICAL, BOTH LOAD-BEARING BECAUSE OF THAT MERGE:
  *
  *   1. **NEVER EMIT `allow`.** The one-line ruleset that proved the merge in probe P2 was
@@ -1703,6 +1712,16 @@ export class ApprovalBridge {
    *
    * `always` is NEVER sent by this bridge. It persists past the call, so only a human
    * explicitly choosing it (at the watch terminal) may produce one.
+   *
+   * BOTH ARE v1 ENDPOINTS, AND THAT IS A DECISION (issue #93) — do not "modernize" either
+   * onto the v2 permission endpoints. **These two endpoints cannot settle a v2 request at
+   * all:** against a live pending v2 request both answer **404 `PermissionNotFoundError`**
+   * (verified on 1.18.7), so a half-migrated bridge would prompt the developer, take their
+   * answer, and be unable to deliver it — booking it here as `contested`, whose note ("already
+   * settled") would be false, while the turn blocks to `GUILD_MESSAGE_TIMEOUT_MS`. **The
+   * approve endpoint is also the one operation opencode marks `deprecated` in 1.18.7**; what
+   * to do when it is removed is in the V1 PIN block in `src/client.ts`, which holds the whole
+   * record. Re-probe with `bash modelguild/verify-permission-surface.sh`.
    */
   /**
    * `#settle`, fire-and-forget, with the rejection swallowed EXPLICITLY.
@@ -1768,9 +1787,25 @@ export class ApprovalBridge {
       return;
     }
     if (status === 404) {
-      // The DOCUMENTED lost-race outcome: opencode had already settled this id, so it is
-      // gone. Not our decision — whoever won it owns the outcome, and their
-      // `permission.replied` (if the stream is healthy) records it.
+      // WHAT IS OBSERVED: opencode will not accept this reply for this id. The USUAL cause is
+      // the documented lost race — another answerer got there first, and their
+      // `permission.replied` (if the stream is healthy) records the outcome, not us.
+      //
+      // THE NOTE NO LONGER ASSERTS THAT CAUSE, because the code cannot know it and at least
+      // one other cause is now foreseeable: the approve endpoint
+      // (`POST /session/{id}/permissions/{permId}`) is the ONE operation opencode marks
+      // `deprecated` on 1.18.7, so its eventual removal would 404 every approval while the
+      // request stayed OPEN — the opposite of "already settled" — and a bridge asserting the
+      // race would be telling the developer something false at exactly the moment they most
+      // need the truth. (A v2-issued request id 404s here for the same reason: still open,
+      // wrong store. See the V1 PIN block in `src/client.ts`.)
+      //
+      // WHAT THIS DOES NOT DO, stated so nobody reads more into it than is here: it does not
+      // DISTINGUISH those causes. Telling a genuine race from a removed endpoint needs an
+      // extra observation (re-list the request and see whether it is still open) plus a
+      // counter that means something different from `contested`, which is a C68 change with
+      // its own tests — deliberately out of scope for this pass. The classification is
+      // unchanged; only the false claim is gone.
       this.#contested += 1;
       this.#write({
         kind: "not-delivered",
@@ -1778,7 +1813,7 @@ export class ApprovalBridge {
         attempted: response,
         by,
         http_status: 404,
-        note: "opencode had already settled this request (another answerer, or it expired) — this reply was NOT the decision",
+        note: "opencode did not accept this reply for this request id (404) — usually another answerer settled it first, but a removed/renamed reply endpoint or a request raised on a different permission surface looks identical here. Either way this reply was NOT the decision",
       });
       return;
     }

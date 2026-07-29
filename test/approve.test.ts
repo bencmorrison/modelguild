@@ -1317,8 +1317,8 @@ export async function run(): Promise<number> {
       await waitFor(() => posted.length === 3, 2_000, 20);
       await new Promise((r) => setTimeout(r, 150));
       obs.push([
-        printed.some((l) => l.includes("too late: opencode had already settled")),
-        "watch: a 404 (somebody answered first) is reported plainly, not retried",
+        printed.some((l) => l.includes("not accepted: opencode would not take a reply")),
+        "watch: a 404 is reported plainly — as an observation, not an asserted cause — and not retried",
       ]);
     } finally {
       await watching;
