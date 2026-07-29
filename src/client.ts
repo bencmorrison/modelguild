@@ -171,9 +171,11 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
  * #91 re-list reads — and a request still open after a refused reply is counted under
  * **`unsettled`**: distinct from `contested` (a 404 race the bridge went and looked for), from
  * `refused` (any other refusal that left nothing open), and from `undelivered` (nothing came
- * back at all). The first one latches an `unsettledReason` naming this deprecation and the
- * status observed, so the removal reads as a diagnosis rather than a rise in a quiet counter,
- * whatever status it presents as.
+ * back at all). An `unsettledReason` names this deprecation and the status observed **whenever
+ * the detection came from an approve-path refusal** — the field keeps the most informative
+ * reason rather than the first, precisely so a weaker detection cannot hold it while this
+ * condition goes unreported. The removal therefore reads as a diagnosis rather than a rise in a
+ * quiet counter, whatever status it presents as.
  * The correct response at that point is to move the APPROVE
  * reply to whatever opencode offers then, re-verify with the probe script below, and update
  * this record and C69a together — NOT to take that removal as licence to move the ruleset

@@ -2674,6 +2674,274 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // #97 REVIEW — the three defects an adversarial pass found in the first cut, plus the
+  //              unasserted reject path. Each is driven through the real bridge against the
+  //              real fake, and each FAILED before its fix.
+  // -------------------------------------------------------------------------
+  {
+    const mkR = async (
+      fake: FakeOpencode,
+      sessionId: string,
+      elicitation: ElicitationRequester,
+      file?: string,
+    ): Promise<ApprovalBridge> => {
+      const opts: ConstructorParameters<typeof ApprovalBridge>[0] = {
+        settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+        gatedTools: ["bash"],
+        channels: ["elicitation"],
+        context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+        armed: true,
+        elicitation,
+      };
+      if (file !== undefined) opts.file = file;
+      const b = new ApprovalBridge(opts);
+      await b.attach(fake.baseUrl, sessionId);
+      return b;
+    };
+    const askR = (b: ApprovalBridge, sessionId: string, id: string): void =>
+      b.handleEvent({
+        ts: Date.now(),
+        sessionId,
+        kind: "permission-asked",
+        summary: "permission asked: bash",
+        permissionId: id,
+        permissionTool: "bash",
+        detail: { metadata: { command: "npm test" } },
+      });
+
+    // (1) A REPLY STILL IN FLIGHT IS NOT A DROPPED DECISION. `#claimed` is set before the POST,
+    //     so a re-list arriving mid-reply used to read a "claimed" id still on opencode's open
+    //     list as a dropped decision — for a reply that then SUCCEEDED. A false positive on the
+    //     exact alarm this change exists to raise, in a window that is wide (250ms reconnect
+    //     backoff vs a 15s reply bound) and positively correlated with the fault, since a wedged
+    //     serve produces both. Driven with a genuinely slow reply that lands.
+    {
+      const dir = tmp("apr-97r1-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97r1",
+        replyDelayMs: 400,
+      });
+      try {
+        fake.addPendingPermission({ id: "per_inflight", sessionID: "ses_97r1" });
+        const bridge = await mkR(fake, "ses_97r1", stubElicitation("accept"), file);
+        askR(bridge, "ses_97r1", "per_inflight");
+        // Mid-flight: the reply POST is sitting in the fake's delay and the request is still on
+        // the open list — the exact state the old code misread.
+        await new Promise((r) => setTimeout(r, 120));
+        c.check(
+          fake.pendingPermissions().includes("per_inflight"),
+          "#97r1: setup — the request is still open while the reply is in flight",
+        );
+        await bridge.reattached();
+        const mid = bridge.summary();
+        c.check(
+          mid.unsettled === 0 && mid.unsettledReason === null,
+          `#97r1: a re-list mid-reply does NOT book a dropped decision (${JSON.stringify(mid)})`,
+        );
+        c.check(
+          mid.degraded === false,
+          "#97r1: nor does it keep the bridge degraded over a reply that has not failed",
+        );
+        // ...and the reply then lands, which is what makes the old verdict provably false.
+        await waitFor(() => bridge.summary().approved === 1, 3_000, 25);
+        const done = bridge.summary();
+        c.check(
+          done.approved === 1 && done.unsettled === 0,
+          `#97r1: the reply DID take effect — the old verdict was simply wrong (${JSON.stringify(done)})`,
+        );
+        c.check(
+          !fake.pendingPermissions().includes("per_inflight"),
+          "#97r1: and opencode settled the request",
+        );
+        const kinds = readApprovals(dir).map((l) => l.kind);
+        c.check(
+          kinds.includes("relist-inflight") && !kinds.includes("relist-unsettled"),
+          `#97r1: the window is recorded as in-flight, not as an unresolved decision (${JSON.stringify(kinds)})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (2) THE LOUD REASON MUST NOT BE HELD BY THE FEEDER THAT CARRIES NO DIAGNOSIS. A re-list
+    //     detection names no status, no endpoint and no next step; a genuine approve-path
+    //     refusal must DISPLACE it, or the C69a expiry condition is unreadable from the one
+    //     field the docs sell as carrying it.
+    {
+      const dir = tmp("apr-97r2-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97r2",
+        approveEndpointGone: 410,
+      });
+      try {
+        // ORDER IS THE WHOLE TEST, so the WEAK feeder must land first. `per_first`'s reply is
+        // intercepted with a 200 the fake never hears about — an accepted reply that did not
+        // take effect — so the re-list arm (rank 0: no status, no endpoint, no next step) is
+        // what latches the reason. `per_second` then goes to the real, 410-ing approve endpoint.
+        fake.addPendingPermission({ id: "per_first", sessionID: "ses_97r2" });
+        const bridge = new ApprovalBridge({
+          settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+          gatedTools: ["bash"],
+          channels: ["elicitation"],
+          context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+          armed: true,
+          file,
+          elicitation: stubElicitation("accept"),
+          fetchImpl: (async (url: unknown, init: unknown) => {
+            const method = String((init as { method?: unknown })?.method ?? "GET");
+            if (method === "POST" && String(url).includes("per_first")) {
+              return { status: 200 } as Response;
+            }
+            return fetch(url as string, init as RequestInit);
+          }) as unknown as typeof fetch,
+        });
+        await bridge.attach(fake.baseUrl, "ses_97r2");
+        askR(bridge, "ses_97r2", "per_first");
+        await waitFor(() => bridge.summary().approved === 1, 3_000, 25);
+        await bridge.reattached(); // the re-list arm fires: weak reason latched first
+        await waitFor(() => bridge.summary().unsettled === 1, 3_000, 25);
+        const weak = bridge.summary();
+        c.check(
+          !(weak.unsettledReason ?? "").includes("deprecated"),
+          `#97r2: setup — the weak re-list reason is latched first, as it must be for this to test anything (${weak.unsettledReason})`,
+        );
+        c.check(
+          weak.unsettled === 1 && weak.approved === 1,
+          `#97r2: a 2xx reply that did not take effect is itself an unsettled decision (${JSON.stringify(weak)})`,
+        );
+        // Now a genuine approve-path refusal on a second request.
+        fake.addPendingPermission({ id: "per_second", sessionID: "ses_97r2" });
+        askR(bridge, "ses_97r2", "per_second");
+        await waitFor(() => bridge.summary().unsettled === 2, 3_000, 25);
+        const s = bridge.summary();
+        c.check(s.unsettled === 2, `#97r2: both stuck requests are counted (${JSON.stringify(s)})`);
+        c.check(
+          (s.unsettledReason ?? "").includes("deprecated") &&
+            (s.unsettledReason ?? "").includes("410"),
+          `#97r2: and the approve-path diagnosis DISPLACES the feeder that carries none (${s.unsettledReason})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (2b) THE RANK RULE ITSELF: the re-list arm may never outrank a refusal, and the reject
+    //      path may never outrank the approve path.
+    {
+      const relist = ApprovalBridge.reasonRank({ fromRefusal: false, approvePath: false });
+      const reject = ApprovalBridge.reasonRank({ fromRefusal: true, approvePath: false });
+      const approve = ApprovalBridge.reasonRank({ fromRefusal: true, approvePath: true });
+      c.check(
+        approve > reject && reject > relist,
+        `#97r2b: approve-path refusal > other refusal > re-list (${approve} > ${reject} > ${relist})`,
+      );
+    }
+
+    // (3) ONE REQUEST, ONE BUCKET. A single serve fault produces BOTH the refused reply and the
+    //     failed still-open check, so the id was booked `contested` (unconfirmed) and then, when
+    //     the re-list later confirmed it still open, ALSO `unsettled` — `requests: 1` with
+    //     buckets summing to 2, against a TSDoc calling them alternatives.
+    {
+      const dir = tmp("apr-97r3-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97r3",
+        approveEndpointGone: true,
+      });
+      try {
+        fake.addPendingPermission({ id: "per_both", sessionID: "ses_97r3" });
+        let failGet = true; // one fault, both symptoms
+        const bridge = new ApprovalBridge({
+          settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+          gatedTools: ["bash"],
+          channels: ["elicitation"],
+          context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+          armed: true,
+          file,
+          elicitation: stubElicitation("accept"),
+          fetchImpl: (async (url: unknown, init: unknown) => {
+            const method = String((init as { method?: unknown })?.method ?? "GET");
+            if (failGet && method === "GET" && String(url).includes("/permission")) {
+              throw new Error("serve wobble");
+            }
+            return fetch(url as string, init as RequestInit);
+          }) as unknown as typeof fetch,
+        });
+        await bridge.attach(fake.baseUrl, "ses_97r3");
+        askR(bridge, "ses_97r3", "per_both");
+        await waitFor(() => bridge.summary().contested === 1, 3_000, 25);
+        const step1 = bridge.summary();
+        c.check(
+          step1.contested === 1 && step1.unsettled === 0,
+          `#97r3: step 1 — refused, cause unconfirmed (${JSON.stringify(step1)})`,
+        );
+        failGet = false; // the serve recovers and the re-list can now confirm
+        await bridge.reattached();
+        const step2 = bridge.summary();
+        c.check(
+          step2.unsettled === 1 && step2.contested === 0,
+          `#97r3: step 2 — the confirmation SUPERSEDES the unconfirmed guess (${JSON.stringify(step2)})`,
+        );
+        c.check(
+          step2.contested + step2.refused + step2.undelivered + step2.unsettled <= step2.requests,
+          `#97r3: the buckets are disjoint and never sum past requests (${JSON.stringify(step2)})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (4) THE REJECT PATH IS CHECKED TOO — the code said so and nothing asserted it. A refused
+    //     reject that leaves the request open blocks the model exactly as a refused approval
+    //     does; only the DIAGNOSIS differs, that endpoint not being the deprecated one.
+    {
+      const dir = tmp("apr-97r4-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97r4",
+        rejectEndpointGone: 410,
+      });
+      try {
+        fake.addPendingPermission({ id: "per_rej", sessionID: "ses_97r4" });
+        const bridge = await mkR(fake, "ses_97r4", stubElicitation("decline"), file);
+        askR(bridge, "ses_97r4", "per_rej");
+        await waitFor(() => bridge.summary().unsettled === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.unsettled === 1 && s.rejected === 0,
+          `#97r4: a refused REJECT that left the request open is unsettled too (${JSON.stringify(s)})`,
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.attempted === "reject" && rec?.http_status === 410 && rec?.still_open === true,
+          `#97r4: recorded against the reject path (${JSON.stringify(rec)})`,
+        );
+        c.check(
+          !(s.unsettledReason ?? "").includes("marks deprecated") &&
+            (s.unsettledReason ?? "").includes("not the known expiry condition"),
+          `#97r4: and the reason does not blame the deprecation, which is the other endpoint (${s.unsettledReason})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // close() must reject anything still open — a bridge going away must never leave the
   // model waiting on a prompt whose listener has gone.
   // -------------------------------------------------------------------------
