@@ -114,6 +114,8 @@ export interface PanelDeps {
   router?: ServeRouter;
   /** Test seam for the `git worktree list` enumeration (issue #96). */
   git?: GitRunner;
+  /** Test seam for a continuation's session-directory lookup (issue #96, finding M3). */
+  fetchSessionDirectory?: (sessionId: string) => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -241,7 +243,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // 1b. READ ROOT for the whole panel (issue #96) — see `resolveReadRoot`. A no-op without
   //     `worktree`; with it, every member is routed to a serve child rooted there and the
   //     agent-def dirs move with it. Refused before the model set is even resolved.
-  const readRoot = resolveReadRoot({
+  const readRoot = await resolveReadRoot({
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     env,
     cwd,
@@ -249,6 +251,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     serve: deps.serve,
     ...(deps.router !== undefined ? { router: deps.router } : {}),
     ...(deps.git !== undefined ? { git: deps.git } : {}),
+    ...(deps.fetchSessionDirectory !== undefined
+      ? { fetchSessionDirectory: deps.fetchSessionDirectory }
+      : {}),
   });
   if (!readRoot.ok) {
     return {
@@ -364,6 +369,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           tier: gate.tier,
           confirmed: gate.confirmed,
           keepSession: keepSessions,
+          ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
         },
         {
           serve,

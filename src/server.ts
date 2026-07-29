@@ -250,7 +250,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "a worktree of a different repo) is a tool error naming the path, never a " +
               "silent fall back to the project root. Omit for the project the server was " +
               "launched in. It widens what the external model can read — and therefore what " +
-              "can reach a third-party provider — by exactly that worktree.",
+              "can reach a third-party provider — by exactly that worktree. On a sessionId " +
+              "CONTINUATION do not repeat it: the root is inherited from the session itself, " +
+              "and a worktree that disagrees with the session's own directory is refused.",
           },
           timeoutMs: TIMEOUT_MS_PROP,
         },
@@ -381,7 +383,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "a worktree of a different repo) is a tool error naming the path, never a " +
               "silent fall back to the project root. Omit for the project the server was " +
               "launched in. It widens what the external model can read — and therefore what " +
-              "can reach a third-party provider — by exactly that worktree.",
+              "can reach a third-party provider — by exactly that worktree. On a sessionId " +
+              "CONTINUATION do not repeat it: the root is inherited from the session itself, " +
+              "and a worktree that disagrees with the session's own directory is refused.",
           },
           timeoutMs: TIMEOUT_MS_PROP,
         },

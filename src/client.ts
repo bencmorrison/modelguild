@@ -420,8 +420,18 @@ export interface FetchSessionOpts {
  * ruleset was STORED — the 1.18.7 probe found a session whose stored `ask` rule was echoed
  * back here and still evaluated `allow` on the v2 surface, so "stored" is only evidence of
  * gating for the v1 evaluator that actually reads it. v2's `GET /api/session/{id}/permission`
- * is a different surface and was NOT probed for equivalence; do not swap it in. */
-export async function fetchSession(opts: FetchSessionOpts): Promise<{ permission?: unknown }> {
+ * is a different surface and was NOT probed for equivalence; do not swap it in.
+ *
+ * It also carries `directory` — the cwd of the serve child the session was CREATED in
+ * (verified on 1.18.7: both `POST /session` and this endpoint report it). That is the
+ * authority for issue #96's read root on a continuation: opencode keys sessions by PROJECT,
+ * and a git worktree and its main checkout are the same project, so a session created on a
+ * worktree-rooted child is happily served by a repo-rooted one — the transport does not
+ * object, while the read fence differs. `directory` is the only thing that says which tree
+ * the conversation was actually held against. */
+export async function fetchSession(
+  opts: FetchSessionOpts,
+): Promise<{ permission?: unknown; directory?: unknown }> {
   const raw = (await requestJson({
     baseUrl: opts.baseUrl,
     path: `/session/${opts.sessionId}`,
@@ -429,7 +439,7 @@ export async function fetchSession(opts: FetchSessionOpts): Promise<{ permission
     timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
     sessionId: opts.sessionId,
     signal: opts.signal,
-  })) as { permission?: unknown };
+  })) as { permission?: unknown; directory?: unknown };
   return raw;
 }
 
@@ -848,6 +858,12 @@ export interface ServeProvider {
 export interface ServeRouter {
   /** The default root — the project the server itself was launched in. */
   readonly projectDir: string;
+  /**
+   * Roots OTHER than the project's that this router has been asked for. Empty means the
+   * primary child is the only one there is, which is what makes a continuation's routing
+   * unambiguous without asking opencode anything (see `resolveReadRoot`).
+   */
+  readonly extraRoots: readonly string[];
   forRoot(root: string): ServeProvider;
 }
 

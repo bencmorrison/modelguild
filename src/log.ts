@@ -767,6 +767,23 @@ export class EvidenceLog {
     tier?: PolicyTier;
     /** Whether the human approved an ask-tier call. Optional; see `#policyFields`. */
     confirmed?: boolean;
+    /**
+     * THE READ ROOT the turn actually ran against (issue #96, review finding M2) — the
+     * directory the `opencode serve` child serving this call was rooted at, when it was NOT
+     * the project the server was launched in.
+     *
+     * Why it belongs in the receipts and not only on the tool result: after #96 the same
+     * prompt and the same `raw_response` are AMBIGUOUS about which tree the answer describes,
+     * and this log is the durable, hash-chained thing you read when Claude's account of an
+     * exchange is in question. `activity.jsonl` is explicitly not the evidence log (C59) and
+     * is not a substitute. It rides on `started` because that is the entry that records what
+     * was asked; the pairing is by `call_id`, so a reader has it for the whole call.
+     *
+     * WRITTEN ONLY WHEN SUPPLIED, exactly like `incomplete_detail`/`scaffold_changed` (C29):
+     * a call with no worktree target emits an entry byte-identical to one written before this
+     * field existed, so no existing run, fixture or `verify()` branch changes shape.
+     */
+    readRoot?: string;
     run?: string;
   }): Promise<StartedResult> {
     if (this.#disabled()) return { ok: true };
@@ -789,6 +806,10 @@ export class EvidenceLog {
         prompt: mode === "full" ? (args.prompt ?? "") : null,
         prompt_hash: nullIfEmpty(promptHash),
         ...policyFields(args.tier, args.confirmed),
+        // Absent unless a non-default read root was actually used — see `readRoot` above.
+        ...(args.readRoot !== undefined && args.readRoot.length > 0
+          ? { read_root: args.readRoot }
+          : {}),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, true);
       return { ok: r.ok, turn: r.turn };

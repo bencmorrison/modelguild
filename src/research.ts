@@ -37,6 +37,7 @@ import {
   activityLayerFor,
   approvalFor,
   resolveReadRoot,
+  readRootBlocks,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
@@ -81,6 +82,8 @@ export interface ResearchDeps {
   router?: ServeRouter;
   /** Test seam for the `git worktree list` enumeration (issue #96). */
   git?: GitRunner;
+  /** Test seam for a continuation's session-directory lookup (issue #96, finding M3). */
+  fetchSessionDirectory?: (sessionId: string) => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -180,7 +183,7 @@ export async function research(
   const confContents = readLayeredConfContents(guildDirs, env);
 
   // 1b. READ ROOT (issue #96) — see `resolveReadRoot`. A no-op without `worktree`.
-  const readRoot = resolveReadRoot({
+  const readRoot = await resolveReadRoot({
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     env,
     cwd,
@@ -188,6 +191,9 @@ export async function research(
     serve: deps.serve,
     ...(deps.router !== undefined ? { router: deps.router } : {}),
     ...(deps.git !== undefined ? { git: deps.git } : {}),
+    ...(deps.fetchSessionDirectory !== undefined
+      ? { fetchSessionDirectory: deps.fetchSessionDirectory }
+      : {}),
   });
   if (!readRoot.ok) {
     return {
@@ -284,6 +290,7 @@ export async function research(
       runId,
       tier: gate.tier,
       confirmed: gate.confirmed,
+      ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
     },
     {
       serve,
@@ -348,7 +355,12 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
-    return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
+    // The read-root note rides as a SECOND text block, never a prefix — `content[0]` must
+    // stay the byte-exact answer (issue #96, review finding L7; see `readRootBlocks`).
+    return {
+      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree)],
+      structuredContent: structured,
+    };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;

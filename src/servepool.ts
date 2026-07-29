@@ -22,38 +22,71 @@
  * shuts itself down and is respawned on demand. The loopback surface itself is the one
  * SECURITY.md already documents, multiplied by the roots in use.
  *
- * TEARDOWN. The pool registers ONE callback on the primary lifecycle (`onShutdown`) rather
- * than duplicating the stdin-EOF / transport-close wiring that the M1 orphan proof rests
- * on. Every extra child therefore dies on the same trigger as the primary one. Each extra
- * additionally installs the lifecycle's own signal/`process.on("exit")` backstop when it
- * starts, so a hard exit kills them too.
+ * NOT A `ServeProvider`. An earlier cut had the pool delegate `withServe` to the primary so
+ * it could stand in wherever a bare provider was wanted (review finding L3). Nothing used it,
+ * and what it actually offered was a way to hand the pool to a call site expecting "the serve"
+ * and silently get the project root — the exact confusion this module exists to remove. The
+ * caller names the root or names the primary lifecycle; there is no third option.
+ *
+ * TEARDOWN, AND THE ONE DISTINCTION THAT COSTS A BUG IF YOU MISS IT (review finding H1).
+ * The pool registers ONE callback on the primary lifecycle (`onShutdown`) rather than
+ * duplicating the stdin-EOF / transport-close wiring that the M1 orphan proof rests on — so
+ * every extra child dies when the PROCESS is going away. It does **not** die when the
+ * primary child is merely being RECLAIMED: `shutdown()` is also how the idle timer and
+ * per-call mode retire a child, and `#inFlight` counts calls on the primary alone, so a
+ * worktree-targeted call running entirely on an extra leaves the primary looking idle. The
+ * first cut of this file claimed "every extra child dies on the same trigger as the primary
+ * one" as a safety property without noticing that two of those triggers are not teardown at
+ * all; the primary's 10-minute idle timer would kill a 15-minute review mid-turn.
+ * `RECLAMATION_REASONS` in `src/lifecycle.ts` is the fence, and it defaults to teardown so
+ * the orphan guarantee cannot be weakened by a reason someone adds later.
+ *
+ * Reclamation still happens — per child. Each extra is a full `OpencodeLifecycle` with its
+ * own idle timer and its own per-call mode, so an idle root retires itself on exactly the
+ * same terms the primary does. Each also joins the process-wide signal/`exit` backstop when
+ * it starts, so a hard exit kills them too.
  */
 
+import { realpathSync } from "node:fs";
+import path from "node:path";
 import { OpencodeLifecycle, type LifecycleOptions } from "./lifecycle.js";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 
-export class ServePool implements ServeProvider, ServeRouter {
+/** Canonicalize a directory for use as a pool key. Falls back to a plain `resolve` when the
+ * path cannot be stat'd, so this never throws on the routing path. */
+function canonical(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+export class ServePool implements ServeRouter {
   readonly #primary: OpencodeLifecycle;
   readonly #extra = new Map<string, OpencodeLifecycle>();
+  /** The primary's root, CANONICALIZED (review finding L4). `resolveWorktreeTarget` hands
+   * back realpaths while `OpencodeLifecycle#projectDir` is whatever `$GUILD_PROJECT_DIR`/cwd
+   * said, so comparing raw strings could mint a second child for a directory that already has
+   * one — reachable only via a symlinked project dir today, but free to close. */
+  readonly #primaryKey: string;
   /** Options handed to every extra child, minus `projectDir` (which IS the key). */
   readonly #opts: Omit<LifecycleOptions, "projectDir">;
 
   constructor(primary: OpencodeLifecycle, opts: Omit<LifecycleOptions, "projectDir"> = {}) {
     this.#primary = primary;
+    this.#primaryKey = canonical(primary.projectDir);
     this.#opts = opts;
-    // Die together. Registered in the constructor so there is no window in which an extra
-    // child exists but is not covered by the primary's teardown.
-    this.#primary.onShutdown(() => this.shutdownExtras("primary-shutdown"));
+    // Die together ON TEARDOWN. Registered in the constructor so there is no window in which
+    // an extra child exists but is not covered by the primary's teardown. `onShutdown`
+    // deliberately does NOT fire for the primary's idle/per-call reclamation — see the
+    // header and `RECLAMATION_REASONS`.
+    this.#primary.onShutdown(() => this.shutdownExtras("primary-teardown"));
   }
 
   /** The default root — the project the server itself was launched in. */
   get projectDir(): string {
     return this.#primary.projectDir;
-  }
-
-  /** The primary child, so the pool can stand in wherever a bare `ServeProvider` is wanted. */
-  withServe<T>(fn: Parameters<ServeProvider["withServe"]>[0]): Promise<T> {
-    return this.#primary.withServe(fn) as Promise<T>;
   }
 
   /**
@@ -67,11 +100,20 @@ export class ServePool implements ServeProvider, ServeRouter {
    * one-choke-point discipline).
    */
   forRoot(root: string): ServeProvider {
-    if (root === this.#primary.projectDir) return this.#primary;
-    const existing = this.#extra.get(root);
+    const key = canonical(root);
+    if (key === this.#primaryKey) return this.#primary;
+    const existing = this.#extra.get(key);
+    // Deliberately RETURNED, not re-created, even if its child has since died: an entry here
+    // is a SUPERVISOR, not a process (review finding L2). `OpencodeLifecycle.ensureServe`
+    // crash-revives on the next call, so dropping the entry when an extra idles out would
+    // only mint a duplicate supervisor for the same directory.
     if (existing) return existing;
-    const child = new OpencodeLifecycle({ ...this.#opts, projectDir: root });
-    this.#extra.set(root, child);
+    // NOTE (review finding L1): constructing a lifecycle spawns NOTHING — no process, no
+    // port, no timer, no signal handler. So a call that is refused after this point (a
+    // missing hardened def in the worktree, a policy deny) leaves behind a Map entry and
+    // nothing else, and that entry is exactly what a corrected retry reuses.
+    const child = new OpencodeLifecycle({ ...this.#opts, projectDir: key });
+    this.#extra.set(key, child);
     return child;
   }
 

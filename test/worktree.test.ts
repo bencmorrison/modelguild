@@ -25,12 +25,20 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+  readdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
 import { resolveWorktreeTarget } from "../src/worktree.js";
-import { consult } from "../src/consult.js";
+import { consult, consultToToolResult } from "../src/consult.js";
 import { panel } from "../src/panel.js";
 import { research } from "../src/research.js";
 import { ServePool } from "../src/servepool.js";
@@ -87,13 +95,22 @@ function fakeServe(fake: FakeOpencode): ServeProvider {
 
 /** A router that records every root it is asked to serve — the assertion that a validated
  * target actually re-roots the child, rather than merely being accepted. */
-function spyRouter(projectDir: string, provider: ServeProvider): ServeRouter & { asked: string[] } {
+function spyRouter(
+  projectDir: string,
+  provider: ServeProvider,
+  seedExtraRoots: string[] = [],
+): ServeRouter & { asked: string[] } {
   const asked: string[] = [];
+  const extra = new Set(seedExtraRoots);
   return {
     projectDir,
     asked,
+    get extraRoots() {
+      return [...extra];
+    },
     forRoot(root: string) {
       asked.push(root);
+      if (root !== projectDir) extra.add(root);
       return provider;
     },
   };
@@ -408,6 +425,279 @@ export async function run(): Promise<number> {
     lc.shutdown("t2");
     c.check(fired === 1, "lifecycle: an unregistered companion stops running");
     c.check(true, "lifecycle: a throwing companion does not break shutdown (we got here)");
+  }
+  {
+    // RECLAMATION vs TEARDOWN (review finding H1). The object-level half; the real-process
+    // half — an extra child surviving the primary's idle fire mid-call — is in
+    // `test/lifecycle.test.ts`, which spawns actual serves.
+    const lc = new OpencodeLifecycle({ projectDir: repo });
+    let fired = 0;
+    lc.onShutdown(() => {
+      fired += 1;
+    });
+    lc.shutdown("idle");
+    c.check(fired === 0, "reasons: 'idle' reclaims THIS child and does NOT run companions");
+    lc.shutdown("per-call");
+    c.check(fired === 0, "reasons: 'per-call' does NOT run companions either");
+    lc.shutdown("stdin-end");
+    c.check(fired === 1, "reasons: 'stdin-end' IS teardown and runs companions");
+    lc.shutdown("transport-close");
+    c.check(fired === 2, "reasons: 'transport-close' IS teardown");
+    lc.shutdown();
+    c.check(fired === 3, "reasons: an ABSENT reason defaults to teardown (never an orphan)");
+    lc.shutdown("something-added-later");
+    c.check(
+      fired === 4,
+      "reasons: an UNRECOGNIZED reason defaults to teardown, so a new reason cannot silently join the exempt set",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 4. Continuations: the SESSION's directory is the authority (finding M3).
+  // -------------------------------------------------------------------------
+  {
+    const logDir = tmp("m96-logs-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const fake = await startFakeOpencode({ historyText: "continued" });
+    try {
+      const router = spyRouter(repo, fakeServe(fake));
+      // (a) A continuation with NO worktree INHERITS the session's root — the case that used
+      //     to silently answer from the project root while continuing a worktree conversation.
+      const inherited = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_wt" },
+        {
+          serve: fakeServe(fake),
+          router,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => wt,
+        },
+      );
+      c.check(inherited.ok, "continuation: a session created in a worktree continues fine");
+      c.check(
+        inherited.ok && inherited.attribution.worktree === wt,
+        "continuation: it INHERITS the session's root without the caller repeating it",
+      );
+      c.check(
+        router.asked.length === 1 && router.asked[0] === wt,
+        "continuation: it is routed to the SESSION's child, not the primary",
+      );
+
+      // (b) A session created in the PROJECT root continues on the primary — no second child.
+      const plain = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_main" },
+        {
+          serve: fakeServe(fake),
+          router,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => repo,
+        },
+      );
+      c.check(plain.ok, "continuation: a project-root session continues on the primary");
+      c.check(router.asked.length === 1, "continuation: the project-root session spawns nothing new");
+
+      // (c) An explicit worktree that DISAGREES with the session is an error naming both.
+      const conflict = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_wt", worktree: repo },
+        {
+          serve: fakeServe(fake),
+          router,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => wt,
+        },
+      );
+      c.check(
+        !conflict.ok && conflict.error.kind === "worktree-invalid",
+        "continuation: a worktree that CONFLICTS with the session is refused",
+      );
+      c.check(
+        !conflict.ok && conflict.error.message.includes(wt) && conflict.error.message.includes(repo),
+        "continuation: the conflict message names BOTH roots",
+      );
+
+      // (d) A matching explicit worktree is fine — repeating yourself is allowed.
+      const agree = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_wt", worktree: wt },
+        {
+          serve: fakeServe(fake),
+          router,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => wt,
+        },
+      );
+      c.check(agree.ok, "continuation: repeating the SAME worktree is accepted");
+
+      // (e) A session that cannot be fetched is a REFUSAL — **when the answer could differ**,
+      //     i.e. this server has actually routed some other root. That scoping is what stops
+      //     `/guild:collaborate` and `/guild:workshop`, which never name a worktree, from
+      //     newly depending on `GET /session/{id}` succeeding.
+      const ambiguousRouter = spyRouter(repo, fakeServe(fake), [wt]);
+      const unfetchable = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_gone" },
+        {
+          serve: fakeServe(fake),
+          router: ambiguousRouter,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => {
+            throw new Error("404 not found");
+          },
+        },
+      );
+      c.check(
+        !unfetchable.ok && unfetchable.error.kind === "worktree-invalid",
+        "continuation: an unfetchable session is refused when another root is in play",
+      );
+
+      // (e2) ...and the same failure with NO other root in play proceeds on the primary,
+      //      exactly as it did before #96 — the plain collaborate/workshop path.
+      const plainRouter = spyRouter(repo, fakeServe(fake));
+      const degradedOk = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_gone" },
+        {
+          serve: fakeServe(fake),
+          router: plainRouter,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => {
+            throw new Error("404 not found");
+          },
+        },
+      );
+      c.check(
+        degradedOk.ok,
+        "continuation: with no other root in play, a failed session lookup does NOT break a plain continuation",
+      );
+      c.check(
+        degradedOk.ok && degradedOk.attribution.worktree === undefined,
+        "continuation: that fallback claims no read root (it is the pre-#96 path, not a guess)",
+      );
+      c.check(plainRouter.asked.length === 0, "continuation: the fallback routes nothing new");
+
+      // (f) A session whose directory is not a worktree of this repository is refused.
+      const foreign = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_other" },
+        {
+          serve: fakeServe(fake),
+          router,
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => otherWt,
+        },
+      );
+      c.check(
+        !foreign.ok && foreign.error.message.includes(otherWt),
+        "continuation: a session created outside this repository's worktrees is refused by name",
+      );
+
+      // (g) A session reporting NO directory is refused rather than defaulted — again, when
+      //     another root is in play.
+      const noDir = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_blank" },
+        {
+          serve: fakeServe(fake),
+          router: spyRouter(repo, fakeServe(fake), [wt]),
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => undefined,
+        },
+      );
+      c.check(!noDir.ok, "continuation: a session with no reported directory is refused");
+
+      // (h) An explicit `worktree` makes the answer ambiguous ON ITS OWN, even with no extra
+      //     root routed yet: the caller named a tree, so a session we cannot check is refused.
+      const askedButBlind = await consult(
+        { question: "more", model: "openai/m", sessionId: "ses_gone", worktree: wt },
+        {
+          serve: fakeServe(fake),
+          router: spyRouter(repo, fakeServe(fake)),
+          env,
+          cwd: repo,
+          fetchSessionDirectory: async () => {
+            throw new Error("404 not found");
+          },
+        },
+      );
+      c.check(
+        !askedButBlind.ok,
+        "continuation: naming a worktree makes an unverifiable session a refusal by itself",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 5. The receipts record WHICH TREE (finding M2), and the text channel says so (L7).
+  // -------------------------------------------------------------------------
+  {
+    const logDir = tmp("m96-logs-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const fake = await startFakeOpencode({ historyText: "answer bytes" });
+    try {
+      const router = spyRouter(repo, fakeServe(fake));
+      const targeted = await consult(
+        { question: "review", model: "openai/m", worktree: wt },
+        { serve: fakeServe(fake), router, env, cwd: repo },
+      );
+      c.check(targeted.ok, "receipts: the targeted call ran");
+      const runs = readdirSync(logDir).filter((n) => n !== "latest");
+      c.check(runs.length === 1, "receipts: exactly one run dir");
+      const lines = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const started = lines.find((e) => e.type === "call" && e.status === "started");
+      c.check(started !== undefined, "receipts: a started entry exists");
+      c.check(
+        started !== undefined && started.read_root === wt,
+        "receipts: the started entry records the READ ROOT the answer describes (M2)",
+      );
+      c.check(lines.length === 3, "receipts: still exactly three lifecycle entries (C22)");
+
+      // L7: the note rides as a SECOND text block; content[0] stays byte-exact.
+      const wire = consultToToolResult(targeted);
+      c.check(
+        wire.content[0].text === (targeted.ok ? targeted.answer : ""),
+        "text: content[0] is still the byte-exact answer (never a prefix)",
+      );
+      c.check(
+        wire.content.length === 2 && wire.content[1].text === `Read root: ${wt}`,
+        "text: a Read root note is appended as its own block so a human sees the tree (L7)",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+  {
+    // ...and an untargeted call is byte-identical to before: no note, no log field.
+    const logDir = tmp("m96-logs-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const fake = await startFakeOpencode({ historyText: "plain" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/m" },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(r.ok, "control: an untargeted call runs");
+      const wire = consultToToolResult(r);
+      c.check(wire.content.length === 1, "control: no read-root block on an untargeted call");
+      const runs = readdirSync(logDir).filter((n) => n !== "latest");
+      const started = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((e) => e.type === "call" && e.status === "started");
+      c.check(
+        started !== undefined && !("read_root" in started),
+        "control: the started entry has NO read_root field (shape-identical to pre-#96)",
+      );
+    } finally {
+      await fake.close();
+    }
   }
 
   for (const d of tmpDirs) {

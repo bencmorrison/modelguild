@@ -96,6 +96,31 @@ const PORT_RACE_WINDOW_MS = 5_000;
 class PortTakenError extends Error {}
 
 /**
+ * SHUTDOWN REASONS THAT ARE **RECLAMATION**, NOT TEARDOWN (issue #96, review finding H1).
+ *
+ * `shutdown()` has always served two different jobs under one name: the process is going
+ * away (stdin EOF, transport close, an explicit teardown), and *this child* is being
+ * reclaimed while the process lives on (the idle timer, per-call mode). That distinction did
+ * not matter while there was exactly one child. It matters now: `ServePool` registers its
+ * teardown on `onShutdown`, and `#inFlight` counts calls on THIS child only — so a
+ * worktree-targeted call running entirely on an extra child leaves the primary looking idle,
+ * and the primary's idle timer would take every extra down MID-CALL. Reachable on shipped
+ * defaults: `GUILD_SERVE_IDLE_MS` is 600s against a 900s `GUILD_MESSAGE_TIMEOUT_MS`, and
+ * `/guild:review` calls `guild_models` (primary) before `guild_consult` (extra), arming
+ * exactly that timer. Under `GUILD_SERVE_PER_CALL=1` it was immediate.
+ *
+ * So companions run for **every** reason EXCEPT these two. The polarity is deliberate:
+ * an unrecognized or ABSENT reason counts as teardown, so a reason added later cannot
+ * silently join the exempt set and weaken the orphan guarantee — it can only be too eager,
+ * which costs a respawn rather than an orphan.
+ *
+ * Reclamation is not "leave the extras running forever": each extra is a full
+ * `OpencodeLifecycle` with its OWN idle timer and its own per-call mode, so it reclaims
+ * itself on the same terms. Coupling reclamation across children was never buying anything.
+ */
+const RECLAMATION_REASONS: ReadonlySet<string> = new Set(["idle", "per-call"]);
+
+/**
  * Does this startup stderr read as a bind conflict?
  *
  * `ServeError` is in the set because on opencode 1.18.7 it is the ONLY signal: a probe
@@ -330,6 +355,12 @@ function exitDesc(h: InternalHandle): string {
   return "exit status unknown";
 }
 
+/** Is this `shutdown()` a reclamation of one child rather than a process teardown?
+ * Absent/unknown reasons are TEARDOWN — see RECLAMATION_REASONS for the polarity argument. */
+function isReclamation(reason: string | undefined): boolean {
+  return reason !== undefined && RECLAMATION_REASONS.has(reason);
+}
+
 /** Kill a serve process group (best-effort, synchronous-safe). */
 function killServe(proc: ChildProcess | undefined): void {
   if (!proc || proc.killed || proc.pid === undefined) return;
@@ -365,7 +396,6 @@ export class OpencodeLifecycle {
   #startPromise: Promise<InternalHandle> | undefined;
   #inFlight = 0;
   #idleTimer: NodeJS.Timeout | undefined;
-  #backstopInstalled = false;
   #triggersAttached = false;
   /**
    * Callbacks run at the top of `shutdown()` (issue #96). The ONE reason this exists: a
@@ -471,15 +501,22 @@ export class OpencodeLifecycle {
   }
 
   /** Kill the serve child and clear all timers. Idempotent. */
-  shutdown(_reason?: string): void {
+  shutdown(reason?: string): void {
     // Companions FIRST and individually guarded (issue #96): the extra serve children a
-    // worktree-targeted review spawned must be torn down on the same trigger, and one that
+    // worktree-targeted review spawned must be torn down on a genuine teardown, and one that
     // throws must not leave this child — the one the orphan proof is about — alive.
-    for (const fn of this.#companions) {
-      try {
-        fn();
-      } catch {
-        /* a companion's failure is never this child's problem */
+    //
+    // But ONLY on teardown. `idle` and `per-call` reclaim THIS child while the process lives
+    // on, and an extra child with a call in flight must survive both (review finding H1; see
+    // RECLAMATION_REASONS for why the exemption is a two-name denylist with a teardown
+    // default rather than a teardown allowlist).
+    if (!isReclamation(reason)) {
+      for (const fn of this.#companions) {
+        try {
+          fn();
+        } catch {
+          /* a companion's failure is never this child's problem */
+        }
       }
     }
     this.#clearIdleTimer();
@@ -612,18 +649,51 @@ export class OpencodeLifecycle {
 
   /** Synchronous, second-layer backstop: kill the child on any process exit/signal. */
   #installBackstop(): void {
-    if (this.#backstopInstalled) return;
-    this.#backstopInstalled = true;
+    // Register THIS instance, then make sure the ONE process-wide handler set exists.
+    OpencodeLifecycle.#live.add(this);
+    OpencodeLifecycle.#installProcessBackstop();
+  }
 
-    process.on("exit", () => {
-      killServe(this.#handle?.proc);
-      killServe(this.#starting?.proc);
-    });
+  /**
+   * Every lifecycle that has ever spawned (or tried to spawn) a child. Deliberately never
+   * pruned: a lifecycle whose child died crash-revives on the next call, so dropping it here
+   * would need a matching re-add on every path that can revive — and `killServe` on an
+   * absent/dead child is already a no-op. The set is bounded by the number of read roots in
+   * use, i.e. by the repository's own worktrees.
+   */
+  static #live = new Set<OpencodeLifecycle>();
+  static #processBackstopInstalled = false;
+
+  /**
+   * The synchronous, second-layer backstop: kill every supervised child on process
+   * exit/signal. **Installed ONCE for the process, not once per lifecycle** (issue #96,
+   * review finding L6). Each instance used to add its own `exit` + three signal listeners, so
+   * a handful of extra read roots — four listeners each — walked straight into Node's
+   * default `MaxListeners` limit of 10 and printed a warning on **stderr**, which for an MCP
+   * stdio server is a real channel a user reads. One handler set iterating a registry has the
+   * same effect and a fixed cost.
+   *
+   * The signal path now kills the not-yet-ready child too (`#starting`), which the per-
+   * instance version only did on `exit` — strictly more thorough, and the direction the
+   * orphan proof cares about.
+   */
+  static #installProcessBackstop(): void {
+    if (OpencodeLifecycle.#processBackstopInstalled) return;
+    OpencodeLifecycle.#processBackstopInstalled = true;
+
+    const killAll = (): void => {
+      for (const lc of OpencodeLifecycle.#live) {
+        killServe(lc.#handle?.proc);
+        killServe(lc.#starting?.proc);
+      }
+    };
+
+    process.on("exit", killAll);
 
     const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
     for (const sig of signals) {
       process.on(sig, () => {
-        killServe(this.#handle?.proc);
+        killAll();
         process.exit(sig === "SIGINT" ? 130 : sig === "SIGTERM" ? 143 : 129);
       });
     }

@@ -33,6 +33,7 @@ import { randomBytes } from "node:crypto";
 import os from "node:os";
 import {
   askViaAgent,
+  fetchSession,
   AgentMismatchError,
   SessionPermissionMismatchError,
   type ServeProvider,
@@ -328,6 +329,8 @@ export interface ConsultDeps {
   router?: ServeRouter;
   /** Test seam for the `git worktree list` enumeration (issue #96). */
   git?: GitRunner;
+  /** Test seam for a continuation's session-directory lookup (issue #96, finding M3). */
+  fetchSessionDirectory?: (sessionId: string) => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -481,9 +484,41 @@ export interface ReadRootOk {
  * production (`src/server.ts` always passes the pool) and is therefore a wiring bug, not a
  * user error — and the honest response to "I cannot honour the root you asked for" is to
  * fail loudly, not to answer about a different one.
+ *
+ * A CONTINUATION'S ROOT COMES FROM THE SESSION, NOT FROM THIS CALL (review finding M3).
+ * opencode keys sessions by PROJECT, and a git worktree and its main checkout are the same
+ * project — probed on 1.18.7: a session created on a worktree-rooted child is served without
+ * complaint by a repo-rooted one, and a full turn posted to the other child completes
+ * normally. Composed with this feature's own probe finding (the read fence follows the serve
+ * child's CWD), a `sessionId` continuation that simply omitted `worktree` would continue the
+ * SAME conversation while fenced at a DIFFERENT directory, and nothing anywhere would say so.
+ * `/guild:collaborate` and `/guild:workshop` drive exactly that pattern.
+ *
+ * So the session's own `directory` — opencode's record of where it was created — is the
+ * authority, and this is where it is consulted:
+ *   - `sessionId` present ⇒ fetch it, and route the continuation THERE. A continuation
+ *     therefore inherits its root by construction; the caller does not have to remember.
+ *   - An explicit `worktree` that resolves to a DIFFERENT root than the session's is an
+ *     ERROR naming both, never a silent win for either. (A matching one is fine — repeating
+ *     yourself is allowed.)
+ *   - A session that cannot be fetched, or whose directory is not the project root and not a
+ *     worktree of this repository, is a REFUSAL. Guessing here is precisely the failure this
+ *     resolves.
+ *
+ * COST, STATED: this makes a continuation contact the serve (one short control-plane GET,
+ * on the primary child) BEFORE the model-policy gate, so a continuation naming a denied model
+ * now ensures a serve is up on its way to being refused. No model turn happens, nothing is
+ * logged, and in practice the serve is already up — you only have a `sessionId` because an
+ * earlier call in this session produced one. A fresh (non-continuation) call is unchanged and
+ * still touches opencode only after every gate.
  */
-export function resolveReadRoot(opts: {
+export async function resolveReadRoot(opts: {
   worktree?: string;
+  /**
+   * A continuation's session id (issue #96, review finding M3). When present, the session's
+   * OWN directory decides the root — see the doc comment.
+   */
+  sessionId?: string;
   env: NodeJS.ProcessEnv;
   cwd: string;
   confContents: string;
@@ -491,43 +526,119 @@ export function resolveReadRoot(opts: {
   router?: ServeRouter;
   /** Test seam: the git runner `resolveWorktreeTarget` uses. */
   git?: GitRunner;
-}): { ok: true; value: ReadRootOk } | { ok: false; message: string } {
+  /** Test seam: how a continuation's session record is fetched (default: the real client). */
+  fetchSessionDirectory?: (sessionId: string) => Promise<string | undefined>;
+}): Promise<{ ok: true; value: ReadRootOk } | { ok: false; message: string }> {
   const { env, cwd, confContents } = opts;
   const target = opts.worktree?.trim() ?? "";
-  if (target.length === 0) {
-    return {
-      ok: true,
-      value: { serve: opts.serve, agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }) },
-    };
-  }
+  const sessionId = opts.sessionId?.trim() ?? "";
+
   // The repository the server itself resolved — never an arbitrary one. The router knows the
   // primary child's cwd; without a router (tests that only exercise validation) fall back to
   // the same value `OpencodeLifecycle` would have used.
   const projectDir =
     opts.router?.projectDir ??
     (env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0 ? env.GUILD_PROJECT_DIR : cwd);
-  const resolved = resolveWorktreeTarget(target, {
-    projectDir,
-    ...(opts.git !== undefined ? { git: opts.git } : {}),
-  });
-  if (!resolved.ok) return { ok: false, message: resolved.message };
 
-  if (resolved.isDefault) {
-    // The target IS the project root: honour it by doing nothing special. No second child,
-    // no second port — the ordinary path, with the root reported back so the caller can see
-    // what it actually got.
+  // Whatever THIS call asked for, validated. `undefined` = it asked for nothing.
+  let asked: { root: string; isDefault: boolean } | undefined;
+  if (target.length > 0) {
+    const resolved = resolveWorktreeTarget(target, {
+      projectDir,
+      ...(opts.git !== undefined ? { git: opts.git } : {}),
+    });
+    if (!resolved.ok) return { ok: false, message: resolved.message };
+    asked = { root: resolved.root, isDefault: resolved.isDefault };
+  }
+
+  // A CONTINUATION: the session's own directory decides, and disagreement is an error.
+  let effective = asked;
+  if (sessionId.length > 0) {
+    // CAN THE ANSWER EVEN DIFFER? If this call names no root AND no other root has been
+    // routed in this server's life, the primary child is the only one that exists, so the
+    // continuation cannot land anywhere else and the lookup decides nothing. That gate is
+    // what keeps `/guild:collaborate` and `/guild:workshop` — which never touch a worktree
+    // — from newly depending on a `GET /session/{id}` succeeding. Where the ambiguity IS
+    // real (a root was named, or extra roots exist), a failed lookup is a refusal.
+    const ambiguous = asked !== undefined || (opts.router?.extraRoots.length ?? 0) > 0;
+    let dir: string | undefined;
+    let lookupError: string | undefined;
+    try {
+      dir = opts.fetchSessionDirectory
+        ? await opts.fetchSessionDirectory(sessionId)
+        : await defaultSessionDirectory(opts.serve, sessionId);
+    } catch (err) {
+      lookupError = err instanceof Error ? err.message : String(err);
+    }
+    if (lookupError !== undefined) {
+      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve);
+      return {
+        ok: false,
+        message:
+          `could not read session '${sessionId}' from opencode to determine which directory ` +
+          `it was created in (${lookupError}). Refusing the continuation: opencode serves a ` +
+          `session from any child of the same project, so continuing without knowing its ` +
+          `directory could answer from a different tree than the one the conversation is ` +
+          `about.`,
+      };
+    }
+    if (dir === undefined || dir.length === 0) {
+      if (!ambiguous) return unrooted(env, cwd, confContents, opts.serve);
+      return {
+        ok: false,
+        message:
+          `opencode did not report a directory for session '${sessionId}', so which tree this ` +
+          `conversation was held against cannot be established. Refusing the continuation ` +
+          `rather than guessing.`,
+      };
+    }
+    const sessionRoot = resolveWorktreeTarget(dir, {
+      projectDir,
+      ...(opts.git !== undefined ? { git: opts.git } : {}),
+    });
+    if (!sessionRoot.ok) {
+      return {
+        ok: false,
+        message:
+          `session '${sessionId}' was created in '${dir}', which is not the project root and ` +
+          `not a worktree of this repository — so this server will not continue it. ` +
+          `(${sessionRoot.message})`,
+      };
+    }
+    if (asked !== undefined && asked.root !== sessionRoot.root) {
+      return {
+        ok: false,
+        message:
+          `worktree '${target}' resolves to '${asked.root}', but session '${sessionId}' was ` +
+          `created in '${sessionRoot.root}'. Refusing: a continuation carries the earlier ` +
+          `turns of a conversation held against ONE tree, and running it fenced at another ` +
+          `would answer about code the session never saw. Omit 'worktree' to continue in the ` +
+          `session's own tree, or start a fresh call (no sessionId) against '${asked.root}'.`,
+      };
+    }
+    effective = { root: sessionRoot.root, isDefault: sessionRoot.isDefault };
+  }
+
+  if (effective === undefined) {
+    // Neither a target nor a resolvable session root: the pre-#96 path, byte-identical.
+    return unrooted(env, cwd, confContents, opts.serve);
+  }
+  if (effective.isDefault) {
+    // The root IS the project root: honour it by doing nothing special. No second child, no
+    // second port — the ordinary path, with the root reported back so the caller can see what
+    // it actually got.
     return {
       ok: true,
       value: {
         serve: opts.serve,
         agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }),
-        worktree: resolved.root,
+        worktree: effective.root,
       },
     };
   }
   if (opts.router === undefined) {
     throw new Error(
-      `internal: a worktree read root ('${resolved.root}') was requested but no ServeRouter ` +
+      `internal: a worktree read root ('${effective.root}') was requested but no ServeRouter ` +
         `was wired, so the call cannot be routed to a serve child rooted there. Refusing to ` +
         `run it against the project root instead.`,
     );
@@ -535,16 +646,41 @@ export function resolveReadRoot(opts: {
   return {
     ok: true,
     value: {
-      serve: opts.router.forRoot(resolved.root),
+      serve: opts.router.forRoot(effective.root),
       // The def must be resolvable FROM THE WORKTREE: opencode looks in the serve cwd's
       // `.opencode/agent/` plus the global dir, and does NOT fall back to the repository's
       // main checkout (probed live, 1.18.7). A worktree whose `.opencode/agent/` is absent
       // — e.g. a repo that never committed the payload — therefore refuses up front rather
       // than dying on an HTTP 500 mid-turn.
-      agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents, projectDir: resolved.root }),
-      worktree: resolved.root,
+      agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents, projectDir: effective.root }),
+      worktree: effective.root,
     },
   };
+}
+
+/** The pre-#96 answer: the primary provider, project-resolved def dirs, no read root. */
+function unrooted(
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  confContents: string,
+  serve: ServeProvider,
+): { ok: true; value: ReadRootOk } {
+  return {
+    ok: true,
+    value: { serve, agentDefDirs: resolveAgentDefDirs({ env, cwd, confContents }) },
+  };
+}
+
+/** Read a session's `directory` off the PRIMARY serve child. Any child of the project can
+ * answer (opencode keys sessions by project), and the primary is the one that always exists. */
+async function defaultSessionDirectory(
+  serve: ServeProvider,
+  sessionId: string,
+): Promise<string | undefined> {
+  return serve.withServe(async (h) => {
+    const rec = await fetchSession({ baseUrl: h.baseUrl, sessionId });
+    return typeof rec.directory === "string" ? rec.directory : undefined;
+  });
 }
 
 export interface LifecycleParams {
@@ -565,6 +701,9 @@ export interface LifecycleParams {
   sessionId?: string;
   /** Keep the session alive after the turn (return its id); default deletes it. */
   keepSession?: boolean;
+  /** The non-default read root this turn ran against (issue #96), recorded on the `started`
+   * evidence entry so the receipts say WHICH TREE the answer describes. Absent otherwise. */
+  readRoot?: string;
 }
 
 /** Every tool's approval plumbing, resolved once by `armApproval` and threaded through the
@@ -719,7 +858,12 @@ export async function runAgentLifecycle(
   });
   // On a continuation the session id is known before the call, so it is stamped on
   // `started` too (a fresh session is only known post-call and lands on `completed`).
-  const started = await d.log.started({ ...common, session: p.sessionId, prompt: p.question });
+  const started = await d.log.started({
+    ...common,
+    session: p.sessionId,
+    prompt: p.question,
+    ...(p.readRoot !== undefined ? { readRoot: p.readRoot } : {}),
+  });
   // One recorder per call. Undefined when the activity layer is absent or `off`, in which
   // case `askViaAgent` opens no subscription at all and nothing below changes.
   //
@@ -841,14 +985,19 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   //     path. With it, the target is validated against `git worktree list` and the call is
   //     routed to a serve child rooted there — and the agent-def dirs move with it, because
   //     opencode resolves agents from the serve's cwd. Refused BEFORE any log write.
-  const readRoot = resolveReadRoot({
+  const readRoot = await resolveReadRoot({
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
+    // A continuation inherits its root from the session (review finding M3).
+    ...(params.sessionId !== undefined ? { sessionId: params.sessionId } : {}),
     env,
     cwd,
     confContents,
     serve: deps.serve,
     ...(deps.router !== undefined ? { router: deps.router } : {}),
     ...(deps.git !== undefined ? { git: deps.git } : {}),
+    ...(deps.fetchSessionDirectory !== undefined
+      ? { fetchSessionDirectory: deps.fetchSessionDirectory }
+      : {}),
   });
   if (!readRoot.ok) {
     return {
@@ -970,6 +1119,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       confirmed: gate.confirmed,
       sessionId: params.sessionId,
       keepSession: params.keepSession === true,
+      ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
     },
     {
       serve,
@@ -1029,6 +1179,22 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
 }
 
 // --- MCP tool-result translation -------------------------------------------
+/**
+ * The read-root note for a tool result's TEXT channel (issue #96, review finding L7).
+ *
+ * A human skimming the transcript sees the text blocks, and after #96 "which tree was this?"
+ * is a question the text has to be able to answer — `guild_panel` already prints it in its
+ * digest. But `guild_consult`/`guild_research` do NOT have a digest: their first text block
+ * is the model's answer **byte-exact**, and a test pins that through the MCP boundary. So the
+ * note is an ADDITIONAL block rather than a prefix — `content[0]` stays byte-identical to the
+ * answer, and the note only exists at all when a non-default root was used. Do not "tidy"
+ * this into a prefix.
+ */
+export function readRootBlocks(worktree: string | undefined): Array<{ type: "text"; text: string }> {
+  if (worktree === undefined || worktree.length === 0) return [];
+  return [{ type: "text", text: `Read root: ${worktree}` }];
+}
+
 /** The MCP CallToolResult wire shape this tool emits. The index signature lets this
  * concrete type match MCP's passthrough `CallToolResult` union member (rather than the
  * task variant) at the handler boundary. */
@@ -1056,7 +1222,10 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
     if (r.sessionId) structured.sessionId = r.sessionId;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
-    return { content: [{ type: "text", text: r.answer }], structuredContent: structured };
+    return {
+      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree)],
+      structuredContent: structured,
+    };
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
