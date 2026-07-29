@@ -3,12 +3,13 @@
  *
  * The MCP translation of bash `/guild:delegate` / `ask.sh --edit`: one model turn through
  * the UNMODIFIED `guild-build` agent (`.opencode/agent/guild-build.md` — a default-deny
- * allowlist re-allowing edit/write/patch/bash; C47/C48), wrapped in the worktree
+ * allowlist re-allowing edit/write/patch/bash + a plain `read`; C47/C48), wrapped in the worktree
  * snapshot/diff machinery (src/snapshot.ts) so the model's changes are recorded as a patch
  * a human reviews. The model's report AND its diff are untrusted DATA the DRIVER reviews and
  * verifies — never instructions to act on (C42/C52). The human diff review is the trust
- * boundary (SECURITY.md guild-build: `bash` is allowed by design, so the non-mutation
- * denies are defense-in-depth, not by construction).
+ * boundary (SECURITY.md guild-build: `bash` is allowed by design, so the remaining
+ * denies are defense-in-depth, not by construction — and there is no secret-read fence
+ * at all since 2026-07-29, issue #29, because `cat` walked through the one there was).
  *
  * TWO DELIBERATE DEVIATIONS FROM bash C16, both task-directed (applied
  * to the write path):

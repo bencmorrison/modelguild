@@ -11,12 +11,15 @@
 #   - the effective floor is deny (an un-listed tool resolves to deny)
 #   - every tool's EFFECTIVE action (last rule matching the tool name OR `*`) is
 #     allow iff it's in the agent's intended allow-set, else deny
-#   - in the `read` map, `*` effectively allows and each secret glob effectively denies
+#   - `read` is a PLAIN top-level allow with NO secret-glob submap, on ALL THREE
+#     agents — the read paths since the 2026-07-22 realignment, guild-build since
+#     the 2026-07-29 maintainer decision (issue #29). The invariant is INVERTED from
+#     what it used to be for guild-build: a re-added carve-out is now the regression.
 #
 # Order-aware + frontmatter-bounded on purpose: earlier presence-only checks on the
 # whole file were fooled three ways (found by dogfooding /guild:review 2026-07-15) — an
 # unprotected frontmatter passed via a look-alike block in the markdown BODY; a
-# `"*": deny` placed AFTER the allows (or a `"*": allow` after the secret denies)
+# `"*": deny` placed AFTER the allows (or a `"*": allow` placed after the re-allows)
 # passed while resolving the opposite way. This version reads only the frontmatter
 # and computes effective (last-match) actions, so those all fail as they should.
 #
@@ -38,8 +41,6 @@ pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 bad()  { printf '\033[31mFAIL\033[0m %s — %s\n' "$1" "$2"; fail=1; }
 
 KNOWN_TOOLS="bash edit write patch grep glob task todowrite webfetch websearch lsp skill"
-# Canonical expected secret-read carve-outs for every non-scoped agent.
-SECRET_GLOBS='*.env *.env.* .env **/.env **/.env.* *.pem **/*.pem *.key **/*.key *.pfx *.p12 id_rsa id_ed25519 **/id_rsa **/id_ed25519 **/.ssh/** **/.aws/** **/.gnupg/** *credentials* **/credentials* **/.netrc **/.git-credentials'
 
 # frontmatter <file> : the YAML between the first `---` and the next `---`. Anything
 # in the markdown body (after the closing fence) is ignored — a look-alike block
@@ -92,16 +93,15 @@ EOF
   printf '%s' "$act"
 }
 
-# check_agent <file> <space-separated expected-allow tools> [read-spec]
+# check_agent <file> <space-separated expected-allow tools>
 #
-# read-spec describes the SHAPE of the read map, because they are not all alike:
-#   plain              read is a plain top-level `read: allow` with NO secret-glob submap
-#                      — the loosened read-only reviewer shape of guild-read/guild-research
-#                      (2026-07-22 realignment): read the repo, dotfiles included.
-#   nonsecret          (default) `*` allows, each secret glob denies — guild-build's read
-#                      TOOL (defense-in-depth): "read the repo, except secrets".
+# `read` is checked separately from the tool loop because it is the one permission that
+# can carry a sub-map. All three agents now want the SAME shape — a plain top-level
+# `read: allow` with no carve-outs — so there is no longer a per-agent read-spec: the
+# read paths lost their secret globs in the 2026-07-22 realignment and guild-build lost
+# its on 2026-07-29 (issue #29). Keeping one shape means a re-fence anywhere is a fail.
 check_agent() {
-  local f="$1" expect="$2" readspec="${3:-nonsecret}" label f0="$fail"; label="$(basename "$f")"
+  local f="$1" expect="$2" label f0="$fail"; label="$(basename "$f")"
   if [ ! -f "$f" ]; then bad "$label" "file not found"; return; fi
   local fm; fm="$(frontmatter "$f")"
   [ -n "$fm" ] || { bad "$label" "no YAML frontmatter block (first line must be '---', closed by '---')"; return; }
@@ -134,30 +134,17 @@ EOF
     esac
   done
 
-  # read map handling depends on the readspec shape.
-  local rm s; rm="$(printf '%s\n' "$fm" | read_map)"
-  case "$readspec" in
-    plain)
-      # Loosened read path (guild-read/guild-research, 2026-07-22 permission realignment):
-      # read is a plain top-level `read: allow` with NO secret-glob submap. The secret
-      # fences were removed as vendor-asymmetry bias — a review subagent reads the repo,
-      # dotfiles included. Assert read resolves to allow at top level AND there is no submap;
-      # a re-added secret-glob carve-out (a read submap) is now itself a regression.
-      [ "$(effective "$tp" read)" = "allow" ] \
-        || bad "$label" "read resolves to '$(effective "$tp" read)', expected a plain top-level 'read: allow'"
-      [ -z "$rm" ] \
-        || bad "$label" "read has a submap; the loosened path expects a plain 'read: allow' with NO secret-glob carve-outs (removed 2026-07-22 — do not re-fence a read-only reviewer)"
-      ;;
-    nonsecret|*)
-      # guild-build: `*` allows, each secret glob denies (defense-in-depth on the read TOOL).
-      [ "$(effective "$rm" '*')" = "allow" ] \
-        || bad "$label" "read map: '*' resolves to '$(effective "$rm" '*')', expected allow (agent can't read non-secret files)"
-      for s in $SECRET_GLOBS; do
-        [ "$(effective "$rm" "$s")" = "deny" ] \
-          || bad "$label" "read map: secret '$s' resolves to '$(effective "$rm" "$s")', expected deny (last-match-wins — is a '\"*\": allow' after it?)"
-      done
-      ;;
-  esac
+  # read: a plain top-level `read: allow`, no submap. Both halves are asserted —
+  # the effective action (so a later `"*": deny` that kills reads is caught) and the
+  # ABSENCE of a carve-out submap (so a re-added secret-glob fence is caught). The
+  # second half is the inverted invariant: those fences were removed as vendor-asymmetry
+  # bias on the read paths (2026-07-22) and as a fence bash walks through on guild-build
+  # (2026-07-29, issue #29), so re-adding one re-implies a boundary that does not exist.
+  local rm; rm="$(printf '%s\n' "$fm" | read_map)"
+  [ "$(effective "$tp" read)" = "allow" ] \
+    || bad "$label" "read resolves to '$(effective "$tp" read)', expected a plain top-level 'read: allow'"
+  [ -z "$rm" ] \
+    || bad "$label" "read has a submap; every agent expects a plain 'read: allow' with NO secret-glob carve-outs (removed 2026-07-22 on the read paths, 2026-07-29 on guild-build — do not re-fence)"
 
   [ "$fail" -eq "$f0" ] && pass "$label: allowlist invariants hold (frontmatter-bounded, effective/last-match-aware)"
 }
@@ -200,10 +187,30 @@ if [ "${1:-}" = "--self-test" ]; then
     > "$d/agent/guild-build.md"
   run_variant "$d/agent" && st_no "MISSED guild-build floor-after-allows (edit path dead)" || st_ok "catches '*': deny placed after the allows"
 
-  # S5. A secret glob removed from guild-build's canonical set -> FAIL.
+  # S5. A secret-glob read submap RE-ADDED to guild-build -> FAIL. This case is the
+  # inverse of the one it replaces (which asserted a glob was PRESENT): the canonical
+  # set was dropped on 2026-07-29 (issue #29) because bash `cat` walked through it, so
+  # re-fencing the read tool is now the regression — it re-implies a credential boundary
+  # bash does not have. Nothing here says the removal made anything safer; it removed a
+  # layer that never held.
   seed
-  grep -v '"\*\*/\.gnupg/\*\*": deny' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
-  run_variant "$d/agent" && st_no "MISSED a removed secret glob from the canonical set" || st_ok "guards the full canonical secret-glob set (guild-build)"
+  awk '{ if ($0=="  read: allow") { print "  read:"; print "    \"*\": allow"; print "    \"*.env\": deny" } else print }' \
+    "$REAL/guild-build.md" > "$d/agent/guild-build.md"
+  run_variant "$d/agent" && st_no "MISSED a re-added secret-glob read submap on guild-build" || st_ok "catches a re-added secret-glob read carve-out (guild-build)"
+
+  # S6. A `"*": allow` appended AFTER guild-build's floor (last-match-wins re-opens
+  # everything) -> FAIL. Guards the floor invariant in the direction S4 does not: S4
+  # moves the floor after the allows, this one leaves the floor in place and overrides it.
+  seed
+  awk '{print} /^  bash: allow$/{print "  \"*\": allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
+  run_variant "$d/agent" && st_no "MISSED a '\"*\": allow' after the floor on guild-build" || st_ok "catches a '\"*\": allow' overriding the deny floor"
+
+  # S7. An extra capability (webfetch) added to guild-build -> FAIL. Guards the
+  # allow-set-is-exact invariant: the floor is intact and every intended tool still
+  # resolves to allow, so only the "not in the intended allow-set" check can catch this.
+  seed
+  awk '{print} /^  bash: allow$/{print "  webfetch: allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
+  run_variant "$d/agent" && st_no "MISSED webfetch added to guild-build's allow-set" || st_ok "catches an unintended capability added to the allow-set"
 
   rm -rf "$d"
   echo
@@ -214,10 +221,13 @@ fi
 
 # guild-read: read-only reviewer ROLE (2026-07-22 realignment). read+grep+glob+web
 # ALLOWED like a Claude review subagent; read is a plain top-level allow (no secret
-# globs). no-write/no-task is the role. `plain` readspec asserts the no-submap shape.
+# globs). no-write/no-task is the role.
 echo "== guild-read (allowlist: read/grep/glob/webfetch/websearch) =="
-check_agent "$AGENT_DIR/guild-read.md" "grep glob webfetch websearch" plain
+check_agent "$AGENT_DIR/guild-read.md" "grep glob webfetch websearch"
 
+# guild-build: the write path. edit/write/patch/bash + a plain read. Its secret-glob
+# read-denies were dropped 2026-07-29 (issue #29) — bash bypassed them, so they were a
+# fence that never held; the def now states what is true. grep/glob/web/task stay denied.
 echo "== guild-build (allowlist: edit/write/patch/bash) =="
 check_agent "$AGENT_DIR/guild-build.md" "edit write patch bash"
 
@@ -225,7 +235,7 @@ check_agent "$AGENT_DIR/guild-build.md" "edit write patch bash"
 # guild-read (2026-07-22 realignment): read+grep+glob+web allowed, no-write/no-task.
 # `bash` stays OUT of the allow-set (that no-shell/no-write scoping is the ROLE).
 echo "== guild-research (allowlist: read/grep/glob/webfetch/websearch) =="
-check_agent "$AGENT_DIR/guild-research.md" "grep glob webfetch websearch" plain
+check_agent "$AGENT_DIR/guild-research.md" "grep glob webfetch websearch"
 
 echo
 if [ "$fail" -eq 0 ]; then printf '\033[32magent permissions: allowlist invariants hold\033[0m\n'

@@ -5,15 +5,23 @@
 # What guild-build claims, and what this proves:
 #   * It CAN edit — edit/write/patch/bash resolve to `allow` (else /guild:delegate is
 #     broken). This script asserts that positively.
-#   * The tool-native escape/egress paths are REMOVED — task, webfetch, websearch
-#     resolve to `deny`, and the `read` tool denies secret globs (.env/keys/creds).
+#   * The tool-native escape/egress paths are REMOVED — task, webfetch, websearch,
+#     grep and glob resolve to `deny`, and `read` is a plain allow.
 #
-# What it deliberately does NOT claim: secret/egress *by construction*. bash is
-# `allow` on this agent (a delegated coding task needs to run builds/tests), and
-# bash can `cat .env` or `curl`, bypassing the read-tool and webfetch denies. So on
-# THIS path those denies are defense-in-depth (they strip the default, tool-native
-# route a compliant model would take) — the real trust boundary is the human diff
-# review in /guild:delegate step 2, not the permission map. Do not oversell it.
+# NO SECRET-READ ASSERTION ANY MORE (changed 2026-07-29, maintainer decision, issue
+# #29). This script used to assert that the `read` tool denied a canonical list of
+# secret globs. Those denies are GONE from the def, so the assertion went with them —
+# it now checks the opposite, that no such fence has come back. Be clear about the
+# direction: this REMOVES a layer. It was defense-in-depth on the read TOOL only, and
+# `bash` — allowed on this agent by design, since a delegated coding task must run
+# builds and tests — walked straight through it with `cat`. What the fence bought was
+# the appearance of a credential boundary this path has never had. Nothing here got
+# safer; the def and this proof now state what is actually true.
+#
+# What this script therefore does NOT claim, and never could: secret/egress *by
+# construction*. bash can `cat .env` or `curl` regardless of the permission map. The
+# real trust boundary is the human diff review in /guild:delegate step 3, not this
+# script and not the map. Do not oversell it.
 #
 # Method mirrors verify-guild-read.sh: a STATIC last-match-wins check of opencode's
 # resolved config (authoritative, fail-CLOSED) + a known-key typo lint + a RUNTIME
@@ -76,14 +84,20 @@ done
 for cap in task webfetch websearch grep glob todowrite lsp skill; do
   if [ "$(effective_action "$cap")" = "deny" ]; then pass "$cap => deny (effective)"; else bad "$cap is NOT effectively denied"; fi
 done
-# Secret reads denied at the read-tool layer (defense-in-depth; bash bypasses).
-SECRET_GLOBS='*.env *.env.* .env **/.env **/.env.* *.pem **/*.pem *.key **/*.key *.pfx *.p12 id_rsa id_ed25519 **/id_rsa **/id_ed25519 **/.ssh/** **/.aws/** **/.gnupg/** *credentials* **/credentials* **/.netrc **/.git-credentials'
-for secret in $SECRET_GLOBS; do
-  a="$(last_action read "$secret")"
-  if [ "$a" = "deny" ]; then pass "read '$secret' => deny (read-tool layer)"; else bad "read '$secret' => '${a:-<none>}' (secret readable via read tool!)"; fi
-done
-[ "$(last_action read '*')" = "allow" ] && pass "read '*' => allow (non-secret reads work)" \
+# read must be a plain allow with NO secret-glob carve-outs (same shape, and the same
+# assertion, as the read paths since their own realignment).
+[ "$(last_action read '*')" = "allow" ] && pass "read '*' => allow (agent can read the repo it must edit)" \
   || bad "read '*' is not allow — agent can't read the repo it must edit"
+# None of the FORMER secret-read globs may resolve to a deny rule — the fences were
+# dropped on 2026-07-29 (issue #29) because bash `cat` bypassed them, so a re-added one
+# is a regression toward implying a boundary this agent does not have. Mirrors the same
+# assertion in verify-guild-read.sh / verify-guild-research.sh.
+FORMER_SECRET_GLOBS='*.env *.env.* .env **/.env **/.env.* *.pem **/*.pem *.key **/*.key *.pfx *.p12 id_rsa id_ed25519 **/id_rsa **/id_ed25519 **/.ssh/** **/.aws/** **/.gnupg/** *credentials* **/credentials* **/.netrc **/.git-credentials'
+secret_fence_present=0
+for secret in $FORMER_SECRET_GLOBS; do
+  [ "$(last_action read "$secret")" = "deny" ] && { bad "read '$secret' => deny — a secret-glob fence is back (removed 2026-07-29, issue #29: bash bypasses it)"; secret_fence_present=1; }
+done
+[ "$secret_fence_present" -eq 0 ] && pass "no secret-glob read-deny remains (fences removed; bash always bypassed them)"
 
 echo "== 2. STATIC: permission keys are all real (typo => silent fail-open) =="
 known=" bash read edit write patch glob grep webfetch task todowrite websearch lsp skill "
@@ -117,10 +131,11 @@ fi  # end runtime probe (skipped under --static)
 echo
 if [ "$fail" -eq 0 ] && [ "$inconclusive" -eq 0 ]; then
   if [ -n "$static_only" ]; then
-    printf '\033[32mguild-build VERIFIED (static)\033[0m — edit/write/patch/bash=allow; task/webfetch/websearch + secret READS=deny (resolved config). Runtime edit probe not run (--static). NOTE: bash is allowed, so secret/egress are defense-in-depth, NOT by construction — the /guild:delegate diff review is the trust boundary.\n'
+    printf '\033[32mguild-build VERIFIED (static)\033[0m — edit/write/patch/bash=allow; read=allow; task/grep/glob/webfetch/websearch=deny (resolved config). Runtime edit probe not run (--static).\n'
   else
-    printf '\033[32mguild-build VERIFIED\033[0m — edit path works; task/webfetch/websearch and secret READS are denied at the tool layer. NOTE: bash is allowed, so secret/egress are defense-in-depth, NOT by construction — the /guild:delegate diff review is the trust boundary.\n'
+    printf '\033[32mguild-build VERIFIED\033[0m — edit path works; task/grep/glob/webfetch/websearch are denied at the tool layer.\n'
   fi
+  printf '  NOTE: bash is allowed by design, so the remaining denies are defense-in-depth, NOT by construction, and there is no secret-read fence at all (removed 2026-07-29, issue #29 — bash bypassed it). This agent can read any repo file, credentials included; the /guild:delegate diff review is the trust boundary.\n'
 elif [ "$fail" -ne 0 ]; then
   printf '\033[31mguild-build NOT verified\033[0m — permission shape is wrong; check the agent def against verify-guild-read.sh conventions.\n'
 else
