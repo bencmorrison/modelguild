@@ -53,6 +53,33 @@
 # non-standard layout. Writes (the evidence logs/) always go to the most-specific root.
 # GUILD_ROOT=/path/to/modelguild
 
+# --- Payload skew notice (src/notice.ts, issue #94) -----------------------------
+# The MCP SERVER updates itself: your .mcp.json launches `npx -y modelguild serve`, which
+# resolves the current release every time. The PAYLOAD it installed — the /guild:* command
+# docs, the hardened agent defs, the policy/config templates — lives in your repo (or your
+# global config) and does NOT move with it. So you can upgrade the server and keep running
+# last release's commands and agent defs without ever being told.
+#
+# When the server starts and finds installed files that are ours, UNEDITED, and DIFFERENT from
+# what this release ships, it writes one notice to stderr naming them. Fix it with
+# `npx modelguild init` — those files are unedited, so init rewrites them in place (it still
+# never overwrites anything you changed; an EDITED file that fell behind is reported as
+# upgrade drift instead, and is never touched).
+#
+# The notice does not claim WHICH side is older, because two hashes cannot say: normally your
+# payload is behind (the server moves, it does not), but a deliberately pinned older server
+# puts it ahead. `init` makes them match either way.
+#
+# The notice appears ONCE PER SERVER VERSION, not once per session: after you have seen it,
+# acting on it or deciding to stay put both leave you in silence until the next release.
+# GUILD_PAYLOAD_NOTICE=off        # on (default) | off. Turns off the START-UP notice only.
+#                                 # `npx modelguild doctor` and the guild_status tool keep
+#                                 # reporting skew regardless — you asked those a question,
+#                                 # and an answer is not a nag. (The same split issue #23
+#                                 # made when `logs clean` kept working under GUILD_LOG=off.)
+#                                 # Lenient like GUILD_ACTIVITY: only the literal `off`
+#                                 # disables it, so a typo fails toward telling you.
+
 # --- Evidence layer (src/log.ts) ------------------------------------------------
 # Every model call is recorded to the git-ignored modelguild/logs/<run_id>/calls.jsonl:
 # raw prompts and responses, with `expected-call`, `started`, and `completed`

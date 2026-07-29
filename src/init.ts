@@ -33,6 +33,17 @@
  * `init` and `doctor` REPORT it. Reporting only: the file is still never touched, and drift
  * is a warning, not a failure — an edit is a supported, deliberate act, so a customized
  * install must not turn `doctor` red.
+ *
+ * PAYLOAD SKEW (issue #94) is the state next door, and it was invisible: the MCP SERVER
+ * updates itself (`npx -y modelguild serve` resolves the current release on every launch),
+ * while the payload it installs lives in the USER'S repo and does not move with it. So a
+ * file that is ours and UNTOUCHED (recorded === current) can still be behind the release
+ * (current ≠ shipped) — nothing to skip, nothing edited, nothing to warn about under #22's
+ * predicate, and therefore no signal at all. `isSkewed` names it; `scanPayload` classifies
+ * every installed file into exactly one of drifted / skewed / unknown; and one detection
+ * entry point (`scanInstalledPayload`) feeds all three surfaces — `doctor`, `guild_status`,
+ * and the server's start-up notice (`src/notice.ts`). Same posture as drift: REPORT only,
+ * never a failure, never an exit-code change.
  */
 
 import { createHash } from "node:crypto";
@@ -48,6 +59,42 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ---------------------------------------------------------------------------
+// "Shipped" — the payload the RUNNING code would install (issue #94).
+//
+// This module lives at `<pkg>/src/init.ts` in dev and `<pkg>/dist/init.js` once built, so
+// `dirname(self)/..` is the package directory in BOTH — and therefore under `npx` (which
+// materializes the package into its own cache and runs it from there) and under a global
+// `npm i -g modelguild` alike. It is deliberately derived from `import.meta.url` rather
+// than from the cwd or an env var: skew is a claim about the code that is executing, so
+// "shipped" must be read from where that code actually lives.
+//
+// `cli.ts` imports this rather than recomputing it, so the installer's notion of the
+// package root and the skew check's cannot drift apart.
+// ---------------------------------------------------------------------------
+export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * The running package's version — the suppression key for the start-up notice
+ * (`src/notice.ts`). `npm` always ships `package.json`, so it is present beside `dist/`
+ * in a published install as well as in a source checkout.
+ *
+ * An unreadable/absent version returns `""`, and callers treat that as "do not suppress":
+ * a version we cannot name is not a version we can claim the user has already been told
+ * about. Never throws — a broken read must degrade the notice, not the server.
+ */
+export function packageVersion(packageRoot: string = PACKAGE_ROOT): string {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof parsed.version === "string" ? parsed.version : "";
+  } catch {
+    return "";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Payload inventory — explicit, like install.sh's PAYLOAD_FILES (no dir walk: a
@@ -230,6 +277,8 @@ const GITIGNORE_BODY = [
   "# Per-user config written by /guild:configure — never commit personal prefs.",
   "modelguild/models.policy.local",
   "modelguild/modelguild.conf.local",
+  "# Per-user, per-machine runtime state (which payload-skew notice you have already seen).",
+  "modelguild/.modelguild-notice.json",
   "# The evidence layer: raw prompts/responses of every model call (modelguild/logs).",
   "modelguild/logs/",
   GITIGNORE_END,
@@ -289,8 +338,13 @@ export interface InitResult {
   shadowed: string[];
   /** UPGRADE DRIFT (issue #22): files init wrote, the user then edited, whose shipped bytes have
    * CHANGED since the version that edit was based on — so this upgrade skipped them and the
-   * user's copy is now behind the release. Reported, never touched. */
-  drifted: DriftEntry[];
+   * user's copy is now behind the release. Reported, never touched.
+   *
+   * There is deliberately NO `skewed` counterpart here (issue #94): an untouched file that is
+   * behind the release passes the ownership check, so THIS RUN just upgraded it. Skew is a
+   * state only an observer that is not installing can be in — `doctor`, `guild_status`, and the
+   * server's start-up notice. Reporting it from `init` would be reporting what init just fixed. */
+  drifted: PayloadFileState[];
   warnings: string[];
   /** `.mcp.json` outcome. `kept` (uninstall only): a `modelguild` key was present but left in
    * place because the ownership record does not prove init wrote it, or the current entry no
@@ -399,73 +453,122 @@ function ensureDir(p: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Upgrade drift (issue #22)
+// Upgrade drift (issue #22) and payload SKEW (issue #94) — THREE hashes, THREE states.
 //
-// The never-clobber rule means an upgrade SKIPS a file the user edited. That is correct and
-// stays — but silently leaves the user on a stale copy when the release has moved on. Drift is
-// the state where THREE hashes are all distinct:
-//   recorded — what init last wrote (proof the file is ours, and which version the edit was
+// Every judgement here is made from the same three values:
+//   recorded — what init last wrote (proof the file is ours, and which version any edit was
 //              based on);
-//   current  — what is on disk now (≠ recorded ⇒ the user edited it);
-//   shipped  — what this package ships now (≠ recorded ⇒ the release moved on since that edit).
-// Only then is the user's copy BEHIND the release. Two adjacent states are deliberately NOT
-// drift: an edit against the still-current release (recorded === shipped — nothing to catch up
-// to), and a file with no record at all (never ours — a user's own file at our path, the
-// `shadowed` case; calling that "stale" would be a guess).
+//   current  — what is on disk now;
+//   shipped  — what the RUNNING package ships now (see PACKAGE_ROOT).
+//
+// DRIFT (#22): recorded ≠ current AND recorded ≠ shipped. The user edited the file AND the
+// release has since moved on, so the never-clobber skip left them behind. Reported, never
+// overwritten.
+//
+// SKEW (#94): recorded === current (untouched since init wrote it) but ≠ shipped. Nothing was
+// edited and nothing was skipped — the file is simply from an older release than the server
+// now running, because the server updates via npx and the payload in the user's repo does not.
+// This is the state #22's predicate is deliberately silent about, and it was invisible.
+//
+// SHADOWED / unjudgeable (#22): no ownership record. An intentional edit and a stale leftover
+// are byte-identical evidence there, so it stays unjudgeable — calling it either would be a
+// guess. Explicitly NOT reclassified as skew.
+//
+// One further state is deliberately NOTHING: ours, edited, and the release still ships what
+// the edit was based on (recorded === shipped) — there is nothing to catch up to.
+//
+// The three predicates are mutually exclusive by construction: drift requires
+// `current !== recorded`, skew requires `current === recorded`, unjudgeable requires no record.
 // ---------------------------------------------------------------------------
 
-/** One file whose installed copy is behind (or unjudgeable against) the shipped payload. */
-export interface DriftEntry {
+/** One installed file that differs from the shipped payload, with the hashes that decided it. */
+export interface PayloadFileState {
   /** Project-relative payload dest — the stable record key in BOTH modes. */
   dest: string;
   /** Absolute path of the user's copy on disk. */
   installedPath: string;
   /** Absolute path of the bytes this package ships (for the `diff` hint). */
   shippedPath: string;
+  /** sha256 of the bytes on disk. For SKEW this is also the recorded hash (that is the
+   * definition), so "recorded vs shipped" is exactly this pair. */
+  installedHash: string;
+  /** sha256 of the bytes this release ships. */
+  shippedHash: string;
 }
 
-/** True when the installed copy is ours, edited, AND behind the shipped payload. See the
- * section comment for why each of the three exclusions is deliberate. */
+/** True when the installed copy is ours, EDITED, and behind the shipped payload (issue #22). */
 export function isDrifted(
   recorded: string | undefined,
   current: string,
   shipped: string,
 ): boolean {
   if (!recorded) return false; // never ours ⇒ not stale, just someone else's file
-  if (current === recorded) return false; // unedited ⇒ the upgrade path handles it
+  if (current === recorded) return false; // unedited ⇒ skew's case, not drift's
   if (current === shipped) return false; // already equals the release ⇒ nothing behind
   return shipped !== recorded; // the release moved on since the edit was based on it
 }
 
-/** One file to test, as resolved by the caller: `doctor` picks the location the file was
- * actually found in (project or global) and the record for THAT mode. */
-export interface DriftScanEntry {
+/**
+ * True when the installed copy is ours, UNTOUCHED since init wrote it, and behind the shipped
+ * payload (issue #94) — a clean install the release has moved past.
+ *
+ * `current === recorded` is what makes this safe to act on: `init` will rewrite exactly these
+ * files (they pass the ownership check), so the fix is `npx modelguild init` with no risk of
+ * clobbering anything. That is why skew and drift get different advice, and why they must not
+ * be merged into one bucket.
+ *
+ * DIRECTION IS NOT KNOWABLE HERE and is not claimed anywhere downstream: two hashes carry no
+ * ordering and the record holds no version, so "behind" is an inference from how the pieces
+ * update (the server moves with npx, the payload does not) — right in the normal case, wrong
+ * for someone who pinned an older server deliberately. The surfaces say "out of sync with what
+ * this server ships" for exactly that reason. The remedy is the same in both directions.
+ */
+export function isSkewed(
+  recorded: string | undefined,
+  current: string,
+  shipped: string,
+): boolean {
+  if (!recorded) return false; // never ours ⇒ unjudgeable, never guessed as behind
+  if (current !== recorded) return false; // edited ⇒ drift's case (or a plain local edit)
+  return current !== shipped; // untouched, but the release ships something else
+}
+
+/** One file to test, as resolved by the caller: the location the file was actually found in
+ * (project or global) and the record for THAT mode. Built by `payloadScanEntries`. */
+export interface PayloadScanEntry {
   dest: string;
   installedPath: string;
   recordPath: string;
 }
 
-export interface DriftScanResult {
-  /** Ours-but-stale (see `isDrifted`). */
-  drifted: DriftEntry[];
+export interface PayloadScanResult {
+  /** Ours, edited, and behind the release (see `isDrifted`). */
+  drifted: PayloadFileState[];
+  /** Ours, untouched, and behind the release (see `isSkewed`). */
+  skewed: PayloadFileState[];
   /** Differs from the shipped bytes but NO ownership record covers it — an intentional edit
    * and a stale leftover are indistinguishable here. Reported as unjudgeable, never guessed. */
-  unknown: DriftEntry[];
+  unknown: PayloadFileState[];
   /** Record files that were consulted and do not exist (absolute, de-duplicated) — the honest
    * reason `unknown` entries could not be judged. */
   missingRecords: string[];
 }
 
 /**
- * Standalone drift scan for `doctor` (which has no install run in hand). Files identical to the
- * shipped bytes are skipped before any record is read, so a pristine install consults nothing.
+ * THE detection function. Every surface that reports drift or skew — `init`'s own run report,
+ * `doctor`, `guild_status`, and the server's start-up notice — resolves to this one comparison;
+ * there is deliberately no second copy of it anywhere.
+ *
+ * Files identical to the shipped bytes are skipped before any record is read, so a pristine
+ * install consults nothing.
  */
-export function scanDrift(packageRoot: string, entries: DriftScanEntry[]): DriftScanResult {
+export function scanPayload(packageRoot: string, entries: PayloadScanEntry[]): PayloadScanResult {
   const srcFor = new Map(payloadFiles().map((p) => [p.dest, p.src]));
   const recordCache = new Map<string, Records>();
   const missingRecords = new Set<string>();
-  const drifted: DriftEntry[] = [];
-  const unknown: DriftEntry[] = [];
+  const drifted: PayloadFileState[] = [];
+  const skewed: PayloadFileState[] = [];
+  const unknown: PayloadFileState[] = [];
   for (const e of entries) {
     const src = srcFor.get(e.dest);
     if (!src) continue; // not a payload file — nothing shipped to compare against
@@ -486,12 +589,86 @@ export function scanDrift(packageRoot: string, entries: DriftScanEntry[]): Drift
       recordCache.set(e.recordPath, readRecords(e.recordPath));
     }
     const recorded = recordCache.get(e.recordPath)?.[e.dest];
-    const entry: DriftEntry = { dest: e.dest, installedPath: e.installedPath, shippedPath };
+    const entry: PayloadFileState = {
+      dest: e.dest,
+      installedPath: e.installedPath,
+      shippedPath,
+      installedHash: current,
+      shippedHash: shipped,
+    };
     if (!recorded) unknown.push(entry);
+    else if (isSkewed(recorded, current, shipped)) skewed.push(entry);
     else if (isDrifted(recorded, current, shipped)) drifted.push(entry);
-    // recorded && !drifted ⇒ ours, edited, but the release has not moved: a plain local edit.
+    // else ⇒ ours, edited, and the release still ships what the edit was based on: nothing.
   }
-  return { drifted, unknown, missingRecords: [...missingRecords] };
+  return { drifted, skewed, unknown, missingRecords: [...missingRecords] };
+}
+
+// ---------------------------------------------------------------------------
+// Where a payload file actually IS, and which record judges it (issue #94).
+//
+// Both `doctor`'s presence check and every skew/drift scan need the same mapping: each piece
+// resolves at RUNTIME from the project location OR the global one, and must then be judged
+// against the record of the location it was FOUND in. That routing goes through `payloadDest`
+// (and `recordPathFor`, which itself goes through `payloadDest`), so the project/global mapping
+// can never drift from the payload's — the #22 property, inherited rather than reimplemented.
+// ---------------------------------------------------------------------------
+export type PayloadLocation = "project" | "global" | "none";
+
+export interface PayloadLocateOptions {
+  targetDir: string;
+  global_dirs: GlobalDirs;
+  /** `--global` mode: ONLY the global locations count (an explicit "check my global install"). */
+  globalOnly?: boolean;
+}
+
+/** Project first, then global — mirroring how each piece resolves at runtime. Fail-closed:
+ * found in neither ⇒ `"none"`. */
+export function locatePayload(destRel: string, opts: PayloadLocateOptions): PayloadLocation {
+  const at = (global: boolean): boolean => {
+    const { base, rel } = payloadDest(destRel, {
+      global,
+      targetDir: opts.targetDir,
+      global_dirs: opts.global_dirs,
+    });
+    return existsSync(path.join(base, rel));
+  };
+  if (opts.globalOnly) return at(true) ? "global" : "none";
+  if (at(false)) return "project";
+  if (at(true)) return "global";
+  return "none";
+}
+
+/** The scan entries for every installed payload file, each paired with the record of the
+ * location it was found in. Files present in neither location are omitted (absence is the
+ * presence check's business, not skew's). */
+export function payloadScanEntries(opts: PayloadLocateOptions): PayloadScanEntry[] {
+  const out: PayloadScanEntry[] = [];
+  for (const { dest } of payloadFiles()) {
+    const where = locatePayload(dest, opts);
+    if (where === "none") continue;
+    const destOpts = {
+      global: where === "global",
+      targetDir: opts.targetDir,
+      global_dirs: opts.global_dirs,
+    };
+    const { base, rel } = payloadDest(dest, destOpts);
+    out.push({
+      dest,
+      installedPath: path.join(base, rel),
+      recordPath: recordPathFor(destOpts),
+    });
+  }
+  return out;
+}
+
+/** The one entry point the surfaces call: locate every payload file, then classify it.
+ * `packageRoot` defaults to the running package (`PACKAGE_ROOT`) — which is what "shipped"
+ * means here — and is injectable for tests. */
+export function scanInstalledPayload(
+  opts: PayloadLocateOptions & { packageRoot?: string },
+): PayloadScanResult {
+  return scanPayload(opts.packageRoot ?? PACKAGE_ROOT, payloadScanEntries(opts));
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +891,13 @@ export function init(opts: InitOptions): InitResult {
         result.skipped.push(dest);
         const recorded = records[dest];
         if (isDrifted(recorded, current, payloadHash)) {
-          result.drifted.push({ dest, installedPath: destAbs, shippedPath: srcAbs });
+          result.drifted.push({
+            dest,
+            installedPath: destAbs,
+            shippedPath: srcAbs,
+            installedHash: current,
+            shippedHash: payloadHash,
+          });
           result.warnings.push(
             `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +
               `NEWER version: your copy is stale (see the drift note).`,

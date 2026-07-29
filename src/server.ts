@@ -27,6 +27,9 @@ import { delegate, delegateToToolResult } from "./delegate.js";
 import { models, modelsToToolResult } from "./models.js";
 import { parsePerCallTimeoutMs, layeredRoots } from "./config.js";
 import { enforceRetentionOnStart, resolveRunIdArg } from "./log.js";
+// The payload-skew notice (issue #94). Its own module so it is unit-testable: importing THIS
+// file constructs the MCP server and connects the stdio transport at module top level.
+import { emitPayloadSkewNotice } from "./notice.js";
 // The progress channel lives in its own module so it can be tested: importing THIS file
 // constructs the MCP server and connects the stdio transport at module top level.
 import { withProgress, type ProgressCapableExtra } from "./progress.js";
@@ -167,8 +170,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "port, pid, and agent count, PLUS the doctor-seed checks (the primary guild root " +
         "and the ordered config/policy LAYERS in effect — project over global baseline — " +
         "the model-policy layer chain with each file's presence, whether an explicit " +
-        "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir). " +
-        "Takes no arguments.",
+        "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir), the " +
+        "approval-bridge state, and the INSTALLED PAYLOAD measured against this server's " +
+        "(structuredContent.payload: files that are behind this release — `skewed` = ours and " +
+        "untouched, fixed by `npx modelguild init`; `drifted` = ours and edited, reported " +
+        "never overwritten; `unknown` = no ownership record, unjudgeable). The server updates " +
+        "itself via npx while the commands/agent defs in the repo do not, so a skewed payload " +
+        "means the /guild:* commands running are from an older release. Takes no arguments.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -719,6 +727,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         `${pruned.days} day(s) from ${pruned.dir}\n`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Payload-skew notice, once per SERVER VERSION (issue #94).
+//
+// The server updates itself via npx; the `/guild:*` commands, hardened agent defs and
+// templates it installed into the user's repo do not move with it. Nobody who never runs
+// `doctor` would ever learn that — so the one moment the server is guaranteed to reach says
+// it, once per release, and then goes quiet (`GUILD_PAYLOAD_NOTICE=off` silences it outright;
+// `doctor`/`guild_status` keep reporting regardless, per issue #23's `logs clean` precedent).
+//
+// STDERR ONLY — stdout is the MCP protocol channel — and NON-FATAL by construction:
+// `emitPayloadSkewNotice` returns its outcome as data and cannot throw, and the `try` here is
+// the belt to that braces. A broken check degrades the notice, never the lifecycle.
+try {
+  emitPayloadSkewNotice();
+} catch {
+  /* unreachable by design; a start-up notice may never take the server down */
 }
 
 const transport = new StdioServerTransport();
