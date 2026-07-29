@@ -146,6 +146,124 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
 
 // --- session permission ruleset (issue #20 slice 4) ------------------------
 /**
+ * V1 PERMISSION SURFACE — PINNED BY DECISION (issue #93; maintainer, 2026-07-29).
+ *
+ * Everything the approval bridge touches is opencode's **v1** permission surface, and it
+ * stays there deliberately. This is a recorded decision, not an artefact of when the code
+ * happened to be written. The v1 seam is: the ruleset sent as `POST /session`'s `permission`
+ * field (`createSession`, below), the copy echoed back by `GET /session/{id}`
+ * (`fetchSession`), the open-request snapshot `GET /permission` (`listPendingPermissions`),
+ * and the two replies in `src/approve.ts` / `src/cli.ts` — `POST
+ * /session/{id}/permissions/{permId}` and `POST /permission/{id}/reply`.
+ *
+ * THE GROUND IS MOVING UNDER ONE OF THOSE FOUR, AND THE PIN SAYS SO RATHER THAN OMITTING IT.
+ * `POST /session/{sessionID}/permissions/{permissionID}` (operationId `permission.respond`,
+ * the APPROVE half) is marked **`deprecated: true`** in 1.18.7's `/doc` — and it is the ONLY
+ * deprecated operation in the entire document (verified: one hit across every path and
+ * method). That is not an argument for migrating: a deprecated endpoint that WORKS beats a
+ * live one that silently gates nothing. But it is a real **expiry condition** on this pin, and
+ * a reader of this record is entitled to know it. **When that endpoint is removed** — a 404 on
+ * every approval while rejections still work — the bridge does not quietly degrade into
+ * "approvals never land": `#settle` would book each approval as `contested`/`undelivered`, so
+ * the failure is at least recorded. The correct response at that point is to move the APPROVE
+ * reply to whatever opencode offers then, re-verify with the probe script below, and update
+ * this record and C69a together — NOT to take that removal as licence to move the ruleset
+ * itself onto v2, which is a separate question this pin answers on its own evidence.
+ *
+ * opencode 1.18.7 ALSO exposes a v2 surface: `POST /api/session/{id}/permission` ("evaluate
+ * and, when approval is required, create a permission request for a session") and `GET
+ * /api/session/{id}/permission`. Those are the obvious modernization target, and they are
+ * the wrong one. **Do not migrate onto them.**
+ *
+ * THE PROBE (live `opencode serve`, opencode 1.18.7, 2026-07-29 — the coordinating session's
+ * own observation; `allow` was first noticed by the agent implementing #91, which is why that
+ * PR stayed on v1, and it was re-probed independently before this was written). A session
+ * created with `{"permission":[{"permission":"bash","pattern":"*","action":"ask"}]}` — echoed
+ * back as STORED by `GET /session/{id}` — answers the v2 evaluator with
+ * `{"data":{"id":"per_…","effect":"allow"}}`. `allow`, not `ask`. The same for `edit` and
+ * `read`, the same when the request body names the `agent` explicitly, and identical to a
+ * control session created with NO ruleset at all: **the v2 evaluator does not consult the v1
+ * ruleset stored on the session.** `GET /permission` stays `[]` throughout, so no request is
+ * ever raised and no human is ever prompted.
+ *
+ * FURTHER FINDINGS THAT SHARPEN THAT, ALL FROM THE SAME 1.18.7 PROBE, AND EACH ONE MAKES THE
+ * MIGRATION WORSE RATHER THAN MERELY DIFFERENT:
+ *   - **v2 is not inert — it evaluates the AGENT DEF, just not the session ruleset.** `bash`
+ *     answers `deny` for `guild-read`/`guild-research` and `allow` for `build`. So the tools
+ *     v2 waves through are precisely the ones this bridge would gate: C66 invariant 2 lets it
+ *     gate only tools the agent ALREADY allows, and those are exactly the ones v2 answers
+ *     `allow` for. The gate would be a no-op over its entire domain, not a partial one.
+ *   - **The two surfaces keep SEPARATE pending stores.** A v2 `ask` (reachable via opencode's
+ *     built-in `*.env` rule) put three requests on `GET /api/session/{id}/permission` and
+ *     `/api/permission/request` while `GET /permission` stayed `[]` — so the #91 re-list, which
+ *     reads the v1 list, would keep answering "nothing is open".
+ *   - **A v2 ask IS seen, IS promptable, and CANNOT BE ANSWERED — which is worse than being
+ *     missed.** `src/activity.ts` has handled `permission.v2.asked` since #20 (`31800c4`), and
+ *     a REAL frame captured off `GET /event` on 1.18.7 normalizes to a fully populated
+ *     `{kind:"permission-asked", permissionId:"per_…", permissionTool:"read"}`, which
+ *     `handleEvent` routes straight into `#onAsked`. So the bridge WOULD prompt the developer
+ *     and start the approval clock — and then **both** pinned v1 reply endpoints reject the
+ *     v2 request id with **404 `PermissionNotFoundError`**. Verified against a live pending v2
+ *     request: `POST /permission/{id}/reply` and `POST /session/{id}/permissions/{id}` both
+ *     404, while `POST /api/session/{id}/permission/{id}/reply` answers 400 on body shape —
+ *     i.e. the request genuinely exists, in the other store. A human decision would therefore
+ *     be taken and silently dropped: `#settle` books the 404 as **`contested`**, whose note
+ *     says opencode "had already settled this request", which would be FALSE here — it is
+ *     still open — and the turn then blocks to `GUILD_MESSAGE_TIMEOUT_MS` (15 min) rather
+ *     than the 120 s approval deadline. **An earlier version of this record claimed the event
+ *     was dropped as an unknown type. That was WRONG** — refutable from `src/activity.ts:325`
+ *     in seconds — and is corrected here rather than quietly deleted, because a false claim
+ *     in a record whose whole purpose is to be trusted later is the worst thing it can carry.
+ * A corollary for anyone re-probing: an `ask` from v2 is NOT evidence that the ruleset was
+ * honoured (the built-in `*.env` rule produces one on a session with no ruleset at all). The
+ * question is whether the ruleset CHANGES the answer, which is why
+ * `modelguild/verify-permission-surface.sh` is differential — gated session vs control
+ * session, same agent, same action.
+ *
+ * WHAT BREAKS IF SOMEBODY MIGRATES ANYWAY. The bridge would report itself **armed** — the
+ * ruleset is accepted, echoed back, and passes C69's stored-ruleset check — while opencode
+ * waved the gated tool straight through. Running ungated while the caller believes the turn
+ * is gated is the single outcome CONTRACT C69 says this feature must never produce, and it
+ * fails SILENTLY: a clean run reporting `requests: 0` looks exactly like a model that asked
+ * for nothing. C66's two narrowing invariants are expressed as v1 rules, so they would go on
+ * being enforced — against a ruleset nothing evaluates.
+ *
+ * ONE OBSERVATION, NOT A DIAGNOSIS. The very FIRST v2 evaluation after serve startup returned
+ * `effect:"deny"` for a body that returned `allow` on every later attempt, including on that
+ * same session re-probed three times. Not reproduced — the 2026-07-29 re-probe's own first
+ * post-startup evaluation answered `allow` — and no cause is claimed here. It is recorded
+ * because "the first call after startup differs" is exactly the shape of thing that makes a
+ * migration look fine in testing, and it is why the probe script evaluates several rounds
+ * and prints them all rather than trusting one.
+ *
+ * WHAT WOULD HAVE TO BE TRUE TO REVISIT — a PRECONDITION for any migration, not an
+ * alternative to this pin:
+ *   1. A FRESH probe on a LATER opencode showing that the v2 evaluator honours the ruleset
+ *      stored on the session (this build does not, and an old probe proves nothing about a
+ *      new build in either direction); OR the ruleset re-expressed in v2's own terms, with
+ *      C66's invariants (`ask` only, never gate a tool the def denies) re-derived for that
+ *      shape rather than assumed to carry over. **That probe is RUNNABLE, not a plan:**
+ *      `bash modelguild/verify-permission-surface.sh` — exit 0 "pin holds", exit 7
+ *      "ATTENTION, revisit #93", exit 6 inconclusive. Run it after an opencode bump, the way
+ *      the `verify-guild-*.sh` proofs are run; it calls no model.
+ *   2. The `verify-guild-*.sh`-style proof extended to cover it — live serve, a genuinely
+ *      blocked tool call, a real answer. `test/approve.test.ts` runs against a fake that
+ *      implements the v1 behaviour, so it would go GREEN on a v2 bridge that gates nothing.
+ * Anything short of both is a change that reports itself armed on evidence it does not have.
+ *
+ * `modelguild/tests/check-v1-permission-pin.sh` (CI) holds the mechanical half, and its reach
+ * is stated honestly because overstating it is how a check gets trusted past its evidence: it
+ * greps for a **literal** v2 PERMISSION path (`/api/permission…`, `/api/session/…/permission`)
+ * in non-comment lines of `src/`, and requires this record to still be here. It is scoped to
+ * the permission surface deliberately — the rest of opencode's `/api/` tree is not covered by
+ * this decision and blocking it would tax an unrelated migration into deleting the check.
+ * Being a literal grep, it does NOT catch the same prefix split or computed
+ * (`"/api" + "/permission"`, a `const V2 = "/api"` template, `join("/")`, or `/api` folded
+ * into the base URL), nor a future permission surface under a different prefix. Those stay
+ * review judgment against C69a.
+ */
+
+/**
  * One `PermissionRule` for `POST /session`'s `permission` field — verified against opencode
  * 1.18.7's `/doc` (`{permission, pattern, action}`; the ruleset is `PermissionRule[]`).
  *
@@ -260,6 +378,9 @@ export async function createSession(opts: CreateSessionOpts): Promise<SessionRef
     body.model = { id: modelID, providerID }; // session-create shape: {id, providerID}
   }
   if (opts.permission !== undefined && opts.permission.length > 0) {
+    // THIS FIELD IS THE v1 GATE, AND IT IS PINNED THERE BY DECISION (issue #93): opencode's
+    // v2 evaluator does not consult what is stored here, so moving the gate onto it would
+    // leave the bridge reporting itself armed while the tool ran. See the V1 PIN above.
     assertAskOnlyRuleset(opts.permission, opts.allowedTools);
     body.permission = opts.permission;
   }
@@ -293,7 +414,13 @@ export interface FetchSessionOpts {
 
 /** `GET /session/{id}` — the session record, including the `permission` ruleset it was
  * CREATED with (verified on 1.18.7: create and get both echo it). A per-session ruleset is
- * fixed at creation, so this is the only honest way to answer "is this continuation gated?". */
+ * fixed at creation, so this is the only honest way to answer "is this continuation gated?".
+ *
+ * v1 BY DECISION (issue #93; see the V1 PIN above). What this endpoint proves is that the
+ * ruleset was STORED — the 1.18.7 probe found a session whose stored `ask` rule was echoed
+ * back here and still evaluated `allow` on the v2 surface, so "stored" is only evidence of
+ * gating for the v1 evaluator that actually reads it. v2's `GET /api/session/{id}/permission`
+ * is a different surface and was NOT probed for equivalence; do not swap it in. */
 export async function fetchSession(opts: FetchSessionOpts): Promise<{ permission?: unknown }> {
   const raw = (await requestJson({
     baseUrl: opts.baseUrl,
@@ -392,6 +519,11 @@ export interface ListPendingPermissionsOpts {
  *
  * It THROWS on a transport failure, a non-2xx, or a body that is not an array — the caller
  * (`src/approve.ts`) turns that into a degradation, never into a call failure.
+ *
+ * v1 BY DECISION (issue #93; see the V1 PIN above). This is the list the bridge's own replies
+ * settle, and during the 2026-07-29 probe a v2 evaluation raised nothing into it — so a
+ * bridge half-migrated onto the v2 endpoints would re-list an empty set forever and read it
+ * as "the model asked for nothing".
  */
 export async function listPendingPermissions(
   opts: ListPendingPermissionsOpts,

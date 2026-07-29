@@ -79,6 +79,17 @@ jobs:
         # words is still human judgment in review.
         run: bash modelguild/tests/check-claude-md.sh --self-test
 
+      - name: v1 permission-surface pin (+ self-test)
+        # Issue #93 / CONTRACT C69a: the approval bridge speaks opencode's v1 permission
+        # surface by decision. The v2 endpoints (/api/session/{id}/permission, …) do not
+        # consult the ruleset the bridge stores on the session, so a migration would report
+        # itself armed while the gated tool ran. A literal v2 PERMISSION path in a non-comment
+        # line of src/ fails here — permission surface ONLY, so an unrelated /api/ migration
+        # (guild_models -> /api/model, say) is not blocked. The behavioural re-probe is
+        # modelguild/verify-permission-surface.sh: it needs a running serve, so it is
+        # local-only, like the verify-guild-*.sh proofs.
+        run: bash modelguild/tests/check-v1-permission-pin.sh --self-test
+
       - name: Host-config symlink confinement
         run: bash .devcontainer/test-prepare-host-config.sh
 
@@ -166,6 +177,13 @@ jobs:
         # Same lint on stock bash 3.2 + BSD awk/grep — its checks lean on awk and
         # grep -Fi, so the macOS job exercises the portability the Linux job can't.
         run: bash modelguild/tests/check-claude-md.sh --self-test
+
+      - name: v1 permission-surface pin (+ self-test)
+        # Same lint on BSD grep/sed: it leans on `grep -RIn --include`, a `sed` that strips
+        # trailing line comments, and two -E passes — exactly the shapes that behave
+        # differently outside GNU tools, so the platform this job exists for is the one
+        # where it could silently stop catching a v2 migration (issue #93, CONTRACT C69a).
+        run: bash modelguild/tests/check-v1-permission-pin.sh --self-test
 
       - name: ShellCheck lint script (skips cleanly without shellcheck; + self-test)
         run: |

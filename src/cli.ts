@@ -881,6 +881,13 @@ export function formatApprovalNotice(a: ApprovalAskLine): string {
  * BOTH the watcher and the server's own bridge may answer the same request. **First reply
  * wins and opencode is the arbiter** — a reply to an already-settled permission id is a 404
  * (verified on opencode 1.18.7), which is reported here as "already answered", never retried.
+ *
+ * THESE ARE v1 ENDPOINTS BY DECISION (issue #93), and they must stay the same pair
+ * `src/approve.ts` uses: this terminal and the server's bridge answer the SAME request id, so
+ * moving one side alone would break the arbitration above as well as the gate. Both endpoints
+ * 404 against a v2 request id, and the approve one is the single operation opencode marks
+ * `deprecated` on 1.18.7 — the whole record, including what to do when that endpoint goes,
+ * is the V1 PIN block in `src/client.ts`. It is not restated here on purpose.
  */
 async function replyToPermission(
   a: ApprovalAskLine,
@@ -1163,7 +1170,15 @@ export async function runWatch(
         const res = await replyToPermission(next, yes, inject?.fetchImpl ?? fetch);
         settled.add(next.permission_id);
         if (res.status === 404) {
-          console.log("   · too late: opencode had already settled this request (timeout, or another answerer).");
+          // States the OBSERVATION, not a cause. "Already settled" is the usual explanation
+          // and used to be asserted outright — but a removed reply endpoint (the approve one
+          // is opencode's only `deprecated` operation) or a request raised on a different
+          // permission surface 404s identically while the request is still OPEN. Telling the
+          // developer their answer arrived too late when it never arrived at all is the
+          // wrong failure to report. See the V1 PIN block in `src/client.ts`.
+          console.log(
+            "   · not accepted: opencode would not take a reply for this request id (404) — usually somebody (or the timeout) settled it first.",
+          );
         } else if (res.status === 0 || res.status >= 400) {
           console.log(`   ! reply failed (${res.status}${res.error ? ` ${res.error}` : ""}) — the server's fail-closed timeout will reject it.`);
         } else {
