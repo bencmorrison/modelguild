@@ -37,11 +37,13 @@ import {
   chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { delegate, delegateToToolResult, type DelegateResult } from "../src/delegate.js";
 import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
-import type { ServeProvider } from "../src/client.js";
+import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
+import type { ServeProvider, ServeRouter } from "../src/client.js";
 import type { ServeHandle } from "../src/lifecycle.js";
 import { Checker, fixtureGitEnv } from "./harness.js";
 
@@ -884,6 +886,759 @@ export async function run(): Promise<number> {
     // A hostile/garbage inherited count must not make git fatal on every fixture call.
     c.check(resolved("commit.gpgsign", { GIT_CONFIG_COUNT: "not-a-number" }) === "false",
       "G4: an unparseable inherited GIT_CONFIG_COUNT is ignored, not propagated into a fatal");
+  }
+
+  // =========================================================================
+  // H. THE WRITE ROOT — delegating into a sibling git worktree (issue #107).
+  //
+  // The one assertion this whole section exists for: THE RECORDED PATCH IS OF THE TREE THE
+  // MODEL EDITED. #96 moved the serve child's cwd and deliberately left the capture layer at
+  // the project dir; re-rooting one without the other would produce a patch that is wrong
+  // while reporting `captureComplete:true`, which is strictly worse than refusing. So the
+  // fixtures below put DIFFERENT, DISTINGUISHABLE content in the two trees and mutate only
+  // the worktree — a capture still rooted at the project dir cannot pass them by accident:
+  // it would record an empty patch (nothing changed there) and report "nothing to review".
+  // =========================================================================
+  {
+    /** A committed repo carrying the hardened WRITE def, so the pre-flight passes from any
+     * worktree git checks out (`.opencode/agent/**` is tracked, exactly as in this repo). */
+    const initRepoWithDef = (prefix: string, files: Record<string, string>): string =>
+      realpathSync(
+        initRepo(
+          { ".opencode/agent/guild-build.md": "---\nmode: all\n---\nx\n", ...files },
+          prefix,
+        ),
+      );
+    const addWorktree = (repo: string, branch: string): string => {
+      const dir = path.join(tmp(`m107-wt-${branch}-`), "wt");
+      const r = git(repo, ["worktree", "add", "-q", "-b", branch, dir]);
+      if (r.status !== 0) throw new Error(`git worktree add failed in ${repo}`);
+      return realpathSync(dir);
+    };
+    /** Records every root it is asked to serve — the proof the CHILD moved, not just the
+     * capture. Modelled on `test/worktree.test.ts`'s spy so both features assert re-rooting
+     * the same way. */
+    const spyRouter = (
+      projectDir: string,
+      provider: ServeProvider,
+    ): ServeRouter & { asked: string[] } => {
+      const asked: string[] = [];
+      const extra = new Set<string>();
+      return {
+        projectDir,
+        asked,
+        get extraRoots() {
+          return [...extra];
+        },
+        forRoot(root: string) {
+          asked.push(root);
+          if (root !== projectDir) extra.add(root);
+          return provider;
+        },
+      };
+    };
+    /** A permissive guild root, so nothing but the worktree logic can refuse. */
+    const permissiveRoot = (): string => {
+      const root = tmp("m107-guild-");
+      writeFileSync(path.join(root, "models.policy.local"), "allow *\n");
+      return root;
+    };
+
+    // (a) THE CORE CASE: a valid sibling worktree is accepted, the child is rooted THERE,
+    //     the model's edits land THERE, and the recorded patch is a patch OF THAT TREE.
+    {
+      const repo = initRepoWithDef("m107-repo-", {
+        "a.txt": "PROJECT-ROOT-ORIGINAL\n",
+        "only-in-project.txt": "P\n",
+      });
+      const wt = addWorktree(repo, "feature");
+      const logDir = tmp("m107-logs-");
+      const env = envWith({ GUILD_ROOT: permissiveRoot(), GUILD_LOG_DIR: logDir });
+      const fake = await startFakeOpencode({ historyText: "edited the branch" });
+      try {
+        const provider = mutatingServe(fake, () => {
+          // The model edits ONLY the worktree. If the capture is rooted at the project dir
+          // it sees no change at all and reports "nothing to review".
+          writeFileSync(path.join(wt, "a.txt"), "WORKTREE-EDITED-BY-MODEL\n");
+          writeFileSync(path.join(wt, "created-in-worktree.txt"), "NEWINWT\n");
+          // A sentinel in the OTHER tree. A capture still rooted at the project dir would
+          // record this created file; a correctly re-rooted one cannot see it at all.
+          writeFileSync(path.join(repo, "leak-sentinel.txt"), "SHOULD-NOT-BE-CAPTURED\n");
+        });
+        const router = spyRouter(repo, provider);
+        // Dirty the worktree first: the recovery hint is surfaced only for a tree that had
+        // uncommitted work to clobber (C39), and the hint's TREE is what this case is about.
+        writeFileSync(path.join(wt, "only-in-project.txt"), "UNCOMMITTED-IN-WT\n");
+        const r = await delegate(
+          { task: "edit the branch", model: "openai/m", worktree: wt },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#107(a): a valid sibling worktree target runs the delegation");
+        c.check(
+          router.asked.length === 1 && router.asked[0] === wt,
+          "#107(a): the serve child is rooted at the WORKTREE (router asked for exactly it)",
+        );
+        c.check(
+          read(wt, "a.txt") === "WORKTREE-EDITED-BY-MODEL\n",
+          "#107(a): the model's edit landed in the WORKTREE",
+        );
+        c.check(
+          read(repo, "a.txt") === "PROJECT-ROOT-ORIGINAL\n",
+          "#107(a): the project root was NOT touched",
+        );
+        c.check(
+          r.ok && r.attribution.worktree === wt,
+          "#107(a): the result names the tree that was edited",
+        );
+
+        // ---- THE ASSERTION THAT MATTERS MOST ----
+        const patchPath = r.ok ? r.capture.patchPath : null;
+        c.check(patchPath !== null, "#107(a): a patch was recorded (NOT 'nothing to review')");
+        const patch = patchPath ? readFileSync(patchPath, "utf8") : "";
+        c.check(
+          patch.includes("WORKTREE-EDITED-BY-MODEL"),
+          "#107(a): THE PATCH IS OF THE TARGET TREE — it carries the worktree's new content",
+        );
+        c.check(
+          patch.includes("created-in-worktree.txt"),
+          "#107(a): a file CREATED in the worktree is in the patch (C37 scar, at the new root)",
+        );
+        c.check(
+          !patch.includes("leak-sentinel"),
+          "#107(a): a file created in the PROJECT root is absent from the patch (no leakage)",
+        );
+        c.check(
+          r.ok && r.capture.captureComplete && r.capture.filesChanged === 2,
+          "#107(a): the capture is COMPLETE and counts both changed files",
+        );
+
+        // The recovery hint must land the user in the right tree: a bare `git checkout`
+        // pasted at the project root would restore INTO the project root, from a tree sha
+        // that resolves there too (shared object database) — silently wrong.
+        const hint = r.ok ? r.capture.recoveryHint : null;
+        c.check(
+          hint !== null && hint.includes(`git -C ${wt} checkout `),
+          "#107(a): the recovery hint names the TARGET tree (`git -C <worktree> checkout`)",
+        );
+        const preTree = r.ok ? r.capture.preTree : null;
+        c.check(preTree !== null, "#107(a): a pre-turn tree sha was recorded");
+        if (preTree) {
+          git(wt, ["checkout", preTree, "--", "a.txt"]);
+          c.check(
+            read(wt, "a.txt") === "PROJECT-ROOT-ORIGINAL\n",
+            "#107(a): the hint's tree sha really restores the worktree's pre-turn content",
+          );
+        }
+
+        // Receipts: the started entry says WHICH TREE was mutated, in its own field.
+        const runs = readdirSync(logDir).filter((n) => n !== "latest");
+        c.check(runs.length === 1, "#107(a): exactly one evidence run");
+        const lines = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        const started = lines.find((e) => e.type === "call" && e.status === "started");
+        c.check(
+          started !== undefined && started.write_root === wt,
+          "#107(a): the started entry records write_root — the receipt names the edited tree",
+        );
+        c.check(
+          started !== undefined && started.read_root === undefined,
+          "#107(a): it does NOT masquerade as read_root (a mutation is not a reading)",
+        );
+        const diffEntry = lines.find((e) => e.type === "delegate-diff");
+        c.check(
+          diffEntry !== undefined && diffEntry.call_id === started?.call_id,
+          "#107(a): the delegate-diff is paired to that started entry by call_id",
+        );
+
+        // The text channel names the tree for a human skimming the transcript.
+        const wire = delegateToToolResult(r);
+        c.check(
+          wire.content[0]?.text === "edited the branch",
+          "#107(a): content[0] is still the model's report byte-exact (note is a new block)",
+        );
+        c.check(
+          wire.content.some((b) => b.text === `Edited tree: ${wt}`),
+          "#107(a): an 'Edited tree' block is appended",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (b) THE CROSS-ROOT GUARD, stated as its own test: if the capture root and the edit root
+    //     ever disagree, this fails. The model edits the PROJECT root while the call targets
+    //     the WORKTREE — the exact inversion of (a). A correct capture (rooted at the target)
+    //     sees nothing and says "nothing to review"; a capture that had silently stayed at the
+    //     project dir would happily record a complete-looking patch of a tree the caller never
+    //     asked about, which is issue #107's whole failure mode.
+    {
+      const repo = initRepoWithDef("m107-cross-", { "a.txt": "A0\n" });
+      const wt = addWorktree(repo, "cross");
+      const logDir = tmp("m107-logs-");
+      const env = envWith({ GUILD_ROOT: permissiveRoot(), GUILD_LOG_DIR: logDir });
+      const fake = await startFakeOpencode({ historyText: "wrong tree" });
+      try {
+        const provider = mutatingServe(fake, () => {
+          writeFileSync(path.join(repo, "a.txt"), "EDITED-IN-THE-PROJECT-ROOT\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(
+          r.ok && r.capture.patchPath === null && r.capture.filesChanged === 0,
+          "#107(b): a change made in the PROJECT root is NOT captured by a worktree-targeted call",
+        );
+        const runs = readdirSync(logDir).filter((n) => n !== "latest");
+        const entries = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        c.check(
+          entries.every((e) => e.type !== "delegate-diff"),
+          "#107(b): and no delegate-diff entry claims a patch of the untargeted tree",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (c) REFUSALS, through the SAME choke point and refusal shape as the read tools:
+    //     an off-list path, and a worktree of a DIFFERENT repository. Nothing is routed,
+    //     nothing is logged, and — the write-path-specific half — no model turn runs.
+    {
+      const repo = initRepoWithDef("m107-ref-", { "a.txt": "A\n" });
+      const other = initRepoWithDef("m107-other-", { "b.txt": "B\n" });
+      const otherWt = addWorktree(other, "elsewhere");
+      const stranger = tmp("m107-stranger-");
+      for (const [target, label] of [
+        [stranger, "a path not in `git worktree list`"],
+        [otherWt, "a worktree of a DIFFERENT repository"],
+      ] as const) {
+        const logDir = tmp("m107-logs-");
+        const env = envWith({ GUILD_ROOT: permissiveRoot(), GUILD_LOG_DIR: logDir });
+        const fake = await startFakeOpencode({ historyText: "unused" });
+        try {
+          let mutated = false;
+          const provider = mutatingServe(fake, () => {
+            mutated = true;
+          });
+          const router = spyRouter(repo, provider);
+          const r = await delegate(
+            { task: "t", model: "openai/m", worktree: target },
+            { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+          );
+          c.check(!r.ok && r.error.kind === "worktree-invalid", `#107(c): ${label} is REFUSED`);
+          c.check(
+            !r.ok && r.error.message.includes(target),
+            `#107(c): the refusal NAMES the path (${label})`,
+          );
+          c.check(
+            router.asked.length === 0 && !mutated,
+            `#107(c): nothing is routed or run (${label})`,
+          );
+          const runs = existsSync(logDir) ? readdirSync(logDir).filter((n) => n !== "latest") : [];
+          c.check(runs.length === 0, `#107(c): no evidence run is written (${label}) — gap parity`);
+        } finally {
+          await fake.close();
+        }
+      }
+    }
+
+    // (d) A TARGET WITHOUT THE HARDENED WRITE DEF refuses UP FRONT — before `log.expect()`
+    //     AND before the snapshot. opencode resolves agents from the SERVE's cwd, so the
+    //     project's own copy must NOT rescue the worktree; and the write path's fallback
+    //     would be the UNRESTRICTED `build` agent, which is why this must never degrade.
+    {
+      const repo = initRepoWithDef("m107-nodef-", { "a.txt": "A\n" });
+      const wt = addWorktree(repo, "nodef");
+      rmSync(path.join(wt, ".opencode"), { recursive: true, force: true });
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        // Fail-closed needs BOTH the project sibling and the global opencode dir absent.
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "unused" });
+      try {
+        let mutated = false;
+        const provider = mutatingServe(fake, () => {
+          mutated = true;
+        });
+        const router = spyRouter(repo, provider);
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          !r.ok && r.error.kind === "agent-def-missing",
+          "#107(d): a worktree with no guild-build def REFUSES (no fallback to `build`)",
+        );
+        c.check(
+          !r.ok && r.error.message.includes(path.join(wt, ".opencode", "agent")),
+          "#107(d): the message names the WORKTREE's agent dir, not the project's",
+        );
+        c.check(!r.ok && r.error.exitAnalogue === 5, "#107(d): still the C57 exit-5 analogue");
+        c.check(!mutated, "#107(d): no model turn ran");
+        const runs = existsSync(logDir) ? readdirSync(logDir).filter((n) => n !== "latest") : [];
+        c.check(runs.length === 0, "#107(d): NOTHING is logged (gap parity, C24)");
+        // Control: the same repo WITH the def in the worktree passes the same gate, so the
+        // refusal above is about the missing def and not about worktrees in general.
+        const okWt = addWorktree(repo, "hasdef");
+        const ok = await delegate(
+          { task: "t", model: "openai/m", worktree: okWt },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(ok.ok, "#107(d): control — a worktree that HAS the def is accepted");
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (e) THE APPROVAL BRIDGE PARSES THE DEF IN FORCE IN THE TARGET TREE (H3 invariant).
+    //     `approvalFor` must receive the RE-ROOTED agentDefDirs, or a user-hardened def in
+    //     the worktree would be ignored and a tool it DENIES would be gated into an
+    //     approvable one. Asserted through observable behaviour: the worktree's def denies
+    //     every write tool, so the intersection with the tier is empty, so arming gates
+    //     nothing — and a call with NO answering channel is therefore NOT refused. Against
+    //     the project's permissive def it arms and refuses for want of a channel, which is
+    //     the control that keeps this from being vacuous.
+    {
+      const repo = initRepoWithDef("m107-appr-", { "a.txt": "A\n" });
+      const wt = addWorktree(repo, "hardened");
+      writeFileSync(
+        path.join(wt, ".opencode", "agent", "guild-build.md"),
+        [
+          "---",
+          "mode: all",
+          "permission:",
+          '  "*": deny',
+          "  bash: deny",
+          "  edit: deny",
+          "  write: deny",
+          "  patch: deny",
+          "---",
+          "hardened by the user",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        path.join(repo, ".opencode", "agent", "guild-build.md"),
+        [
+          "---",
+          "mode: all",
+          "permission:",
+          '  "*": deny',
+          "  edit: allow",
+          "  write: allow",
+          "  patch: allow",
+          "  bash: allow",
+          "---",
+          "the project's permissive copy",
+          "",
+        ].join("\n"),
+      );
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        GUILD_APPROVE: "write",
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "ok" });
+      try {
+        const provider = mutatingServe(fake, () => {});
+        const router = spyRouter(repo, provider);
+        const targeted = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          targeted.ok || targeted.error.kind !== "approval-channel-missing",
+          "#107(e): armed against the TARGET's hardened def, nothing is gated — so no " +
+            "channel refusal (the allow-set came from the def in force in that tree)",
+        );
+        const untargeted = await delegate(
+          { task: "t", model: "openai/m" },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          !untargeted.ok && untargeted.error.kind === "approval-channel-missing",
+          "#107(e): control — the project's permissive def DOES arm, proving (e) is not vacuous",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (f) AN UNTARGETED CALL IS UNCHANGED: no new field on the result, no new field in the
+    //     receipts, the same three lifecycle entries, and the pre-#107 recovery hint verbatim.
+    {
+      const repo = initRepoWithDef("m107-plain-", { "a.txt": "A0\n" });
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "plain" });
+      try {
+        writeFileSync(path.join(repo, "dirty.txt"), "UNCOMMITTED\n");
+        const r = await delegate(
+          { task: "t", model: "openai/m" },
+          {
+            serve: mutatingServe(fake, () => writeFileSync(path.join(repo, "a.txt"), "A1\n")),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(r.ok, "#107(f): an untargeted delegation still runs (no router needed)");
+        c.check(
+          r.ok && r.attribution.worktree === undefined,
+          "#107(f): no `worktree` field on the attribution",
+        );
+        c.check(
+          delegateToToolResult(r).content.length === 1,
+          "#107(f): no 'Edited tree' block — the wire shape is unchanged",
+        );
+        c.check(
+          r.ok && r.capture.recoveryHint === `git checkout ${r.capture.preTree} -- <path>`,
+          "#107(f): the recovery hint is the pre-#107 string verbatim (C39), no `-C`",
+        );
+        const runs = readdirSync(logDir).filter((n) => n !== "latest");
+        const entries = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        const lifecycle = entries.filter(
+          (e) => e.type === "call" || e.type === "expected-call",
+        );
+        c.check(lifecycle.length === 3, "#107(f): still exactly three lifecycle entries (C22)");
+        c.check(
+          lifecycle.every((e) => !("write_root" in e) && !("read_root" in e)),
+          "#107(f): NO write_root/read_root key — entries are shape-identical to pre-#107",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (g) TARGETING THE PROJECT ROOT ITSELF is honoured without minting a second child, and
+    //     is reported — the caller asked, so the answer says which root it got.
+    {
+      const repo = initRepoWithDef("m107-self-", { "a.txt": "A0\n" });
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "self" });
+      try {
+        const provider = mutatingServe(fake, () =>
+          writeFileSync(path.join(repo, "a.txt"), "A1\n"),
+        );
+        const router = spyRouter(repo, provider);
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: repo },
+          { serve: provider, router, env, cwd: repo, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#107(g): targeting the project root itself is accepted");
+        c.check(router.asked.length === 0, "#107(g): it spawns NO second serve child");
+        c.check(
+          r.ok && r.attribution.worktree === repo && r.capture.filesChanged === 1,
+          "#107(g): it reports the root used and captures the change there",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // (i) THE SHAPE THAT KEEPS (a)/(b) TRUE. Stated precisely, because the first cut of this
+    //     block over-claimed and a reviewer broke it: **the behavioural cases are the net.**
+    //     Substituting any wrong root makes them fail loudly, and that is what actually holds
+    //     the property. What THIS block adds is narrower and worth having anyway — it pins the
+    //     specific call shapes through which a second, independent root could re-enter without
+    //     any behavioural test being written for it. It is NOT a proof that the project dir is
+    //     unreachable: `cwd` is still in scope after the resolution (the evidence log takes it
+    //     deliberately, since the log root is NOT re-rooted at the target), so the assertions
+    //     below name the capture consumers explicitly rather than blacklisting a token.
+    //     A reviewer demonstrated the gap by rewriting `captureAndLog(before, { writeRoot, … })`
+    //     to `{ writeRoot: cwd, … }`: every check here passed while 38 behavioural checks
+    //     failed. The shorthand-property assertion below is what closes that exact hole.
+    {
+      const src = readFileSync(new URL("../src/delegate.ts", import.meta.url), "utf8");
+      const body = src.slice(src.indexOf("export async function delegate("));
+      const afterResolution = body.slice(body.indexOf("const writeRoot = readRoot.value.root;"));
+      c.check(
+        (src.match(/resolveRepoDir\(/g) || []).length === 2,
+        "#107(i): resolveRepoDir is DEFINED once and CALLED once — one place resolves the default",
+      );
+      c.check(
+        !afterResolution.includes("resolveRepoDir(") &&
+          !afterResolution.includes("deps.repoDir") &&
+          !afterResolution.includes("process.cwd()") &&
+          !afterResolution.includes("env.GUILD_PROJECT_DIR"),
+        "#107(i): the project-dir accessors are not re-read below the resolution",
+      );
+      // `cwd` cannot be blacklisted outright — the evidence log legitimately takes it, and the
+      // log root is deliberately NOT re-rooted at the target. So pin the ONE permitted use
+      // instead: any other appearance in code (comments stripped) is a new way to reach it.
+      const codeAfter = afterResolution
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("//") && !l.trimStart().startsWith("*"))
+        .join("\n");
+      c.check(
+        (codeAfter.match(/\bcwd\b/g) || []).length === 1 &&
+          codeAfter.includes("new EvidenceLog({ env, cwd, guildDir, guildDirs })"),
+        "#107(i): the only post-resolution use of `cwd` is the evidence log's own root",
+      );
+      // THE HOLE A REVIEWER ACTUALLY EXPLOITED: the capture entry point took whatever it was
+      // handed. Requiring the SHORTHAND property means the value passed is the binding named
+      // `writeRoot` and cannot be silently swapped for another expression.
+      c.check(
+        src.includes("captureAndLog(before, {\n    writeRoot,\n"),
+        "#107(i): captureAndLog is handed the `writeRoot` BINDING (shorthand), not an expression",
+      );
+      c.check(
+        (src.match(/snapshotWorktree\(/g) || []).length === 1 &&
+          src.includes("snapshotWorktree(writeRoot)"),
+        "#107(i): the ONLY snapshot is of writeRoot",
+      );
+      c.check(
+        (src.match(/scaffoldDigest\(/g) || []).length === 1 &&
+          src.includes("scaffoldDigest(ctx.writeRoot)"),
+        "#107(i): the scaffold tamper digest is taken at writeRoot",
+      );
+      c.check(
+        src.includes("repoDir: ctx.writeRoot"),
+        "#107(i): captureDelegateDiff is handed writeRoot as its repo dir",
+      );
+    }
+
+    // (j) THE FAILURE PATH REACHES THE WIRE (review finding M2). `DelegateFail.worktree` was
+    //     set on the result object and then dropped by `delegateToToolResult`, so a client got
+    //     `structuredContent` with only `error` — contradicting the field's own doc comment,
+    //     the tool description and step 3 of the command doc. Asserted on BOTH shapes of
+    //     failure, because they fail for different reasons and only one has a capture:
+    //     a pre-turn refusal (policy deny) and a turn that RAN and died.
+    {
+      const repo = initRepoWithDef("m107-failwire-", { "a.txt": "A0\n" });
+      const wt = addWorktree(repo, "failwire");
+      const denyRoot = tmp("m107-guild-deny-");
+      writeFileSync(path.join(denyRoot, "models.policy.local"), "deny openai/*\n");
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: denyRoot,
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "unused" });
+      try {
+        const provider = mutatingServe(fake, () => {});
+        const denied = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(
+          !denied.ok && denied.error.kind === "policy-deny" && denied.worktree === wt,
+          "#107(j): a post-resolution refusal carries the targeted tree on the RESULT",
+        );
+        const wire = delegateToToolResult(denied);
+        c.check(
+          wire.structuredContent?.worktree === wt,
+          "#107(j): ...and it reaches structuredContent.worktree (M2: it did not before)",
+        );
+        c.check(
+          wire.content.some((b) => b.text === `Edited tree: ${wt}`),
+          "#107(j): ...and the text channel names it too",
+        );
+      } finally {
+        await fake.close();
+      }
+
+      // THE CONSEQUENTIAL CASE: the turn ran, the model already edited the target tree, and
+      // the call then failed. `capture.patchPath` points into the PROJECT's logs, so without
+      // `worktree` on the wire nothing in the result names the tree that was mutated.
+      const logDir2 = tmp("m107-logs-");
+      const env2 = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir2,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake2 = await startFakeOpencode({ historyText: "x", failMessage: true });
+      try {
+        const provider = mutatingServe(fake2, () =>
+          writeFileSync(path.join(wt, "a.txt"), "EDITED-THEN-FAILED\n"),
+        );
+        const failed = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env: env2,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(!failed.ok && failed.error.kind === "call-failed", "#107(j): the turn failed");
+        c.check(
+          read(wt, "a.txt") === "EDITED-THEN-FAILED\n",
+          "#107(j): ...after the model had already edited the TARGET tree",
+        );
+        const wire2 = delegateToToolResult(failed);
+        c.check(
+          wire2.structuredContent?.worktree === wt && wire2.isError === true,
+          "#107(j): the failed-call wire names the mutated tree (the case that matters)",
+        );
+        c.check(
+          wire2.structuredContent?.capture !== undefined,
+          "#107(j): ...alongside the partial capture, so both are actionable together",
+        );
+      } finally {
+        await fake2.close();
+      }
+    }
+
+    // (k) THE M1 DISCRIMINATOR: the benign scaffold wording is offered ONLY where opencode's
+    //     own trigger held. Under an `init --global` install a target can carry NO `.opencode/`
+    //     at all and still pass the def pre-check — and opencode never scaffolds such a tree
+    //     (probed), so scaffolding that appears there was written by something else. The first
+    //     cut inferred the precondition instead of checking it and handed exactly that case the
+    //     reassuring wording, on the one signal covering an execution-carrying blind spot.
+    {
+      const globalAgents = path.join(tmp("m107-xdgglobal-"), "opencode", "agent");
+      mkdirSync(globalAgents, { recursive: true });
+      writeFileSync(path.join(globalAgents, "guild-build.md"), "---\nmode: all\n---\nx\n");
+      const xdg = path.dirname(path.dirname(globalAgents));
+
+      // A repo with NO `.opencode/` anywhere — the def comes from the global dir alone.
+      const repo = realpathSync(initRepo({ "a.txt": "A0\n" }, "m107-noopencode-"));
+      const wt = addWorktree(repo, "globaldef");
+      c.check(
+        !existsSync(path.join(wt, ".opencode")),
+        "#107(k): fixture — the target carries no .opencode/ (global-install shape)",
+      );
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: xdg,
+      });
+      const fake = await startFakeOpencode({ historyText: "ok" });
+      try {
+        const provider = mutatingServe(fake, () => {
+          // Exactly what opencode would NOT have done here: a write into the plugin dir.
+          mkdirSync(path.join(wt, ".opencode", "node_modules", "evil"), { recursive: true });
+          writeFileSync(path.join(wt, ".opencode", "node_modules", "evil", "index.js"), "x\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(r.ok, "#107(k): the global-only def passes the pre-check (no .opencode/ needed)");
+        c.check(
+          r.ok && r.capture.scaffoldChanged,
+          "#107(k): the tamper flag fires — it never varies on the wording",
+        );
+        const warn = r.ok ? (r.capture.scaffoldWarning ?? "") : "";
+        c.check(
+          warn.includes("NO .opencode/ directory beforehand") && warn.includes("UNEXPLAINED"),
+          "#107(k): and the warning says opencode does NOT explain it — no benign reading",
+        );
+        c.check(
+          !warn.includes("SUFFICIENT explanation"),
+          "#107(k): the benign wording is NOT offered where the trigger did not hold",
+        );
+      } finally {
+        await fake.close();
+      }
+
+      // The control: the SAME shape of write, into a tree that DID have `.opencode/` before,
+      // gets the benign-but-non-committal wording — so (k) is a discriminator, not a blanket.
+      const repo2 = initRepoWithDef("m107-hasopencode-", { "a.txt": "A0\n" });
+      const wt2 = addWorktree(repo2, "hasdir");
+      const logDir2 = tmp("m107-logs-");
+      const env2 = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir2,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake2 = await startFakeOpencode({ historyText: "ok" });
+      try {
+        const provider = mutatingServe(fake2, () => {
+          mkdirSync(path.join(wt2, ".opencode", "node_modules", "pkg"), { recursive: true });
+          writeFileSync(path.join(wt2, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt2 },
+          {
+            serve: provider,
+            router: spyRouter(repo2, provider),
+            env: env2,
+            cwd: repo2,
+            repoDir: repo2,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        const warn = r.ok ? (r.capture.scaffoldWarning ?? "") : "";
+        c.check(
+          r.ok && r.capture.scaffoldChanged && warn.includes("SUFFICIENT explanation"),
+          "#107(k): control — with .opencode/ present beforehand, the benign reading IS offered",
+        );
+        c.check(
+          warn.includes("not proof that it is the whole of what appeared"),
+          "#107(k): ...and it does not over-claim what one digest can carry",
+        );
+      } finally {
+        await fake2.close();
+      }
+    }
+
+    // (h) THE SCAFFOLD-DIGEST PIN. `EMPTY_SCAFFOLD_DIGEST` is derived from `scaffoldDigest`'s
+    //     payload construction rather than from a call, so a change to that construction would
+    //     silently break the "the runtime was CREATED, not modified" narrowing that the
+    //     scaffold-trigger probe (#107, closing #96's known unknown) motivated.
+    {
+      const bare = tmp("m107-scaffold-");
+      c.check(
+        scaffoldDigest(bare) === EMPTY_SCAFFOLD_DIGEST,
+        "#107(h): a tree with no serve scaffolding hashes to EMPTY_SCAFFOLD_DIGEST",
+      );
+      mkdirSync(path.join(bare, ".opencode", "node_modules", "pkg"), { recursive: true });
+      writeFileSync(path.join(bare, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
+      c.check(
+        scaffoldDigest(bare) !== EMPTY_SCAFFOLD_DIGEST,
+        "#107(h): materializing the plugin runtime moves the digest off the empty value",
+      );
+    }
   }
 
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
