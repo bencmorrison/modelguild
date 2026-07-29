@@ -102,12 +102,17 @@ export interface FakeOpencodeOpts {
   listPermissionsGarbage?: boolean;
   /**
    * THE APPROVE ENDPOINT IS GONE (issue #97). `POST /session/{id}/permissions/{permId}` answers
-   * 404 and leaves the request OPEN — the shape the deprecation of `permission.respond` will
-   * eventually produce, and the one that is byte-identical to a lost race at the reply itself
-   * and only distinguishable by re-listing. Rejections (`POST /permission/{id}/reply`) keep
-   * working, so this reproduces an APPROVAL-ONLY outage rather than a dead server.
+   * a refusal and leaves the request OPEN — the shape the deprecation of `permission.respond`
+   * will eventually produce, byte-identical at the reply to a lost race and distinguishable
+   * only by re-listing. Rejections (`POST /permission/{id}/reply`) keep working, so this
+   * reproduces an APPROVAL-ONLY outage rather than a dead server.
+   *
+   * **The STATUS is parameterized on purpose** (review, 2026-07-29): a removed route need not
+   * answer 404 — a path that still matches the method table gives 405, a retired endpoint 410,
+   * a proxy or rewritten API 501 — and the product has to reach the same verdict for all of
+   * them. `true` means 404; a number is sent verbatim.
    */
-  approveEndpointGone?: boolean;
+  approveEndpointGone?: boolean | number;
   /** Reject session-create when a `permission` ruleset is present, and echo NOTHING back —
    * models an opencode build that silently ignores the field, which must be caught rather
    * than run ungated. */
@@ -310,10 +315,13 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         const permId = sessPermMatch[2];
         if (opts.approveEndpointGone) {
-          // The endpoint no longer exists: 404, and — the whole point — the request is NOT
-          // settled, so `GET /permission` still lists it. Indistinguishable from a lost race at
-          // the reply; distinguishable only by asking what is still open (issue #97).
-          send(404, { error: "not found" });
+          // The endpoint no longer exists — and, the whole point, the request is NOT settled,
+          // so `GET /permission` still lists it. Indistinguishable from a lost race at the
+          // reply; distinguishable only by asking what is still open (issue #97). The status is
+          // whatever the caller asked for, defaulting to 404.
+          const status =
+            typeof opts.approveEndpointGone === "number" ? opts.approveEndpointGone : 404;
+          send(status, { error: "no longer available" });
           return;
         }
         const resolve = pendingPerms.get(permId);

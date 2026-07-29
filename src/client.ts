@@ -162,14 +162,18 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
  * deprecated operation in the entire document (verified: one hit across every path and
  * method). That is not an argument for migrating: a deprecated endpoint that WORKS beats a
  * live one that silently gates nothing. But it is a real **expiry condition** on this pin, and
- * a reader of this record is entitled to know it. **When that endpoint is removed** — a 404 on
- * every approval while rejections still work — the bridge does not quietly degrade into
- * "approvals never land". **Since issue #97 it DETECTS it rather than merely recording it:** a
- * 404 is followed by `GET /permission` (this file's `listPendingPermissions` — the same v1
- * snapshot the #91 re-list reads), and a request still open after a refused reply is counted
- * under **`unsettled`**, distinct from `contested`, which now means a race the bridge actually
- * confirmed. The first one latches an `unsettledReason` naming this deprecation and the probe
- * script, so the removal reads as a diagnosis rather than as a rise in a quiet counter.
+ * a reader of this record is entitled to know it. **When that endpoint is removed** — every
+ * approval refused while rejections still work — the bridge does not quietly degrade into
+ * "approvals never land". **Since issue #97 it DETECTS it rather than merely recording it:**
+ * ANY non-2xx opencode answers, deliberately not the 404 alone (a removed route can equally
+ * give 405/410/501, and keying on 404 would have let those fall into the transport counter), is
+ * followed by `GET /permission` — this file's `listPendingPermissions`, the same v1 snapshot the
+ * #91 re-list reads — and a request still open after a refused reply is counted under
+ * **`unsettled`**: distinct from `contested` (a 404 race the bridge went and looked for), from
+ * `refused` (any other refusal that left nothing open), and from `undelivered` (nothing came
+ * back at all). The first one latches an `unsettledReason` naming this deprecation and the
+ * status observed, so the removal reads as a diagnosis rather than a rise in a quiet counter,
+ * whatever status it presents as.
  * The correct response at that point is to move the APPROVE
  * reply to whatever opencode offers then, re-verify with the probe script below, and update
  * this record and C69a together — NOT to take that removal as licence to move the ruleset

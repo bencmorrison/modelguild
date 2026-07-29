@@ -2544,6 +2544,133 @@ export async function run(): Promise<number> {
         await fake.close();
       }
     }
+
+    // (e) THE REMOVAL NEED NOT PRESENT AS 404 (widened by review, 2026-07-29). A route that
+    //     still matches the method table answers 405, a retired one 410, a proxy 501 — and
+    //     until this widening every one of those fell past the check into `undelivered`, whose
+    //     note ASSERTS "this reply did not reach opencode". It did reach opencode; opencode
+    //     refused it. Same defect as the 404, one branch over.
+    {
+      const dir = tmp("apr-97e-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97e",
+        approveEndpointGone: 410,
+      });
+      try {
+        fake.addPendingPermission({ id: "per_gone410", sessionID: "ses_97e" });
+        const bridge = await mk97(fake, "ses_97e", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97e", "per_gone410");
+        await waitFor(() => bridge.summary().unsettled === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.unsettled === 1 && s.undelivered === 0,
+          `#97e: a 410 whose request is STILL OPEN reaches \`unsettled\`, not \`undelivered\` (${JSON.stringify(s)})`,
+        );
+        c.check(
+          s.contested === 0 && s.refused === 0,
+          "#97e: and neither the race counter nor the undiagnosed one absorbs it",
+        );
+        c.check(
+          (s.unsettledReason ?? "").includes("410"),
+          `#97e: the reason names the status actually observed, not a hard-coded 404 (${s.unsettledReason})`,
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.http_status === 410 && rec?.still_open === true,
+          `#97e: and the record carries the real status, so 404 and 410 are told apart without diffing counters (${JSON.stringify(rec)})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (f) A NON-404 REFUSAL WITH NOTHING OPEN IS `refused`, NOT `contested`. Nothing is stuck,
+    //     but the lost-race reading belongs to a 404 — stretching `contested` over a 410 would
+    //     re-create the very overload this issue removed from it.
+    {
+      const dir = tmp("apr-97f-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97f",
+        approveEndpointGone: 405,
+      });
+      try {
+        const bridge = await mk97(fake, "ses_97f", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97f", "per_405");
+        await waitFor(() => bridge.summary().refused === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.refused === 1 && s.contested === 0,
+          `#97f: a 405 with nothing open is refused, not booked as a race (${JSON.stringify(s)})`,
+        );
+        c.check(
+          s.undelivered === 0 && s.unsettled === 0,
+          "#97f: and it is neither a transport failure nor a stuck decision",
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.http_status === 405 && rec?.counted_as === "refused",
+          `#97f: the record names the status and the bucket (${JSON.stringify(rec)})`,
+        );
+        c.check(
+          !String(rec?.note ?? "").includes("lost race"),
+          "#97f: and claims no race it has no evidence for",
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (g) A TRANSPORT FAILURE IS STILL `undelivered`, AND IS THE ONLY THING THERE. Nothing came
+    //     back, so opencode's state is genuinely unknown — the one arm the widening left alone.
+    {
+      const dir = tmp("apr-97g-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_97g" });
+      try {
+        const bridge = new ApprovalBridge({
+          settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+          gatedTools: ["bash"],
+          channels: ["elicitation"],
+          context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+          armed: true,
+          file,
+          elicitation: stubElicitation("accept"),
+          fetchImpl: (async (url: unknown, init: unknown) => {
+            // POSTs (the reply) fail in transit; GETs still work, so a check WOULD have been
+            // possible — proving the transport arm is chosen deliberately, not by accident.
+            if (String((init as { method?: unknown })?.method ?? "GET") === "POST") {
+              throw new Error("connection refused");
+            }
+            return fetch(url as string, init as RequestInit);
+          }) as unknown as typeof fetch,
+        });
+        await bridge.attach(fake.baseUrl, "ses_97g");
+        askBash(bridge, "ses_97g", "per_transport");
+        await waitFor(() => bridge.summary().undelivered === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.undelivered === 1 && s.unsettled === 0 && s.refused === 0 && s.contested === 0,
+          `#97g: nothing came back, so it stays a transport failure (${JSON.stringify(s)})`,
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.http_status === null && typeof rec?.error === "string",
+          `#97g: recorded with no status and the transport error (${JSON.stringify(rec)})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
