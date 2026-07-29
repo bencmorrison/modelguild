@@ -27,6 +27,9 @@ import { delegate, delegateToToolResult } from "./delegate.js";
 import { models, modelsToToolResult } from "./models.js";
 import { parsePerCallTimeoutMs, layeredRoots } from "./config.js";
 import { enforceRetentionOnStart, resolveRunIdArg } from "./log.js";
+// The payload-skew notice (issue #94). Its own module so it is unit-testable: importing THIS
+// file constructs the MCP server and connects the stdio transport at module top level.
+import { emitPayloadSkewNotice } from "./notice.js";
 // The progress channel lives in its own module so it can be tested: importing THIS file
 // constructs the MCP server and connects the stdio transport at module top level.
 import { withProgress, type ProgressCapableExtra } from "./progress.js";
@@ -168,8 +171,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "port, pid, and agent count, PLUS the doctor-seed checks (the primary guild root " +
         "and the ordered config/policy LAYERS in effect — project over global baseline — " +
         "the model-policy layer chain with each file's presence, whether an explicit " +
-        "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir). " +
-        "Takes no arguments.",
+        "$GUILD_ROOT is leaving a root unlayered, and logging on/off plus the log dir), the " +
+        "approval-bridge state, and the INSTALLED PAYLOAD compared against the payload this " +
+        "server ships (structuredContent.payload — files whose bytes DIFFER: `skewed` = ours " +
+        "and unedited, `drifted` = ours and edited (reported, never overwritten), `unknown` = " +
+        "no ownership record, unjudgeable). Do NOT report a direction: hashes carry no " +
+        "ordering and the ownership record holds no version. Normally the payload is BEHIND " +
+        "the server (the server updates itself via npx on every launch, the files in the repo " +
+        "do not), but a deliberately pinned older server puts it ahead instead, and this tool " +
+        "cannot tell those apart. Say the files are out of sync with what the server ships, " +
+        "and give the version-pinned fix `npx modelguild@<payload.serverVersion> init`, which " +
+        "converges either way (plain `npx modelguild init` installs the LATEST payload and " +
+        "does not converge on a pinned older server). Takes no arguments.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -531,7 +544,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
   if (name === STATUS_TOOL) {
     const status = await guildStatus();
-    return { content: [{ type: "text", text: JSON.stringify(status) }] };
+    // `structuredContent` AS WELL AS the text blob (issue #94). The tool description names
+    // `structuredContent.payload`, but the data only ever rode in `content[0].text` as JSON —
+    // so a caller following the description read a field that did not exist. Every other tool
+    // here that promises structured data actually sets it (`models.ts`, `delegate.ts`).
+    //
+    // NO `outputSchema` is declared, matching every tool in this server: the MCP spec makes
+    // `outputSchema` a validation contract for `structuredContent`, and `GuildDoctorSeed` is a
+    // diagnostic shape that has grown with every feature (roots, policy layers, logging,
+    // approval, now payload) — a schema would be a second definition of it to keep in sync,
+    // which is exactly the drift shape this repo avoids elsewhere.
+    return {
+      content: [{ type: "text", text: JSON.stringify(status) }],
+      structuredContent: status as unknown as Record<string, unknown>,
+    };
   }
 
   if (name === MODELS_TOOL) {
@@ -744,6 +770,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         `${pruned.days} day(s) from ${pruned.dir}\n`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Payload-skew notice, once per SERVER VERSION (issue #94).
+//
+// The server updates itself via npx; the `/guild:*` commands, hardened agent defs and
+// templates it installed into the user's repo do not move with it. Nobody who never runs
+// `doctor` would ever learn that — so the one moment the server is guaranteed to reach says
+// it, once per release, and then goes quiet (`GUILD_PAYLOAD_NOTICE=off` silences it outright;
+// `doctor`/`guild_status` keep reporting regardless, per issue #23's `logs clean` precedent).
+//
+// STDERR ONLY — stdout is the MCP protocol channel — and NON-FATAL by construction:
+// `emitPayloadSkewNotice` returns its outcome as data and cannot throw, and the `try` here is
+// the belt to that braces. A broken check degrades the notice, never the lifecycle.
+try {
+  emitPayloadSkewNotice();
+} catch {
+  /* unreachable by design; a start-up notice may never take the server down */
 }
 
 const transport = new StdioServerTransport();

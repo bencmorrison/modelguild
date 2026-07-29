@@ -221,6 +221,84 @@ export async function run(): Promise<number> {
     "(n) global drift is a ! warning line too, never a ✗",
   );
 
+  // ---- issue #94: PAYLOAD SKEW — cases (o)-(r) ---------------------------------
+  // The MCP server updates itself via npx; the payload it installed in the repo does not. So a
+  // CLEAN install ends up behind the release with nothing edited and nothing skipped — invisible
+  // to #22's drift predicate, and the state this issue is about. Doctor is where a user looks
+  // when something behaves oddly, so it must say so — as a WARNING that leaves the exit code
+  // alone, exactly like drift: being behind a release is not a broken install.
+  //
+  // "Behind the release" is simulated the only way it can be from inside the repo that IS the
+  // release: change the installed bytes AND record that same hash as ours, so the file reads as
+  // untouched-since-install while the shipped bytes have moved on.
+  const skewLines = (out: string): string[] =>
+    out.split("\n").filter((l) => /OUT OF SYNC|payload skew|Normally they are BEHIND/.test(l));
+
+  const projSkew = tempDir();
+  init({ targetDir: projSkew, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const SKEW_DEST = ".claude/commands/guild/panel.md";
+  const skewBytes = "AN OLDER RELEASE OF PANEL\n";
+  writeFileSync(path.join(projSkew, SKEW_DEST), skewBytes);
+  const sRecPath = path.join(projSkew, "modelguild/.modelguild-install.json");
+  const sRec = JSON.parse(readFileSync(sRecPath, "utf8"));
+  sRec.files[SKEW_DEST] = createHash("sha256").update(skewBytes).digest("hex");
+  writeFileSync(sRecPath, JSON.stringify(sRec, null, 2) + "\n");
+
+  const o = await captureDoctor(["--dir", projSkew], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+  c.check(o.out.includes("OUT OF SYNC"), "(o) doctor reports a clean install that is behind the release as skew");
+  c.check(o.out.includes(SKEW_DEST), "(o) doctor names the skewed file");
+  c.check(o.out.includes("npx modelguild init"), "(o) doctor names the fix (init rewrites unedited files in place)");
+  c.check(!o.out.includes("STALE"), "(o) skew is NOT reported as drift (the file was never edited)");
+  c.check(!o.out.includes("CANNOT"), "(o) skew is NOT reported as unjudgeable (it has an ownership record)");
+  c.check(
+    o.code === base.code,
+    `(o) skew does not change doctor's verdict — a warning, not a failure (${o.code} vs baseline ${base.code})`,
+  );
+  c.check(
+    skewLines(o.out).every((l) => !l.includes("✗")),
+    "(o) the skew report is a ! warning line, never a ✗ (behind a release is not broken)",
+  );
+  c.check(
+    !o.out.includes("no payload skew"),
+    "(o) the up-to-date ✓ line is NOT printed when a file is behind the release",
+  );
+
+  // ---- (p) the SILENCE KNOB governs the start-up notice, NOT doctor ---------
+  // Precedent, cited deliberately: issue #23's `logs clean` still runs under GUILD_LOG=off,
+  // because it was asked for in so many words. Doctor is asked for; the start-up line is not.
+  {
+    const prev = process.env.GUILD_PAYLOAD_NOTICE;
+    process.env.GUILD_PAYLOAD_NOTICE = "off";
+    try {
+      const p = await captureDoctor(["--dir", projSkew], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+      c.check(p.out.includes("OUT OF SYNC"), "(p) GUILD_PAYLOAD_NOTICE=off does NOT silence doctor's skew report");
+      c.check(p.code === base.code, `(p) the knob does not change doctor's verdict either (${p.code})`);
+    } finally {
+      if (prev === undefined) delete process.env.GUILD_PAYLOAD_NOTICE;
+      else process.env.GUILD_PAYLOAD_NOTICE = prev;
+    }
+  }
+
+  // ---- (q) a pristine install reports neither skew nor drift ---------------
+  c.check(base.out.includes("no payload skew"), "(q) a pristine install reports no payload skew");
+  c.check(!base.out.includes("OUT OF SYNC"), "(q) a pristine install reports nothing behind the release");
+
+  // ---- (r) plain doctor over a GLOBAL install judges SKEW by the GLOBAL record ----
+  // Same mode-correctness (r) as the drift case (n), on the state that has no edit to hint at
+  // it. The project here is empty, so a wrong record would report nothing at all.
+  const gSkewDest = path.join(gHome, ".claude/commands/guild/panel.md");
+  writeFileSync(gSkewDest, skewBytes);
+  const gRec2 = JSON.parse(readFileSync(gRecPath, "utf8"));
+  gRec2.files[SKEW_DEST] = createHash("sha256").update(skewBytes).digest("hex");
+  writeFileSync(gRecPath, JSON.stringify(gRec2, null, 2) + "\n");
+  const r = await captureDoctor(["--dir", emptyProject], inject);
+  c.check(r.out.includes("OUT OF SYNC"), "(r) plain doctor detects skew in a global-only install");
+  c.check(r.out.includes(gSkewDest), "(r) skew names the file in the GLOBAL commands dir (judged by the global record)");
+  c.check(
+    skewLines(r.out).every((l) => !l.includes("✗")),
+    "(r) global skew is a ! warning line too, never a ✗",
+  );
+
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;
 }

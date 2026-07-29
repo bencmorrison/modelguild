@@ -457,6 +457,44 @@ export function resolveActivitySettings(opts: {
 }
 
 /* ---------------------------------------------------------------------------
+ * Payload-skew notice knob (issue #94) — `GUILD_PAYLOAD_NOTICE`.
+ *
+ * Same chain as every other knob: env override > `modelguild.conf.local` > default, resolved
+ * across the layered roots like the rest (issue #19), so a global `off` binds in a project
+ * that never restates it. File-based, not env-only, per the repo convention — a Claude-driven
+ * setup runs in a subshell and cannot durably `export`.
+ *
+ * Defaults to **on**, and only the literal `off` disables it (the lenient `GUILD_ACTIVITY`
+ * shape, not the strict `GUILD_APPROVE` one): a typo should fail toward telling the user their
+ * commands are out of date, never toward silence. Nothing here is a capability or a gate, so
+ * there is nothing a wrong value can leave un-enforced.
+ *
+ * SCOPE, and it is the whole point of the knob (maintainer decision, 2026-07-29): it governs
+ * the UNSOLICITED surface only — the notice the MCP server writes to stderr at start-up.
+ * `doctor` and `guild_status` keep reporting skew with it off, on the same reasoning issue #23
+ * used for `logs clean` under `GUILD_LOG=off`: those were asked for in so many words, and a
+ * diagnostic that answers a question you just asked is not a nag.
+ * --------------------------------------------------------------------------- */
+export interface PayloadNoticeSettings {
+  /** Whether the START-UP notice may be emitted. Never consulted by `doctor`/`guild_status`. */
+  enabled: boolean;
+}
+
+export function resolvePayloadNoticeSettings(opts: {
+  env?: NodeJS.ProcessEnv;
+  confContents?: string;
+} = {}): PayloadNoticeSettings {
+  const env = opts.env ?? process.env;
+  const conf = opts.confContents ?? "";
+  const fromEnv = env.GUILD_PAYLOAD_NOTICE;
+  const raw =
+    fromEnv !== undefined && fromEnv !== ""
+      ? fromEnv
+      : confGet(conf, "GUILD_PAYLOAD_NOTICE") || "on";
+  return { enabled: raw.trim().toLowerCase() !== "off" };
+}
+
+/* ---------------------------------------------------------------------------
  * Default-model precedence (C8): `-m` flag > `$GUILD_MODEL` env > conf `GUILD_MODEL`
  * > opencode's own default (empty). `flag` is the value of an explicit `-m`; `undefined`
  * means none was given (an EMPTY `-m` value is a usage error handled by the caller's

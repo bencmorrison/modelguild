@@ -488,6 +488,29 @@ export async function run(): Promise<number> {
     const clean = guildDoctorSeed(envWith({ GUILD_ROOT: projectRoot }), tmp("m5-noproj-"), tmp("m5-nohome-"));
     c.check(clean.guildRoot.conflict === null,
       "layers: $GUILD_ROOT with no other root on disk reports no note (nothing dropped)");
+
+    // PAYLOAD (issue #94) — `guild_status` is the third surface on the ONE detection, and the
+    // tool description names `structuredContent.payload`, so the seed must actually carry it.
+    // (The wire-level `structuredContent` assertion lives in mcp-client.test, which needs the
+    // real opencode binary; this offline check is the one CI runs.)
+    c.check(
+      typeof seed.payload.serverVersion === "string" &&
+        Array.isArray(seed.payload.skewed) &&
+        Array.isArray(seed.payload.drifted) &&
+        Array.isArray(seed.payload.unknown),
+      "payload: the doctor seed classifies the installed payload (skewed / drifted / unknown)",
+    );
+    c.check(
+      typeof seed.payload.noticeEnabled === "boolean" && typeof seed.payload.noticeStatePath === "string",
+      "payload: the seed reports the notice knob AND where its suppression state lives",
+    );
+    // The knob governs the START-UP notice only: guild_status was asked for, so it answers
+    // either way (issue #23's `logs clean`-under-`GUILD_LOG=off` precedent).
+    const offSeed = guildDoctorSeed(envWith({ GUILD_PAYLOAD_NOTICE: "off" }), cwd, home);
+    c.check(
+      offSeed.payload.noticeEnabled === false && Array.isArray(offSeed.payload.skewed),
+      "payload: GUILD_PAYLOAD_NOTICE=off is REPORTED but does not stop guild_status classifying",
+    );
   }
 
   // -------------------------------------------------------------------------

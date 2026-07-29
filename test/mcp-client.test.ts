@@ -44,6 +44,27 @@ export async function run(): Promise<number> {
     c.check(Array.isArray(content) && content.length === 1, "call returned one content block");
     c.check(content[0]?.type === "text", "content block is text");
 
+    // `structuredContent` must ACTUALLY be on the wire (issue #94, review finding H1). The tool
+    // description promises `structuredContent.payload`; for a while the data existed only inside
+    // `content[0].text` as JSON, so a caller following the description read a field that was not
+    // there. This is the only test that sees the real MCP wire shape.
+    const structured = result.structuredContent as
+      | { payload?: { serverVersion?: unknown; skewed?: unknown; drifted?: unknown; unknown?: unknown; noticeStatePath?: unknown } }
+      | undefined;
+    c.check(structured !== undefined, "guild_status returns structuredContent (not only a JSON text blob)");
+    c.check(
+      structured?.payload !== undefined,
+      "structuredContent.payload is present — the exact field the tool description names",
+    );
+    c.check(
+      typeof structured?.payload?.serverVersion === "string" &&
+        Array.isArray(structured.payload.skewed) &&
+        Array.isArray(structured.payload.drifted) &&
+        Array.isArray(structured.payload.unknown) &&
+        typeof structured.payload.noticeStatePath === "string",
+      "structuredContent.payload carries the version, the three classified lists, and the notice state path",
+    );
+
     const status = JSON.parse(content[0]?.text ?? "{}") as {
       opencodeVersion?: unknown;
       port?: unknown;

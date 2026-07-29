@@ -6,12 +6,35 @@
  * (the payload assets live there — the same files npm's `files` allowlist ships).
  */
 
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Checker, repoRoot } from "./harness.js";
-import { init, isDrifted, type ServerLaunch } from "../src/init.js";
+import { Checker, repoRoot, tsxBin } from "./harness.js";
+import {
+  init,
+  isDrifted,
+  isSkewed,
+  packageVersion,
+  payloadFiles,
+  resolveGlobalDirs,
+  scanInstalledPayload,
+  type ServerLaunch,
+} from "../src/init.js";
+import { emitPayloadSkewNotice, noticeStatePath, readNoticeState } from "../src/notice.js";
 
 // The shipped default launch line: portable, non-interactive npx form.
 const LAUNCH: ServerLaunch = { command: "npx", args: ["-y", "modelguild", "serve"] };
@@ -188,6 +211,399 @@ export async function run(): Promise<number> {
   c.check(!isDrifted("a", "a", "c"), "isDrifted: unedited ⇒ not stale (the upgrade handles it)");
   c.check(!isDrifted("a", "c", "c"), "isDrifted: already equals the shipped bytes ⇒ not stale");
   c.check(!isDrifted("a", "b", "a"), "isDrifted: release unchanged since the edit ⇒ not stale");
+
+  // --- issue #94: PAYLOAD SKEW — ours, UNTOUCHED, and behind the release ---------
+  //
+  // The state #22 is deliberately silent about, and the one this issue exists for: the MCP
+  // server updates itself via npx, the payload in the user's repo does not, so a CLEAN install
+  // ends up behind with nothing edited and nothing skipped. Nothing warned about it.
+  //
+  // "Shipped" is the payload of the package the running code was loaded from, so these cases
+  // build a FAKE package root (payload + a package.json version) and move it on — which is
+  // exactly what a release does, and lets the version-keyed suppression below be driven
+  // without publishing anything.
+  const fakePackage = (version: string, mutate?: (root: string) => void): string => {
+    const root = tempProject();
+    writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "modelguild", version }) + "\n");
+    for (const { src } of payloadFiles()) {
+      const dst = path.join(root, src);
+      mkdirSync(path.dirname(dst), { recursive: true });
+      copyFileSync(path.join(repoRoot, src), dst);
+    }
+    mutate?.(root);
+    return root;
+  };
+  const CONSULT = ".claude/commands/guild/consult.md";
+  const bumpConsult = (root: string) => {
+    writeFileSync(path.join(root, CONSULT), readFileSync(path.join(root, CONSULT), "utf8") + "\n<!-- next release -->\n");
+  };
+
+  const PKG_V1 = fakePackage("1.0.0");
+  const PKG_V2 = fakePackage("2.0.0", bumpConsult);
+  const PKG_V3 = fakePackage("3.0.0", bumpConsult); // same payload as V2, newer version
+
+  c.check(packageVersion(PKG_V2) === "2.0.0", "packageVersion reads the running package's version");
+  c.check(packageVersion(tempProject()) === "", "packageVersion returns '' when package.json is absent (never throws)");
+
+  // A project installed from V1, then measured against V2: one file is behind, untouched.
+  const TS = tempProject();
+  init({ targetDir: TS, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+  const skewDirs = resolveGlobalDirs({ homeDir: tempProject(), xdgConfigHome: tempProject() });
+  const scanAgainst = (pkg: string, target = TS) =>
+    scanInstalledPayload({ packageRoot: pkg, targetDir: target, global_dirs: skewDirs });
+
+  const sameRelease = scanAgainst(PKG_V1);
+  c.check(
+    sameRelease.skewed.length === 0 && sameRelease.drifted.length === 0 && sameRelease.unknown.length === 0,
+    "skew: a clean install measured against the release it came from is clean",
+  );
+
+  const behind = scanAgainst(PKG_V2);
+  c.check(behind.skewed.length === 1, `skew: a clean install behind the release reports 1 skewed file (got ${behind.skewed.length})`);
+  c.check(behind.skewed[0]?.dest === CONSULT, "skew: names the file the release moved on");
+  c.check(behind.skewed[0]?.installedPath === path.join(TS, CONSULT), "skew: carries the absolute installed path");
+  c.check(behind.skewed[0]?.shippedPath === path.join(PKG_V2, CONSULT), "skew: carries the absolute shipped path");
+  c.check(
+    behind.skewed[0]?.installedHash !== behind.skewed[0]?.shippedHash,
+    "skew: carries the recorded(=installed) vs shipped hashes that decided it",
+  );
+  c.check(behind.drifted.length === 0, "skew: an untouched file behind the release is NOT reported as drift");
+  c.check(behind.unknown.length === 0, "skew: an untouched file behind the release is NOT reported as unjudgeable");
+
+  // (ii) an EDITED file the release also moved is still DRIFT, never reclassified as skew.
+  const TSD = tempProject();
+  init({ targetDir: TSD, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+  writeFileSync(path.join(TSD, CONSULT), "MY EDIT OF AN OLD RELEASE\n");
+  setRecord(TSD, CONSULT, sha("AN OLDER RELEASE\n"));
+  const edited = scanAgainst(PKG_V2, TSD);
+  c.check(edited.drifted.length === 1 && edited.drifted[0]?.dest === CONSULT, "skew: an edited file the release moved is DRIFT");
+  c.check(edited.skewed.length === 0, "skew: drift is NOT reclassified as skew");
+
+  // (iii) an EDITED file the release still ships (recorded === shipped) is NEITHER.
+  const TSE = tempProject();
+  init({ targetDir: TSE, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+  writeFileSync(path.join(TSE, CONSULT), "MY EDIT OF THE CURRENT RELEASE\n");
+  const editedCurrent = scanAgainst(PKG_V1, TSE);
+  c.check(
+    editedCurrent.skewed.length === 0 && editedCurrent.drifted.length === 0 && editedCurrent.unknown.length === 0,
+    "skew: an edit against the version the release still ships is neither skew nor drift",
+  );
+
+  // (iv) NO ownership record ⇒ still unjudgeable. Guessing "behind" here would be a guess.
+  const TSN = tempProject();
+  init({ targetDir: TSN, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+  setRecord(TSN, CONSULT, null);
+  const noRecord = scanAgainst(PKG_V2, TSN);
+  c.check(noRecord.unknown.length === 1 && noRecord.unknown[0]?.dest === CONSULT, "skew: no record ⇒ unjudgeable");
+  c.check(noRecord.skewed.length === 0, "skew: an unrecorded difference is NOT guessed as skew");
+
+  // (v) --global: skew judged against the GLOBAL record and the GLOBAL location.
+  const SG_HOME = tempProject();
+  const SG_XDG = tempProject();
+  init({ targetDir: tempProject(), packageRoot: PKG_V1, serverLaunch: LAUNCH, global: true, homeDir: SG_HOME, xdgConfigHome: SG_XDG });
+  const gScan = scanInstalledPayload({
+    packageRoot: PKG_V2,
+    targetDir: tempProject(), // an EMPTY project: nothing here can supply the answer
+    global_dirs: resolveGlobalDirs({ homeDir: SG_HOME, xdgConfigHome: SG_XDG }),
+  });
+  c.check(gScan.skewed.length === 1, `skew: a global-only install behind the release reports skew (got ${gScan.skewed.length})`);
+  c.check(
+    gScan.skewed[0]?.installedPath === path.join(SG_HOME, ".claude/commands/guild/consult.md"),
+    "skew: --global skew names the file in the GLOBAL commands dir, judged by the global record",
+  );
+
+  // isSkewed's predicate, directly — the second half of the three-state rule.
+  c.check(isSkewed("a", "a", "b"), "isSkewed: ours, untouched, behind the release ⇒ skew");
+  c.check(!isSkewed(undefined, "a", "b"), "isSkewed: no record ⇒ not ours ⇒ unjudgeable, not skew");
+  c.check(!isSkewed("a", "b", "c"), "isSkewed: edited ⇒ drift's case, not skew");
+  c.check(!isSkewed("a", "a", "a"), "isSkewed: identical to the shipped bytes ⇒ not skew");
+  c.check(!isDrifted("a", "a", "b"), "isDrifted: an untouched file behind the release is skew, NOT drift");
+
+  // --- issue #94: the START-UP NOTICE — once per server version, silenceable --------
+  {
+    const noticeHome = tempProject();
+    let out: string[] = [];
+    const base = {
+      env: {} as NodeJS.ProcessEnv,
+      cwd: TS,
+      home: noticeHome,
+      xdgConfigHome: tempProject(),
+      write: (t: string) => { out.push(t); },
+    };
+    // The state lives in the GLOBAL guild root, never in the project (review finding M3).
+    const statePath = noticeStatePath({ env: {}, home: noticeHome });
+    c.check(
+      statePath === path.join(noticeHome, ".claude/modelguild/.modelguild-notice.json"),
+      "notice: state resolves to the GLOBAL guild root, not the project",
+    );
+
+    // (1) skew present, never announced ⇒ it fires.
+    const n1 = emitPayloadSkewNotice({ ...base, packageRoot: PKG_V2 });
+    c.check(n1.outcome === null, `notice: fires when a clean install is behind the release (outcome ${n1.outcome})`);
+    c.check(n1.skewed.length === 1, "notice: reports the skewed file");
+    c.check(out.join("").includes(CONSULT), "notice: names the file that is behind");
+    c.check(out.join("").includes("OUT OF SYNC"), "notice: says the file does not match what this server ships");
+    c.check(out.join("").includes("GUILD_PAYLOAD_NOTICE=off"), "notice: names the knob that silences it");
+    c.check(out.length === 1, "notice: written as ONE block (stderr is shared with the serve child)");
+    c.check(n1.statePath === statePath, "notice: reports where it filed the announcement");
+    // M2: the remedy must CONVERGE. Plain `npx modelguild init` resolves the LATEST dist-tag,
+    // which does not converge when the server is a deliberately pinned older release — the
+    // exact case the direction-neutral wording exists for.
+    c.check(
+      out.join("").includes("npx modelguild@2.0.0 init"),
+      "notice: the fix is PINNED to the running version (plain `init` takes latest and may not converge)",
+    );
+    c.check(
+      /plain `npx modelguild init` installs the LATEST/.test(out.join("")),
+      "notice: says why the unpinned command is not the fix",
+    );
+    // NOTHING is written into the user's repo — the population this fires for has by definition
+    // not re-run `init`, so an ignore line in init's block would arrive too late to help.
+    c.check(
+      !existsSync(path.join(TS, "modelguild/.modelguild-notice.json")),
+      "notice: writes NOTHING into the project (no untracked file appears in the user's repo)",
+    );
+    c.check(
+      !readFileSync(path.join(TS, ".gitignore"), "utf8").includes(".modelguild-notice.json"),
+      "notice: init's .gitignore block carries no line for it either (there is nothing to ignore)",
+    );
+    // Keyed on the ownership RECORD that judged the files, so what is announced and what counts
+    // as announced come from one place (review finding L2).
+    c.check(
+      n1.key === path.join(TS, "modelguild/.modelguild-install.json"),
+      "notice: the suppression key is the ownership record the skew was judged against",
+    );
+    c.check(
+      readNoticeState(statePath).seen[n1.key] === "2.0.0",
+      "notice: records the server VERSION it announced, under that key (not a session marker)",
+    );
+    // The suppression state must NOT live in — or disturb — the ownership record: that file is
+    // the sole basis for never-clobber and hash-verified uninstall.
+    const recAfter = readJson(path.join(TS, "modelguild/.modelguild-install.json"));
+    c.check(
+      typeof recAfter.files?.[CONSULT] === "string" && recAfter.seen === undefined,
+      "notice: the ownership record is untouched and carries no notice state (separate files)",
+    );
+
+    // (2) same version again ⇒ silent (per VERSION, not per session).
+    out = [];
+    const n2 = emitPayloadSkewNotice({ ...base, packageRoot: PKG_V2 });
+    c.check(n2.outcome === "already-shown", `notice: does NOT fire again for the same server version (outcome ${n2.outcome})`);
+    c.check(out.length === 0, "notice: nothing is written on the second start at the same version");
+
+    // (3) a NEW version with the same skew ⇒ it fires again.
+    out = [];
+    const n3 = emitPayloadSkewNotice({ ...base, packageRoot: PKG_V3 });
+    c.check(n3.outcome === null, `notice: fires again for a NEW server version (outcome ${n3.outcome})`);
+    c.check(out.join("").includes("3.0.0"), "notice: names the new server version");
+
+    // (4) the knob silences it — via env AND via the layered conf file.
+    out = [];
+    const n4 = emitPayloadSkewNotice({ ...base, env: { GUILD_PAYLOAD_NOTICE: "off" }, packageRoot: fakePackage("4.0.0", bumpConsult) });
+    c.check(n4.outcome === "knob-off", `notice: GUILD_PAYLOAD_NOTICE=off (env) suppresses it (outcome ${n4.outcome})`);
+    c.check(out.length === 0, "notice: nothing is written with the knob off");
+    writeFileSync(path.join(TS, "modelguild/modelguild.conf.local"), "GUILD_PAYLOAD_NOTICE=off\n");
+    const n5 = emitPayloadSkewNotice({ ...base, packageRoot: fakePackage("5.0.0", bumpConsult) });
+    c.check(n5.outcome === "knob-off", `notice: the conf file silences it too (file-based config, outcome ${n5.outcome})`);
+    c.check(out.length === 0, "notice: nothing is written with the conf knob off");
+    rmSync(path.join(TS, "modelguild/modelguild.conf.local"));
+
+    // (5) no skew at all ⇒ nothing, and nothing recorded.
+    out = [];
+    const clean = tempProject();
+    init({ targetDir: clean, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+    const n6 = emitPayloadSkewNotice({ ...base, cwd: clean, packageRoot: PKG_V1 });
+    c.check(n6.outcome === "no-skew", `notice: silent when the payload matches the release (outcome ${n6.outcome})`);
+    c.check(
+      readNoticeState(noticeStatePath({ env: {}, home: noticeHome })).seen[
+        path.join(clean, "modelguild/.modelguild-install.json")
+      ] === undefined,
+      "notice: a healthy install files nothing (no key recorded for it)",
+    );
+
+    // (6) FAILURE-PROOF: a broken environment degrades the notice, never throws. The package
+    //     root is a file rather than a directory, so every payload read fails.
+    out = [];
+    const brokenPkg = path.join(tempProject(), "not-a-dir");
+    writeFileSync(brokenPkg, "x");
+    let threw = false;
+    let n7;
+    try {
+      n7 = emitPayloadSkewNotice({ ...base, packageRoot: brokenPkg });
+    } catch { threw = true; }
+    c.check(!threw, "notice: an unreadable package root does not throw (it may never take the server down)");
+    c.check(n7?.outcome === "no-skew" || n7?.outcome === "error", `notice: it degrades to a reported outcome (${n7?.outcome})`);
+
+    // (7) M4 — a FIFO at the state path must NOT BLOCK. `readFileSync` on a FIFO with no writer
+    //     hangs, and no try/catch can reach a block: the server would never reach `connect`.
+    //     The `lstat`-is-a-regular-file gate is what makes this return at all.
+    {
+      const fifoHome = tempProject();
+      const fifoState = noticeStatePath({ env: {}, home: fifoHome });
+      mkdirSync(path.dirname(fifoState), { recursive: true });
+      let madeFifo = false;
+      try {
+        execFileSync("mkfifo", [fifoState]);
+        madeFifo = true;
+      } catch {
+        /* no mkfifo on this platform — the guard is still asserted by the directory case below */
+      }
+      if (madeFifo) {
+        const t0 = Date.now();
+        const state = readNoticeState(fifoState);
+        c.check(
+          Object.keys(state.seen).length === 0 && Date.now() - t0 < 2000,
+          "notice: a FIFO at the state path reads as 'never shown' and does NOT block the server",
+        );
+        out = [];
+        const nf = emitPayloadSkewNotice({ ...base, home: fifoHome, packageRoot: PKG_V2 });
+        c.check(nf.outcome === null, "notice: it still announces (the unreadable state re-arms, never silences)");
+        unlinkSync(fifoState);
+      }
+      // A DIRECTORY at the state path: unreadable AND unwritable, so it re-arms every time.
+      const dirHome = tempProject();
+      const dirState = noticeStatePath({ env: {}, home: dirHome });
+      mkdirSync(dirState, { recursive: true });
+      c.check(
+        Object.keys(readNoticeState(dirState).seen).length === 0,
+        "notice: a directory at the state path reads as 'never shown' rather than throwing",
+      );
+      out = [];
+      const nd1 = emitPayloadSkewNotice({ ...base, home: dirHome, packageRoot: PKG_V2 });
+      const nd2 = emitPayloadSkewNotice({ ...base, home: dirHome, packageRoot: PKG_V2 });
+      c.check(
+        nd1.stateWriteFailed === true && nd2.outcome === null,
+        "notice: an unwritable state means it fires on EVERY start — the honest cost, reported as stateWriteFailed",
+      );
+    }
+
+    // (8) M5 — the write must NOT FOLLOW A SYMLINK at the state path. `writeFileSync` did,
+    //     creating a file outside the guild root; the temp-file + `rename` replaces the LINK.
+    {
+      const symHome = tempProject();
+      const symState = noticeStatePath({ env: {}, home: symHome });
+      const outside = path.join(tempProject(), "escaped.json");
+      writeFileSync(outside, "ORIGINAL\n");
+      mkdirSync(path.dirname(symState), { recursive: true });
+      symlinkSync(outside, symState);
+      out = [];
+      emitPayloadSkewNotice({ ...base, home: symHome, packageRoot: PKG_V2 });
+      c.check(
+        readFileSync(outside, "utf8") === "ORIGINAL\n",
+        "notice: the state write does NOT follow a symlink out of the guild root (rename replaces the link)",
+      );
+      c.check(
+        !lstatSync(symState).isSymbolicLink() && readNoticeState(symState).seen !== undefined,
+        "notice: the symlink itself is replaced by the real state file",
+      );
+    }
+
+    // (9) L1/L2 — the key is the RECORD, so a GLOBAL-only payload is announced ONCE across the
+    //     projects that share it, even when each project has its own `modelguild/` (which
+    //     /guild:configure creates). A root-derived key re-announced it per project.
+    {
+      const shHome = tempProject();
+      const shXdg = tempProject();
+      init({ targetDir: tempProject(), packageRoot: PKG_V1, serverLaunch: LAUNCH, global: true, homeDir: shHome, xdgConfigHome: shXdg });
+      // Two DIFFERENT projects, each with its own modelguild/ dir but no project payload.
+      const projA = tempProject();
+      const projB = tempProject();
+      for (const p of [projA, projB]) mkdirSync(path.join(p, "modelguild"), { recursive: true });
+      const shBase = {
+        env: {} as NodeJS.ProcessEnv,
+        home: shHome,
+        xdgConfigHome: shXdg,
+        packageRoot: PKG_V2,
+        write: (t: string) => { out.push(t); },
+      };
+      out = [];
+      const a1 = emitPayloadSkewNotice({ ...shBase, cwd: projA });
+      const b1 = emitPayloadSkewNotice({ ...shBase, cwd: projB });
+      c.check(a1.outcome === null, "notice: the shared global payload is announced in the first project");
+      c.check(
+        a1.key === path.join(shHome, ".claude/modelguild/.modelguild-install.json"),
+        "notice: a global-only payload keys on the GLOBAL ownership record",
+      );
+      c.check(
+        b1.outcome === "already-shown",
+        `notice: the SAME global payload is not re-announced in a second project (outcome ${b1.outcome})`,
+      );
+    }
+
+    // (10) L6/$GUILD_ROOT — an explicitly pinned root takes the state too ("guild state lives
+    //      here"), instead of the notice silently writing into the user's home.
+    {
+      const pinned = tempProject();
+      c.check(
+        noticeStatePath({ env: { GUILD_ROOT: pinned }, home: tempProject() }) ===
+          path.join(pinned, ".modelguild-notice.json"),
+        "notice: $GUILD_ROOT takes the suppression state (an explicitly pinned root stays the whole answer)",
+      );
+    }
+  }
+
+  // --- issue #94: the WIRING — a REAL `src/server.ts` emits the notice on stderr ----
+  // The block above proves the emitter; only this proves server.ts actually calls it, that the
+  // line lands on STDERR (stdout is the MCP transport), and that the per-version suppression
+  // survives across PROCESSES — which is the whole point of putting it in a file.
+  //
+  // Offline: the notice (like the #23 retention prune) happens before `connect`, no opencode
+  // child is ever spawned, and the process exits on the stdin EOF we hand it. "Shipped" for a
+  // real server is the repo it is running from, so skew is simulated by moving the INSTALLED
+  // bytes and recording that same hash as ours — untouched-since-install, behind the release.
+  {
+    const SW = tempProject();
+    init({ targetDir: SW, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    const swBytes = "AN OLDER RELEASE OF REVIEW\n";
+    const SW_DEST = ".claude/commands/guild/review.md";
+    writeFileSync(path.join(SW, SW_DEST), swBytes);
+    setRecord(SW, SW_DEST, sha(swBytes));
+
+    const swHome = tempProject();
+    const runServer = async (): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const child = spawn(tsxBin, [path.join(repoRoot, "src", "server.ts")], {
+        cwd: SW,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: swHome,
+          XDG_CONFIG_HOME: path.join(swHome, ".config"),
+          GUILD_LOG: "off", // no run dir, no retention noise — the notice is independent of it
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d.toString()));
+      child.stderr.on("data", (d) => (stderr += d.toString()));
+      child.stdin.end();
+      const code = await new Promise<number>((resolve) => {
+        const t = setTimeout(() => { child.kill("SIGKILL"); resolve(-1); }, 30_000);
+        child.on("close", (x) => { clearTimeout(t); resolve(x ?? -1); });
+      });
+      return { code, stdout, stderr };
+    };
+
+    const s1 = await runServer();
+    c.check(s1.code === 0, `#94 wiring: src/server.ts starts and exits cleanly on stdin EOF (exit ${s1.code})`);
+    c.check(/OUT OF SYNC/.test(s1.stderr), "#94 wiring: a REAL server start reports the payload skew");
+    c.check(s1.stderr.includes(SW_DEST), "#94 wiring: the notice names the file that is behind");
+    c.check(!/OUT OF SYNC/.test(s1.stdout), "#94 wiring: the notice is on STDERR, never stdout (the MCP channel)");
+    c.check(
+      existsSync(noticeStatePath({ env: {}, home: swHome })),
+      "#94 wiring: the server recorded the version it announced, under the injected HOME",
+    );
+    c.check(
+      !existsSync(path.join(SW, "modelguild/.modelguild-notice.json")),
+      "#94 wiring: a REAL server start writes NOTHING into the project it serves",
+    );
+
+    const s2 = await runServer();
+    c.check(!/OUT OF SYNC/.test(s2.stderr), "#94 wiring: a SECOND server start at the same version is silent");
+    c.check(
+      readFileSync(path.join(SW, SW_DEST), "utf8") === swBytes,
+      "#94 wiring: the notice reports only — it never touches the file",
+    );
+  }
 
   // --- --write-mcp merge preserves a sibling server ------------------------
   const T2 = tempProject();

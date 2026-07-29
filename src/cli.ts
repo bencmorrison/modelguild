@@ -23,16 +23,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   init,
+  locatePayload,
   mcpServerEntry,
+  packageVersion,
   payloadFiles,
   payloadDest,
-  recordPathFor,
   resolveGlobalDirs,
-  scanDrift,
-  type DriftEntry,
-  type DriftScanEntry,
+  scanInstalledPayload,
+  PACKAGE_ROOT,
+  type PayloadFileState,
   type ServerLaunch,
 } from "./init.js";
+import { formatSkewNote, noticeStatePath } from "./notice.js";
 import { layeredRoots, readLayeredConfContents } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
 import { EvidenceLog, DEFAULT_RETENTION_DAYS, parseRunId } from "./log.js";
@@ -47,7 +49,9 @@ import {
 } from "./approve.js";
 
 const SELF = fileURLToPath(import.meta.url); // <pkg>/dist/cli.js  or  <pkg>/src/cli.ts
-const PACKAGE_ROOT = path.resolve(path.dirname(SELF), "..");
+// PACKAGE_ROOT comes from `init.ts` (issue #94): the installer's notion of "where the payload
+// this build ships lives" and the skew check's must be the same value, not two derivations of
+// it that could diverge.
 
 /** How the running CLI would re-launch itself for the `serve` entry. Honest by
  * construction: it names the exact interpreter+entry that is executing right now, so the
@@ -200,7 +204,7 @@ function runInit(argv: string[]): number {
  * offered: overwriting an edit on the user's behalf is exactly what the ownership model exists
  * to prevent, and a flag that does it invites the mistake the skip was protecting against.
  */
-function printDriftNote(drifted: DriftEntry[], indent: string): void {
+function printDriftNote(drifted: PayloadFileState[], indent: string): void {
   console.warn(
     `${indent}! ${drifted.length} file(s) you edited are STALE — this release ships a newer ` +
       `version of them, and init never overwrites your edits, so your copy stayed behind:`,
@@ -267,6 +271,24 @@ export async function runDoctor(
   }
   targetDir = path.resolve(targetDir);
   const gdirs = resolveGlobalDirs({ homeDir: inject?.homeDir, xdgConfigHome: inject?.xdgConfigHome });
+  // THE ONE INPUT `doctor` RESOLVES DIFFERENTLY FROM THE IN-SERVER SURFACES, SURFACED RATHER
+  // THAN HIDDEN (review finding L7). `guild_status` and the start-up notice scan
+  // `resolveProjectDir` = `$GUILD_PROJECT_DIR` else cwd (what `.mcp.json` sets, and what the
+  // serve child is rooted at); `doctor` scans `--dir` else the cwd, because an explicit CLI
+  // argument must beat an inherited env var and a stale exported `$GUILD_PROJECT_DIR` must not
+  // silently redirect a health check run in a different repo. They converge in every normal
+  // setup and can disagree under a `--write-mcp` install, so when they do, say so — a divergent
+  // report nobody can explain is worse than either rule.
+  {
+    const serverDir = process.env.GUILD_PROJECT_DIR;
+    if (serverDir && serverDir.length > 0 && path.resolve(serverDir) !== targetDir) {
+      console.warn(
+        `! \$GUILD_PROJECT_DIR is ${path.resolve(serverDir)}, but this check ran against ` +
+          `${targetDir}. The MCP server scans the former; doctor scans --dir (else the cwd). ` +
+          `Re-run with --dir "${path.resolve(serverDir)}" to check what the server sees.`,
+      );
+    }
+  }
   let ok = true;
   const line = (good: boolean, msg: string) => {
     console.log(`${good ? "✓" : "✗"} ${msg}`);
@@ -322,20 +344,13 @@ export async function runDoctor(
   // perfectly-working GLOBAL install (`init --global`) falsely fails 0/8, 0/3, no policy. `--global`
   // stays an explicit "verify ONLY my global install" and checks the global location alone.
   // Fail-closed either way: found in NEITHER ⇒ still a ✗ / exit 1.
-  const projectOpts: Parameters<typeof payloadDest>[1] = { global: false, targetDir, global_dirs: gdirs };
   const globalOpts: Parameters<typeof payloadDest>[1] = { global: true, targetDir, global_dirs: gdirs };
-  const existsAt = (dest: string, opts: Parameters<typeof payloadDest>[1]): boolean => {
-    const { base, rel } = payloadDest(dest, opts);
-    return existsSync(path.join(base, rel));
-  };
   type Found = "project" | "global" | "none";
   // In --global mode only the global location counts; in default mode project OR global does.
-  const locate = (dest: string): Found => {
-    if (global) return existsAt(dest, globalOpts) ? "global" : "none";
-    if (existsAt(dest, projectOpts)) return "project";
-    if (existsAt(dest, globalOpts)) return "global";
-    return "none";
-  };
+  // `locatePayload` (issue #94) is that mapping, shared with the skew/drift scan below and with
+  // `guild_status` — one routing through `payloadDest`, not a per-surface copy.
+  const locateOpts = { targetDir, global_dirs: gdirs, globalOnly: global };
+  const locate = (dest: string): Found => locatePayload(dest, locateOpts);
 
   // Expected counts are derived from `payloadFiles()` (the same list `init` installs), so
   // adding a command or agent def can never silently desync doctor's threshold — nothing is
@@ -465,23 +480,39 @@ export async function runDoctor(
   // Honest about the limit: with no ownership record, an intentional edit and a stale leftover are
   // byte-identical evidence. Doctor reports those as UNJUDGEABLE and names the missing record
   // rather than guessing "stale". Neither case changes the exit code — an edit is supported.
-  const driftEntries: DriftScanEntry[] = [];
-  for (const { dest } of payloadFiles()) {
-    const where = locate(dest);
-    if (where === "none") continue;
-    const opts = where === "global" ? globalOpts : projectOpts;
-    const { base, rel } = payloadDest(dest, opts);
-    driftEntries.push({
-      dest,
-      installedPath: path.join(base, rel),
-      recordPath: recordPathFor(opts),
-    });
+  const drift = scanInstalledPayload({ packageRoot: PACKAGE_ROOT, ...locateOpts });
+  const anyPayload = payloadFiles().some(({ dest }) => locate(dest) !== "none");
+  // PAYLOAD SKEW (issue #94) — ours, UNTOUCHED, and behind the release: a clean install the
+  // server has moved past, which #22's drift predicate is deliberately silent about and which
+  // therefore had no surface at all. Reported here (and by `guild_status`, and once per version
+  // at server start) — and, like drift, it is a WARNING that does not touch the exit code:
+  // being behind a release is not a broken install, and a user who has chosen not to upgrade
+  // must not have `doctor` call their setup broken. `GUILD_PAYLOAD_NOTICE=off` silences the
+  // start-up notice, NOT this: doctor was asked for (issue #23's `logs clean` precedent).
+  if (drift.skewed.length > 0) {
+    for (const l of formatSkewNote({ skewed: drift.skewed, version: packageVersion(PACKAGE_ROOT) })) {
+      console.warn(l);
+    }
+    // Where the start-up notice records what it has already said (review finding L6). Printed
+    // only alongside a finding, so a healthy run stays quiet — but printed, because there was
+    // otherwise nowhere to look to inspect or reset it.
+    console.warn(
+      `  The start-up notice files what it has announced in ${noticeStatePath({})} — delete ` +
+        `that to be told again. GUILD_PAYLOAD_NOTICE=off stops that notice, not this report.`,
+    );
   }
-  const drift = scanDrift(PACKAGE_ROOT, driftEntries);
   if (drift.drifted.length > 0) {
     printDriftNote(drift.drifted, "");
-  } else if (driftEntries.length > 0 && drift.unknown.length === 0) {
-    console.log("✓ no upgrade drift: every installed file matches the version it was written from");
+  }
+  if (
+    anyPayload &&
+    drift.drifted.length === 0 &&
+    drift.skewed.length === 0 &&
+    drift.unknown.length === 0
+  ) {
+    console.log(
+      "✓ no payload skew, no upgrade drift: every installed file matches what this release ships",
+    );
   }
   if (drift.unknown.length > 0) {
     console.warn(

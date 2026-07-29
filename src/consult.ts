@@ -51,9 +51,22 @@ import {
   resolveAgentDefDirs,
   hardenedDefPresentIn,
   resolveActivitySettings,
+  resolvePayloadNoticeSettings,
   type GuildRoot,
   type RootSource,
 } from "./config.js";
+// Payload skew/drift (issues #22, #94) — the SAME detection `doctor` and the server's
+// start-up notice use. `guild_status` is a third surface on one comparison, not a fourth
+// implementation of it.
+import {
+  PACKAGE_ROOT,
+  packageVersion,
+  resolveGlobalDirs,
+  resolveProjectDir,
+  scanInstalledPayload,
+  type PayloadFileState,
+} from "./init.js";
+import { noticeStatePath } from "./notice.js";
 import {
   policyTierAcross,
   resolvePolicyLayers,
@@ -160,7 +173,51 @@ export interface GuildDoctorSeed {
   /** The approval bridge's knobs and whether anything can answer (issue #20 slice 4). A
    * token-free answer to "am I actually gated, and why did that call refuse?". */
   approval: ApprovalDoctorInfo;
+  /** PAYLOAD SKEW / UPGRADE DRIFT (issues #94, #22) — the installed `/guild:*` commands,
+   * agent defs and templates measured against what THIS server ships. The MCP server updates
+   * itself via npx and the payload in the repo does not, so "which version of the commands am
+   * I actually running?" has no other cheap answer. */
+  payload: PayloadDoctorInfo;
 }
+
+/** `guild_status`'s view of the installed payload. Bounded by construction — the payload is a
+ * fixed, short list — so the whole classification is reported rather than a count. */
+export interface PayloadDoctorInfo {
+  /** The running server's version — what `skewed` is behind. `""` if unreadable. */
+  serverVersion: string;
+  /** Ours, untouched, behind the release: `npx modelguild init` fixes these in place. */
+  skewed: PayloadFileReport[];
+  /** Ours, edited, behind the release: reported, never overwritten (issue #22). */
+  drifted: PayloadFileReport[];
+  /** Differs from the shipped bytes with no ownership record — unjudgeable, never guessed. */
+  unknown: PayloadFileReport[];
+  /** Whether the START-UP notice is enabled. `doctor`/`guild_status` report skew either way —
+   * the knob governs the unsolicited surface only. */
+  noticeEnabled: boolean;
+  /** Where the notice's per-version suppression state lives (review finding L6: nothing
+   * reported it, so a user who wanted to reset or inspect it had nowhere to look). */
+  noticeStatePath: string;
+}
+
+export interface PayloadFileReport {
+  dest: string;
+  installedPath: string;
+  /** sha256 on disk. For a SKEWED file this is by definition also the RECORDED hash, so
+   * `installedHash` vs `shippedHash` is exactly the "recorded vs shipped" comparison. */
+  installedHash: string;
+  shippedHash: string;
+  /** The ownership record this verdict was made against — project or global, whichever the
+   * file was found in. Names WHICH install the row is about on a mixed setup. */
+  recordPath: string;
+}
+
+const payloadReport = (f: PayloadFileState): PayloadFileReport => ({
+  dest: f.dest,
+  installedPath: f.installedPath,
+  installedHash: f.installedHash,
+  shippedHash: f.shippedHash,
+  recordPath: f.recordPath,
+});
 
 /**
  * The filesystem/env checks M4 made a precondition for production: multi-root conflict,
@@ -186,6 +243,16 @@ export function guildDoctorSeed(
   const head = layers.find((l) => l.exists) ?? layers[0];
   const log = new EvidenceLog({ env, cwd, guildDir, guildDirs });
   const confContents = readLayeredConfContents(guildDirs, env);
+  // Payload skew/drift (issue #94). Resolved from the same (env, cwd, home) this function is
+  // already injected with — `resolveGlobalDirs` derives the XDG dir from `env`, and the project
+  // dir comes from the SHARED `resolveProjectDir` that `src/notice.ts` uses (review finding L7:
+  // the two had derived it separately) — so `guild_status` and its test drive the same code with
+  // no new parameters and never touch the real `~`.
+  const payloadScan = scanInstalledPayload({
+    packageRoot: PACKAGE_ROOT,
+    targetDir: resolveProjectDir(env, cwd),
+    global_dirs: resolveGlobalDirs({ homeDir: home, env }),
+  });
   return {
     guildRoot: {
       root: rootRes.root,
@@ -196,6 +263,16 @@ export function guildDoctorSeed(
     policy: { file: head.file, source: head.source, layers },
     logging: { enabled: log.enabled(), logDir: log.logDir() },
     approval: approvalDoctorInfo({ env, confContents, logDir: log.logDir() }),
+    payload: {
+      serverVersion: packageVersion(PACKAGE_ROOT),
+      skewed: payloadScan.skewed.map(payloadReport),
+      drifted: payloadScan.drifted.map(payloadReport),
+      unknown: payloadScan.unknown.map(payloadReport),
+      // Reported, never CONSULTED here: `guild_status` was asked for, so it answers whatever
+      // the knob says (issue #23's `logs clean`-under-`GUILD_LOG=off` precedent).
+      noticeEnabled: resolvePayloadNoticeSettings({ env, confContents }).enabled,
+      noticeStatePath: noticeStatePath({ env, home }),
+    },
   };
 }
 
