@@ -450,20 +450,27 @@ export function scaffoldDigest(repoDir: string): string {
  *   - The moment is **the first request that loads the project's plugin runtime** — `GET /agent`
  *     and `POST /session` both do it — NOT serve startup, which is lazy: a serve that answered
  *     `/doc` and then sat idle for 25s wrote nothing.
- * `guild_delegate` requires `.opencode/agent/guild-build.md` in the tree it edits (it refuses
- * otherwise), so the condition is ALWAYS met on the write path. Consequence: the FIRST
- * delegation into a tree whose runtime has not been materialized yet will see the scaffolding
- * appear during the turn, and the before/after digests differ for a reason that is opencode's
- * own housekeeping rather than anything the model did.
+ * THE CONDITION IS CHECKED, NEVER INFERRED (review finding M1). It is tempting to argue that
+ * `guild_delegate` requires `.opencode/agent/guild-build.md` in the tree it edits, so the
+ * `.opencode/` precondition always holds on the write path — the first cut of #107 said exactly
+ * that, in five places, and it is WRONG: `resolveAgentDefDirs` also resolves the opencode
+ * GLOBAL agent dir, so a target with no `.opencode/` at all passes the def pre-check under an
+ * `init --global` install. `WorktreeSnapshot.opencodeDir` records the real answer at baseline
+ * time; `src/delegate.ts` reads that, not a premise.
+ *
+ * Consequence where the precondition DOES hold: the first delegation into a tree whose runtime
+ * has not been materialized yet sees the scaffolding appear during the turn, and the
+ * before/after digests differ for a reason that is opencode's own housekeeping.
  *
  * WHAT THE WRITE PATH DOES WITH THAT, and what it deliberately does NOT do: the
- * `scaffoldChanged` FLAG is unchanged — it still fires, because something in an
+ * `scaffoldChanged` FLAG is unchanged — it always fires, because something in an
  * execution-carrying directory really did change and suppressing it would be the tamper
- * signal's one unforgivable failure. Only the WARNING TEXT is narrowed, to say the scaffolding
- * was CREATED rather than modified. Pre-emptively warming the child before the baseline
- * snapshot was considered and rejected: it would pin the write path's evidence baseline to an
- * undocumented lazy-load ordering in a dependency this repo tracks unpinned, and buy only the
- * suppression of a first-call-per-tree warning.
+ * signal's one unforgivable failure. Only the WARNING TEXT varies, across three cases, and it
+ * never claims more than a single digest can carry (it cannot separate "opencode scaffolded"
+ * from "opencode scaffolded AND something else was written alongside it"). Pre-emptively
+ * warming the child before the baseline snapshot was considered and rejected: it would pin the
+ * write path's evidence baseline to an undocumented lazy-load ordering in a dependency this
+ * repo tracks unpinned, and buy only the suppression of a first-call-per-tree warning.
  */
 export const EMPTY_SCAFFOLD_DIGEST = createHash("sha256").update("").digest("hex");
 
@@ -478,13 +485,51 @@ export interface WorktreeSnapshot {
   submodules: string;
   /** Tamper-signal digest of the excluded serve scaffolding (see scaffoldDigest). */
   scaffold: string;
+  /**
+   * Did an `.opencode/` DIRECTORY exist in this root **before** the model turn? (issue #107,
+   * review finding M1.)
+   *
+   * THIS IS THE DISCRIMINATOR FOR THE TAMPER SIGNAL'S BENIGN READING, and it must be captured
+   * HERE, at baseline time, because after the turn the directory exists either way. The probe
+   * (see `EMPTY_SCAFFOLD_DIGEST`) established that opencode materializes its plugin runtime
+   * into a serve cwd **iff that cwd already contains `.opencode/`** — so this flag is exactly
+   * the precondition of "opencode's own first-run scaffolding could explain what appeared".
+   *
+   * The first cut of #107 did not record it. It INFERRED the precondition instead, from
+   * "`guild_delegate` requires `guild-build.md` in the tree it edits" — **and that inference
+   * is false**: `resolveAgentDefDirs` also resolves the opencode GLOBAL agent dir
+   * (`${XDG_CONFIG_HOME:-~/.config}/opencode/agent`), which is the entire point of
+   * `init --global`, so a target worktree can carry NO `.opencode/` at all and still pass the
+   * def pre-check. In that configuration opencode never scaffolds — so scaffolding that
+   * appears anyway was written by something else, and the inferred premise would have handed
+   * precisely that case the benign wording. Do not replace this with an inference again.
+   */
+  opencodeDir: boolean;
+}
+
+/** True iff an `.opencode/` directory exists in `repoDir` — opencode's own scaffolding
+ * precondition, probed on 1.18.7. A FILE named `.opencode` is not the trigger. */
+function hasOpencodeDir(repoDir: string): boolean {
+  try {
+    return lstatSync(path.join(repoDir, ".opencode")).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Take the BEFORE snapshot of `repoDir`. Cheap and non-mutating (C36). */
 export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
   const gitWorktree = isGitWorktree(repoDir);
   if (!gitWorktree) {
-    return { gitWorktree: false, dirty: false, tree: null, ignored: "", submodules: "clean", scaffold: "" };
+    return {
+      gitWorktree: false,
+      dirty: false,
+      tree: null,
+      ignored: "",
+      submodules: "clean",
+      scaffold: "",
+      opencodeDir: hasOpencodeDir(repoDir),
+    };
   }
   const tree = snapshotTree(repoDir);
   return {
@@ -494,6 +539,7 @@ export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
     ignored: ignoredFingerprint(repoDir),
     submodules: submoduleState(repoDir),
     scaffold: scaffoldDigest(repoDir),
+    opencodeDir: hasOpencodeDir(repoDir),
   };
 }
 

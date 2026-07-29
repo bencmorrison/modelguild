@@ -319,8 +319,16 @@ export async function delegate(
   //         after-tree, the ignored-file fingerprint, the submodule state, `scaffoldDigest`,
   //         the recovery hint and the recorded patch (C37–C40).
   //     `resolveRepoDir` is consumed INLINE as the repository the target is validated against
-  //     and is never bound to a local, so after this statement there is no variable in scope
-  //     holding the project dir: the only root a consumer can reach is `writeRoot`.
+  //     and is never bound to a local. **That is a discipline, not a proof, and the honest
+  //     statement matters here**: `cwd` remains in scope (the evidence log takes it, and the
+  //     log root is deliberately NOT re-rooted at the target), so nothing in the type system
+  //     stops a future edit handing `cwd` to a capture consumer. A reviewer did exactly that
+  //     and the first cut's structural test passed. What actually holds the property is the
+  //     BEHAVIOURAL suite — fixtures that mutate one tree while targeting the other, which
+  //     fail loudly the moment the two roots diverge — backed by `test/delegate.test.ts`
+  //     #107(i), which pins the specific call shapes (including that this function's result is
+  //     handed on as the `writeRoot` BINDING, not an arbitrary expression) through which a
+  //     second root could otherwise re-enter unnoticed.
   //
   //     NO SESSION-AUTHORITY LOOKUP, deliberately. #96 made `GET /session/{id}`'s `directory`
   //     the authority for a read CONTINUATION, because opencode serves a session from any child
@@ -598,24 +606,34 @@ async function captureAndLog(
   // captureComplete — a scaffolding write is invisible to the fingerprint by design, so this
   // is the ONLY place it surfaces.
   const scaffoldChanged = before.gitWorktree && scaffoldDigest(ctx.writeRoot) !== before.scaffold;
-  // THE FLAG IS UNCHANGED; ONLY THE WORDING NARROWS (issue #107). The probe that closed #96's
-  // known unknown (see EMPTY_SCAFFOLD_DIGEST) established that opencode materializes its
-  // plugin runtime into any serve cwd that already HAS an `.opencode/` directory, on the first
-  // request that loads it. `guild_delegate` requires `.opencode/agent/guild-build.md` in the
-  // tree it edits, so the FIRST delegation into a tree whose runtime is not yet materialized
-  // always sees the scaffolding appear — most visibly on a freshly added worktree, which is
-  // this feature's headline case. Reporting that as "changed — review it" identically to a
-  // model writing into an existing plugin dir would train the reader to ignore the one signal
-  // covering an execution-carrying blind spot. So a before-state of NO scaffolding at all says
-  // so, in those words. It is still flagged, and `scaffoldChanged` still true: something in a
-  // directory opencode loads and executes really did appear, and this is a tamper signal whose
-  // one unforgivable failure would be staying quiet.
-  const scaffoldCreated = scaffoldChanged && before.scaffold === EMPTY_SCAFFOLD_DIGEST;
+  // THE FLAG NEVER VARIES; ONLY THE WORDING DOES, AND ONLY ON A CHECKED PRECONDITION
+  // (issue #107, review finding M1). The probe that closed #96's known unknown (see
+  // EMPTY_SCAFFOLD_DIGEST) established that opencode materializes its plugin runtime into a
+  // serve cwd **iff that cwd already contains an `.opencode/` directory**, on the first request
+  // that loads it. Where that held, the first delegation into a not-yet-materialized tree sees
+  // the scaffolding appear for a reason that is opencode's housekeeping, and reporting it in
+  // the same words as a model writing into an EXISTING plugin dir would train the reader to
+  // ignore the one signal covering an execution-carrying blind spot.
+  //
+  // THE PRECONDITION IS READ FROM THE SNAPSHOT, NOT INFERRED. The first cut of this code
+  // inferred it — "delegate requires guild-build.md in the target, so `.opencode/` always
+  // exists" — and that is FALSE: `resolveAgentDefDirs` also resolves the opencode GLOBAL agent
+  // dir, so under an `init --global` install a target with NO `.opencode/` passes the def
+  // pre-check. In that configuration opencode never scaffolds, so scaffolding appearing anyway
+  // has NO benign explanation — it is a write into a directory `opencode serve` loads and
+  // executes — and the inferred premise handed exactly that case the reassuring wording.
+  //
+  // Hence three cases, and the middle one deliberately does not over-claim: a single digest
+  // cannot separate "opencode scaffolded" from "opencode scaffolded AND something was written
+  // alongside it", so it offers a SUFFICIENT explanation without asserting it is the whole one.
+  const scaffoldAppeared = scaffoldChanged && before.scaffold === EMPTY_SCAFFOLD_DIGEST;
   const scaffoldWarning = !scaffoldChanged
     ? null
-    : scaffoldCreated
-      ? "the transport's plugin directory (.opencode/node_modules + manifests) was CREATED during this call — expected on the first delegation into a tree whose opencode runtime had not been materialized yet (opencode scaffolds any serve cwd that already has an .opencode/ directory); still worth a glance, since this directory is loaded by opencode serve"
-      : "the transport's plugin directory (.opencode/node_modules + manifests) changed during this call — review it; this directory is loaded by opencode serve";
+    : !scaffoldAppeared
+      ? "the transport's plugin directory (.opencode/node_modules + manifests) changed during this call — review it; this directory is loaded by opencode serve"
+      : before.opencodeDir
+        ? "the transport's plugin directory (.opencode/node_modules + manifests) APPEARED during this call, in a tree that already had an .opencode/ directory — opencode materializes its own runtime into exactly such a tree on first use, which is a SUFFICIENT explanation but not proof that it is the whole of what appeared (one digest cannot separate opencode's scaffolding from anything written alongside it). Review the directory; opencode serve loads and executes it"
+        : "the transport's plugin directory (.opencode/node_modules + manifests) was CREATED during this call in a tree that had NO .opencode/ directory beforehand — opencode does NOT scaffold such a tree (probed on 1.18.7), so its first-run materialization does not explain this. Treat it as an UNEXPLAINED write into a directory opencode serve loads and executes, and review it before anything else";
 
   // NO RUN, NO CAPTURE — the guard `consult.ts` and `approve.ts` already apply before
   // calling `log.dir()`, missing here (review finding F1/F2 on issue #73). Two reasons,
@@ -811,11 +829,20 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.capture) structured.capture = r.capture;
+  // THE TREE TRAVELS ON THE FAILURE PATH TOO (issue #107, review finding M2). Success carries
+  // it via `...r.attribution`; failure has no attribution, so the first cut set `DelegateFail
+  // .worktree` and then never copied it to the wire — the field's own doc comment, the tool
+  // description and `/guild:delegate` step 3 all promised something the client never received.
+  // The case that makes it consequential is `call-failed`/`agent-mismatch`, where the model
+  // ALREADY EDITED the target tree: `capture.patchPath` points into the PROJECT's logs and, on
+  // a clean pre-turn tree, `recoveryHint` is null — so without this nothing in the result names
+  // the tree that was actually mutated.
+  if (r.worktree) structured.worktree = r.worktree;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {
-    content: [{ type: "text", text: r.error.message }],
+    content: [{ type: "text", text: r.error.message }, ...writeRootBlocks(r.worktree)],
     structuredContent: structured,
     isError: true,
   };

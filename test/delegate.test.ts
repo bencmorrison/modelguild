@@ -1366,12 +1366,18 @@ export async function run(): Promise<number> {
       }
     }
 
-    // (i) BY CONSTRUCTION, not just by behaviour: after the root is resolved there is no
-    //     second way to reach the project dir on this path. (a)/(b) prove the CURRENT code
-    //     captures the right tree; this pins the SHAPE that keeps it true, because the
-    //     regression this issue exists to prevent is somebody reintroducing an independent
-    //     root — and a wrong-but-complete-looking patch is exactly the failure a behavioural
-    //     test can only catch once someone has written the fixture for it.
+    // (i) THE SHAPE THAT KEEPS (a)/(b) TRUE. Stated precisely, because the first cut of this
+    //     block over-claimed and a reviewer broke it: **the behavioural cases are the net.**
+    //     Substituting any wrong root makes them fail loudly, and that is what actually holds
+    //     the property. What THIS block adds is narrower and worth having anyway — it pins the
+    //     specific call shapes through which a second, independent root could re-enter without
+    //     any behavioural test being written for it. It is NOT a proof that the project dir is
+    //     unreachable: `cwd` is still in scope after the resolution (the evidence log takes it
+    //     deliberately, since the log root is NOT re-rooted at the target), so the assertions
+    //     below name the capture consumers explicitly rather than blacklisting a token.
+    //     A reviewer demonstrated the gap by rewriting `captureAndLog(before, { writeRoot, … })`
+    //     to `{ writeRoot: cwd, … }`: every check here passed while 38 behavioural checks
+    //     failed. The shorthand-property assertion below is what closes that exact hole.
     {
       const src = readFileSync(new URL("../src/delegate.ts", import.meta.url), "utf8");
       const body = src.slice(src.indexOf("export async function delegate("));
@@ -1383,8 +1389,28 @@ export async function run(): Promise<number> {
       c.check(
         !afterResolution.includes("resolveRepoDir(") &&
           !afterResolution.includes("deps.repoDir") &&
-          !afterResolution.includes("process.cwd()"),
-        "#107(i): nothing below the resolution reaches for the project dir again",
+          !afterResolution.includes("process.cwd()") &&
+          !afterResolution.includes("env.GUILD_PROJECT_DIR"),
+        "#107(i): the project-dir accessors are not re-read below the resolution",
+      );
+      // `cwd` cannot be blacklisted outright — the evidence log legitimately takes it, and the
+      // log root is deliberately NOT re-rooted at the target. So pin the ONE permitted use
+      // instead: any other appearance in code (comments stripped) is a new way to reach it.
+      const codeAfter = afterResolution
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("//") && !l.trimStart().startsWith("*"))
+        .join("\n");
+      c.check(
+        (codeAfter.match(/\bcwd\b/g) || []).length === 1 &&
+          codeAfter.includes("new EvidenceLog({ env, cwd, guildDir, guildDirs })"),
+        "#107(i): the only post-resolution use of `cwd` is the evidence log's own root",
+      );
+      // THE HOLE A REVIEWER ACTUALLY EXPLOITED: the capture entry point took whatever it was
+      // handed. Requiring the SHORTHAND property means the value passed is the binding named
+      // `writeRoot` and cannot be silently swapped for another expression.
+      c.check(
+        src.includes("captureAndLog(before, {\n    writeRoot,\n"),
+        "#107(i): captureAndLog is handed the `writeRoot` BINDING (shorthand), not an expression",
       );
       c.check(
         (src.match(/snapshotWorktree\(/g) || []).length === 1 &&
@@ -1400,6 +1426,200 @@ export async function run(): Promise<number> {
         src.includes("repoDir: ctx.writeRoot"),
         "#107(i): captureDelegateDiff is handed writeRoot as its repo dir",
       );
+    }
+
+    // (j) THE FAILURE PATH REACHES THE WIRE (review finding M2). `DelegateFail.worktree` was
+    //     set on the result object and then dropped by `delegateToToolResult`, so a client got
+    //     `structuredContent` with only `error` — contradicting the field's own doc comment,
+    //     the tool description and step 3 of the command doc. Asserted on BOTH shapes of
+    //     failure, because they fail for different reasons and only one has a capture:
+    //     a pre-turn refusal (policy deny) and a turn that RAN and died.
+    {
+      const repo = initRepoWithDef("m107-failwire-", { "a.txt": "A0\n" });
+      const wt = addWorktree(repo, "failwire");
+      const denyRoot = tmp("m107-guild-deny-");
+      writeFileSync(path.join(denyRoot, "models.policy.local"), "deny openai/*\n");
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: denyRoot,
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "unused" });
+      try {
+        const provider = mutatingServe(fake, () => {});
+        const denied = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(
+          !denied.ok && denied.error.kind === "policy-deny" && denied.worktree === wt,
+          "#107(j): a post-resolution refusal carries the targeted tree on the RESULT",
+        );
+        const wire = delegateToToolResult(denied);
+        c.check(
+          wire.structuredContent?.worktree === wt,
+          "#107(j): ...and it reaches structuredContent.worktree (M2: it did not before)",
+        );
+        c.check(
+          wire.content.some((b) => b.text === `Edited tree: ${wt}`),
+          "#107(j): ...and the text channel names it too",
+        );
+      } finally {
+        await fake.close();
+      }
+
+      // THE CONSEQUENTIAL CASE: the turn ran, the model already edited the target tree, and
+      // the call then failed. `capture.patchPath` points into the PROJECT's logs, so without
+      // `worktree` on the wire nothing in the result names the tree that was mutated.
+      const logDir2 = tmp("m107-logs-");
+      const env2 = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir2,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake2 = await startFakeOpencode({ historyText: "x", failMessage: true });
+      try {
+        const provider = mutatingServe(fake2, () =>
+          writeFileSync(path.join(wt, "a.txt"), "EDITED-THEN-FAILED\n"),
+        );
+        const failed = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env: env2,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(!failed.ok && failed.error.kind === "call-failed", "#107(j): the turn failed");
+        c.check(
+          read(wt, "a.txt") === "EDITED-THEN-FAILED\n",
+          "#107(j): ...after the model had already edited the TARGET tree",
+        );
+        const wire2 = delegateToToolResult(failed);
+        c.check(
+          wire2.structuredContent?.worktree === wt && wire2.isError === true,
+          "#107(j): the failed-call wire names the mutated tree (the case that matters)",
+        );
+        c.check(
+          wire2.structuredContent?.capture !== undefined,
+          "#107(j): ...alongside the partial capture, so both are actionable together",
+        );
+      } finally {
+        await fake2.close();
+      }
+    }
+
+    // (k) THE M1 DISCRIMINATOR: the benign scaffold wording is offered ONLY where opencode's
+    //     own trigger held. Under an `init --global` install a target can carry NO `.opencode/`
+    //     at all and still pass the def pre-check — and opencode never scaffolds such a tree
+    //     (probed), so scaffolding that appears there was written by something else. The first
+    //     cut inferred the precondition instead of checking it and handed exactly that case the
+    //     reassuring wording, on the one signal covering an execution-carrying blind spot.
+    {
+      const globalAgents = path.join(tmp("m107-xdgglobal-"), "opencode", "agent");
+      mkdirSync(globalAgents, { recursive: true });
+      writeFileSync(path.join(globalAgents, "guild-build.md"), "---\nmode: all\n---\nx\n");
+      const xdg = path.dirname(path.dirname(globalAgents));
+
+      // A repo with NO `.opencode/` anywhere — the def comes from the global dir alone.
+      const repo = realpathSync(initRepo({ "a.txt": "A0\n" }, "m107-noopencode-"));
+      const wt = addWorktree(repo, "globaldef");
+      c.check(
+        !existsSync(path.join(wt, ".opencode")),
+        "#107(k): fixture — the target carries no .opencode/ (global-install shape)",
+      );
+      const logDir = tmp("m107-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: xdg,
+      });
+      const fake = await startFakeOpencode({ historyText: "ok" });
+      try {
+        const provider = mutatingServe(fake, () => {
+          // Exactly what opencode would NOT have done here: a write into the plugin dir.
+          mkdirSync(path.join(wt, ".opencode", "node_modules", "evil"), { recursive: true });
+          writeFileSync(path.join(wt, ".opencode", "node_modules", "evil", "index.js"), "x\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(r.ok, "#107(k): the global-only def passes the pre-check (no .opencode/ needed)");
+        c.check(
+          r.ok && r.capture.scaffoldChanged,
+          "#107(k): the tamper flag fires — it never varies on the wording",
+        );
+        const warn = r.ok ? (r.capture.scaffoldWarning ?? "") : "";
+        c.check(
+          warn.includes("NO .opencode/ directory beforehand") && warn.includes("UNEXPLAINED"),
+          "#107(k): and the warning says opencode does NOT explain it — no benign reading",
+        );
+        c.check(
+          !warn.includes("SUFFICIENT explanation"),
+          "#107(k): the benign wording is NOT offered where the trigger did not hold",
+        );
+      } finally {
+        await fake.close();
+      }
+
+      // The control: the SAME shape of write, into a tree that DID have `.opencode/` before,
+      // gets the benign-but-non-committal wording — so (k) is a discriminator, not a blanket.
+      const repo2 = initRepoWithDef("m107-hasopencode-", { "a.txt": "A0\n" });
+      const wt2 = addWorktree(repo2, "hasdir");
+      const logDir2 = tmp("m107-logs-");
+      const env2 = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir2,
+        XDG_CONFIG_HOME: tmp("m107-xdg-"),
+      });
+      const fake2 = await startFakeOpencode({ historyText: "ok" });
+      try {
+        const provider = mutatingServe(fake2, () => {
+          mkdirSync(path.join(wt2, ".opencode", "node_modules", "pkg"), { recursive: true });
+          writeFileSync(path.join(wt2, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt2 },
+          {
+            serve: provider,
+            router: spyRouter(repo2, provider),
+            env: env2,
+            cwd: repo2,
+            repoDir: repo2,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        const warn = r.ok ? (r.capture.scaffoldWarning ?? "") : "";
+        c.check(
+          r.ok && r.capture.scaffoldChanged && warn.includes("SUFFICIENT explanation"),
+          "#107(k): control — with .opencode/ present beforehand, the benign reading IS offered",
+        );
+        c.check(
+          warn.includes("not proof that it is the whole of what appeared"),
+          "#107(k): ...and it does not over-claim what one digest can carry",
+        );
+      } finally {
+        await fake2.close();
+      }
     }
 
     // (h) THE SCAFFOLD-DIGEST PIN. `EMPTY_SCAFFOLD_DIGEST` is derived from `scaffoldDigest`'s
