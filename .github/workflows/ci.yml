@@ -69,7 +69,10 @@ jobs:
       - name: Documentation workflow lint (+ self-test)
         run: bash modelguild/tests/check-docs.sh --self-test
 
-      - name: CONTRACT count lint (+ self-test)
+      - name: CONTRACT structural lint (+ self-test)
+        # Prose counts vs src/init.ts (issue #36) AND clause-id uniqueness
+        # (issue #113 — a cited C-number must resolve to one clause; the letter
+        # suffix is part of the id, so C32/C32a are two ids, not one twice).
         run: bash modelguild/tests/check-contract-counts.sh --self-test
       - name: CLAUDE.md thin-pointer lint (+ self-test)
         # Machine-checks the CLAUDE.md/AGENTS.md thin-pointer invariant that went
@@ -171,7 +174,10 @@ jobs:
       - name: Documentation workflow lint (+ self-test)
         run: bash modelguild/tests/check-docs.sh --self-test
 
-      - name: CONTRACT count lint (+ self-test)
+      - name: CONTRACT structural lint (+ self-test)
+        # Prose counts vs src/init.ts (issue #36) AND clause-id uniqueness
+        # (issue #113 — a cited C-number must resolve to one clause; the letter
+        # suffix is part of the id, so C32/C32a are two ids, not one twice).
         run: bash modelguild/tests/check-contract-counts.sh --self-test
       - name: CLAUDE.md thin-pointer lint (+ self-test)
         # Same lint on stock bash 3.2 + BSD awk/grep — its checks lean on awk and
