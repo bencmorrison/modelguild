@@ -42,7 +42,8 @@
  */
 
 import os from "node:os";
-import { type ServeProvider } from "./client.js";
+import { type ServeProvider, type ServeRouter } from "./client.js";
+import { type GitRunner } from "./worktree.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -50,6 +51,7 @@ import {
   runAgentLifecycle,
   activityLayerFor,
   approvalFor,
+  resolveReadRoot,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
@@ -91,6 +93,14 @@ export interface PanelParams {
    */
   keepSessions?: boolean;
   /**
+   * READ ROOT for the WHOLE panel (issue #96): a git worktree of THIS repository every
+   * member reads against. Validated against `git worktree list`; anything else refuses the
+   * panel by name before a single member is dispatched. It is deliberately panel-WIDE — a
+   * panel exists to put ONE question to several models, and members reading different trees
+   * would make their answers incomparable while looking as if they disagreed.
+   */
+  worktree?: string;
+  /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Applies to EVERY member of this panel. Precedence: over
    * `GUILD_MESSAGE_TIMEOUT_MS` env/conf/default; the test seam `deps.messageTimeoutMs` wins.
@@ -100,6 +110,12 @@ export interface PanelParams {
 
 export interface PanelDeps {
   serve: ServeProvider;
+  /** Serve providers keyed by read root (issue #96); wired to the `ServePool` in production. */
+  router?: ServeRouter;
+  /** Test seam for the `git worktree list` enumeration (issue #96). */
+  git?: GitRunner;
+  /** Test seam for a continuation's session-directory lookup (issue #96, finding M3). */
+  fetchSessionDirectory?: (sessionId: string) => Promise<string | undefined>;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   home?: string;
@@ -172,6 +188,8 @@ export interface PanelOk {
   /** resolvePanelModels warnings (dedup, <2 models, single-provider) — surfaced, C14. */
   warnings: string[];
   rootConflict?: string;
+  /** The read root every member ran against; present only when one was targeted (#96). */
+  worktree?: string;
 }
 
 export interface PanelFail {
@@ -186,6 +204,9 @@ export interface PanelFail {
   error:
     | { kind: "agent-def-missing"; message: string; exitAnalogue: number }
     | { kind: "no-models"; message: string; exitAnalogue: number }
+    // The named read root is not a worktree of this repository (issue #96). Panel-wide,
+    // like the def check, and refused before any member runs.
+    | { kind: "worktree-invalid"; message: string; exitAnalogue: null }
     // Panel-wide, like the def check: every member runs the same agent, so a bad approval
     // knob or a missing answering channel refuses the WHOLE panel up front — before any log
     // write, and before a single member is dispatched.
@@ -219,7 +240,31 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //    agent, so one presence check up front decides the whole panel: if the def is absent,
   //    REFUSE loudly rather than run any member on whatever opencode resolves in its place.
   //    Refused BEFORE the model-set resolution and any log write (gap parity) — no member runs.
-  const agentDefDirs = resolveAgentDefDirs({ env, cwd, confContents });
+  // 1b. READ ROOT for the whole panel (issue #96) — see `resolveReadRoot`. A no-op without
+  //     `worktree`; with it, every member is routed to a serve child rooted there and the
+  //     agent-def dirs move with it. Refused before the model set is even resolved.
+  const readRoot = await resolveReadRoot({
+    ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
+    env,
+    cwd,
+    confContents,
+    serve: deps.serve,
+    ...(deps.router !== undefined ? { router: deps.router } : {}),
+    ...(deps.git !== undefined ? { git: deps.git } : {}),
+    ...(deps.fetchSessionDirectory !== undefined
+      ? { fetchSessionDirectory: deps.fetchSessionDirectory }
+      : {}),
+  });
+  if (!readRoot.ok) {
+    return {
+      ok: false,
+      warnings: [],
+      rootConflict,
+      error: { kind: "worktree-invalid", message: readRoot.message, exitAnalogue: null },
+    };
+  }
+  const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+
   if (!hardenedDefPresentIn(PANEL_AGENT, agentDefDirs).present) {
     return {
       ok: false,
@@ -324,9 +369,10 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           tier: gate.tier,
           confirmed: gate.confirmed,
           keepSession: keepSessions,
+          ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
         },
         {
-          serve: deps.serve,
+          serve,
           log,
           messageTimeoutMs,
           activity,
@@ -369,7 +415,14 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     }),
   );
 
-  return { ok: true, runId, results, warnings: panelRes.warnings, rootConflict };
+  return {
+    ok: true,
+    runId,
+    results,
+    warnings: panelRes.warnings,
+    rootConflict,
+    ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+  };
 }
 
 // --- MCP tool-result translation -------------------------------------------
@@ -381,6 +434,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
 function renderPanelText(r: PanelOk): string {
   const lines: string[] = [];
   lines.push(`Panel of ${r.results.length} model(s) — run ${r.runId || "(logging off)"}.`);
+  if (r.worktree) lines.push(`Read root: ${r.worktree}`);
   if (r.rootConflict) lines.push(`Root: ${r.rootConflict}`);
   if (r.warnings.length > 0) {
     lines.push("");
@@ -419,5 +473,6 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
     warnings: r.warnings,
   };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.worktree) structured.worktree = r.worktree;
   return { content: [{ type: "text", text: renderPanelText(r) }], structuredContent: structured };
 }

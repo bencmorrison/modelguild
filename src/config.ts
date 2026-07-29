@@ -153,6 +153,20 @@ export function resolveAgentDefDir(opts: {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   confContents?: string;
+  /**
+   * The directory the serve child will actually be spawned from (issue #96). Normally the
+   * project dir — but a worktree-targeted read call re-roots the child at a validated
+   * sibling worktree, and **opencode resolves agents from the SERVE's cwd, not from the git
+   * repository**: probed live on 1.18.7 (2026-07-29), a serve rooted at a worktree of a repo
+   * whose MAIN checkout holds `.opencode/agent/guild-read.md` does not list `guild-read` at
+   * all (`GET /agent`), and a message naming it answers HTTP 500. So the presence pre-check
+   * must follow the child, or it would pass on the project's copy and the turn would then
+   * die on an unresolvable agent. Overrides the `$GUILD_PROJECT_DIR`/cwd sibling; still
+   * loses to an explicit `GUILD_AGENT_DIR` (env or conf), which means "look here, nowhere
+   * else" — with the caveat this block already carries, that such an override can disagree
+   * with where opencode actually resolves defs.
+   */
+  projectDir?: string;
 }): string {
   const env = opts.env ?? process.env;
   const cwd = opts.cwd ?? process.cwd();
@@ -161,9 +175,12 @@ export function resolveAgentDefDir(opts: {
   const fromConf = confGet(opts.confContents ?? "", "GUILD_AGENT_DIR");
   if (fromConf.length > 0) return fromConf;
   // The sibling: the project dir the serve is spawned from (matches lifecycle.ts).
-  const projectDir = env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0
-    ? env.GUILD_PROJECT_DIR
-    : cwd;
+  const projectDir =
+    opts.projectDir && opts.projectDir.length > 0
+      ? opts.projectDir
+      : env.GUILD_PROJECT_DIR && env.GUILD_PROJECT_DIR.length > 0
+        ? env.GUILD_PROJECT_DIR
+        : cwd;
   return path.join(projectDir, ".opencode", "agent");
 }
 
@@ -193,10 +210,17 @@ export function resolveAgentDefDirs(opts: {
   confContents?: string;
   home?: string;
   xdgConfigHome?: string;
+  /** Where the serve child will be rooted (issue #96) — see `resolveAgentDefDir`. */
+  projectDir?: string;
 }): string[] {
   const env = opts.env ?? process.env;
   const cwd = opts.cwd ?? process.cwd();
-  const primary = resolveAgentDefDir({ env, cwd, confContents: opts.confContents });
+  const primary = resolveAgentDefDir({
+    env,
+    cwd,
+    confContents: opts.confContents,
+    ...(opts.projectDir !== undefined ? { projectDir: opts.projectDir } : {}),
+  });
   const home = opts.home ?? os.homedir();
   const xdg =
     opts.xdgConfigHome && opts.xdgConfigHome.length > 0

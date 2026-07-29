@@ -242,6 +242,18 @@ export async function delegate(
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
 
+  // NO `worktree` READ ROOT ON THIS PATH (issue #96, deliberate and scoped). The READ tools
+  // can be re-rooted at a validated sibling worktree; the WRITE path cannot, and is not.
+  // Everything downstream of here — `snapshotWorktree`, the throwaway-index baseline, the
+  // after-tree, the ignored-file fingerprint, the submodule state, the recovery hint and the
+  // recorded patch (C37–C40) — is rooted at THIS project dir, and the delegate result's whole
+  // value is that the patch faithfully records what the model changed. Re-rooting the serve
+  // child without re-rooting the snapshot would capture the wrong tree while still LOOKING
+  // complete, which is worse than not offering the feature. Doing it properly is a larger
+  // change (snapshot against the target repo, recovery hints that name it, and the
+  // `.opencode/` scaffolding tamper signal in someone else's worktree) and belongs in its
+  // own issue.
+  //
   // 2. NO-FALLBACK def gate (deviation from bash C16). A missing guild-build def REFUSES
   //    loudly — never silently degrades to the UNRESTRICTED `build`. Refused before any log
   //    write (gap parity) and before any snapshot (nothing ran).

@@ -4,7 +4,11 @@
  * (free — no model call). Every wait is bounded.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { OpencodeLifecycle, type ServeHandle } from "../src/lifecycle.js";
+import { ServePool } from "../src/servepool.js";
 import { ServeEventBus, closeAllBuses, liveBusCount } from "../src/activity.js";
 import { Checker, pidAlive, waitFor, withTimeout, sleep } from "./harness.js";
 
@@ -159,6 +163,103 @@ export async function run(): Promise<number> {
     c.check(liveBusCount() === 0, "bus: it stays closed (no reconnect against a dead port)");
     c.check(degraded === "" || degraded.length > 0, "bus: any degrade reason is delivered, never thrown");
     closeAllBuses();
+  }
+
+  // ---------------------------------------------------------------------------
+  // ServePool with REAL children (issue #96, review finding H1a).
+  //
+  // WHY IT LIVES HERE. `test/worktree.test.ts` covers the pool by inspecting lifecycle
+  // OBJECTS and deliberately spawns nothing — which is exactly the hole that let H1 ship: the
+  // entire second-child PROCESS lifecycle was untested by anything that runs processes, so
+  // the M1 orphan guarantee did not cover the one new thing that could break it. This file
+  // already spawns the real `opencode serve` and has no graceful skip, so it is the home.
+  //
+  // Two claims, and they pull in opposite directions on purpose:
+  //   (1) the primary's IDLE timer must NOT kill an extra child with a call in flight on it;
+  //   (2) a genuine TEARDOWN must still take that same extra child down.
+  // A fix that only satisfied (1) would be an orphan bug; one that only satisfied (2) is the
+  // bug being fixed.
+  {
+    const extraRootDir = mkdtempSync(path.join(tmpdir(), "m96-root-"));
+    // Primary idle window deliberately SHORTER than the in-flight extra call, so the timer
+    // is guaranteed to fire mid-call rather than racing it.
+    const primary = new OpencodeLifecycle({ idleMs: 1_000 });
+    const pool = new ServePool(primary);
+    try {
+      // Arm the primary's idle timer exactly the way `/guild:review` does — a call that runs
+      // on the PRIMARY (guild_models) and returns, leaving the timer running.
+      const primaryPid = await withTimeout(
+        primary.withServe(async (h) => {
+          await poke(h);
+          return h.pid;
+        }),
+        SPAWN_MS,
+        "pool:primary withServe",
+      );
+      c.check(primary.isRunning, "pool: primary up with its idle timer armed");
+
+      const extra = pool.forRoot(extraRootDir);
+      c.check(extra !== primary, "pool: a second root yields a different supervisor");
+
+      // A call in flight on the EXTRA child, spanning the primary's idle window.
+      let extraPid = 0;
+      let callError = "";
+      let stillAliveMidCall = false;
+      let stillPooledMidCall = false;
+      const inFlight = extra.withServe(async (h) => {
+        extraPid = h.pid;
+        await sleep(3_000); // > primary idleMs, so the primary's timer fires during this
+        // Probed from INSIDE the call: this is the moment the bug destroyed.
+        try {
+          await poke(h);
+          stillAliveMidCall = true;
+        } catch {
+          stillAliveMidCall = false;
+        }
+        stillPooledMidCall = pool.extraRoots.length === 1;
+        return h.pid;
+      });
+
+      // The in-flight call is caught rather than awaited bare: with the bug present the extra
+      // child is SIGKILLed mid-call and this rejects, and a thrown suite reports far less than
+      // a failed check does. (Verified as a negative control: with the reclamation exemption
+      // removed, the two checks below fail instead of the suite exploding.)
+      const returned = await withTimeout(
+        inFlight.catch((err: unknown) => {
+          callError = err instanceof Error ? err.message : String(err);
+          return -1;
+        }),
+        SPAWN_MS,
+        "pool:extra withServe",
+      );
+      c.check(
+        await waitFor(() => !pidAlive(primaryPid), 6_000),
+        "pool: the primary's idle timer DID fire (its own child is dead)",
+      );
+      c.check(
+        stillAliveMidCall,
+        `pool: the extra child SURVIVED the primary's idle-timer fire, mid-call (H1)${callError ? ` [call failed: ${callError}]` : ""}`,
+      );
+      c.check(stillPooledMidCall, "pool: the extra stayed in the pool across that fire");
+      c.check(returned === extraPid && extraPid > 0, "pool: the in-flight extra call completed");
+      c.check(pidAlive(extraPid), "pool: the extra child is still alive after its call returned");
+
+      // (2) A genuine teardown still takes it with it — the orphan guarantee, unweakened.
+      primary.shutdown("stdin-end");
+      c.check(pool.extraRoots.length === 0, "pool: teardown emptied the pool");
+      c.check(
+        await waitFor(() => !pidAlive(extraPid), 8_000),
+        "pool: teardown killed the extra child too (no orphan)",
+      );
+    } finally {
+      pool.shutdownExtras("cleanup");
+      primary.shutdown("cleanup");
+      try {
+        rmSync(extraRootDir, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 
   await sleep(50);
