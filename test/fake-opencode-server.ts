@@ -95,9 +95,19 @@ export interface FakeOpencodeOpts {
    */
   gateBlind?: boolean;
   /** Serve `GET /permission` with a 500 (or, with `listPermissionsGarbage`, with a body that
-   * is not an array) — drives "a failed re-list DEGRADES, it does not throw into the call". */
+   * is not an array) — drives "a failed re-list DEGRADES, it does not throw into the call".
+   * It ALSO drives issue #97's third shape: a 404 whose still-open check cannot be made, which
+   * must be recorded as unconfirmed rather than classified as a race. */
   failListPermissions?: boolean;
   listPermissionsGarbage?: boolean;
+  /**
+   * THE APPROVE ENDPOINT IS GONE (issue #97). `POST /session/{id}/permissions/{permId}` answers
+   * 404 and leaves the request OPEN — the shape the deprecation of `permission.respond` will
+   * eventually produce, and the one that is byte-identical to a lost race at the reply itself
+   * and only distinguishable by re-listing. Rejections (`POST /permission/{id}/reply`) keep
+   * working, so this reproduces an APPROVAL-ONLY outage rather than a dead server.
+   */
+  approveEndpointGone?: boolean;
   /** Reject session-create when a `permission` ruleset is present, and echo NOTHING back —
    * models an opencode build that silently ignores the field, which must be caught rather
    * than run ungated. */
@@ -299,6 +309,13 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       if (method === "POST" && sessPermMatch) {
         const body = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
         const permId = sessPermMatch[2];
+        if (opts.approveEndpointGone) {
+          // The endpoint no longer exists: 404, and — the whole point — the request is NOT
+          // settled, so `GET /permission` still lists it. Indistinguishable from a lost race at
+          // the reply; distinguishable only by asking what is still open (issue #97).
+          send(404, { error: "not found" });
+          return;
+        }
         const resolve = pendingPerms.get(permId);
         if (resolve === undefined) {
           // Verified against opencode 1.18.7: an unknown/already-settled id is a 404. That is

@@ -1802,7 +1802,12 @@ export async function run(): Promise<number> {
       s404.rejected === 0 && s404.approved === 0,
       `M5: a 404 reply is NOT counted as a decision (${JSON.stringify(s404)})`,
     );
-    c.check(s404.contested === 1, "M5: it is counted as contested — somebody else settled it");
+    // The stub answers 404 to EVERYTHING, including the #97 still-open re-check, so the cause
+    // cannot be established and it falls to `contested` as unconfirmed — which is the point:
+    // an unverifiable 404 is never upgraded to a claim in either direction. The three shapes
+    // that CAN be told apart are driven against the real fake in the #97 block below.
+    c.check(s404.contested === 1, "M5: it is not counted as a decision but as a 404 whose cause is unconfirmed");
+    c.check(s404.unsettled === 0, "M5: and not as an undelivered decision, which was never established");
     c.check(s404.requests === 1, "M5: the request itself is still counted");
     lost.close();
 
@@ -2048,6 +2053,13 @@ export async function run(): Promise<number> {
       c.check(
         lines.some((l) => l.kind === "relist-unsettled" && l.permission_id === "per_alreadyrejected"),
         `#91b: and the unresolved decision is RECORDED, not hidden (${JSON.stringify(lines.map((l) => l.kind))})`,
+      );
+      // #97: recorded AND counted. This arm reaches `unsettled` by the OTHER route — the reply
+      // here was a 200 that did not take effect, so the 404 re-check never ran — which is what
+      // makes the counter mean one thing however the stuck request was discovered.
+      c.check(
+        s.unsettled === 1 && (s.unsettledReason ?? "").includes("still lists"),
+        `#91b/#97: a decision opencode did not act on is COUNTED, not just logged (${s.unsettled}, ${s.unsettledReason})`,
       );
       bridge.close();
       closeAllBuses();
@@ -2315,6 +2327,218 @@ export async function run(): Promise<number> {
             `#91f: approvals.jsonl records the recovery (${JSON.stringify(lines.map((l) => l.kind))})`,
           );
         }
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // #97 — AN APPROVE-PATH 404 IS NOT SELF-EXPLANATORY, AND THE BRIDGE MUST TELL THE TWO
+  //       CAUSES APART. A lost race (somebody answered first; healthy) and a dead reply
+  //       endpoint (the decision was dropped and the request is STILL OPEN; the turn stalls to
+  //       GUILD_MESSAGE_TIMEOUT_MS) produce the same 404. `permission.respond` — the approve
+  //       half — is the one operation opencode 1.18.7 marks `deprecated`, so the second shape
+  //       is a foreseeable approval-only outage, and a quiet `contested` would absorb it.
+  //
+  //       ALL THREE SHAPES ARE DRIVEN, because a test covering one proves no distinction: the
+  //       404 AND the follow-up `GET /permission` both hit the real fake (no stub `fetch` on
+  //       the reply path), so what is asserted is the bridge asking opencode a second question
+  //       and believing the answer.
+  // -------------------------------------------------------------------------
+  {
+    const mk97 = async (
+      fake: FakeOpencode,
+      sessionId: string,
+      elicitation: ElicitationRequester,
+      file?: string,
+    ): Promise<ApprovalBridge> => {
+      const opts: ConstructorParameters<typeof ApprovalBridge>[0] = {
+        settings: { tier: "all", egress: "off", timeoutMs: 60_000 },
+        gatedTools: ["bash"],
+        channels: ["elicitation"],
+        context: { runId: "", callId: "c", model: "m", agent: "guild-build", command: "/guild:delegate" },
+        armed: true,
+        elicitation,
+      };
+      if (file !== undefined) opts.file = file;
+      const b = new ApprovalBridge(opts);
+      await b.attach(fake.baseUrl, sessionId);
+      return b;
+    };
+    const askBash = (b: ApprovalBridge, sessionId: string, id: string): void =>
+      b.handleEvent({
+        ts: Date.now(),
+        sessionId,
+        kind: "permission-asked",
+        summary: "permission asked: bash",
+        permissionId: id,
+        permissionTool: "bash",
+        detail: { metadata: { command: "npm test" } },
+      });
+
+    // (a) A GENUINE RACE — i.e. opencode is no longer holding the request when this bridge's
+    //     answer arrives, which is what a race LEAVES BEHIND.
+    //
+    //     WHY IT IS STAGED THAT WAY RATHER THAN BY ACTUALLY REPLYING TWICE: with a healthy
+    //     stream, a race the bridge loses usually never reaches `#settle` at all — the winner's
+    //     `permission.replied` arrives first and `#settle` short-circuits on the recorded
+    //     outcome. The 404 branch is reached precisely when opencode is not holding the request
+    //     and this bridge has not been told, so that is the state driven here. Both the reply
+    //     and the follow-up `GET /permission` are real requests against the fake.
+    {
+      const dir = tmp("apr-97a-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({ historyText: "unused", sessionId: "ses_97a" });
+      try {
+        const bridge = await mk97(fake, "ses_97a", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97a", "per_race");
+        await waitFor(() => bridge.summary().contested === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.contested === 1 && s.unsettled === 0,
+          `#97a: a CONFIRMED race is contested, not unsettled (${JSON.stringify(s)})`,
+        );
+        c.check(
+          s.unsettledReason === null,
+          "#97a: and nothing claims the delivery path is broken when it is not",
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.still_open === false,
+          `#97a: the evidence records that the request was CONFIRMED gone (${JSON.stringify(rec)})`,
+        );
+        c.check(
+          String(rec?.note ?? "").includes("lost race"),
+          "#97a: and the note may now say 'race' — because it was checked",
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (b) THE ENDPOINT IS GONE. The approve endpoint 404s WITHOUT settling — the shape the
+    //     deprecation will eventually produce — so the request is still open and the
+    //     developer's yes was dropped. This must NOT be booked as a race.
+    {
+      const dir = tmp("apr-97b-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97b",
+        approveEndpointGone: true,
+      });
+      try {
+        fake.addPendingPermission({ id: "per_stuck", sessionID: "ses_97b" });
+        const bridge = await mk97(fake, "ses_97b", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97b", "per_stuck");
+        await waitFor(() => bridge.summary().unsettled === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.unsettled === 1 && s.contested === 0,
+          `#97b: a 404 whose request is STILL OPEN is not a race (${JSON.stringify(s)})`,
+        );
+        c.check(
+          s.approved === 0 && s.rejected === 0,
+          "#97b: and it is still not counted as a decision — nothing was delivered",
+        );
+        c.check(
+          s.undelivered === 0,
+          "#97b: nor as `undelivered`, whose meaning is a reply that never reached opencode",
+        );
+        c.check(
+          (s.unsettledReason ?? "").includes("deprecated") &&
+            (s.unsettledReason ?? "").includes("verify-permission-surface.sh"),
+          `#97b: the loud half names the diagnosis and the next step (${s.unsettledReason})`,
+        );
+        c.check(
+          s.degraded === false,
+          "#97b: and it does NOT set `degraded`, which means blind — this bridge can see fine, it cannot deliver",
+        );
+        c.check(
+          fake.pendingPermissions().includes("per_stuck"),
+          "#97b: setup — opencode really is still holding the request (otherwise this passes for the wrong reason)",
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec?.still_open === true && rec?.attempted === "once",
+          `#97b: the evidence names the approve path and the still-open fact (${JSON.stringify(rec)})`,
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (c) THE CHECK ITSELF FAILS. Neither cause can be established, so neither is claimed: it
+    //     falls to `contested` with `still_open: null`, and — the rule that matters most — the
+    //     failed control-plane GET must not throw into the call.
+    {
+      const dir = tmp("apr-97c-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97c",
+        approveEndpointGone: true,
+        failListPermissions: true,
+      });
+      try {
+        const bridge = await mk97(fake, "ses_97c", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97c", "per_unknowable");
+        await waitFor(() => bridge.summary().contested === 1, 3_000, 25);
+        const s = bridge.summary();
+        c.check(
+          s.contested === 1 && s.unsettled === 0,
+          `#97c: an unverifiable 404 is not upgraded to an undelivered decision (${JSON.stringify(s)})`,
+        );
+        c.check(
+          s.unsettledReason === null,
+          "#97c: and raises no alarm it cannot support",
+        );
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec !== undefined && rec.still_open === null,
+          `#97c: the evidence says 'could not tell' rather than guessing (${JSON.stringify(rec)})`,
+        );
+        c.check(
+          String(rec?.note ?? "").includes("could NOT be established"),
+          "#97c: in words, not just a null",
+        );
+        bridge.close();
+      } finally {
+        closeAllBuses();
+        await fake.close();
+      }
+    }
+
+    // (d) AN AMBIGUOUS LIST IS NOT EVIDENCE EITHER. `GET /permission` answering with an entry
+    //     that names no session could be ours, so "absent from the filtered list" does not
+    //     mean "gone" — the same conservatism #91's `clean` rule applies.
+    {
+      const dir = tmp("apr-97d-");
+      const file = path.join(dir, APPROVALS_FILE);
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        sessionId: "ses_97d",
+        approveEndpointGone: true,
+      });
+      try {
+        // An entry with no `sessionID` at all — opencode's schema marks it required, so this is
+        // a protocol violation, and `listPendingPermissions` counts it `unattributable`.
+        fake.addPendingPermission({ id: "per_nameless", sessionID: "" });
+        const bridge = await mk97(fake, "ses_97d", stubElicitation("accept"), file);
+        askBash(bridge, "ses_97d", "per_elsewhere");
+        await waitFor(() => bridge.summary().contested === 1, 3_000, 25);
+        const rec = readApprovals(dir).find((l) => l.kind === "not-delivered");
+        c.check(
+          rec !== undefined && rec.still_open === null,
+          `#97d: an unattributable entry makes the answer unknown, not 'gone' (${JSON.stringify(rec)})`,
+        );
+        bridge.close();
       } finally {
         closeAllBuses();
         await fake.close();

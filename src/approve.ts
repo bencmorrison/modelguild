@@ -73,6 +73,20 @@
  *      (a second reply to a settled permission id is a 404 — verified on 1.18.7), and the
  *      loser is recorded, not retried.
  *
+ * A 404 IS NOT SELF-EXPLANATORY, SO IT IS CHECKED (issue #97). That arbitration 404 is
+ * byte-identical to the 404 a REMOVED reply endpoint would give — and `permission.respond`, the
+ * approve half, is the only operation opencode 1.18.7 marks `deprecated`. Its removal would
+ * 404 every approval while rejections kept landing: the developer says yes, nothing happens,
+ * the turn stalls to `GUILD_MESSAGE_TIMEOUT_MS`. So a 404 is followed by one bounded
+ * `GET /permission` (the same v1 snapshot the #91 re-list reads, filtered to this session):
+ * **still open ⇒ the reply did not land** and it is counted under `unsettled` with a latched
+ * `unsettledReason`; **absent ⇒ consistent with the race**, and `contested` now names something
+ * the bridge went and looked for rather than assumed; **the check unable to answer ⇒ neither**,
+ * recorded as unconfirmed rather than guessed. It deliberately does NOT feed
+ * `degraded`, which since #91 means "blind NOW" and clears when the stream and the open-request
+ * list say so — a bridge that can see perfectly well but cannot deliver is a different failure,
+ * and a `#relist` clearing it would erase it.
+ *
  * THE BLIND WINDOW, AND WHAT SHRINKING IT DOES AND DOES NOT BUY (issue #91). This bridge
  * answers requests off the event stream, so losing that stream makes it blind: requests still
  * OPEN are rejected fail-closed (`#onDegraded`), but one raised WHILE blind was never seen at
@@ -970,7 +984,7 @@ export interface ApprovalSummary {
   /**
    * OUTCOMES, COUNTED FROM EVIDENCE, NOT FROM INTENT (review finding M5). A decision is
    * counted only once opencode ACCEPTED the reply (2xx) or reported one on the event stream.
-   * A reply that 404'd (lost the race) or never left the process counts under `contested` /
+   * A reply that 404'd or never left the process counts under `contested` / `unsettled` /
    * `undelivered` instead — the old code incremented before the POST and could claim
    * `rejected: 1` for a reply that never landed.
    */
@@ -980,10 +994,59 @@ export interface ApprovalSummary {
   timedOut: number;
   /** Answered by somebody other than this process (a subset of approved+rejected). */
   externallyAnswered: number;
-  /** Our reply lost the race (404 — opencode had already settled it). Not an outcome. */
+  /**
+   * A 404 that was **not** confirmed to have left the request open — the documented lost race
+   * (somebody else answered first and opencode arbitrated), or a 404 whose cause could not be
+   * established because the open-request check could not answer — it failed, or it returned an
+   * entry that could not be attributed and might have been this one. Not an outcome.
+   *
+   * NARROWED BY EVIDENCE (issue #97). Every 404 landed here until this bridge learned to ask
+   * `GET /permission` whether the id is still open; the confirmed-still-open ones now go to
+   * `unsettled` instead. The per-request record carries `still_open: false | null`, so "absent
+   * from the open list" and "the check could not be made" stay distinguishable in the evidence
+   * even though both sit in this one number.
+   *
+   * ONE THING IT STILL CANNOT SEE, stated so the narrowing is not read as more than it is: the
+   * list consulted is the **v1** open-request snapshot (CONTRACT C69a), so a request raised on
+   * another permission surface is absent from it and reads as `still_open: false` — true of
+   * that list, and not the same claim as "somebody else answered". The record's note says so
+   * rather than asserting the race outright.
+   */
   contested: number;
   /** Our reply never reached opencode (transport failure). Not an outcome. */
   undelivered: number;
+  /**
+   * DISTINCT REQUESTS THIS BRIDGE ANSWERED THAT OPENCODE DID NOT ACT ON AND STILL LISTS AS
+   * OPEN (issue #97). The developer's decision was taken and dropped: nothing runs (opencode
+   * still holds the call at its `ask`), but nothing proceeds either, so the turn stalls to
+   * `GUILD_MESSAGE_TIMEOUT_MS` instead of settling on the approval deadline.
+   *
+   * WHY IT IS NEITHER `contested` NOR `undelivered`. `contested` means somebody ELSE's answer
+   * won — routine, healthy, nothing to act on. This is the opposite: nobody's answer won and
+   * the request is verifiably still there. `undelivered` means the reply never reached opencode
+   * at all, where opencode's state is unknown and the diagnosis is "the serve or the network is
+   * down". Here the reply DID reach opencode, opencode answered it (404), and the request is
+   * provably open — the diagnosis is "this reply endpoint no longer settles this request".
+   * Folding it into either would make that number mean two different things at exactly the
+   * moment its meaning matters.
+   *
+   * FED BY TWO OBSERVATIONS OF THE SAME CONDITION, deduplicated by permission id: a 404 whose
+   * follow-up `GET /permission` still lists the id, and the re-list's own discovery that a
+   * request this bridge already answered is still open (C68's existing "recorded, not retried"
+   * case, which had no counter of its own).
+   *
+   * A NON-ZERO VALUE ON THE APPROVE PATH IS THE STATED EXPIRY CONDITION OF THE v1 PIN
+   * (CONTRACT C69a): `POST /session/{id}/permissions/{permId}` is the one operation opencode
+   * marks `deprecated`, and its removal 404s every approval while rejections keep working — an
+   * approval-only outage. `unsettledReason` names it at the point it is first confirmed.
+   */
+  unsettled: number;
+  /**
+   * Why the FIRST confirmed-undelivered decision could not be delivered, latched — the loud
+   * half of `unsettled`, so a reader who does not diff counters still gets the diagnosis and
+   * the next step. Null when nothing was ever confirmed undelivered.
+   */
+  unsettledReason: string | null;
   /** Elicitation cancelled while another live channel could still answer, so this bridge
    * deliberately did NOT settle the request (review finding H2). */
   abstained: number;
@@ -1098,6 +1161,11 @@ export class ApprovalBridge {
   #external = 0;
   #contested = 0;
   #undelivered = 0;
+  /** Ids counted under `unsettled`, so the two observations that can detect the same stuck
+   * request (a 404 whose re-check found it open; a re-list finding one we already answered)
+   * count it exactly once — the same distinct-request discipline as `#seen`. */
+  #unsettledIds = new Set<string>();
+  #unsettledReason: string | null = null;
   #abstained = 0;
   #decidedBy: Record<string, number> = {};
   #degraded = false;
@@ -1255,6 +1323,8 @@ export class ApprovalBridge {
       externallyAnswered: this.#external,
       contested: this.#contested,
       undelivered: this.#undelivered,
+      unsettled: this.#unsettledIds.size,
+      unsettledReason: this.#unsettledReason,
       abstained: this.#abstained,
       decidedBy: { ...this.#decidedBy },
       degraded: this.#degraded,
@@ -1482,6 +1552,16 @@ export class ApprovalBridge {
       // the dedup exists to prevent. Recorded instead, and it keeps the bridge degraded,
       // because a decision of ours is demonstrably unresolved.
       count.unsettled();
+      // ...and it is the SAME condition the 404 re-check detects (issue #97): a decision this
+      // bridge took that opencode did not act on. It goes to the same counter, deduplicated by
+      // id, so `unsettled` means one coherent thing however it was discovered — this arm used
+      // to be recorded in the log and counted nowhere, which is exactly the "a quiet counter
+      // absorbs a systematic failure" shape #97 is about.
+      this.#markUnsettled(
+        permissionId,
+        "opencode still lists a request this bridge had already answered as OPEN, so that " +
+          "reply did not take effect",
+      );
       this.#write({
         kind: "relist-unsettled",
         permission_id: permissionId,
@@ -1706,9 +1786,9 @@ export class ApprovalBridge {
    *     bus routed to THIS session.
    *
    * THE OUTCOME IS RECORDED FROM THE RESPONSE, NOT FROM THE ATTEMPT (review finding M5): a
-   * 2xx settles it, a 404 means we lost the race (`contested` — opencode already settled it,
-   * and its `permission.replied` is the authority), and a transport failure is `undelivered`.
-   * The old code counted before the POST and could claim a rejection that never landed.
+   * 2xx settles it, a transport failure is `undelivered`, and a 404 is CHECKED rather than
+   * assumed (issue #97) — see the 404 branch below. The old code counted before the POST and
+   * could claim a rejection that never landed.
    *
    * `always` is NEVER sent by this bridge. It persists past the call, so only a human
    * explicitly choosing it (at the watch terminal) may produce one.
@@ -1717,8 +1797,10 @@ export class ApprovalBridge {
    * onto the v2 permission endpoints. **These two endpoints cannot settle a v2 request at
    * all:** against a live pending v2 request both answer **404 `PermissionNotFoundError`**
    * (verified on 1.18.7), so a half-migrated bridge would prompt the developer, take their
-   * answer, and be unable to deliver it — booking it here as `contested`, whose note ("already
-   * settled") would be false, while the turn blocks to `GUILD_MESSAGE_TIMEOUT_MS`. **The
+   * answer, and be unable to deliver it, while the turn blocks to `GUILD_MESSAGE_TIMEOUT_MS`.
+   * The 404 branch's still-open check does NOT rescue that case — the v1 list is the wrong
+   * store for a v2 request, so it reads as absent (`still_open: false`); what catches a
+   * half-migration is C69's stored-ruleset check and the pin itself, not a counter. **The
    * approve endpoint is also the one operation opencode marks `deprecated` in 1.18.7**; what
    * to do when it is removed is in the V1 PIN block in `src/client.ts`, which holds the whole
    * record. Re-probe with `bash modelguild/verify-permission-surface.sh`.
@@ -1787,25 +1869,66 @@ export class ApprovalBridge {
       return;
     }
     if (status === 404) {
-      // WHAT IS OBSERVED: opencode will not accept this reply for this id. The USUAL cause is
-      // the documented lost race — another answerer got there first, and their
-      // `permission.replied` (if the stream is healthy) records the outcome, not us.
+      // WHAT IS OBSERVED: opencode will not accept this reply for this id. Two very different
+      // situations produce that byte-identically, and until issue #97 this branch could not
+      // tell them apart:
       //
-      // THE NOTE NO LONGER ASSERTS THAT CAUSE, because the code cannot know it and at least
-      // one other cause is now foreseeable: the approve endpoint
-      // (`POST /session/{id}/permissions/{permId}`) is the ONE operation opencode marks
-      // `deprecated` on 1.18.7, so its eventual removal would 404 every approval while the
-      // request stayed OPEN — the opposite of "already settled" — and a bridge asserting the
-      // race would be telling the developer something false at exactly the moment they most
-      // need the truth. (A v2-issued request id 404s here for the same reason: still open,
-      // wrong store. See the V1 PIN block in `src/client.ts`.)
+      //   1. A GENUINE RACE — another answerer (normally the `modelguild watch --approve`
+      //      terminal) got there first, opencode arbitrated, and their `permission.replied` is
+      //      the authority. Routine and healthy; nothing is stuck.
+      //   2. THE REPLY DID NOT LAND — the request is still open and nobody's decision reached
+      //      it. `POST /session/{id}/permissions/{permId}` is the ONE operation opencode marks
+      //      `deprecated` on 1.18.7, so its removal 404s every APPROVAL while rejections keep
+      //      working: an approval-only outage in which the developer says yes, nothing
+      //      happens, and the turn stalls to `GUILD_MESSAGE_TIMEOUT_MS`. A v2-issued request
+      //      id 404s here for the same reason (still open, wrong store — see the V1 PIN block
+      //      in `src/client.ts`).
       //
-      // WHAT THIS DOES NOT DO, stated so nobody reads more into it than is here: it does not
-      // DISTINGUISH those causes. Telling a genuine race from a removed endpoint needs an
-      // extra observation (re-list the request and see whether it is still open) plus a
-      // counter that means something different from `contested`, which is a C68 change with
-      // its own tests — deliberately out of scope for this pass. The classification is
-      // unchanged; only the false claim is gone.
+      // SO IT IS CHECKED, NOT ASSUMED. `GET /permission` — the same v1 snapshot the #91
+      // re-list reads, filtered to this session — answers whether the id is STILL OPEN. Still
+      // open ⇒ not a race, and it is counted under `unsettled`, whose whole purpose is that a
+      // quiet `contested` can never absorb a systematic approval failure. Gone ⇒ the race is
+      // CONFIRMED, and `contested` now means something it was previously only assuming. The
+      // check failing (an unreachable serve, a garbage body, an entry we could not attribute)
+      // is neither, and is recorded as `still_open: null` rather than guessed either way.
+      //
+      // THE CHECK IS NOT RESTRICTED TO THE APPROVE PATH even though only that endpoint carries
+      // a known expiry condition: a reject that 404s while the request stays open leaves the
+      // model blocked in exactly the same way, and the observation costs one bounded
+      // control-plane GET on a path that has already failed.
+      //
+      // WHAT IS DELIBERATELY NOT DONE: a confirmed-undelivered APPROVAL is not retried as a
+      // REJECT down the endpoint that still works. That would unstick the turn by inverting a
+      // decision the developer did make into one they did not — this bridge may fail closed on
+      // silence, never convert a human's yes into a no. It stalls visibly instead, counted and
+      // named.
+      const stillOpen = await this.#stillOpen(permissionId);
+      if (stillOpen === true) {
+        this.#markUnsettled(
+          permissionId,
+          `opencode answered 404 to this bridge's '${response}' reply and still lists the ` +
+            `request as OPEN, so the decision was not delivered` +
+            (response === "once"
+              ? ` — on the APPROVE endpoint (POST /session/{id}/permissions/{permId}), the one ` +
+                `operation opencode 1.18.7 marks deprecated. If this repeats, approvals are ` +
+                `failing while rejections still land: re-probe with ` +
+                `\`bash modelguild/verify-permission-surface.sh\` and see CONTRACT C69a.`
+              : `.`),
+        );
+        this.#write({
+          kind: "not-delivered",
+          permission_id: permissionId,
+          attempted: response,
+          by,
+          http_status: 404,
+          still_open: true,
+          note:
+            "opencode refused this reply (404) AND still lists the request as open — this is " +
+            "NOT the documented lost race: nobody's decision reached it. The request stays " +
+            "open until the model-turn timeout, and it is counted under `unsettled`",
+        });
+        return;
+      }
       this.#contested += 1;
       this.#write({
         kind: "not-delivered",
@@ -1813,7 +1936,11 @@ export class ApprovalBridge {
         attempted: response,
         by,
         http_status: 404,
-        note: "opencode did not accept this reply for this request id (404) — usually another answerer settled it first, but a removed/renamed reply endpoint or a request raised on a different permission surface looks identical here. Either way this reply was NOT the decision",
+        still_open: stillOpen,
+        note:
+          stillOpen === false
+            ? "opencode did not accept this reply for this request id (404) and does not list the request among its open ones — consistent with the documented lost race: another answerer settled it first, and their reply, not this one, was the decision. (The list read is the v1 open-request snapshot, so a request raised on a DIFFERENT permission surface would also read as absent here — see CONTRACT C69a.)"
+            : "opencode did not accept this reply for this request id (404), and whether the request is still open could NOT be established — the open-request check failed, or opencode listed an entry that could not be attributed and might be this one. Recorded as unconfirmed rather than classified as a race; either way this reply was NOT the decision",
       });
       return;
     }
@@ -1827,6 +1954,55 @@ export class ApprovalBridge {
       error: error || null,
       note: "this reply did not reach opencode; the request may still be open until the model-turn timeout",
     });
+  }
+
+  /**
+   * IS THIS REQUEST STILL OPEN? (issue #97) — `true` / `false` / `null` for "could not tell".
+   *
+   * The one extra observation that makes a 404 diagnosable. It reads the SAME v1 snapshot the
+   * #91 re-list reads (`GET /permission`, filtered to this session by `listPendingPermissions`,
+   * whose session argument is mandatory precisely because the endpoint is global to the serve
+   * child — on a panel, answering off another member's list would be this bridge deciding for a
+   * session it does not own).
+   *
+   * IT MAY NOT THROW, EVER — same rule as the re-list. It is called from `#settle`, which every
+   * caller fires and forgets, so an escape would be an unhandled rejection in a process that
+   * must stay up, and a failed control-plane GET must never become a call failure. Every
+   * failure answers `null`, which the caller records as "unconfirmed" rather than guessing.
+   *
+   * `null` ALSO COVERS AN AMBIGUOUS LIST, not just a failed one: an entry opencode listed for
+   * this session without a usable `id` (`malformed`), or one naming no session at all
+   * (`unattributable`), COULD be the request being asked about — so "absent from `pending`"
+   * only means "gone" when the list had neither. Same conservatism as #91's `clean` rule: an
+   * unreadable entry is a gap, never evidence.
+   *
+   * IT DECIDES NOTHING AND SENDS NOTHING. Both C66 invariants (never emit `allow`, never gate a
+   * tool the def denies) are untouched by this path — it is a read.
+   */
+  async #stillOpen(permissionId: string): Promise<boolean | null> {
+    if (this.#baseUrl.length === 0 || this.#sessionId.length === 0) return null;
+    try {
+      const listed = await listPendingPermissions({
+        baseUrl: this.#baseUrl,
+        sessionId: this.#sessionId,
+        fetchImpl: this.#fetchImpl,
+      });
+      if (listed.pending.some((p) => p.id === permissionId)) return true;
+      if (listed.malformed > 0 || listed.unattributable > 0) return null;
+      return false;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Count a request whose decision opencode did not act on, once per id, and latch the FIRST
+   * reason as the loud half of the counter. Both detections of the condition (the 404 re-check
+   * and the re-list) funnel through here so `unsettled` cannot double-count or disagree with
+   * itself. Guarded like every other record-keeper: it can never fail a call. */
+  #markUnsettled(permissionId: string, reason: string): void {
+    if (this.#unsettledIds.has(permissionId)) return;
+    this.#unsettledIds.add(permissionId);
+    if (this.#unsettledReason === null) this.#unsettledReason = reason;
   }
 
   async #post(pathname: string, body: unknown): Promise<{ status: number }> {
