@@ -331,10 +331,15 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //     checker's per-child cache would collapse N identical asks anyway). Placed after the
   //     model-set resolution so an empty set stays a cheap `no-models` refusal, and before the
   //     approval pre-flight, `newRun` and any member dispatch. See `gateAgentFloor`.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
   const floor = await gateAgentFloor({
     serve,
     agent: PANEL_AGENT,
     agentDefDirs,
+    announced,
     ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
   });
   if (!floor.ok) {
@@ -345,13 +350,26 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       error: { kind: "agent-unhardened", message: floor.message, exitAnalogue: null },
     };
   }
-  const unverified = floor.unverified;
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: re-asked inside each member's own turn lease. Built ONCE from the same checker, so on
    * the shared child every member is a cache hit; under `GUILD_SERVE_PER_CALL=1` each member's
    * lease is a different child, so each gets a real check on the one that serves it. */
   const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     PANEL_AGENT,
     agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
   );
 
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
@@ -374,7 +392,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       ok: false,
       warnings: panelRes.warnings,
       rootConflict,
-      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       error: {
         kind: armed.refusal.kind,
         message: armed.refusal.message,
@@ -450,8 +468,13 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       // created), so there is no live session to continue; fabricating an id would send a
       // round-2 continuation at a dead/wrong session. The absent sessionId is exactly what
       // makes the round-2 consult loop skip this member.
+      // `agent-unhardened` carries its own actionable message (review B4) — same reasoning as the
+      // single-model tools: wrapping a refusal in "the call failed" loses the remedy the command
+      // docs tell the driver to report verbatim.
       const message =
-        outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+        outcome.kind === "agent-mismatch" ||
+        outcome.kind === "approval-not-applied" ||
+        outcome.kind === "agent-unhardened"
           ? outcome.reason
           : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
@@ -475,7 +498,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     results,
     warnings: panelRes.warnings,
     rootConflict,
-    ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
+    ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
     ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
   };
 }

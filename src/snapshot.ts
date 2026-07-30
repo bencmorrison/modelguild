@@ -604,9 +604,12 @@ export function scaffoldDigest(repoDir: string): string {
  * The earlier draft said the gate put the scaffolding inside the baseline so `scaffoldChanged`
  * stopped firing. **That does not reproduce.** Measured on 1.18.7 (2026-07-30, three runs):
  * `GET /agent` returns in ~200-270ms, and `node_modules` appears **+579ms / +581ms / +3680ms
- * AFTER the response** — while the production gap between the gate returning and the baseline is
- * a handful of synchronous fs calls. A post-gate baseline therefore would not have held
+ * AFTER the response**. A post-gate baseline therefore would almost certainly not have held
  * `node_modules`, the before/after digests would still differ, and the flag would still fire.
+ * **Stated as a MARGIN, not an impossibility (review B5): the gate→baseline gap is not "a handful
+ * of synchronous fs calls"** — it contains `new EvidenceLog`, the approval pre-flight (def reads
+ * plus a watcher-presence scan) and `log.newRun()`, which includes a retention scan over the logs
+ * root. Almost certainly far under 579ms, but it is a race, not a proof.
  *
  * **What a post-gate baseline actually breaks is the WORDING BRANCH.**
  * `.opencode/.gitignore` is written SYNCHRONOUSLY — it is already on disk at the instant the

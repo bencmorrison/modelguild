@@ -857,6 +857,20 @@ export async function run(): Promise<number> {
         );
       }
       c.check(asked === 2, `A3: the floor was checked on BOTH leases (got ${asked})`);
+      if (!r.ok) {
+        // B4: the LATE shape must read like the EARLY one — its own actionable message, not
+        // wrapped in "the call failed: ...". The command docs tell the driver to report it
+        // verbatim, so the wrapper reached the human with a remedy buried in it.
+        c.check(
+          /NOT resolving with its default-deny floor|did not resolve any agent/.test(r.error.message),
+          "B4: the late refusal carries the floor message itself, unwrapped",
+        );
+        c.check(
+          !/call to '.*' failed/.test(r.error.message),
+          "B4: ...and is NOT wrapped in the generic call-failed sentence",
+        );
+        c.check(/fresh opencode serve child/i.test(r.error.message), "B4: so the remedy survives");
+      }
       c.check(
         fake.recorded.messageBodies.length === 0,
         "A3: no model was called — the refusal lands before any message",
@@ -901,6 +915,108 @@ export async function run(): Promise<number> {
           `A3: and NOT a missing-entry/cardinality failure — that is the outcome this path exists to avoid (${verdict.message})`,
         );
       }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // =========================================================================
+  // 9c. B1 — THE DIVERGENT CASE: early says `verified`, THE SERVING CHILD says `unverified`.
+  //     No fixture constructed this before, which is why the suite could not catch it: the
+  //     pre-turn path suppressed its note "because the early gate already warned", and when the
+  //     early gate had nothing to warn about, the turn ran on a never-verified child with
+  //     NOTHING on any channel — no stderr line and no `agentUnverified`. Reproduced before the
+  //     fix. `GUILD_SERVE_PER_CALL=1` guarantees two instances; a crash-revive or a short
+  //     `GUILD_SERVE_IDLE_MS` does it on the shared child too.
+  // =========================================================================
+  {
+    const logDir = tmp("m111-logs-");
+    const env = envWith({
+      GUILD_ROOT: tmp("m111-guild-"),
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDir("guild-read"),
+    });
+    const lines: string[] = [];
+    let asked = 0;
+    const checker = new AgentFloorChecker({
+      warn: (l) => lines.push(l),
+      list: async () => {
+        asked += 1;
+        // Early lease: hardened. Serving lease: opencode has gone away ⇒ unverified.
+        if (asked === 1) return [hardenedAgent("guild-read", ["read"])];
+        throw new Error("serve went away between the gate and the turn");
+      },
+    });
+    const fake = await startFakeOpencode({ historyText: "the answer" });
+    const handles = [fakeServeHandle(fake.baseUrl), fakeServeHandle(fake.baseUrl)];
+    let lease = 0;
+    const serve = {
+      withServe: <T,>(fn: (h: (typeof handles)[0]) => Promise<T>): Promise<T> =>
+        fn(handles[Math.min(lease++, 1)]),
+    };
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/m" },
+        { serve, env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(r.ok, "B1: the call still PROCEEDS — the cannot-ask direction is unchanged");
+      c.check(asked === 2, `B1: both leases were checked (got ${asked})`);
+      // THE TWO ASSERTIONS THAT FAILED BEFORE THE FIX.
+      c.check(
+        r.ok && r.agentUnverified !== undefined,
+        "B1: the LATE unverified verdict reaches the tool result — it reached no channel at all before",
+      );
+      c.check(
+        lines.length === 1,
+        `B1: and exactly one stderr line, from the late check (got ${lines.length})`,
+      );
+      c.check(
+        (lines[0] ?? "").includes("guild-read"),
+        "B1: the line names the agent it could not verify",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // The in-call DUPLICATE this dedupe exists to remove is still removed: one child, both leases
+  // unverified ⇒ ONE line, not two. (Regressing to "always announce" would put it back.)
+  {
+    const logDir = tmp("m111-logs-");
+    const env = envWith({
+      GUILD_ROOT: tmp("m111-guild-"),
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDir("guild-read"),
+    });
+    const lines: string[] = [];
+    const checker = new AgentFloorChecker({
+      warn: (l) => lines.push(l),
+      list: async () => {
+        throw new Error("always unreachable");
+      },
+    });
+    const fake = await startFakeOpencode({ historyText: "the answer" });
+    // ONE handle ⇒ one instance ⇒ one cache key across both leases.
+    const handle = fakeServeHandle(fake.baseUrl);
+    const serve = {
+      withServe: <T,>(fn: (h: typeof handle) => Promise<T>): Promise<T> => fn(handle),
+    };
+    try {
+      const r1 = await consult(
+        { question: "q", model: "openai/m" },
+        { serve, env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(r1.ok && r1.agentUnverified !== undefined, "B1: same-child call surfaces the note");
+      c.check(lines.length === 1, `B1: ONE line for one child in one call (got ${lines.length})`);
+      // ...and it still repeats on the NEXT call, which is C1's requirement.
+      await consult(
+        { question: "q2", model: "openai/m" },
+        { serve, env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(
+        lines.length === 2,
+        `B1: and it repeats on the next call — dedupe is per call, not per child forever (got ${lines.length})`,
+      );
     } finally {
       await fake.close();
     }

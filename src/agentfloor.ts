@@ -67,9 +67,12 @@
  * cannot-ask direction are Claude's.
  *
  * COST, STATED — and it was understated in the first cut (review R5, measured 2026-07-30).
- *   - One extra control-plane GET per call. Retained per child+agent once `verified`, so a
- *     3-model panel pays it once; re-issued every call while the verdict is NOT verified, which
- *     is the state where the extra check is wanted.
+ *   - Control-plane `GET /agent`s per call: **ONE** on the shared child once the verdict is
+ *     `verified` (the pre-turn check is then a cache hit, and a 3-model panel still pays one).
+ *     **TWO** whenever the verdict is NOT `verified` — the entry is deleted, so the pre-turn path
+ *     recomputes — and **TWO under `GUILD_SERVE_PER_CALL=1`** whatever the verdict, because the
+ *     serving child is a different instance and therefore a different key. The first cut of this
+ *     list said "one per call" flatly; it is one only in the common case (review B6).
  *   - `ServeProvider.withServe` entries go **1 → 2** on a fresh consult. On the shared long-lived
  *     child that is nearly free (ensure-running, in-flight accounting, an idle-timer re-arm).
  *     **Under `GUILD_SERVE_PER_CALL=1` it is not**: each entry is a full spawn + readiness poll +
@@ -305,9 +308,11 @@ export interface AgentFloorCheckerOpts {
  * NOTHING IS EVER EVICTED, AND THAT IS A COST (review A6, 2026-07-30). Only `verified` entries
  * are retained, and they are retained for the life of the process — there is no eviction on child
  * shutdown even though `OpencodeLifecycle.onShutdown` exists. On the shared child that is a
- * handful of entries forever. Under `GUILD_SERVE_PER_CALL=1` **every call is a new child and
- * therefore a new key that can never be hit again**, so the map grows without bound on a
- * long-lived server (a short string key and a settled promise per call — slow, but unbounded).
+ * handful of entries forever. Under `GUILD_SERVE_PER_CALL=1` **every call brings a new child and
+ * therefore new keys that can never be hit again** — two CACHE entries for every call, one per
+ * lease, since the early gate and the pre-turn check see different instances — so the map grows without bound on a
+ * long-lived server (two short string keys and two settled promises per call: slow, but
+ * unbounded).
  * Stated as a cost rather than fixed: eviction means this module subscribing to lifecycle events,
  * which is machinery the invariant does not need, and the bound is small enough that naming it is
  * the honest trade. If a deployment ever cares, `onShutdown` is the hook.
@@ -323,9 +328,51 @@ export class AgentFloorChecker {
   }
 
   /**
-   * Verify the floor for `agent` on the child `serve` provides. `agentDefDirs` is used only to
-   * make a refusal actionable (it names the files to go and look at); it is never read.
+   * ANNOUNCING IS THE CALLER'S DECISION, NOT THE CACHED COMPUTATION'S (review B1, 2026-07-30).
+   *
+   * The first cut passed an `announce` flag into `#run`, so the decision was baked into the
+   * PROMISE. Two failures came out of that, both reproduced:
+   *   - the pre-turn path suppressed the note to avoid an in-call duplicate, which is correct
+   *     only while the two verdicts AGREE. When the early gate said `verified` and the serving
+   *     child said `unverified`, the turn ran on a never-verified child with **nothing on any
+   *     channel** — no stderr line and no `agentUnverified`. That is C73's "proceed and SAY SO"
+   *     broken for precisely the child A3 exists to talk about;
+   *   - and a *different concurrent call's* early gate — whose whole job is the unconditional
+   *     line — could join a pre-turn-created in-flight promise and emit nothing, which made
+   *     "a stderr line cannot be un-written" false for a window of one `GET /agent`.
+   *
+   * So `#run` never warns. Each entry point awaits the (possibly shared) promise and then decides
+   * for itself, against an `announced` set the CALLER owns. Dedupe is therefore keyed on the CACHE
+   * KEY — i.e. on the child instance — within one call: the same child seen twice in one call warns
+   * once, a *different* serving child warns again, and the next call brings a fresh set so the note
+   * still repeats per call exactly as C1 requires. A joiner announces on its own terms regardless
+   * of who created the promise.
    */
+  #announce(verdict: AgentFloorVerdict, key: string, announced?: Set<string>): void {
+    if (verdict.state !== "unverified") return;
+    if (announced !== undefined) {
+      if (announced.has(key)) return;
+      announced.add(key);
+    }
+    // The maintainer's constraint on the cannot-ask direction: proceed, but NEVER silently. The
+    // structured `agentUnverified` can be ignored by a driver; a stderr line cannot be un-written.
+    this.#warn(`modelguild: ${verdict.note}`);
+  }
+
+  /**
+   * Verify the floor for `agent` on the child `serve` provides — taking a lease of this method's
+   * own. `agentDefDirs` is used only to make a refusal actionable (it names the files to go and
+   * look at); it is never read. `announced` scopes the stderr dedupe to one call (see `#announce`).
+   */
+  verify(
+    serve: ServeProvider,
+    agent: string,
+    agentDefDirs: readonly string[] = [],
+    opts: { announced?: Set<string> } = {},
+  ): Promise<AgentFloorVerdict> {
+    return serve.withServe((h) => this.verifyHandle(h, agent, agentDefDirs, opts));
+  }
+
   /**
    * Verify against an ALREADY-HELD handle (issue #111, review A3).
    *
@@ -333,58 +380,59 @@ export class AgentFloorChecker {
    * inside `askViaAgent`'s lease, so the child inspected is provably the child that serves the
    * turn. Same cache, so on the shared long-lived child the pre-turn call is a hit and costs
    * nothing; under `GUILD_SERVE_PER_CALL=1` the handle is a different child with a different
-   * `instanceId`, so it is a real check — which is exactly the gap this closes.
+   * `instanceId`, so it is a real check — which is exactly the gap A3 closes.
    */
   async verifyHandle(
     handle: ServeHandle,
     agent: string,
     agentDefDirs: readonly string[] = [],
-    opts: { announce?: boolean } = {},
+    opts: { announced?: Set<string> } = {},
   ): Promise<AgentFloorVerdict> {
     const key = cacheKey(handle, agent);
     const hit = this.#cache.get(key);
-    if (hit !== undefined) return hit;
-    const pending = this.#run(key, handle.baseUrl, agent, agentDefDirs, opts.announce !== false);
+    if (hit !== undefined) {
+      const verdict = await hit;
+      // A HIT IS ANNOUNCED TOO when it is not `verified`. Only `verified` verdicts are retained,
+      // so the only way to hit a non-verified one is to join an in-flight promise — exactly the
+      // concurrent case B1's secondary manifestation is about.
+      this.#announce(verdict, key, opts.announced);
+      return verdict;
+    }
+    const pending = this.#run(key, handle.baseUrl, agent, agentDefDirs);
     this.#cache.set(key, pending);
-    return pending;
+    const verdict = await pending;
+    this.#announce(verdict, key, opts.announced);
+    return verdict;
   }
 
   /**
    * A `PreTurnAgentCheck` bound to one agent and def-dir set — the seam `askViaAgent` calls
-   * inside its own lease. **Only an `unhardened` verdict stops the turn**: `unverified` must not,
-   * because the caller has already surfaced it (`agentUnverified`) and turning "I could not ask"
-   * into a mid-turn abort would reverse C73's decided direction from inside the transport.
+   * inside its own lease.
+   *
+   * **Only an `unhardened` verdict stops the turn**: `unverified` must not, because turning
+   * "I could not ask" into a mid-turn abort would reverse C73's decided direction from inside the
+   * transport. But an `unverified` verdict HERE must still reach the caller's result, because the
+   * early gate may have said `verified` about a different child — that is what `onUnverified` is
+   * for, and without it B1's silent case comes straight back.
    */
-  preTurnCheck(agent: string, agentDefDirs: readonly string[]): PreTurnAgentCheck {
+  preTurnCheck(
+    agent: string,
+    agentDefDirs: readonly string[],
+    opts: { announced?: Set<string>; onUnverified?: (note: string) => void } = {},
+  ): PreTurnAgentCheck {
     return {
       verify: async (handle) => {
-        // `announce: false` — DO NOT re-emit the unverified note here. The tool's early gate has
-        // already written it for THIS call, and the text is agent-scoped and identical, so a
-        // second identical line per call is noise a reader cannot act on. This is not the
-        // warn-once-per-child shortcut C1 rejected: the note still fires on every CALL (from the
-        // early gate), which is the property "never silently" actually needs. What is suppressed
-        // is the duplicate within one call, not the repetition across calls.
-        const verdict = await this.verifyHandle(handle, agent, agentDefDirs, { announce: false });
+        const verdict = await this.verifyHandle(handle, agent, agentDefDirs, {
+          ...(opts.announced !== undefined ? { announced: opts.announced } : {}),
+        });
+        if (verdict.state === "unverified" && opts.onUnverified !== undefined) {
+          opts.onUnverified(verdict.note);
+        }
         return verdict.state === "unhardened"
           ? { ok: false, message: verdict.message }
           : { ok: true };
       },
     };
-  }
-
-  verify(
-    serve: ServeProvider,
-    agent: string,
-    agentDefDirs: readonly string[] = [],
-  ): Promise<AgentFloorVerdict> {
-    return serve.withServe(async (h) => {
-      const key = cacheKey(h, agent);
-      const hit = this.#cache.get(key);
-      if (hit !== undefined) return hit;
-      const pending = this.#run(key, h.baseUrl, agent, agentDefDirs);
-      this.#cache.set(key, pending);
-      return pending;
-    });
   }
 
   /**
@@ -401,11 +449,10 @@ export class AgentFloorChecker {
     baseUrl: string,
     agent: string,
     agentDefDirs: readonly string[],
-    announce = true,
   ): Promise<AgentFloorVerdict> {
     return (async (): Promise<AgentFloorVerdict> => {
       try {
-        const verdict = await this.#compute(baseUrl, agent, agentDefDirs, announce);
+        const verdict = await this.#compute(baseUrl, agent, agentDefDirs);
         if (verdict.state !== "verified") this.#cache.delete(key);
         return verdict;
       } catch (err) {
@@ -418,7 +465,6 @@ export class AgentFloorChecker {
           agent,
           note: unverifiedNote(agent, reason),
         };
-        if (announce) this.#warn(`modelguild: ${verdict.note}`);
         return verdict;
       }
     })();
@@ -428,19 +474,11 @@ export class AgentFloorChecker {
     baseUrl: string,
     agent: string,
     agentDefDirs: readonly string[],
-    announce = true,
   ): Promise<AgentFloorVerdict> {
-    const verdict = await this.#classify(baseUrl, agent, agentDefDirs);
-    if (announce && verdict.state === "unverified") {
-      // The maintainer's constraint on this direction: proceed, but NEVER silently. This line
-      // is the unconditional half — the structured note on the tool result can be ignored by a
-      // driver, a stderr line cannot be un-written. It repeats PER CALL, because an unverified
-      // verdict is NOT retained (see the class doc): the first cut cached it and so warned
-      // once while every later call proceeded unverified in silence — precisely the failure
-      // this line exists to prevent.
-      this.#warn(`modelguild: ${verdict.note}`);
-    }
-    return verdict;
+    // No warning here: announcing is the ENTRY POINT's job, against the caller's `announced` set.
+    // Emitting from inside the cached computation is what made a shared promise decide another
+    // call's stderr (review B1).
+    return this.#classify(baseUrl, agent, agentDefDirs);
   }
 
   async #classify(
@@ -528,12 +566,14 @@ function remedy(agent: string, agentDefDirs: readonly string[]): string {
     `project. ` +
     `THEN GET A FRESH opencode serve CHILD. Fixing the file alone will NOT clear this: a running ` +
     `serve child never re-reads an agent def (probed on opencode 1.18.7), so the old config keeps ` +
-    `being served — and every retry re-arms the idle timer, keeping the stale child alive. Three ` +
-    `ways, most direct first: (1) set GUILD_SERVE_PER_CALL=1, which spawns a fresh child for the ` +
-    `very next call; (2) stop calling ModelGuild until the serve idles out (GUILD_SERVE_IDLE_MS, ` +
-    `default 600s); (3) restart the MCP server process — note that for a stdio server this means ` +
-    `ending and restarting the client session, since 're-adding' the server does not restart one ` +
-    `that is already running.`
+    `being served — and every retry re-arms the idle timer, keeping the stale child alive. Two ` +
+    `ways that work from where you are: (1) STOP CALLING ModelGuild until the serve idles out ` +
+    `(GUILD_SERVE_IDLE_MS, default 600s) — the retry loop itself is what prevents this, so the ` +
+    `fix is to wait rather than retry; (2) restart the MCP SERVER process, which for a stdio ` +
+    `server means ending and restarting the client session — 're-adding' the server does not ` +
+    `restart one that is already running. (GUILD_SERVE_PER_CALL=1 would give every call its own ` +
+    `fresh child, but it is read ONCE when the server starts, so it is a setting to have in the ` +
+    `server's environment beforehand, not an escape from this state.)`
   );
 }
 

@@ -106,8 +106,12 @@ export interface ResearchDeps {
 // --- Result / error shapes -------------------------------------------------
 export type ResearchErrorKind =
   | "agent-def-missing"
-  // The def FILE is present but opencode is not applying it (issue #111, C73). exitAnalogue
-  // null — no bash counterpart, and NOT a reuse of C57's 5 ("the def is missing").
+  // The def FILE is present but opencode is not applying it (issue #111, C73). TWO SHAPES, and
+  // they differ in footprint (review B4): the EARLY refusal is decided before any log write and
+  // before any snapshot — nothing ran; the LATE one comes from the re-check made inside the turn's
+  // own serve lease, so it lands after `expect`/`started` and is recorded like a failed call. Both
+  // carry the same `kind`; exit-analogue null either way (no bash counterpart, and NOT a reuse of
+  // C57's 5, which means specifically "the def is missing").
   | "agent-unhardened"
   /** The named read root is not a worktree of this repository (issue #96). */
   | "worktree-invalid"
@@ -266,10 +270,15 @@ export async function research(
   //     but is opencode APPLYING it? Before any log write and before the approval pre-flight
   //     (which reads the def SOURCE and would otherwise arm against a map that is not in
   //     force). See `gateAgentFloor`.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
   const floor = await gateAgentFloor({
     serve,
     agent: RESEARCH_AGENT,
     agentDefDirs,
+    announced,
     ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
   });
   if (!floor.ok) {
@@ -279,12 +288,25 @@ export async function research(
       error: { kind: "agent-unhardened", model: "", exitAnalogue: null, message: floor.message },
     };
   }
-  const unverified = floor.unverified;
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
   const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     RESEARCH_AGENT,
     agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
   );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
@@ -305,7 +327,7 @@ export async function research(
     return {
       ok: false,
       rootConflict,
-      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -357,14 +379,21 @@ export async function research(
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
-    if (unverified !== undefined) ok.agentUnverified = unverified;
+    if (floorNote.note !== undefined) ok.agentUnverified = floorNote.note;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   // agent-mismatch (positive-direction addition over bash; no exit analogue) carries its
   // own message; a plain call failure is wrapped. Both stay exitAnalogue null.
+    // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
+    // (agent named, resolved action, remedy), and the command docs tell the driver to report
+    // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
+    // capture.patchPath" with a null patchPath and no model call — plus a doubled period
+    // (review B4). The two shapes of one kind now read the same.
   const message =
-    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+    outcome.kind === "agent-mismatch" ||
+    outcome.kind === "approval-not-applied" ||
+    outcome.kind === "agent-unhardened"
       ? outcome.reason
       : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ResearchFail = {
@@ -379,7 +408,7 @@ export async function research(
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
-  if (unverified !== undefined) fail.agentUnverified = unverified;
+  if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
   return fail;
 }
 

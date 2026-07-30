@@ -198,10 +198,14 @@ export type DelegateErrorKind =
   | "agent-def-missing"
   // The def FILE is present but opencode is not applying it — the resolved config carries no
   // default-deny floor (issue #111, C73). Worst here of anywhere: without the floor,
-  // `guild-build` resolves on opencode's built-in `"*": allow`, i.e. the UNRESTRICTED tool
-  // set, which is exactly what the def-missing refusal exists to prevent. Refused before the
-  // snapshot and before any log write. exitAnalogue null (no bash counterpart; NOT a reuse of
-  // C57's 5, which is specifically "the def is missing").
+  // `guild-build` resolves on opencode's built-in `"*": allow`, i.e. the UNRESTRICTED tool set,
+  // which is exactly what the def-missing refusal exists to prevent. TWO SHAPES, and the footprint
+  // differs (review B4 — an earlier comment claimed the early one's footprint for both): the EARLY
+  // refusal lands before `snapshotScaffold`, before the git snapshot and before any log write, so
+  // nothing ran and nothing was recorded; the LATE one comes from the re-check inside the turn's
+  // own serve lease, so it lands AFTER the scaffold baseline, AFTER `snapshotWorktree` and AFTER
+  // `expect`/`started`, and is recorded exactly like a failed call (three entries, one call_id).
+  // exitAnalogue null either way (no bash counterpart; NOT a reuse of C57's 5).
   | "agent-unhardened"
   // The target named a directory that is not a worktree of this repository (issue #107,
   // reusing #96's kind and refusal shape verbatim). Refused before any log write AND before
@@ -444,6 +448,9 @@ export async function delegate(
   //     gate silences `scaffoldChanged`: measured on 1.18.7 (three runs), `GET /agent` returns in
   //     ~200-270ms and `node_modules` lands +579ms/+581ms/+3680ms AFTER the response, so a
   //     post-gate baseline would still differ from the after-tree and the flag would still fire.
+  //     (A margin, not a certainty — review B5: the gap below contains `new EvidenceLog`, the
+  //     approval pre-flight and `log.newRun()`'s retention scan, so it is a race this wins wide,
+  //     not an impossibility.)
   //     It is that `.opencode/.gitignore` IS written synchronously, and it is in
   //     `isServeScaffold`'s set — so a post-gate `before.scaffold` is non-EMPTY,
   //     `scaffoldAppeared` below is false, and the SEVERE "plugin directory MODIFIED, no benign
@@ -460,10 +467,15 @@ export async function delegate(
   //     otherwise arm against a map that is not in force), before `newRun`, and before
   //     `snapshotWorktree`: a refusal here leaves no run and takes no snapshot of a tree it
   //     was never going to touch. See `gateAgentFloor`.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
   const floor = await gateAgentFloor({
     serve,
     agent: DELEGATE_AGENT,
     agentDefDirs,
+    announced,
     ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
   });
   if (!floor.ok) {
@@ -474,12 +486,25 @@ export async function delegate(
       error: { kind: "agent-unhardened", model: "", exitAnalogue: null, message: floor.message },
     };
   }
-  const unverified = floor.unverified;
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
   const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     DELEGATE_AGENT,
     agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
   );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
@@ -502,7 +527,7 @@ export async function delegate(
     return {
       ok: false,
       rootConflict,
-      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: armed.refusal.kind,
@@ -580,13 +605,20 @@ export async function delegate(
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
-    if (unverified !== undefined) ok.agentUnverified = unverified;
+    if (floorNote.note !== undefined) ok.agentUnverified = floorNote.note;
     return ok;
   }
 
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
+    // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
+    // (agent named, resolved action, remedy), and the command docs tell the driver to report
+    // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
+    // capture.patchPath" with a null patchPath and no model call — plus a doubled period
+    // (review B4). The two shapes of one kind now read the same.
   const message =
-    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+    outcome.kind === "agent-mismatch" ||
+    outcome.kind === "approval-not-applied" ||
+    outcome.kind === "agent-unhardened"
       ? outcome.reason
       : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
@@ -605,7 +637,7 @@ export async function delegate(
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
-  if (unverified !== undefined) fail.agentUnverified = unverified;
+  if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
   return fail;
 }
 

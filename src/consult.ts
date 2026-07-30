@@ -282,10 +282,12 @@ export function guildDoctorSeed(
 // --- Result / error shapes -------------------------------------------------
 export type ConsultErrorKind =
   | "agent-def-missing"
-  // The def FILE is present but opencode is not applying it: the resolved config carries no
-  // default-deny floor, so the hardened agent is not hardened (issue #111, C73). Exit-analogue
-  // null — no bash counterpart, and deliberately NOT a reuse of C57's 5, which is specifically
-  // "the def is missing".
+  // The def FILE is present but opencode is not applying it (issue #111, C73). TWO SHAPES, and
+  // they differ in footprint (review B4): the EARLY refusal is decided before any log write and
+  // before any snapshot — nothing ran; the LATE one comes from the re-check made inside the turn's
+  // own serve lease, so it lands after `expect`/`started` and is recorded like a failed call. Both
+  // carry the same `kind`; exit-analogue null either way (no bash counterpart, and NOT a reuse of
+  // C57's 5, which means specifically "the def is missing").
   | "agent-unhardened"
   // The review target named a directory that is not a worktree of this repository
   // (issue #96). Refused before any log write, like every other pre-call refusal.
@@ -588,9 +590,13 @@ export async function gateAgentFloor(opts: {
   agentDefDirs: readonly string[];
   /** Injected in tests so one suite's per-child cache never decides another's assertion. */
   checker?: AgentFloorChecker;
+  /** Per-CALL stderr dedupe, shared with the in-lease re-check (review B1). See `#announce`. */
+  announced?: Set<string>;
 }): Promise<AgentFloorGate> {
   const checker = opts.checker ?? defaultAgentFloorChecker;
-  const verdict = await checker.verify(opts.serve, opts.agent, opts.agentDefDirs);
+  const verdict = await checker.verify(opts.serve, opts.agent, opts.agentDefDirs, {
+    ...(opts.announced !== undefined ? { announced: opts.announced } : {}),
+  });
   if (verdict.state === "unhardened") return { ok: false, message: verdict.message };
   if (verdict.state === "unverified") return { ok: true, unverified: verdict.note };
   return { ok: true };
@@ -1287,10 +1293,15 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check. Step 2 proved the
   //     file exists; this proves opencode is APPLYING it. Before any log write and before the
   //     approval pre-flight; see `gateAgentFloor` for why it sits exactly here.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
   const floor = await gateAgentFloor({
     serve,
     agent: CONSULT_AGENT,
     agentDefDirs,
+    announced,
     ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
   });
   if (!floor.ok) {
@@ -1306,12 +1317,25 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
   /** Carried onto every result below — see `ConsultOk.agentUnverified`. */
-  const unverified = floor.unverified;
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
   const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     CONSULT_AGENT,
     agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
   );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does), so the
@@ -1334,7 +1358,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     return {
       ok: false,
       rootConflict,
-      ...(unverified !== undefined ? { agentUnverified: unverified } : {}),
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -1393,15 +1417,22 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     if (params.keepSession === true) ok.sessionId = outcome.sessionId;
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
-    if (unverified !== undefined) ok.agentUnverified = unverified;
+    if (floorNote.note !== undefined) ok.agentUnverified = floorNote.note;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   // agent-mismatch is a positive-direction addition over bash (which has no post-call
   // agent check); it has NO bash exit analogue, so exitAnalogue stays null like
   // call-failed — the kind + isError carry the fail-closed signal.
+    // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
+    // (agent named, resolved action, remedy), and the command docs tell the driver to report
+    // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
+    // capture.patchPath" with a null patchPath and no model call — plus a doubled period
+    // (review B4). The two shapes of one kind now read the same.
   const message =
-    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+    outcome.kind === "agent-mismatch" ||
+    outcome.kind === "approval-not-applied" ||
+    outcome.kind === "agent-unhardened"
       ? outcome.reason
       : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ConsultFail = {
@@ -1419,7 +1450,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
-  if (unverified !== undefined) fail.agentUnverified = unverified;
+  if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
   return fail;
 }
 
