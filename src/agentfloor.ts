@@ -48,6 +48,16 @@
  * rules are fetched as data and resolved in this file — so the sentinel involves no opencode
  * behaviour and cannot be special-cased by it.
  *
+ * THE SENTINEL HAS ITS OWN FALSE-REFUSAL CLASS, and it is not the `task` one (review R6,
+ * 2026-07-30): a def written as a DENYLIST — every unwanted tool denied by name, with no `"*"`
+ * rule at all — resolves nothing for the sentinel, so `effectiveAction` returns `undefined` and
+ * this refuses as "nothing matched". That is a def opencode applies perfectly well, refused for
+ * having no floor. It is the intended direction, because the floor is the design (AGENTS.md's
+ * "prefer an allowlist floor over a denylist for any versioned tool surface", reached the hard
+ * way) and a denylist genuinely does leave every future opencode tool allowed — but it is a
+ * refusal of a working configuration, so it is named here rather than left for someone to
+ * discover from the message.
+ *
  * THIS IS NOT A NEW FENCE. It verifies that the fence the def already declares is in force.
  * PARITY (AGENTS.md): you would want the same before running an Anthropic subagent under a
  * restricted tool set — "the restriction I configured is actually applied" is not a
@@ -56,10 +66,21 @@
  * (Ben, 2026-07-29); the effective-action test, the sentinel probe, the caching shape and the
  * cannot-ask direction are Claude's.
  *
- * COST, STATED: one extra control-plane GET per call (cached per serve child, so a panel pays
- * it once), and a new refusal that stops work when the def in force is not the hardened one.
- * It also means the read/write tools now touch opencode BEFORE the approval pre-flight rather
- * than only at the turn — see the placement note in each tool.
+ * COST, STATED — and it was understated in the first cut (review R5, measured 2026-07-30).
+ *   - One extra control-plane GET per call. Retained per child+agent once `verified`, so a
+ *     3-model panel pays it once; re-issued every call while the verdict is NOT verified, which
+ *     is the state where the extra check is wanted.
+ *   - `ServeProvider.withServe` entries go **1 → 2** on a fresh consult. On the shared long-lived
+ *     child that is nearly free (ensure-running, in-flight accounting, an idle-timer re-arm).
+ *     **Under `GUILD_SERVE_PER_CALL=1` it is not**: each entry is a full spawn + readiness poll +
+ *     teardown, so this roughly DOUBLES the startup cost of a call against the ~30s readiness
+ *     ceiling `src/lifecycle.ts` documents.
+ *   - **And in that mode the child that is CHECKED is not the child that runs the turn.** The
+ *     verdict still transfers in practice — the second child is spawned at the same cwd from the
+ *     same files, so it resolves identically — but it is a fresh resolution, not the one this
+ *     check observed. Nothing here may claim the checked child is the serving child.
+ *   - A new refusal that stops work when the def in force is not the hardened one, and a first
+ *     touch of opencode that now precedes the approval pre-flight rather than only the turn.
  */
 
 import { listAgents, type ResolvedAgent, type ServeProvider } from "./client.js";
@@ -224,11 +245,34 @@ export interface AgentFloorCheckerOpts {
  * lifecycle. The URL stays in the key as a second component, which can only ever make the key
  * STRICTER (an extra component causes a miss, never a stale hit).
  *
- * WHAT IS STILL NOT CLAIMED: freshness. A `verified` verdict is retained for the life of that
- * child, and opencode re-reads agent defs — so a def edited to REMOVE its floor mid-session,
- * on a child already verified, is not re-checked until that child is replaced. That is the
- * cost of caching at all, it runs in the same direction as every other pre-flight here (a
- * check happens before the turn, not continuously), and it is not dressed up as more.
+ * WHY RETAINING `verified` PER CHILD IS CORRECT BY CONSTRUCTION, and not merely cheap.
+ * An earlier draft of this comment said opencode "re-reads agent defs", and offered the
+ * retention as an accepted risk. **That is FALSE, and it was refuted by probe** (1.18.7,
+ * 2026-07-30, reproduced independently by two reviewers and again here). A running serve child
+ * NEVER re-reads a def:
+ *
+ *     hardened def, fresh serve      : rules=19  effective(probe)=deny
+ *     same child, def VOIDED on disk : rules=19  effective(probe)=deny   (unchanged)
+ *     fresh serve, same voided file  : rules=13  no floor
+ *
+ * And **enforcement does not re-read either — which is the half that matters.** With a serve
+ * started on a `bash: allow` def and a `bash: deny` def swapped in on disk under the same agent
+ * name, `GET /agent` still reported `bash:*:allow` and a real model turn ACTUALLY RAN bash
+ * (`['bash','completed','MARKER-BASH-RAN\n']`). So the check and the enforcement read the SAME
+ * config, fixed at spawn. There is therefore no state in which this reports `deny` while the
+ * child enforces `allow`: for a given child instance the answer cannot change, so caching it is
+ * a proof, not a risk. That is exactly why the key had to become the child INSTANCE — the
+ * guarantee is scoped to one child and to nothing wider.
+ *
+ * THE COST LANDS SOMEWHERE ELSE, AND IT IS REAL: RECOVERY. Because the child does not re-read,
+ * a user who does precisely what an `unhardened` refusal tells them — fix the def, re-run
+ * `init` — **stays refused**, since the stale child is still serving the old config (probed
+ * end-to-end: voided ⇒ refused, fixed ⇒ refused, retried ⇒ refused). Worse,
+ * `OpencodeLifecycle.withServe` re-arms the idle timer on every entry, so retrying inside
+ * `GUILD_SERVE_IDLE_MS` (default 600s) keeps the stale child alive indefinitely. `remedy()`
+ * therefore names getting a FRESH CHILD, and says why. Killing the child from here on an
+ * `unhardened` verdict was considered and NOT done: that is the #96 finding-H1 shape (tearing
+ * down a child that may have other calls in flight) and is a separate decision.
  *
  * The cached value is the PROMISE, so a panel's concurrent members share one in-flight request
  * rather than racing three identical ones — including on the failure path, where the re-check
@@ -369,6 +413,16 @@ export class AgentFloorChecker {
   }
 }
 
+/**
+ * The remedy text — and FIXING THE FILE IS NOT ENOUGH, which is why this says so.
+ *
+ * Probed on 1.18.7 (2026-07-30): a running `opencode serve` child never re-reads an agent def,
+ * for the resolved config OR for enforcement. So the obvious remedy — edit the def, re-run
+ * `init`, retry — leaves the same refusal in place, because the stale child is still serving.
+ * And `OpencodeLifecycle.withServe` re-arms the idle timer on every entry, so a user retrying
+ * in a tight loop keeps that child alive past `GUILD_SERVE_IDLE_MS` indefinitely. A remedy that
+ * omits the fresh-child step sends the user round a loop that cannot terminate.
+ */
 function remedy(agent: string, agentDefDirs: readonly string[]): string {
   const where =
     agentDefDirs.length > 0
@@ -377,7 +431,12 @@ function remedy(agent: string, agentDefDirs: readonly string[]): string {
   return (
     `${where} for a duplicate key or a tab-indented line; or delete it and re-run ` +
     `\`npx modelguild init\` to reinstall the shipped def (never-clobber means an EDITED def ` +
-    `is skipped, so it has to be removed first).`
+    `is skipped, so it has to be removed first). ` +
+    `THEN GET A FRESH opencode serve CHILD — restart the MCP server (in Claude Code, restart ` +
+    `the session or re-add the server), or stop calling ModelGuild until the serve idles out ` +
+    `(GUILD_SERVE_IDLE_MS, default 600s). Fixing the file alone will NOT clear this: a running ` +
+    `serve child never re-reads an agent def (probed on opencode 1.18.7), so the old config ` +
+    `keeps being served — and every retry re-arms the idle timer, keeping the stale child alive.`
   );
 }
 
@@ -393,8 +452,16 @@ function unverifiedNote(agent: string, reason: string): string {
     `PROCEEDING: this check is a verification of a control opencode itself still enforces, and ` +
     `failing the call on a control-plane hiccup would convert a transient into an outage. What ` +
     `is NOT established for this call is that the def on disk is the def in force (issue #111, ` +
-    `CONTRACT C73). If it persists, run \`modelguild/verify-guild-*.sh\` for the resolved-config ` +
-    `proof.`
+    `CONTRACT C73). ` +
+    // R3 (review, 2026-07-30). The read paths lose only the guarantee above; an ARMED approval
+    // bridge loses something sharper, and AGENTS.md names it as the worst failure this feature
+    // can have, so it must be in the note rather than inferred by the reader.
+    `AND IF THE APPROVAL BRIDGE IS ARMED (GUILD_APPROVE / GUILD_APPROVE_EGRESS), its gating may ` +
+    `be NARROWER than the set of tools opencode will actually run: the bridge computes what to ` +
+    `gate from the def SOURCE (C66's never-widen intersection), so on a def opencode is not ` +
+    `applying, every tool the void newly permits runs UNGATED and UNPROMPTED while the run ` +
+    `reports itself armed. ` +
+    `If this persists, run \`modelguild/verify-guild-*.sh\` for the resolved-config proof.`
   );
 }
 

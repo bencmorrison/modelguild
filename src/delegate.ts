@@ -76,6 +76,7 @@ import {
   snapshotWorktree,
   captureDelegateDiff,
   scaffoldDigest,
+  snapshotScaffold,
   EMPTY_SCAFFOLD_DIGEST,
 } from "./snapshot.js";
 
@@ -434,6 +435,19 @@ export async function delegate(
     };
   }
 
+  // 4a. THE SCAFFOLD BASELINE IS HOISTED ABOVE THE GATE (issue #111 review; maintainer
+  //     decision 2026-07-30). This is a READ of a directory tree — it writes nothing, runs no
+  //     git and mints nothing — so it does not touch the rule that a refusal below snapshots
+  //     nothing (C24 gap parity). It is here because the gate's own `GET /agent`
+  //     MATERIALIZES opencode's plugin runtime into a cwd containing `.opencode/` (re-probed on
+  //     1.18.7, 2026-07-30: an idle serve writes nothing at 12s; one `GET /agent` writes
+  //     `.gitignore` at once and `node_modules` + manifests within ~3s). Taken AFTER the gate,
+  //     the scaffolding would already be inside the baseline, `scaffoldChanged` would stop
+  //     firing on a tree's first delegation, and the pre-warm that `src/snapshot.ts` and
+  //     AGENTS.md both record as REJECTED would have been silently in force. The git snapshot
+  //     stays below the gate, where a refusal never reaches it.
+  const scaffoldBefore = snapshotScaffold(writeRoot);
+
   // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check, and the highest
   //     stakes copy of it: step 2 proved `guild-build.md` exists, this proves opencode is
   //     APPLYING it. Without the floor, `guild-build` resolves on opencode's built-in
@@ -495,8 +509,9 @@ export async function delegate(
   // 5. Snapshot the RESOLVED root BEFORE the model runs (throwaway index; caller's index and
   //    worktree untouched — C36/C37). Nothing has been edited yet, so this is the baseline —
   //    of `writeRoot`, which is by construction the same directory the serve child below is
-  //    rooted at.
-  const before = snapshotWorktree(writeRoot);
+  //    rooted at. The SCAFFOLD half of the baseline was captured at step 4a, before the gate
+  //    touched opencode at all; everything taken here is git state, which the gate cannot move.
+  const before = snapshotWorktree(writeRoot, scaffoldBefore);
 
   // 6. The model turn, via the UNMODIFIED guild-build agent (shared spine + agent-mismatch).
   const outcome = await runAgentLifecycle(

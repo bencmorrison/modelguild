@@ -51,10 +51,15 @@ export interface ServeHandle {
    *
    * This is a plain monotonic counter, so within a process it can never repeat: two handles
    * carry the same id **iff they are the same child**. A cache keyed on it therefore cannot
-   * inherit a dead child's answer. It claims nothing beyond that — in particular it is NOT a
-   * freshness token: the same child's configuration can still change under it (opencode
-   * re-reads agent defs), which is why anything keyed on it must also decide what it is
-   * willing to retain.
+   * inherit a dead child's answer.
+   *
+   * WHAT IT IS EVIDENCE OF, exactly. For the agent-permission config it is a strong identity:
+   * a running child never re-reads its agent defs — probed on 1.18.7 (2026-07-30), for the
+   * resolved config AND for enforcement — so that config is fixed at spawn and this id is a
+   * complete key for it. An earlier version of this comment claimed the opposite ("opencode
+   * re-reads agent defs") and was refuted. It is still NOT a general freshness token: it says
+   * nothing about anything else a child might reload, so any cache keyed on it must state what
+   * it is retaining and why that particular answer cannot change under one child.
    */
   instanceId: number;
 }

@@ -109,9 +109,18 @@ function mutatingServe(fake: FakeOpencode, mutate: () => void): ServeProvider {
   return { withServe: (fn) => fn(handle) };
 }
 
-/** A plain (non-mutating) ServeProvider for gate/refusal cases. */
+/** A plain (NON-mutating) ServeProvider for gate/refusal cases.
+ *
+ * IT CLEARS THE HOOK (review R6, 2026-07-30). `mutatingServe` installs `mutate` on the FAKE, not
+ * on the provider, so it outlives the provider that set it — and a later `fakeServe` over the
+ * same fake would then still mutate on a turn, quietly making a "non-mutating" provider
+ * mutating. Only one site pairs them today (`fakeServe` after a `mutatingServe` on the same
+ * fake) and it is benign because that call is refused before any message POST, so this is a
+ * latent trap rather than a live bug — which is exactly when it is cheap to close. Clearing here
+ * makes the name true regardless of what ran before. */
 function fakeServe(fake: FakeOpencode): ServeProvider {
   const handle = fakeServeHandle(fake.baseUrl);
+  fake.setOnMessage(undefined);
   return { withServe: (fn) => fn(handle) };
 }
 
@@ -1416,10 +1425,19 @@ export async function run(): Promise<number> {
         src.includes("captureAndLog(before, {\n    writeRoot,\n"),
         "#107(i): captureAndLog is handed the `writeRoot` BINDING (shorthand), not an expression",
       );
+      // EXTENDED for issue #111's hoist (2026-07-30), not relaxed: the baseline is now taken in
+      // TWO calls (the scaffold precondition above the resolved-agent gate, the git state below
+      // it), so the property "every capture root is the `writeRoot` BINDING" has to be asserted
+      // on both. Loosening this to "at least one of them" is what would make it decorative.
       c.check(
         (src.match(/snapshotWorktree\(/g) || []).length === 1 &&
-          src.includes("snapshotWorktree(writeRoot)"),
-        "#107(i): the ONLY snapshot is of writeRoot",
+          src.includes("snapshotWorktree(writeRoot, scaffoldBefore)"),
+        "#107(i): the ONLY git snapshot is of writeRoot",
+      );
+      c.check(
+        (src.match(/snapshotScaffold\(/g) || []).length === 1 &&
+          src.includes("snapshotScaffold(writeRoot)"),
+        "#111(i): the ONLY scaffold baseline is of writeRoot, and there is exactly one",
       );
       c.check(
         (src.match(/scaffoldDigest\(/g) || []).length === 1 &&
@@ -1623,6 +1641,72 @@ export async function run(): Promise<number> {
         );
       } finally {
         await fake2.close();
+      }
+    }
+
+    // (l) THE GATE MUST NOT EAT THE SCAFFOLD SIGNAL (issue #111 review R2; maintainer decision
+    //     2026-07-30). `GET /agent` ALONE materializes opencode's plugin runtime into a cwd that
+    //     contains `.opencode/` (re-probed on 1.18.7, 2026-07-30), and the resolved-agent gate
+    //     issues that request before the turn. With the scaffold baseline taken after the gate,
+    //     the scaffolding is already inside the baseline and `scaffoldChanged` stops firing on a
+    //     tree's FIRST delegation — silencing an execution-carrying tamper signal and quietly
+    //     implementing the pre-warm that `src/snapshot.ts` and AGENTS.md both record as REJECTED.
+    //
+    //     The fake reproduces exactly that ordering via `setOnAgentList`: the scaffolding appears
+    //     during the gate's GET, NOT during the model turn. So this case fails on the pre-hoist
+    //     code (baseline after the gate ⇒ scaffoldChanged false) and passes only because
+    //     `snapshotScaffold` is called before it.
+    {
+      const repo = initRepoWithDef("m111-scaffold-", { "a.txt": "A0\n" });
+      const wt = addWorktree(repo, "gatefirst");
+      const logDir = tmp("m111-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m111-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "ok" });
+      try {
+        // The MODEL turn edits a tracked file and touches no scaffolding at all.
+        const provider = mutatingServe(fake, () => {
+          writeFileSync(path.join(wt, "a.txt"), "A1\n");
+        });
+        // The GATE's GET /agent is what writes the plugin runtime — as the real server does.
+        let agentGets = 0;
+        fake.setOnAgentList(() => {
+          agentGets += 1;
+          mkdirSync(path.join(wt, ".opencode", "node_modules", "plugin"), { recursive: true });
+          writeFileSync(
+            path.join(wt, ".opencode", "node_modules", "plugin", "index.js"),
+            "module.exports = {}\n",
+          );
+          writeFileSync(path.join(wt, ".opencode", "package.json"), "{}\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(agentGets >= 1, "#111(l): fixture — the gate really did read GET /agent");
+        c.check(r.ok, "#111(l): the delegation still succeeds");
+        c.check(
+          r.ok && r.capture.scaffoldChanged === true,
+          "#111(l): scaffoldChanged STILL FIRES on the first delegation — the gate's own GET /agent is not inside the baseline",
+        );
+        c.check(
+          r.ok && (r.capture.scaffoldWarning ?? "").includes("SUFFICIENT explanation"),
+          "#111(l): ...with the benign-but-non-committal wording, since .opencode/ existed at baseline",
+        );
+        // And the git half of the capture is unaffected: the model's edit is still the patch.
+        c.check(r.ok && r.capture.filesChanged === 1, "#111(l): the model's own edit is still captured");
+      } finally {
+        await fake.close();
       }
     }
 

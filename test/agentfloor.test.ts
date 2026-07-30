@@ -299,8 +299,19 @@ export async function run(): Promise<number> {
   }
 
   {
-    // A FIXED def must be accepted on the very next call. This is the user-facing half of C1:
-    // add a duplicate key, get refused, fix the file — and stay refused forever was the bug.
+    // WHAT THIS ASSERTS, PRECISELY (claim corrected after review R1, 2026-07-30): that the CACHE
+    // does not outlive the defect it described. When `GET /agent` starts answering `hardened`,
+    // the very next call sees `verified` — no restart of the checker, no new child.
+    //
+    // WHAT IT DOES **NOT** ASSERT, and the first wording of it wrongly implied: that a user who
+    // fixes their def on disk is accepted on their next call. They are NOT. Probed on 1.18.7
+    // (2026-07-30): a running `opencode serve` child never re-reads an agent def — not for the
+    // resolved config and not for enforcement — so the fixed file changes nothing until a FRESH
+    // child exists, and `withServe` re-arms the idle timer on every entry, so retrying keeps the
+    // stale child alive. That is why `remedy()` names getting a fresh child. It cannot be
+    // asserted here: this suite spawns no opencode, and the fake's `list` flips instantly, which
+    // is precisely the behaviour the product does not deliver. The end-to-end recovery sequence
+    // was verified by hand against a real serve instead.
     let voided = true;
     const checker = new AgentFloorChecker({
       warn: () => {},
@@ -313,8 +324,38 @@ export async function run(): Promise<number> {
     const after = await checker.verify(serve, "guild-read");
     c.check(
       after.state === "verified",
-      "C1: FIXING the def is accepted on the NEXT call — a cached refusal outlived the defect it described",
+      "C1: once the RESOLVED CONFIG reports a floor, the next call is accepted — the cached refusal did not outlive it (NB: on a real serve that needs a fresh child, see remedy())",
     );
+  }
+
+  // The refusal must SAY that fixing the file is not enough, because it is not: the child does
+  // not re-read. A remedy that stops at "fix the def" sends the user round a loop that cannot
+  // terminate (probed 1.18.7, 2026-07-30 — fixed def, same child, still refused on every retry).
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      agents: [voidedAgent("guild-read")],
+    });
+    try {
+      const { checker } = collectingChecker();
+      const v = await checker.verify(fakeServe(fake), "guild-read", ["/some/agent/dir"]);
+      const msg = v.state === "unhardened" ? v.message : "";
+      c.check(v.state === "unhardened", "R1: the voided def refuses");
+      c.check(
+        /fresh opencode serve child/i.test(msg),
+        "R1: the remedy names getting a FRESH serve child, not just fixing the file",
+      );
+      c.check(
+        /never re-reads/i.test(msg),
+        "R1: and says WHY — a running child never re-reads a def",
+      );
+      c.check(
+        /idle timer|GUILD_SERVE_IDLE_MS/i.test(msg),
+        "R1: and warns that retrying keeps the stale child alive",
+      );
+    } finally {
+      await fake.close();
+    }
   }
 
   // =========================================================================

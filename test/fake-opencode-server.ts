@@ -162,20 +162,43 @@ export interface ResolvedAgentFixture {
 }
 
 /**
- * opencode's own built-in permission rules, as captured from a live 1.18.7 `GET /agent`
- * (2026-07-29). They are what a VOIDED def resolves to on its own — note the array ENDS with
- * a general `"*": allow`, which is precisely why a def whose frontmatter opencode cannot parse
- * runs with no floor.
+ * opencode's own built-in permission rules — a REAL CAPTURE from a live 1.18.7 `GET /agent`,
+ * all **13** entries in order, taken from a serve rooted at a scratch project holding a VOIDED
+ * `guild-read.md` (2026-07-30; the same 13 the probe recorded on 2026-07-29).
+ *
+ * The first cut of this array had **8** entries while the prose two paragraphs down said 13,
+ * and still called itself a capture (review R6). It is a full capture now. Note where the
+ * general catch-all sits: `"*": allow` is entry 0 and nothing later overrides it, which is
+ * exactly why a def whose frontmatter opencode cannot parse runs with **no floor**.
+ *
+ * Two entries carry MACHINE-SPECIFIC absolute paths (this dev container's opencode data dir and
+ * `/tmp`). They are reproduced verbatim rather than tidied, because the point of a capture is
+ * that it is what was observed; nothing in the product reads them, and no assertion depends on
+ * their values. The duplicated `external_directory` tool-output entry at the end is in the real
+ * payload too — it is not a transcription slip.
  */
 const OPENCODE_BUILTINS: Array<{ permission: string; pattern: string; action: string }> = [
   { permission: "*", pattern: "*", action: "allow" },
   { permission: "doom_loop", pattern: "*", action: "ask" },
   { permission: "external_directory", pattern: "*", action: "ask" },
+  {
+    permission: "external_directory",
+    pattern: "/home/node/.local/share/opencode/tool-output/*",
+    action: "allow",
+  },
+  { permission: "external_directory", pattern: "/tmp/opencode/*", action: "allow" },
   { permission: "question", pattern: "*", action: "deny" },
   { permission: "plan_enter", pattern: "*", action: "deny" },
   { permission: "plan_exit", pattern: "*", action: "deny" },
   { permission: "read", pattern: "*", action: "allow" },
   { permission: "read", pattern: "*.env", action: "ask" },
+  { permission: "read", pattern: "*.env.*", action: "ask" },
+  { permission: "read", pattern: "*.env.example", action: "allow" },
+  {
+    permission: "external_directory",
+    pattern: "/home/node/.local/share/opencode/tool-output/*",
+    action: "allow",
+  },
 ];
 
 /**
@@ -196,10 +219,10 @@ export function hardenedAgent(name: string, allow: string[]): ResolvedAgentFixtu
 }
 
 /**
- * A VOIDED resolution — the def's frontmatter applied in NO part. The built-ins alone, and
+ * A VOIDED resolution — the def's frontmatter applied in NO part: the 13 built-ins alone, plus
  * `description: null` / `mode: "all"`, exactly as the live probe reported for a def carrying a
  * duplicate nested key or a tab-indented line. `mode` reading `all` here is deliberate: it is
- * opencode's default, which is why `mode` cannot be used as the tell.
+ * opencode's own default, which is why `mode` cannot be used as the tell.
  */
 export function voidedAgent(name: string): ResolvedAgentFixture {
   return { name, mode: "all", description: null, permission: [...OPENCODE_BUILTINS] };
@@ -277,6 +300,16 @@ export interface FakeOpencode {
    * mutation on disk" (the partial-capture contract) still holds.
    */
   setOnMessage(fn: (() => void) | undefined): void;
+  /**
+   * Run `fn` at the START of the next and every `GET /agent` (issue #111 review R2).
+   *
+   * It exists to reproduce ONE probed behaviour of the real server: `GET /agent` alone
+   * materializes opencode's plugin runtime into a serve cwd that contains `.opencode/`
+   * (1.18.7, 2026-07-30). The resolved-agent gate issues exactly that request before the turn,
+   * so without this hook no offline test could tell whether the scaffold tamper baseline is
+   * captured before or after the gate — and "before" is the whole of the fix.
+   */
+  setOnAgentList(fn: (() => void) | undefined): void;
   /** For each gated turn, the reply the blocked tool actually observed — `"once"`,
    * `"reject"`, or the sentinel `"(never answered)"`. This is what proves the gate BLOCKED,
    * not merely that a reply was sent somewhere. */
@@ -309,6 +342,8 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   let permCount = 0;
   /** Fired at the start of every message POST — see `FakeOpencode.setOnMessage`. */
   let onMessage: (() => void) | undefined;
+  /** Fired at the start of every `GET /agent` — see `FakeOpencode.setOnAgentList`. */
+  let onAgentList: (() => void) | undefined;
   const eventClients = new Set<import("node:http").ServerResponse>();
   /** Permission requests awaiting a reply, keyed by id → the resolver that unblocks the
    * gated tool. This is the fake's whole model of probe P3: an `ask` blocks the turn. */
@@ -386,6 +421,9 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       // reads: the def SOURCE is irrelevant to it, so a suite fixtures the RESOLUTION here.
       if (method === "GET" && (url === "/agent" || url.startsWith("/agent?"))) {
         recorded.agentGets += 1;
+        // The real 1.18.7 behaviour this stands in for: reading the agent list loads the
+        // project's plugin runtime, which writes `.opencode/node_modules` + manifests.
+        if (onAgentList !== undefined) onAgentList();
         if (opts.failAgentList) {
           const status = typeof opts.failAgentList === "number" ? opts.failAgentList : 500;
           send(status, { error: "forced agent-list failure" });
@@ -716,6 +754,9 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         attachedEventClients: () => eventClients.size,
         setOnMessage: (fn) => {
           onMessage = fn;
+        },
+        setOnAgentList: (fn) => {
+          onAgentList = fn;
         },
         permissionReplies: () => [...replies],
         pendingPermissions: () => [...pendingPerms.keys()],
