@@ -27,6 +27,58 @@ export interface FakeOpencodeOpts {
    * proves the client reads history, not the sync body. Defaults to a fixed
    * wrong-marker so "the sync body must not be the source" is always exercised. */
   syncText?: string;
+  /**
+   * PER-TURN HISTORY SHAPES (issue #117 review), 1-based; a turn past the end of the array
+   * reuses the LAST element, so `["rejected"]` means "every turn is rejected" and
+   * `["text", "rejected"]` means "turn 1 answered, every later turn said nothing".
+   *
+   * The second form is the whole point. The history used to be turn-INDEPENDENT — one canned
+   * block served for every session and every turn — which is exactly why the continuation test
+   * passed while being structurally incapable of catching the cross-turn defect: the fixture
+   * could not express "turn 1 answered, turn 2 said nothing" at all.
+   *
+   * The shapes:
+   *  - `"text"` — the normal multi-message turn: a tool-call-only assistant message, then a
+   *    text-bearing one carrying `historyText`. The backward walk exists for this shape.
+   *  - `"rejected"` — REBUILT FROM A REAL CAPTURE (opencode 1.18.7, `GET /session/{id}/message`,
+   *    2026-07-30). The first cut invented it as `step-start`/`step-finish` with `finish:"stop"`
+   *    and no error — a plausible fiction, and this repo has been burned by exactly that before
+   *    (the activity fixtures were written from the design's table and stayed green while
+   *    production was broken). What a provider-rejected turn ACTUALLY contributes is ONE
+   *    assistant message with **zero parts**, `finish: null`, and a populated **`info.error`**:
+   *    `{name:"APIError", data:{message:"You have exceeded your monthly quota", statusCode:402,
+   *    isRetryable:false, …}}`. `historyText: ""` is the neighbouring shape (a text part present
+   *    and empty); both must reach the same outcome, so both are fixtured.
+   *  - `"non-string-text"` — the final message's text part is present but its `text` is not a
+   *    string. opencode's parts are wire data, so the product's type guard can legitimately
+   *    reject one; when it does, the walk must stop at the turn boundary rather than reach back.
+   *  - `"preamble-then-textless"` — a text-bearing assistant message followed by a second one
+   *    that carries nothing and an `info.error`, both inside ONE turn. This is C74's stated
+   *    BOUND, fixtured: the preamble IS this turn's text and is returned.
+   */
+  turnShapes?: TurnShape[];
+  /**
+   * PER-TURN ANSWER TEXT, 1-based, falling back to `historyText` for turns past the end. Only
+   * needed where a test must prove WHICH turn the extracted text came from — with one shared
+   * `historyText` a continuation's answer is indistinguishable from the previous turn's, which
+   * is precisely the confusion the turn-scoping fix is about.
+   */
+  turnTexts?: string[];
+  /**
+   * The `info.error` a rejected turn carries. Defaults to the captured quota rejection above.
+   * A test that asserts the provider's own words reach the refusal message sets its own.
+   */
+  rejectionError?: { name?: string; message?: string; statusCode?: number };
+  /**
+   * Serve an EMPTY final answer only for the request whose body model id
+   * (`providerID/modelID`) equals this — the `failMessageForModel` shape for issue #117, so a
+   * panel can have exactly ONE silent member while its siblings answer against the same fake.
+   * That is the case the issue reports: a 3-model panel that came back with 2 answers.
+   *
+   * Keyed on the SESSION the turn was posted to (the history GET carries no model), so it
+   * needs `distinctSessions` to tell members apart.
+   */
+  emptyAnswerForModel?: string;
   /** Delay (ms) before the POST message response — used to trigger a timeout abort. */
   messageDelayMs?: number;
   /** Return 500 on the GET history (drive an error path with the session created). */
@@ -326,6 +378,147 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   });
 }
 
+/**
+ * THE HISTORY IS TURN-DEPENDENT (issue #117 review). It used to be a fixed three-message array
+ * served for every session and every turn, which is why the continuation test could pass while
+ * being structurally incapable of catching the cross-turn defect: the fake could not represent
+ * "turn 1 answered, turn 2 said nothing" at all.
+ *
+ * One record per `POST /session/{id}/message`, keyed by session, in order. `GET .../message`
+ * renders the whole list — user message + assistant message(s) per turn — so a continuation
+ * really does read a payload containing an earlier turn's answer. A session with no recorded
+ * turn still renders ONE default turn, so the low-level fixtures that call `fetchHistory`
+ * without posting anything are unchanged.
+ */
+export type TurnShape = "text" | "rejected" | "non-string-text" | "preamble-then-textless";
+interface TurnRecord {
+  question: string;
+  shape: TurnShape;
+  text: string;
+}
+
+/** The first text part of a message POST body, so a rendered turn echoes what was asked. */
+function firstTextPart(body: Record<string, unknown>): string | undefined {
+  const parts = Array.isArray(body.parts) ? (body.parts as Array<Record<string, unknown>>) : [];
+  for (const p of parts) {
+    if (p.type === "text" && typeof p.text === "string") return p.text;
+  }
+  return undefined;
+}
+
+/** Which shape this turn serves. Decided at POST time: the model id and the turn number are
+ * both only knowable there, and the history GET carries neither. */
+function turnShapeFor(opts: FakeOpencodeOpts, modelId: string, turnNo: number): TurnShape {
+  if (opts.emptyAnswerForModel !== undefined && modelId === opts.emptyAnswerForModel) return "rejected";
+  const shapes = opts.turnShapes;
+  if (shapes === undefined || shapes.length === 0) return "text";
+  return shapes[Math.min(turnNo, shapes.length) - 1];
+}
+
+/** This turn's answer text: `turnTexts[n-1]` when supplied, else `historyText`. */
+function turnTextFor(opts: FakeOpencodeOpts, turnNo: number): string {
+  const texts = opts.turnTexts;
+  if (texts === undefined || texts.length === 0) return opts.historyText;
+  return texts[Math.min(turnNo, texts.length) - 1];
+}
+
+/**
+ * The `info.error` of a rejected turn, byte-shaped like the live capture (1.18.7, 2026-07-30).
+ * `data` on the real payload also carries `responseHeaders`/`responseBody`; those are omitted
+ * here on purpose — the product whitelists three fields, and a fixture that supplied the rest
+ * would let a stringify-everything regression pass unnoticed.
+ */
+function rejectionError(opts: FakeOpencodeOpts): Record<string, unknown> {
+  const e = opts.rejectionError ?? {};
+  return {
+    name: e.name ?? "APIError",
+    data: {
+      message: e.message ?? "You have exceeded your monthly quota",
+      statusCode: e.statusCode ?? 402,
+      isRetryable: false,
+    },
+  };
+}
+
+/** One turn → the messages opencode would have appended for it. */
+function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknown[] {
+  // Optionally stamp info.agent on the assistant messages (agent-mismatch probe).
+  const agentField = opts.servedAgent !== undefined ? { agent: opts.servedAgent } : {};
+  const asst = (id: string, extra: Record<string, unknown>): Record<string, unknown> => ({
+    id,
+    role: "assistant",
+    ...agentField,
+    providerID: "openai",
+    modelID: "gpt-fake",
+    cost: 0.0042,
+    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+    ...extra,
+  });
+  const user = {
+    info: { id: `msg_user_${n}`, role: "user", time: { created: n } },
+    parts: [{ id: `t${n}p0`, type: "text", text: turn.question }],
+  };
+  // A REJECTED turn contributes ONE assistant message with zero parts, `finish: null` and a
+  // populated `info.error` — the captured shape, not an invented step-start/step-finish pair.
+  // No tool message either: the turn never got far enough to call anything.
+  if (turn.shape === "rejected") {
+    return [
+      user,
+      { info: asst(`msg_asst_${n}`, { finish: null, error: rejectionError(opts) }), parts: [] },
+    ];
+  }
+  // Every other shape keeps the MULTI-MESSAGE turn the backward walk exists for: a tool-call
+  // assistant message with no text, then the text-bearing one.
+  const toolMsg = {
+    info: asst(`msg_asst_tool_${n}`, { finish: "tool-calls" }),
+    parts: [
+      { id: `t${n}p1`, type: "step-start" },
+      {
+        id: `t${n}p2`,
+        type: "tool",
+        callID: `call_${n}`,
+        tool: "read",
+        state: {
+          status: "completed",
+          input: { filePath: "/x/marker.txt" },
+          output: "MARKER-FILE-CONTENTS",
+        },
+      },
+      { id: `t${n}p3`, type: "step-finish" },
+    ],
+  };
+  if (turn.shape === "preamble-then-textless") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_pre_${n}`, { finish: "stop" }),
+        parts: [{ id: `t${n}p4`, type: "text", text: turn.text }],
+      },
+      { info: asst(`msg_asst_${n}`, { finish: null, error: rejectionError(opts) }), parts: [] },
+    ];
+  }
+  // A text part whose `text` is not a string: present, and correctly rejected by the type
+  // guard — so this turn reconstructs to "" without any part being missing.
+  const textPart =
+    turn.shape === "non-string-text"
+      ? { id: `t${n}p5`, type: "text", text: 42 }
+      : { id: `t${n}p5`, type: "text", text: turn.text };
+  return [
+    user,
+    toolMsg,
+    {
+      info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+      // The REAL final answer, byte-exact. May contain newlines/quotes/unicode.
+      parts: [
+        { id: `t${n}p4`, type: "step-start" },
+        textPart,
+        { id: `t${n}p6`, type: "step-finish" },
+      ],
+    },
+  ];
+}
+
 export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode> {
   const sessionId = opts.sessionId ?? "ses_fake";
   const syncText = opts.syncText ?? "SYNC-BODY-TEXT-THAT-MUST-NOT-BE-RETURNED";
@@ -348,6 +541,8 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   /** Permission requests awaiting a reply, keyed by id → the resolver that unblocks the
    * gated tool. This is the fake's whole model of probe P3: an `ask` blocks the turn. */
   const pendingPerms = new Map<string, (reply: string) => void>();
+  /** This session's turns, in order — see `TurnRecord`. */
+  const turns = new Map<string, TurnRecord[]>();
   /**
    * The REQUEST RECORD for each open id, so `GET /permission` can serve it (issue #91).
    *
@@ -627,6 +822,21 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         // Yield once so the client's stream reader drains before the POST resolves.
         await new Promise((r) => setTimeout(r, 10));
         if (opts.messageDelayMs) await new Promise((r) => setTimeout(r, opts.messageDelayMs));
+        // RECORD THE TURN (issue #117 review) so the history GET can render this session's
+        // whole exchange rather than one canned turn. Shape is decided here, at post time,
+        // because that is when the model id and the turn number are both known.
+        {
+          const list = turns.get(msgMatch[1]) ?? [];
+          const model = (body.model ?? {}) as Record<string, unknown>;
+          const modelId = `${model.providerID ?? ""}/${model.modelID ?? ""}`;
+          const turnNo = list.length + 1;
+          list.push({
+            question: firstTextPart(body) ?? "the question",
+            shape: turnShapeFor(opts, modelId, turnNo),
+            text: turnTextFor(opts, turnNo),
+          });
+          turns.set(msgMatch[1], list);
+        }
         // Per-model failure: 500 only for the targeted model (siblings still succeed).
         if (opts.failMessageForModel) {
           const m = (body.model ?? {}) as Record<string, unknown>;
@@ -658,65 +868,28 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
       }
 
       // GET /session/{id}/message  → the full history (the sanctioned source)
+      //
+      // TURN-DEPENDENT since issue #117's review: rendered from this session's recorded turns
+      // rather than from one canned block, so a continuation reads a payload that genuinely
+      // contains the earlier turn's answer AND the new turn's silence.
       if (method === "GET" && msgMatch) {
         recorded.historyGets.push(msgMatch[1]);
         if (opts.failHistory) {
           send(500, { error: "forced history failure" });
           return;
         }
-        // Optionally stamp info.agent on the assistant messages (agent-mismatch probe).
-        const agentField = opts.servedAgent !== undefined ? { agent: opts.servedAgent } : {};
-        send(200, [
-          {
-            info: { id: "msg_user", role: "user", time: { created: 1 } },
-            parts: [{ id: "p0", type: "text", text: "the question" }],
-          },
-          {
-            info: {
-              id: "msg_asst_tool",
-              role: "assistant",
-              ...agentField,
-              providerID: "openai",
-              modelID: "gpt-fake",
-              cost: 0.0042,
-              tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-              finish: "tool-calls",
-            },
-            parts: [
-              { id: "p1", type: "step-start" },
-              {
-                id: "p2",
-                type: "tool",
-                callID: "call_1",
-                tool: "read",
-                state: {
-                  status: "completed",
-                  input: { filePath: "/x/marker.txt" },
-                  output: "MARKER-FILE-CONTENTS",
-                },
-              },
-              { id: "p3", type: "step-finish" },
-            ],
-          },
-          {
-            info: {
-              id: "msg_asst_final",
-              role: "assistant",
-              ...agentField,
-              providerID: "openai",
-              modelID: "gpt-fake",
-              cost: 0.0042,
-              tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-              finish: "stop",
-            },
-            // The REAL final answer, byte-exact. May contain newlines/quotes/unicode.
-            parts: [
-              { id: "p4", type: "step-start" },
-              { id: "p5", type: "text", text: opts.historyText },
-              { id: "p6", type: "step-finish" },
-            ],
-          },
-        ]);
+        const recordedTurns = turns.get(msgMatch[1]);
+        // A session nobody posted to still renders ONE turn — the shape every pre-#117
+        // fixture that calls `fetchHistory` directly has always seen.
+        const list: TurnRecord[] =
+          recordedTurns !== undefined && recordedTurns.length > 0
+            ? recordedTurns
+            : [{ question: "the question", shape: turnShapeFor(opts, "", 1), text: turnTextFor(opts, 1) }];
+        const messages: unknown[] = [];
+        list.forEach((turn, i) => {
+          messages.push(...renderTurn(turn, i + 1, opts));
+        });
+        send(200, messages);
         return;
       }
 

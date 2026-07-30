@@ -96,6 +96,48 @@ export async function run(): Promise<number> {
     "a provider with no id is skipped",
   );
 
+  // --- issue #117: `status` is NOT an entitlement signal, so nothing filters on it -------
+  // The payload carries a per-model `status`; probed 2026-07-30 it read "active" for ids that
+  // had failed at call time. So the contract is that it changes NOTHING — asserted as
+  // behaviour (same ids in, same ids out) rather than left as a prose promise, and pinned so a
+  // later "helpful" filter has to delete this case deliberately.
+  {
+    const withStatus = {
+      providers: [
+        {
+          id: "github-copilot",
+          name: "GitHub Copilot",
+          models: {
+            reachable: { id: "reachable", status: "active" },
+            // Probed unreachable — and the payload says "active" about it too.
+            unreachable: { id: "unreachable", status: "active" },
+            odd: { id: "odd", status: "retired" },
+          },
+        },
+      ],
+    };
+    const p = parseProviders(withStatus);
+    c.check(p.count === 3, "#117: every listed id is enumerated regardless of `status`");
+    c.check(
+      JSON.stringify(p.models) ===
+        JSON.stringify(["github-copilot/odd", "github-copilot/reachable", "github-copilot/unreachable"]),
+      "#117: no status-based filtering (the field is not an entitlement signal)",
+    );
+  }
+
+  // The TEXT channel is where a human reads the list, so it carries the caveat the tool
+  // description carries: this is configuration, not reachability.
+  {
+    const tr = modelsToToolResult({ ok: true, ...parseProviders(FIXTURE) });
+    const text = tr.content[0].text;
+    c.check(/authed provider config/i.test(text), "#117: the text names what the set actually is");
+    c.check(
+      /rejected by the provider at call time/i.test(text),
+      "#117: the text states a listed id may still be rejected at call time",
+    );
+    c.check(!/model\(s\) available/.test(text), "#117: the old 'available' overclaim is gone");
+  }
+
   // --- models() over the http fixture -------------------------------------
   const good = await startFixture(FIXTURE);
   try {

@@ -125,6 +125,9 @@ export type ResearchErrorKind =
   | "approval-channel-missing"
   | "approval-not-applied"
   | "call-failed"
+  /** The turn completed and the model produced NO ANSWER (issue #117, C74) — a read-path
+   * refusal, never an empty success. `guild_delegate` cannot produce it. */
+  | "empty-answer"
   | "agent-mismatch";
 
 export interface ResearchAttribution {
@@ -169,6 +172,10 @@ export interface ResearchOk {
 export interface ResearchFail {
   ok: false;
   error: ResearchError;
+  /** WHERE THE RECEIPT IS (issue #117 review) — see `ConsultFail.runId`/`callId`. Present only
+   * when the call reached the model and the evidence layer is on. */
+  runId?: string;
+  callId?: string;
   rootConflict?: string;
   /** See `ResearchOk.agentUnverified`. */
   agentUnverified?: string;
@@ -350,6 +357,8 @@ export async function research(
       runId,
       tier: gate.tier,
       confirmed: gate.confirmed,
+      // A read path with no text produced nothing at all (issue #117, C74).
+      requireAnswer: true,
       ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
     },
     {
@@ -395,7 +404,10 @@ export async function research(
     outcome.kind === "approval-not-applied" ||
     outcome.kind === "agent-unhardened"
       ? outcome.reason
-      : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
+      : // Issue #117: an empty answer names the model, because that is the whole finding.
+        outcome.kind === "empty-answer"
+        ? `The research call to '${modelLabel}' returned NO ANSWER: ${outcome.reason}`
+        : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ResearchFail = {
     ok: false,
     rootConflict,
@@ -406,6 +418,8 @@ export async function research(
       message,
     },
   };
+  if (runId.length > 0) fail.runId = runId;
+  if (outcome.callId.length > 0) fail.callId = outcome.callId;
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
@@ -434,6 +448,8 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
     };
   }
   const structured: Record<string, unknown> = { error: r.error };
+  if (r.runId) structured.runId = r.runId;
+  if (r.callId) structured.callId = r.callId;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;

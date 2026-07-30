@@ -188,14 +188,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: MODELS_TOOL,
       description:
-        "List the provider/model ids the caller's opencode can actually reach (from the " +
-        "running serve's authed provider config — the same set `opencode models` prints, " +
-        "plus each provider's default). Read-only enumeration: NO policy check, NO model " +
-        "call, no cost. Use it to pick a model/panel for guild_consult, guild_panel, " +
-        "guild_research, or guild_delegate. Returns structuredContent.models (flat sorted " +
-        "ids), .providers (grouped, with each provider's default), and .defaults. Takes no " +
-        "arguments. It does NOT report policy tiers — a listed model may still be deny/ask " +
-        "under the model policy; the per-call tool enforces that.",
+        "List the provider/model ids in the running serve's AUTHED PROVIDER CONFIG — the " +
+        "same set `opencode models` prints, plus each provider's default. Read-only " +
+        "enumeration: NO policy check, NO model call, no cost. Use it to pick a model/panel " +
+        "for guild_consult, guild_panel, guild_research, or guild_delegate. Returns " +
+        "structuredContent.models (flat sorted ids), .providers (grouped, with each " +
+        "provider's default), and .defaults. Takes no arguments. TWO THINGS IT DOES NOT " +
+        "TELL YOU. It does NOT report policy tiers — a listed model may still be deny/ask " +
+        "under the model policy; the per-call tool enforces that. And the config is " +
+        "PER-PROVIDER, not per-model entitlement: a listed id can still be REJECTED by the " +
+        "provider at call time (issue #117). On the READ tools (guild_consult, guild_panel, " +
+        "guild_research) that now surfaces as an empty-answer error rather than a blank " +
+        "answer; guild_delegate deliberately does NOT opt in, so a rejected id there returns " +
+        "a successful call with an empty report and no patch — check both before trusting " +
+        "it. If an id fails either way, pick another and say so.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {

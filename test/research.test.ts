@@ -209,6 +209,43 @@ export async function run(): Promise<number> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 5. EMPTY ANSWER (issue #117, C74): a research turn that completes and produces no text
+  //    is an ERROR here too — the same opt-in the other read paths take. A sourced report
+  //    with nothing in it cites nothing, so "" is never a research answer.
+  // -------------------------------------------------------------------------
+  {
+    const root = tmp("m7r-guild-"); // default-allow
+    const logDir = tmp("m7r-logs-");
+    const env = envWith({
+      GUILD_ROOT: root,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDirWithResearch(),
+    });
+    const fake = await startFakeOpencode({ historyText: "" });
+    try {
+      const r: ResearchResult = await research(
+        { question: "cite X", model: "openai/web-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok, "empty-answer: research refuses an empty answer");
+      if (!r.ok) {
+        c.check(r.error.kind === "empty-answer", "empty-answer: kind is empty-answer");
+        c.check(r.error.exitAnalogue === null, "empty-answer: exit analogue is null");
+        c.check(r.error.message.includes("openai/web-model"), "empty-answer: message names the model");
+        c.check(researchToToolResult(r).isError === true, "empty-answer: MCP result flags isError");
+      }
+      c.check(fake.recorded.deletes.length === 1, "empty-answer: the session was deleted, not leaked");
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      c.check(
+        new EvidenceLog({ env }).verify(runId).code === 0,
+        "empty-answer: the run verifies clean (capture completed; only exit_code says no answer)",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
   console.log(`research.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

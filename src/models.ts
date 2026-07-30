@@ -1,5 +1,34 @@
 /**
- * `guild_models` — list the models opencode can actually reach.
+ * `guild_models` — enumerate the running serve's AUTHED PROVIDER CONFIGURATION.
+ *
+ * IT IS NOT A REACHABILITY LIST, AND THIS FILE USED TO SAY IT WAS (issue #117, maintainer
+ * report 2026-07-30). The set is per-PROVIDER, not per-model entitlement: a GitHub Copilot
+ * subscription authenticates the provider, and the config then lists model ids that
+ * subscription is not entitled to. Probed on 1.18.7 — five listed ids each completed a full
+ * round-trip and came back with an EMPTY answer and `session error: The requested model is
+ * not supported.` in the activity trace. What this tool answers is "which ids can be named",
+ * not "which ids will answer".
+ *
+ * NO FILTER IS OFFERED, and the payload's own `status` field is the reason it cannot be one.
+ * `/config/providers` carries a per-model `status`; re-probed 2026-07-30 it had exactly ONE
+ * value across the entire payload — `active`, 25 of 25 — so it partitions nothing and a filter
+ * on it would remove no id while claiming to have checked. **An earlier version of this comment
+ * said something stronger and FALSE** — that `active` was read "including ids that had failed at
+ * call time earlier the same day" — which the next sentence contradicted, because those five ids
+ * were **absent** from that payload entirely and so were never observed carrying any status at
+ * all. (Provenance: the error was the coordinating Claude's, in the brief this file was written
+ * against; corrected 2026-07-30. It matters because the false claim was the *sole* stated
+ * justification for offering no filter, and the true observation is a better one.) A static list
+ * in this repo is worse: the catalog moved within hours of the issue being filed (39 ids at
+ * filing, 25 at the probe, and all five failing ids simply gone), so a shipped denylist would be
+ * stale on arrival and would start withholding ids the user has. Probe-and-cache costs a call
+ * per model and goes stale the same way. So the honest fix is the description: this enumerates
+ * configuration, and an unreachable id is caught at CALL time — how loudly depends on the tool.
+ * An id absent from the catalog answers HTTP 500 ⇒ `call-failed`, everywhere. A LISTED id the
+ * provider rejects ends the turn empty, and only the READ tools refuse that (`empty-answer`,
+ * C74); `guild_delegate` does not opt in, so there it is `ok:true` with an empty `report` and a
+ * null `patchPath` — silent, by design, because an empty report beside a real patch is a
+ * successful delegation and this path cannot tell the two apart.
  *
  * This is the LAST thing the migrated command docs shelled out to the `opencode`
  * binary for (`Bash(opencode models:*)`): a read-only enumeration of the caller's
@@ -75,6 +104,10 @@ async function fetchJson(url: string): Promise<unknown> {
  * Parse a `/config/providers` payload into the flat + grouped model views. Pure and
  * defensive: an entry with no `id` or no `models` object is skipped rather than throwing,
  * so a future/odd provider shape degrades to "fewer models listed", never a crash.
+ *
+ * The per-model `status` field is read by NOTHING here, deliberately — see the file header:
+ * it carried one value (`active`) for every id in the payload, so it separates nothing and
+ * filtering on it would be a guarantee this cannot make.
  */
 export function parseProviders(raw: unknown): Omit<ModelsResult, "ok" | "error"> {
   const root = (raw ?? {}) as WireConfigProviders;
@@ -115,7 +148,8 @@ export function parseProviders(raw: unknown): Omit<ModelsResult, "ok" | "error">
 }
 
 /**
- * List the models the running serve can reach. Read-only; no policy, no model call.
+ * List the models in the running serve's authed provider config (NOT a reachability
+ * claim — see the file header). Read-only; no policy, no model call.
  * A serve/HTTP failure is returned as `ok:false` with the error message (the tool
  * surfaces it as `isError`) rather than thrown, matching the other tools' shape.
  */
@@ -161,7 +195,12 @@ export function modelsToToolResult(r: ModelsResult): McpToolResult {
   const text =
     r.count === 0
       ? "No models available. Run `opencode auth login` to authenticate a provider."
-      : `${r.count} model(s) available:\n${lines.join("\n")}`;
+      : // "configured", not "available": the set is per-provider, so a listed id can still be
+        // rejected at call time (issue #117). The text channel is what a human reads, so it
+        // carries the caveat rather than leaving it in the tool description alone.
+        `${r.count} model(s) in the authed provider config (per-provider, not per-model ` +
+        `entitlement — a listed id may still be rejected by the provider at call time):\n` +
+        lines.join("\n");
   return {
     content: [{ type: "text", text }],
     structuredContent: {

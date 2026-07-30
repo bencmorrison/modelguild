@@ -159,6 +159,12 @@ export type PanelMemberErrorKind =
    */
   | "agent-unhardened"
   | "call-failed"
+  /**
+   * The member's turn completed and the model produced NO ANSWER (issue #117, C74). It lands
+   * in `error`, NEVER as `text: ""` — a blank member used to render as a blank line and the
+   * synthesis proceeded a voice short without saying so.
+   */
+  | "empty-answer"
   | "agent-mismatch";
 
 export interface PanelMemberError {
@@ -440,6 +446,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           tier: gate.tier,
           confirmed: gate.confirmed,
           keepSession: keepSessions,
+          // Issue #117 (C74). This is the member that used to drop out QUIETLY: an empty
+          // `text` rendered as a blank line and the synthesis proceeded a voice short.
+          requireAnswer: true,
           ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
         },
         {
@@ -476,7 +485,10 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         outcome.kind === "approval-not-applied" ||
         outcome.kind === "agent-unhardened"
           ? outcome.reason
-          : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
+          : // Issue #117: an empty answer names the model, because that is the whole finding.
+            outcome.kind === "empty-answer"
+            ? `The panel call to '${model}' returned NO ANSWER: ${outcome.reason}`
+            : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
         model,
         callId: outcome.callId,

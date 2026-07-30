@@ -807,16 +807,50 @@ export async function fetchHistory(opts: FetchHistoryOpts): Promise<SessionHisto
 }
 
 /**
+ * WHERE THIS TURN STARTS — the index just past the LAST `user` message (issue #117 review).
+ *
+ * `fetchHistory` returns the WHOLE session, and every extractor below walks it backwards.
+ * Unbounded, that walk crosses turn boundaries, which on a `sessionId` continuation is not a
+ * near-miss but a wrong answer to a different question: a turn that produced nothing let the
+ * walk fall through to the PREVIOUS turn's text, and the caller got a confident, correct-
+ * looking answer to the question it asked last time (reproduced live 2026-07-30 —
+ * `deepseek-v4-flash-free` answered `"BANANA"`, a quota-exhausted `gpt-5.6-terra` was asked
+ * something else on the same session, and `"BANANA"` came back as the new answer with
+ * `ok:true`, recorded as this call's byte-exact `raw_response` with `exit_code: 0`).
+ *
+ * A `user` message is the only turn delimiter opencode's history has, and it is a reliable
+ * one: a turn is exactly one `POST /session/{id}/message` and that POST is what appends the
+ * user message. Bounding here KEEPS the reason the backward walk exists — opencode splits one
+ * turn into a tool-call-only assistant message followed by a text-bearing one, and the walk is
+ * what skips the former — while removing its reach into anything the caller did not just ask.
+ *
+ * No `user` message at all ⇒ index 0, i.e. the whole history is the turn. That is the honest
+ * reading of a payload with no delimiter, and it keeps every low-level fixture that serves
+ * assistant messages alone behaving exactly as before.
+ */
+export function turnStartIndex(history: SessionHistory): number {
+  for (let i = history.messages.length - 1; i >= 0; i--) {
+    if (history.messages[i].role === "user") return i + 1;
+  }
+  return 0;
+}
+
+/**
  * The final assistant text, reconstructed BYTE-EXACT from history (invariant 2).
  *
- * The "final answer" is the last assistant message that carries text parts —
+ * The "final answer" is the last assistant message OF THIS TURN that carries text parts —
  * the one the sync response also returns — so a trailing pure-tool-call assistant
  * message can't blank the answer. Text parts are concatenated verbatim in order
  * with NO separator, trim, or normalization, so newlines (including a trailing
  * one), quotes, and unicode survive intact.
+ *
+ * TURN-SCOPED since issue #117's review: the walk stops at `turnStartIndex`, so a turn that
+ * said nothing yields `""` rather than the previous turn's answer. `""` is then the caller's
+ * to interpret — `requireAnswer` turns it into an `EmptyAnswerError`.
  */
 export function finalAssistantText(history: SessionHistory): string {
-  for (let i = history.messages.length - 1; i >= 0; i--) {
+  const start = turnStartIndex(history);
+  for (let i = history.messages.length - 1; i >= start; i--) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
     const textParts = m.parts.filter(
@@ -836,9 +870,17 @@ export function finalAssistantText(history: SessionHistory): string {
  * different agent" (a real mismatch to fail closed on) from "opencode didn't say" (which
  * must not be treated as a mismatch — the check is only as strong as the field's
  * presence, and inventing a mismatch on absence would break on a build that drops it).
+ *
+ * TURN-SCOPED for the same reason as `finalAssistantText`, and it matters just as much here:
+ * unbounded, a round-2 continuation validated the agent against ROUND ONE's message, so a
+ * silent fallback to a full-access agent on the new turn would have been checked against the
+ * hardened agent that served the old one. A turn with no text-bearing assistant message now
+ * answers `undefined` — "opencode didn't say", the documented fail-open (issue #78) — rather
+ * than an answer borrowed from a turn this check is not about.
  */
 export function servingAgent(history: SessionHistory): string | undefined {
-  for (let i = history.messages.length - 1; i >= 0; i--) {
+  const start = turnStartIndex(history);
+  for (let i = history.messages.length - 1; i >= start; i--) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
     const textParts = m.parts.filter(
@@ -847,6 +889,64 @@ export function servingAgent(history: SessionHistory): string | undefined {
     if (textParts.length === 0) continue;
     const agent = m.info.agent;
     return typeof agent === "string" && agent.length > 0 ? agent : undefined;
+  }
+  return undefined;
+}
+
+/** Longest provider-error string quoted into a refusal. Untrusted third-party text on its way
+ * into an error message a human reads: bounded, one line, no control characters. */
+const PROVIDER_ERROR_MAX = 300;
+
+/**
+ * THE PROVIDER'S OWN DIAGNOSIS for this turn, when opencode carried one (issue #117 review).
+ *
+ * A turn that answers nothing is exactly the turn whose cause you cannot see: the activity
+ * layer's `session error:` line is the usual channel and it is EMPTY under `GUILD_ACTIVITY=off`,
+ * so the refusal used to send the reader to a place that could be blank. The history itself
+ * carries the answer — a rejected turn's assistant message has `info.error` populated. Captured
+ * live from opencode 1.18.7 on 2026-07-30:
+ *
+ *   {name:"APIError", data:{message:"You have exceeded your monthly quota", statusCode:402,
+ *                           isRetryable:false, responseHeaders:{…}, responseBody:"…"}}
+ *
+ * Only `name`, `data.message` and `data.statusCode` are read. `data` also carries the full
+ * response headers and body — routing those into an error string would put provider tokens and
+ * quota telemetry somewhere nobody asked for them, so the extraction is a whitelist, not a
+ * stringify. The result is truncated, flattened to one line and stripped of control characters:
+ * it is third-party text, and this is a message a human reads.
+ *
+ * TURN-SCOPED like its neighbours, and searching the LAST assistant message of the turn first —
+ * the error belongs to the message that failed. `undefined` when opencode reported nothing,
+ * which is a normal outcome and never an inference that all was well.
+ */
+export function finalAssistantError(history: SessionHistory): string | undefined {
+  const start = turnStartIndex(history);
+  for (let i = history.messages.length - 1; i >= start; i--) {
+    const m = history.messages[i];
+    if (m.role !== "assistant") continue;
+    const err = m.info.error;
+    if (err === null || typeof err !== "object") continue;
+    const e = err as Record<string, unknown>;
+    const data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Record<
+      string,
+      unknown
+    >;
+    const name = typeof e.name === "string" && e.name.length > 0 ? e.name : undefined;
+    const message =
+      typeof data.message === "string" && data.message.length > 0
+        ? data.message
+        : typeof e.message === "string" && e.message.length > 0
+          ? e.message
+          : undefined;
+    const status = typeof data.statusCode === "number" ? data.statusCode : undefined;
+    if (name === undefined && message === undefined && status === undefined) continue;
+    const head = name !== undefined && message !== undefined ? `${name}: ${message}` : (name ?? message ?? "");
+    const withStatus = status !== undefined ? `${head}${head.length > 0 ? " " : ""}(HTTP ${status})` : head;
+    // Control characters are stripped rather than escaped: this string is going into a
+    // one-line error message, and a provider that returns a newline must not reshape it.
+    const flat = withStatus.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+    if (flat.length === 0) continue;
+    return flat.length > PROVIDER_ERROR_MAX ? `${flat.slice(0, PROVIDER_ERROR_MAX)}\u2026` : flat;
   }
   return undefined;
 }
@@ -1020,6 +1120,46 @@ export class AgentFloorNotInForceError extends Error {
 }
 
 /**
+ * Raised when the turn completed and the model produced NO ANSWER (issue #117, C74).
+ *
+ * Opt-in per call (`AskViaAgentOpts.requireAnswer`): the READ paths set it, `guild_delegate`
+ * does not — an empty report beside a real patch is a successful delegation, so the same
+ * text means opposite things on the two paths.
+ *
+ * Thrown from INSIDE `askViaAgent`'s try, before `succeeded` is set, exactly like
+ * `AgentMismatchError` — so the existing ownership × outcome deletion matrix tears a
+ * session we created down rather than orphaning it, and no second cleanup path exists.
+ *
+ * `text` is the byte-exact final text as read from history (`""`, or whitespace only). It is
+ * carried so the evidence layer can still record what was actually produced: C25's byte-exact
+ * rule does not get a hole cut in it just because the bytes turned out to be blank.
+ *
+ * `providerError` is the turn's own `info.error`, whitelisted and bounded by
+ * `finalAssistantError`. When opencode carried one it is QUOTED, because the alternative the
+ * first cut offered — "check the call's activity errors" — points at a channel that is empty
+ * whenever `GUILD_ACTIVITY=off`, i.e. it could send the reader to a blank file. Absent, the
+ * message stays useful by naming what to check instead of asserting a cause it does not have.
+ */
+export class EmptyAnswerError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly text: string,
+    readonly providerError?: string,
+  ) {
+    super(
+      "the model completed its turn and produced NO ANSWER (this turn's final assistant " +
+        "text is empty or whitespace only) — refusing to return silence as an answer. " +
+        (providerError !== undefined
+          ? `The provider reported: ${providerError}`
+          : "opencode reported no error for the turn, so the cause is not in the history — " +
+            "check the model id (a provider can reject a configured id) and, if the activity " +
+            "layer is on, the call's activity errors."),
+    );
+    this.name = "EmptyAnswerError";
+  }
+}
+
+/**
  * Raised when the approval bridge is armed but the session this turn will run in is NOT
  * carrying the required `ask` rules — i.e. the gate the caller believes is on is not on.
  *
@@ -1080,6 +1220,13 @@ export interface AskViaAgentOpts {
    * unset (e.g. low-level client tests), no check is done.
    */
   expectedAgent?: string;
+  /**
+   * REQUIRE AN ANSWER (issue #117, C74). When set, a turn whose final assistant text is
+   * empty or whitespace-only throws `EmptyAnswerError` instead of returning `text: ""`.
+   * Left unset (the default, and `guild_delegate`'s deliberate choice) the empty text is
+   * returned as before.
+   */
+  requireAnswer?: boolean;
   /**
    * LIVE ACTIVITY (issue #20). Attached immediately after the session id is known — a
    * fresh session's, or the continued `sessionId`'s — and BEFORE the turn is sent, so the
@@ -1274,8 +1421,27 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         }
       }
 
+      const text = finalAssistantText(history);
+      // NO ANSWER ⇒ NOT A SUCCESS (issue #117, C74). Thrown here, beside the mismatch check
+      // and for the same mechanical reason: `succeeded` is still false, so the deletion
+      // matrix below cleans up a session we created instead of leaking it.
+      //
+      // TRIMMED-empty, not `=== ""`: a turn that produced only a newline or a run of spaces
+      // has said nothing either, and treating that as an answer would leave the exact hole
+      // this closes open to a one-whitespace-character difference. The byte-exact text still
+      // travels on the error, so nothing is lost from the record.
+      //
+      // THIS CHECK IS ONLY AS GOOD AS `finalAssistantText`'S BOUND. Before that walk was
+      // turn-scoped it reached back across turn boundaries, so on a `sessionId` continuation a
+      // silent turn inherited the PREVIOUS turn's answer, `text.trim()` was non-empty, and this
+      // line never fired — the guard failed open on exactly the drivers that continue sessions
+      // (`/guild:collaborate`, `/guild:workshop` round 2). Do not unbound that walk.
+      if (opts.requireAnswer === true && text.trim() === "") {
+        throw new EmptyAnswerError(sessionId, text, finalAssistantError(history));
+      }
+
       const result: AskResult = {
-        text: finalAssistantText(history),
+        text,
         sessionId,
         metadata,
         toolParts: toolParts(history),
@@ -1310,6 +1476,14 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       //   continued + THROW     (any keep)       → KEEP  (the CALLER owns the id and may
       //                                             retry; deleting destroys e.g. workshop
       //                                             round-1 state we did not create)
+      //
+      // ISSUE #117 GAVE THAT LAST ROW A NEW WAY TO FIRE, and the shift is documented rather
+      // than engineered around: a CONTINUED session with `keepSession:false` whose turn answers
+      // nothing is now KEPT, where before #117 that turn succeeded with `text:""` and the
+      // session was deleted as the documented final turn. The rule is unchanged and right — the
+      // id belongs to the caller and an `empty-answer` is retryable — but the observable
+      // behaviour did move, so say it: a continuation that fails this way leaves its session
+      // alive on the serve child, for whoever owns the id to retry or drop.
       const shouldDelete = continued
         ? succeeded && !opts.keepSession
         : !succeeded || !opts.keepSession;

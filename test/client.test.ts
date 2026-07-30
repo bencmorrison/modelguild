@@ -14,11 +14,15 @@ import {
   sendMessage,
   fetchHistory,
   finalAssistantText,
+  finalAssistantError,
+  servingAgent,
+  turnStartIndex,
   toolParts,
   splitModel,
   OpencodeHttpError,
   AgentMismatchError,
   type ServeProvider,
+  type SessionHistory,
 } from "../src/client.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { Checker, fakeServeHandle } from "./harness.js";
@@ -398,6 +402,163 @@ export async function run(): Promise<number> {
     } finally {
       await fake.close();
     }
+  }
+
+  // 10. TURN-SCOPED EXTRACTION (issue #117 review, defect 1) --------------------
+  //
+  //     Unit-level, on hand-built histories, because the property is about the SHAPE of the
+  //     payload and the shapes here are copied from a live capture (opencode 1.18.7,
+  //     `GET /session/{id}/message`, 2026-07-30) rather than from a design table:
+  //
+  //       {role:"user",      parts:["text"],                                   texts:["…BANANA"]}
+  //       {role:"assistant", finish:"stop", error:null,
+  //                          parts:["step-start","reasoning","text","step-finish"], texts:["BANANA"]}
+  //       {role:"user",      parts:["text"],                                   texts:["…KIWI"]}
+  //       {role:"assistant", finish:null, parts:[],
+  //                          error:{name:"APIError", data:{message:"You have exceeded your
+  //                                 monthly quota", statusCode:402, …}}}
+  //
+  //     `fetchHistory` returns the WHOLE session, so an unbounded backward walk answers the
+  //     second question with the first answer.
+  {
+    const user = (text: string) => ({
+      role: "user",
+      info: { role: "user" } as Record<string, unknown>,
+      parts: [{ type: "text", text }] as Array<Record<string, unknown>>,
+    });
+    const answered = (text: string, agent?: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop", error: null, ...(agent ? { agent } : {}) } as Record<
+        string,
+        unknown
+      >,
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", text: "…" },
+        { type: "text", text },
+        { type: "step-finish" },
+      ] as Array<Record<string, unknown>>,
+    });
+    const rejected = (agent?: string) => ({
+      role: "assistant",
+      info: {
+        role: "assistant",
+        finish: null,
+        error: {
+          name: "APIError",
+          data: {
+            message: "You have exceeded your monthly quota",
+            statusCode: 402,
+            isRetryable: false,
+            responseBody: "SHOULD-NOT-BE-QUOTED",
+            responseHeaders: { "x-request-id": "SHOULD-NOT-BE-QUOTED" },
+          },
+        },
+        ...(agent ? { agent } : {}),
+      } as Record<string, unknown>,
+      parts: [] as Array<Record<string, unknown>>,
+    });
+    const toolOnly = (agent?: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "tool-calls", ...(agent ? { agent } : {}) } as Record<
+        string,
+        unknown
+      >,
+      parts: [
+        { type: "step-start" },
+        { type: "tool", tool: "read", state: { status: "completed" } },
+        { type: "step-finish" },
+      ] as Array<Record<string, unknown>>,
+    });
+
+    const crossTurn: SessionHistory = {
+      messages: [user("Reply with exactly: BANANA"), answered("BANANA", "guild-read"), user("Reply with exactly: KIWI"), rejected("build")],
+    };
+    c.check(turnStartIndex(crossTurn) === 3, "turn scope: the turn starts just past the LAST user message");
+    c.check(
+      finalAssistantText(crossTurn) === "",
+      "turn scope: a silent turn yields '' — NOT the previous turn's answer (the #117 defect)",
+    );
+    c.check(
+      servingAgent(crossTurn) === undefined,
+      "turn scope: servingAgent does not validate this turn against the PREVIOUS turn's message",
+    );
+
+    // The reason the backward walk exists, still working: one turn split across a tool-only
+    // assistant message and a text-bearing one.
+    const multiMessageTurn: SessionHistory = {
+      messages: [user("q"), toolOnly("guild-read"), answered("THE ANSWER", "guild-read")],
+    };
+    c.check(
+      finalAssistantText(multiMessageTurn) === "THE ANSWER",
+      "turn scope: a tool-only assistant message still cannot blank the answer",
+    );
+    c.check(servingAgent(multiMessageTurn) === "guild-read", "turn scope: servingAgent reads the answering message");
+
+    // And it still reaches back across a tool-only message WITHIN the turn on a continuation.
+    const continuedMulti: SessionHistory = {
+      messages: [user("q1"), answered("OLD", "guild-read"), user("q2"), toolOnly("guild-read"), answered("NEW", "guild-read")],
+    };
+    c.check(finalAssistantText(continuedMulti) === "NEW", "turn scope: a continuation returns ITS OWN turn's answer");
+
+    // No user message at all (the low-level fixtures): the whole history is the turn.
+    const noUser: SessionHistory = { messages: [answered("ONLY", "guild-read")] };
+    c.check(turnStartIndex(noUser) === 0, "turn scope: with no user message the whole history is the turn");
+    c.check(finalAssistantText(noUser) === "ONLY", "turn scope: an undelimited history is unchanged");
+
+    // A text part that is PRESENT but not a string is no answer — and must not reach back.
+    const nonString: SessionHistory = {
+      messages: [
+        user("q1"),
+        answered("OLD"),
+        user("q2"),
+        {
+          role: "assistant",
+          info: { role: "assistant", finish: "stop" } as Record<string, unknown>,
+          parts: [{ type: "text", text: 42 }] as Array<Record<string, unknown>>,
+        },
+      ],
+    };
+    c.check(finalAssistantText(nonString) === "", "turn scope: a non-string text part is no answer, and borrows nothing");
+
+    // C74's BOUND: a preamble inside the turn IS this turn's text.
+    const preamble: SessionHistory = {
+      messages: [user("q1"), answered("OLD"), user("q2"), answered("I'll start by"), rejected()],
+    };
+    c.check(finalAssistantText(preamble) === "I'll start by", "turn scope: C74's bound — a preamble inside the turn is returned");
+
+    // The provider's own diagnosis, whitelisted.
+    const diag = finalAssistantError(crossTurn);
+    c.check(diag === "APIError: You have exceeded your monthly quota (HTTP 402)", `provider error formatted: ${String(diag)}`);
+    c.check(
+      !String(diag).includes("SHOULD-NOT-BE-QUOTED"),
+      "provider error: response body/headers are NOT stringified into the message",
+    );
+    c.check(
+      finalAssistantError(multiMessageTurn) === undefined,
+      "provider error: a healthy turn reports nothing rather than inventing a cause",
+    );
+    c.check(
+      finalAssistantError({ messages: [user("q1"), rejected(), user("q2"), answered("fine")] }) === undefined,
+      "provider error: an EARLIER turn's error is not attributed to this turn",
+    );
+    // Untrusted third-party text: bounded and flattened to one line.
+    const noisy: SessionHistory = {
+      messages: [
+        user("q"),
+        {
+          role: "assistant",
+          info: {
+            role: "assistant",
+            error: { name: "APIError", data: { message: `line1\nline2\t${"x".repeat(500)}` } },
+          } as Record<string, unknown>,
+          parts: [] as Array<Record<string, unknown>>,
+        },
+      ],
+    };
+    const flat = finalAssistantError(noisy) ?? "";
+    c.check(!/[\n\t]/.test(flat), "provider error: control characters are stripped, not passed through");
+    c.check(flat.length <= 301, `provider error: bounded (${flat.length} chars)`);
   }
 
   console.log(`client.test: ${c.passes} passed, ${c.failures} failed`);
