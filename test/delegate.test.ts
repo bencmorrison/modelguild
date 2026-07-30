@@ -2109,6 +2109,59 @@ export async function run(): Promise<number> {
     }
   }
 
+  // =========================================================================
+  // SECTION J (issue #117) — `guild_delegate` IS UNAFFECTED BY THE EMPTY-ANSWER RULE.
+  //
+  // The read paths now refuse a turn that produced no text (C74). This path deliberately does
+  // NOT opt in: a delegation's answer is the PATCH, and a model that edited files and wrote no
+  // prose has still delivered. Refusing here would turn a working delegation into a failure and
+  // — worse — would report it as one while the edits sat on disk unreviewed.
+  //
+  // This is the regression that matters most in the change, so it is asserted on the shape a
+  // real terse model produces (a real patch, an empty report) rather than on the flag.
+  // =========================================================================
+  {
+    const repo = initRepo({ "a.txt": "A\n" });
+    const logDir = tmp("m8-logs-");
+    const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+    const fake = await startFakeOpencode({ historyText: "" });
+    try {
+      const r = await delegate(
+        { task: "edit a.txt, say nothing", model: "openai/m" },
+        {
+          serve: mutatingServe(fake, () => writeFileSync(path.join(repo, "a.txt"), "A-EDITED\n")),
+          env,
+          repoDir: repo,
+          messageTimeoutMs: 5_000,
+        },
+      );
+      c.check(r.ok, "#117(J): an EMPTY report with a real patch is still a SUCCESSFUL delegation");
+      if (r.ok) {
+        c.check(r.report === "", "#117(J): the empty report is returned as-is, not an error");
+        c.check(r.capture.patchPath !== null, "#117(J): the patch was recorded");
+        c.check(r.capture.captureComplete === true, "#117(J): capture complete");
+        c.check(r.capture.filesChanged === 1, "#117(J): the model's edit is in the capture");
+        c.check(
+          readFileSync(r.capture.patchPath as string, "utf8").includes("+A-EDITED"),
+          "#117(J): the patch carries the edit the reviewer must read",
+        );
+        const entries = readFileSync(path.join(logDir, r.attribution.runId, "calls.jsonl"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        const completed = entries.find((e) => e.type === "call" && e.status === "completed");
+        c.check(completed?.exit_code === 0, "#117(J): the completed entry records exit 0 — a success, unchanged");
+        c.check(completed?.capture_state === "complete", "#117(J): capture_state complete");
+        c.check(completed?.raw_response === "", "#117(J): the empty report is recorded byte-exactly");
+        c.check(new EvidenceLog({ env }).verify(r.attribution.runId).code === 0, "#117(J): the run verifies clean");
+      }
+      // A no-text turn on this path still deletes its single-shot session, as before.
+      c.check(fake.recorded.deletes.length === 1, "#117(J): the session was deleted (unchanged behaviour)");
+    } finally {
+      await fake.close();
+    }
+  }
+
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
   console.log(`delegate.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

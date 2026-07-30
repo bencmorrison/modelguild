@@ -338,7 +338,15 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
-  // 6. Empty-but-present answer stays COMPLETE (raw_response "", hash = sha256("")).
+  // 6. EMPTY ANSWER (issue #117, C74) — a turn that produced nothing is an ERROR on the read
+  //    paths, and the capture that recorded the nothing stays COMPLETE.
+  //
+  //    THIS CASE USED TO ASSERT THE OPPOSITE (`r.ok && r.answer === ""`). That was the
+  //    defect, pinned: a provider that rejects the model ends the turn with an empty final
+  //    text, and the tool reported a clean success carrying "" — which on a panel is a member
+  //    silently dropping out. The evidence half of the old case is KEPT verbatim below,
+  //    because it is still correct and is the half that must not move: capture genuinely
+  //    completed, so `capture_state` stays `complete` with the byte-exact empty response.
   // -------------------------------------------------------------------------
   {
     const root = makeGuildRoot();
@@ -350,15 +358,299 @@ export async function run(): Promise<number> {
         { question: "q", model: "openai/allow-model" },
         { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
       );
-      c.check(r.ok && r.answer === "", "empty: a present-but-empty answer returns ''");
-      if (r.ok) {
-        const completed = readEntries(logDir, r.attribution.runId).find(
-          (e) => e.type === "call" && e.status === "completed",
+      c.check(!r.ok, "empty-answer: a present-but-empty answer is a FAILURE, not an ok:'' ");
+      if (!r.ok) {
+        c.check(r.error.kind === "empty-answer", "empty-answer: kind is empty-answer");
+        c.check(r.error.exitAnalogue === null, "empty-answer: exit analogue is null (no bash counterpart)");
+        c.check(
+          r.error.message.includes("openai/allow-model"),
+          "empty-answer: message names the model",
         );
-        c.check(!!completed && completed.capture_state === "complete", "empty: stays complete (not downgraded to failed)");
-        c.check(!!completed && completed.response_hash === SHA256_EMPTY, "empty: response_hash is sha256(\"\")");
-        c.check(new EvidenceLog({ env }).verify(r.attribution.runId).code === 0, "empty: run verifies clean");
+        c.check(
+          /no answer/i.test(r.error.message),
+          "empty-answer: message states that no answer was returned",
+        );
+        c.check(consultToToolResult(r).isError === true, "empty-answer: MCP result flags isError");
       }
+      // The model WAS called — this is not a pre-flight refusal, it is a completed turn.
+      c.check(fake.recorded.messageBodies.length === 1, "empty-answer: the turn actually ran");
+      // NO LEAKED SESSION: the throw happens before `succeeded` is set, so `askViaAgent`'s
+      // existing ownership × outcome matrix deletes the session it created. No second
+      // cleanup path exists, so this assertion is what proves the first one is reached.
+      c.check(
+        fake.recorded.deletes.length === 1,
+        "empty-answer: the created session was DELETED, not leaked",
+      );
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      const entries = readEntries(logDir, runId);
+      const completed = entries.find((e) => e.type === "call" && e.status === "completed");
+      c.check(entries.length === 3, "empty-answer: the full expect→started→completed lifecycle is written");
+      c.check(!!completed && completed.capture_state === "complete", "empty-answer: capture_state stays complete (capture SUCCEEDED; the model said nothing)");
+      c.check(!!completed && completed.raw_response === "", "empty-answer: raw_response is the byte-exact empty answer");
+      c.check(!!completed && completed.response_hash === SHA256_EMPTY, "empty-answer: response_hash is sha256(\"\")");
+      c.check(!!completed && completed.exit_code === 1, "empty-answer: exit_code is 1 (the call produced no answer)");
+      c.check(
+        new EvidenceLog({ env }).verify(runId).code === 0,
+        "empty-answer: verify() ACCEPTS exit 1 + capture_state complete (it reads capture/hashes, never exit_code)",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6b. The OTHER empty shape: a final assistant message with NO text part at all (the shape
+  //     a provider-rejected turn takes). Same outcome — the predicate is on the reconstructed
+  //     text, not on the part's presence.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "empty-answer (no text part): refuses with empty-answer");
+      c.check(fake.recorded.deletes.length === 1, "empty-answer (no text part): session deleted");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6c. WHITESPACE-ONLY is still no answer — and the record keeps the BYTES. The predicate is
+  //     trimmed-empty (a newline is not an answer), but `raw_response` is what came back, not
+  //     a normalized "": C25's byte-exact rule does not get a hole cut in it here.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "\n  \t\n" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "empty-answer (whitespace only): refuses with empty-answer");
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      const completed = readEntries(logDir, runId).find(
+        (e) => e.type === "call" && e.status === "completed",
+      );
+      c.check(!!completed && completed.raw_response === "\n  \t\n", "empty-answer (whitespace only): raw_response keeps the exact bytes");
+      c.check(!!completed && completed.capture_state === "complete", "empty-answer (whitespace only): capture_state stays complete");
+      c.check(new EvidenceLog({ env }).verify(runId).code === 0, "empty-answer (whitespace only): run verifies clean");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6d. THE CROSS-TURN DEFECT (issue #117 review, defect 1). A CONTINUATION whose new turn
+  //     answers nothing must fail — it must NOT inherit the previous turn's answer.
+  //
+  //     THIS IS THE CASE THE FIRST CUT COULD NOT SEE. The old fixture served one canned,
+  //     turn-INDEPENDENT history, so "a continuation that answers nothing" and "a fresh call
+  //     that answers nothing" were the same payload and the test passed while the product was
+  //     broken. Here the fake serves a REAL two-turn history: turn 1 answered `BANANA`, turn 2
+  //     is the captured provider-rejection shape. Against the unbounded backward walk, turn 2
+  //     returns `BANANA` with `ok:true` — reproduced live on 2026-07-30 with
+  //     `deepseek-v4-flash-free` then a quota-exhausted `gpt-5.6-terra`.
+  //
+  //     The caller owns the session, so the deletion matrix KEEPS it (continued + throw ⇒ keep)
+  //     — including under `keepSession:false`, which is the one behaviour #117 shifted.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "BANANA",
+      turnShapes: ["text", "rejected"],
+      sessionId: "ses_prior",
+    });
+    try {
+      const deps = { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 };
+      const first = await consult(
+        { question: "Reply with exactly: BANANA", model: "openai/allow-model", keepSession: true },
+        deps,
+      );
+      c.check(first.ok && first.answer === "BANANA", "cross-turn: turn 1 answers normally");
+      const runId = first.ok ? first.attribution.runId : "";
+      const sid = first.ok ? (first.sessionId ?? "") : "";
+      c.check(sid === "ses_prior", "cross-turn: turn 1 returns the session to continue");
+
+      const r = await consult(
+        {
+          question: "Reply with exactly: KIWI",
+          model: "openai/allow-model",
+          sessionId: sid,
+          runId,
+          keepSession: true,
+        },
+        deps,
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "cross-turn: the silent SECOND turn is empty-answer");
+      // The load-bearing negative: nothing anywhere in the result carries turn 1's answer.
+      c.check(!JSON.stringify(r).includes("BANANA"), "cross-turn: the PRIOR turn's answer is not returned as this call's answer");
+      c.check(fake.recorded.deletes.length === 0, "cross-turn: the CALLER's session is not deleted");
+
+      const entries = readEntries(logDir, runId);
+      const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+      c.check(completed.length === 2, "cross-turn: both turns wrote a completed entry into the one run");
+      c.check(completed[0]?.raw_response === "BANANA", "cross-turn: turn 1's receipt is its own answer");
+      c.check(
+        completed[1]?.raw_response === "",
+        "cross-turn: turn 2's receipt is the EMPTY answer, not turn 1's text",
+      );
+      c.check(completed[1]?.session_id === "ses_prior", "cross-turn: the failed continuation records its session");
+      c.check(new EvidenceLog({ env }).verify(runId).code === 0, "cross-turn: the two-turn run verifies clean");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6e. THE PROVIDER'S OWN DIAGNOSIS reaches the refusal message (issue #117 review). The old
+  //     message sent the reader to `activity.errors`, a channel that is EMPTY under
+  //     `GUILD_ACTIVITY=off` — so it could point at nothing. The turn's own `info.error` is
+  //     read from history instead, whitelisted to name/message/statusCode.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({
+      GUILD_ROOT: root,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDirWithRead(),
+      GUILD_ACTIVITY: "off",
+    });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["rejected"],
+      rejectionError: { name: "APIError", message: "You have exceeded your monthly quota", statusCode: 402 },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "provider error: still an empty-answer refusal");
+      if (!r.ok) {
+        c.check(
+          r.error.message.includes("You have exceeded your monthly quota"),
+          "provider error: the provider's own message is quoted in the refusal",
+        );
+        c.check(r.error.message.includes("402"), "provider error: the status code is quoted");
+        c.check(
+          !/activity errors/.test(r.error.message),
+          "provider error: with a real diagnosis it does NOT send the reader to the (here empty) activity trace",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6f. NO diagnosis available: the message must stay useful rather than assert a cause it
+  //     does not have. `historyText: ""` is a turn that answered with an empty text part and
+  //     carries no `info.error` at all.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "no diagnosis: still refuses");
+      if (!r.ok) {
+        c.check(
+          !/The provider reported/.test(r.error.message),
+          "no diagnosis: no provider text is invented",
+        );
+        c.check(
+          /model id/.test(r.error.message),
+          "no diagnosis: the message still says what to check",
+        );
+        c.check(!!r.runId && !!r.callId, "no diagnosis: the failure names the receipt (runId + callId)");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6g. A NON-STRING text part on a continuation. The part is present, so nothing is missing —
+  //     but its `text` is not a string, the product's type guard correctly rejects it, and the
+  //     walk must then stop at the turn boundary rather than reaching back to turn 1.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "BANANA",
+      turnShapes: ["text", "non-string-text"],
+      sessionId: "ses_prior",
+    });
+    try {
+      const deps = { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 };
+      const first = await consult(
+        { question: "q1", model: "openai/allow-model", keepSession: true },
+        deps,
+      );
+      c.check(first.ok && first.answer === "BANANA", "non-string: turn 1 answers normally");
+      const r = await consult(
+        { question: "q2", model: "openai/allow-model", sessionId: "ses_prior", keepSession: true },
+        deps,
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "non-string: a non-string text part is no answer");
+      c.check(!JSON.stringify(r).includes("BANANA"), "non-string: turn 1's answer is not borrowed");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6h. C74's BOUND, fixtured in both directions. A preamble followed by a dead final message
+  //     INSIDE ONE TURN still passes, returning the preamble — judging content is deliberately
+  //     not attempted. On a FRESH session that is the whole story; on a CONTINUATION the
+  //     returned preamble must be THIS turn's, never the previous turn's answer.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "I'll start by checking the",
+      turnShapes: ["preamble-then-textless"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(
+        r.ok && r.answer === "I'll start by checking the",
+        "bound: a preamble inside the turn is an answer (C74 catches a WHOLLY empty turn, not a useless one)",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnTexts: ["TURN-ONE-ANSWER", "TURN-TWO-PREAMBLE"],
+      turnShapes: ["text", "preamble-then-textless"],
+      sessionId: "ses_prior",
+    });
+    try {
+      const deps = { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 };
+      await consult({ question: "q1", model: "openai/allow-model", keepSession: true }, deps);
+      const r = await consult(
+        { question: "q2", model: "openai/allow-model", sessionId: "ses_prior", keepSession: true },
+        deps,
+      );
+      // Distinct per-turn texts, so this really does say WHICH turn the walk landed on.
+      c.check(r.ok && r.answer === "TURN-TWO-PREAMBLE", "bound: a continuation returns THIS turn's preamble, not turn 1's answer");
     } finally {
       await fake.close();
     }

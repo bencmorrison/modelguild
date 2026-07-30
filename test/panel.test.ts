@@ -605,6 +605,66 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 12b. THE ISSUE-#117 CASE, AND THE ONE THAT ACTUALLY BIT: a member whose turn completes
+  //      and produces NO TEXT. It used to land as `text: ""` — a blank line in the digest and
+  //      a full member entry in `structuredContent` — so a 3-model panel came back with 2
+  //      answers and the synthesis proceeded a voice short without saying so.
+  //
+  //      Now it lands in `error` with kind `empty-answer`, carries NO `text`, and — like every
+  //      other failure kind — NO `sessionId` under `keepSessions`, which is what makes the
+  //      round-2 consult loop skip it. The sibling is untouched, proving this is per member
+  //      rather than a panel-wide abort.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy(""); // default-allow
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "ok voice",
+      distinctSessions: true,
+      emptyAnswerForModel: "beta/silent",
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/silent"], keepSessions: true },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "empty-member: panel itself ok (a silent member is data, not a panel abort)");
+      if (r.ok) {
+        const alpha = r.results.find((m) => m.model === "alpha/ok");
+        const beta = r.results.find((m) => m.model === "beta/silent");
+        c.check(!!alpha && !alpha.error && alpha.text === "ok voice", "empty-member: sibling alpha answered normally");
+        c.check(!!alpha?.sessionId, "empty-member: sibling alpha kept its sessionId");
+        c.check(!!beta?.error && beta.error.kind === "empty-answer", "empty-member: beta reports empty-answer");
+        c.check(beta?.text === undefined, "empty-member: beta carries NO text (not text:'')");
+        c.check(beta?.error?.exitAnalogue === null, "empty-member: beta's exit analogue is null");
+        c.check(!!beta?.error?.message.includes("beta/silent"), "empty-member: beta's message names the model");
+        c.check(beta?.sessionId === undefined, "empty-member: beta has NO sessionId under keepSessions (round-2 skips it)");
+        c.check(fake.recorded.deletes.length === 1, "empty-member: exactly one session deleted (beta's; no orphan, no leak)");
+        c.check(
+          alpha?.sessionId !== undefined && !fake.recorded.deletes.includes(alpha.sessionId),
+          "empty-member: the kept sibling session was NOT deleted",
+        );
+        // The DIGEST is the surface a text-only reader sees: a silent member must read as a
+        // failure there, not as a blank line under its heading.
+        const text = panelToToolResult(r).content[0].text;
+        c.check(/ERROR \(empty-answer\)/.test(text), "empty-member: the rendered digest shows a failure, not a blank line");
+        // beta's capture COMPLETED (it recorded the empty answer byte-exactly), so unlike the
+        // failing-member case above this run verifies CLEAN — the failure is in exit_code,
+        // which verify() does not read.
+        const entries = readEntries(logDir, r.runId);
+        const completed = entries.find((e) => e.call_id === beta?.callId && e.status === "completed");
+        c.check(completed?.capture_state === "complete", "empty-member: beta's completed entry stays capture_state complete");
+        c.check(completed?.raw_response === "", "empty-member: beta's raw_response is the empty answer");
+        c.check(completed?.exit_code === 1, "empty-member: beta's exit_code is 1");
+        c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "empty-member: the run still verifies clean");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Per-call timeoutMs applies to EVERY panel member (issue #37). A small per-call
   // value wins over a large env value and aborts each delayed member. No deps seam.
   // -------------------------------------------------------------------------

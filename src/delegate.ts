@@ -622,11 +622,18 @@ export async function delegate(
       ? outcome.reason
       : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
+  // ISSUE #117 IS DELIBERATELY NOT WIRED HERE, and this line is where that shows. The shared
+  // spine can report `empty-answer`, but only for a caller that asked for it with
+  // `requireAnswer` — and this tool does not, because an empty report beside a real patch is a
+  // successful delegation, not a failure. So the kind is unreachable on this path and is mapped
+  // defensively rather than widening this tool's wire contract with a kind it never emits.
+  const kind: DelegateErrorKind =
+    outcome.kind === "empty-answer" ? "call-failed" : outcome.kind;
   const fail: DelegateFail = {
     ok: false,
     rootConflict,
     error: {
-      kind: outcome.kind,
+      kind,
       model: requestedModel,
       exitAnalogue: null,
       message,

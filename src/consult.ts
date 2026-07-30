@@ -35,6 +35,7 @@ import {
   askViaAgent,
   fetchSession,
   AgentMismatchError,
+  EmptyAnswerError,
   AgentFloorNotInForceError,
   SessionPermissionMismatchError,
   type PreTurnAgentCheck,
@@ -303,6 +304,9 @@ export type ConsultErrorKind =
   | "approval-channel-missing"
   | "approval-not-applied"
   | "call-failed"
+  /** The turn completed and the model produced NO ANSWER (issue #117, C74) — a read-path
+   * refusal, never an empty success. `guild_delegate` cannot produce it. */
+  | "empty-answer"
   | "agent-mismatch";
 
 export interface ConsultAttribution {
@@ -371,6 +375,15 @@ export interface ConsultOk {
 export interface ConsultFail {
   ok: false;
   error: ConsultError;
+  /**
+   * WHERE THE RECEIPT IS (issue #117 review). `ConsultOk` has carried these in `attribution`
+   * since M5; a failure did not, so an `empty-answer` refusal — whose whole rationale is that
+   * the blank response WAS captured byte-exactly — gave the caller no way to go and read it.
+   * `guild_panel` already sets `callId` per member. Present only when the call reached the
+   * model and the evidence layer is on: a pre-flight refusal has no call to point at.
+   */
+  runId?: string;
+  callId?: string;
   /** Even on a refusal, tell the caller which root's policy did the refusing. */
   rootConflict?: string;
   /** See `ConsultOk.agentUnverified` — carried on a failure too, because "the call failed AND
@@ -896,6 +909,13 @@ export interface LifecycleParams {
   /** The non-default WRITE root this turn edited (issue #107) — the write-path counterpart,
    * deliberately its own field rather than a reuse of `readRoot`; see `log.started`. */
   writeRoot?: string;
+  /**
+   * A turn that answers nothing is a FAILURE for this caller (issue #117, C74). OPT-IN, and
+   * the opt-in is the point: `guild_consult`/`guild_panel`/`guild_research` set it, because a
+   * read path with no text produced nothing at all. `guild_delegate` does NOT — its answer is
+   * the patch, and an empty report beside real edits is a successful delegation.
+   */
+  requireAnswer?: boolean;
 }
 
 /** Every tool's approval plumbing, resolved once by `armApproval` and threaded through the
@@ -949,7 +969,13 @@ export type LifecycleOutcome =
       /** `approval-not-applied` is only reachable when the bridge is armed: the session this
        * turn would run in is not carrying the `ask` rules, so the turn was refused rather
        * than run ungated. No model was called. */
-      kind: "call-failed" | "agent-mismatch" | "approval-not-applied" | "agent-unhardened";
+      kind:
+        | "call-failed"
+        | "agent-mismatch"
+        | "approval-not-applied"
+        | "agent-unhardened"
+        /** Only produced when the caller set `requireAnswer` (issue #117, C74). */
+        | "empty-answer";
       /** Present on failure too — a black-box call that DIED is exactly the one whose
        * action trace matters most. */
       activity?: ActivitySummary;
@@ -1098,6 +1124,8 @@ export async function runAgentLifecycle(
       keepSession: p.keepSession,
       // Fail closed if opencode serves a different agent than the hardened one requested.
       expectedAgent: p.agent,
+      // Issue #117: only the read paths ask for this; see `LifecycleParams.requireAnswer`.
+      requireAnswer: p.requireAnswer === true,
     };
     if (recorder !== undefined) askOpts.activity = recorder;
     // A3: re-verify the floor on the child that will actually serve this turn.
@@ -1143,16 +1171,29 @@ export async function runAgentLifecycle(
     // refusal is recorded exactly like a model failure and the run verifies clean. The EARLY
     // gate is what keeps the common case free of any log footprint at all.
     const unhardened = err instanceof AgentFloorNotInForceError;
+    // AN EMPTY ANSWER IS A FAILED CALL WITH AN INTACT CAPTURE (issue #117, C74), which is why
+    // it cannot share the line below. Capture did NOT fail here: the turn completed, history
+    // was read, and what the model produced is known byte-exactly — it is simply blank. So
+    // `capture_state` stays `complete` with the byte-exact `raw_response`, and only
+    // `exit_code` says the call produced no answer. Reusing `failed` would blank a response we
+    // in fact hold — and would also read as the capture-machinery failure issue #74 named on a
+    // NEIGHBOURING field (`capture_complete:false` on the `delegate-diff` entry, not
+    // `capture_state` on `completed`), which is a confusion worth not inviting. The second
+    // reason is the sufficient one. `verify()` reads `capture_state`, the hash chain and
+    // the response digest — never `exit_code` — so exit 1 + complete verifies clean.
+    const empty = err instanceof EmptyAnswerError;
     const reason = err instanceof Error ? err.message : String(err);
     await d.log.completed({
       ...common,
       exit: 1,
       turn: started.turn,
-      // Record the session id we know: the served one on a mismatch, else the continued
-      // id (item 4 — a failed continuation must still record which session it was; null
-      // for a fresh session whose id we never learned before the throw).
-      session: mismatch ? err.sessionId : p.sessionId,
-      captureState: "failed",
+      // Record the session id we know: the served one on a mismatch or an empty answer, else
+      // the continued id (item 4 — a failed continuation must still record which session it
+      // was; null for a fresh session whose id we never learned before the throw).
+      session: mismatch || empty ? err.sessionId : p.sessionId,
+      ...(empty
+        ? { captureState: "complete" as const, response: err.text }
+        : { captureState: "failed" as const }),
     });
     const failed: LifecycleOutcome = {
       ok: false,
@@ -1164,7 +1205,9 @@ export async function runAgentLifecycle(
           ? "approval-not-applied"
           : unhardened
             ? "agent-unhardened"
-            : "call-failed",
+            : empty
+              ? "empty-answer"
+              : "call-failed",
     };
     if (recorder !== undefined) failed.activity = recorder.summary();
     if (approver !== undefined) failed.approval = approver.summary();
@@ -1385,6 +1428,8 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       confirmed: gate.confirmed,
       sessionId: params.sessionId,
       keepSession: params.keepSession === true,
+      // A read path with no text produced nothing at all (issue #117, C74).
+      requireAnswer: true,
       ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
     },
     {
@@ -1434,7 +1479,11 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     outcome.kind === "approval-not-applied" ||
     outcome.kind === "agent-unhardened"
       ? outcome.reason
-      : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
+      : // NAME THE MODEL (issue #117): the whole failure is that nothing came back, so the
+        // one fact worth reporting is which model said nothing.
+        outcome.kind === "empty-answer"
+        ? `The consult call to '${modelLabel}' returned NO ANSWER: ${outcome.reason}`
+        : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ConsultFail = {
     ok: false,
     rootConflict,
@@ -1448,6 +1497,8 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       message,
     },
   };
+  if (runId.length > 0) fail.runId = runId;
+  if (outcome.callId.length > 0) fail.callId = outcome.callId;
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
@@ -1505,6 +1556,8 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
     };
   }
   const structured: Record<string, unknown> = { error: r.error };
+  if (r.runId) structured.runId = r.runId;
+  if (r.callId) structured.callId = r.callId;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
