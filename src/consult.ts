@@ -35,7 +35,9 @@ import {
   askViaAgent,
   fetchSession,
   AgentMismatchError,
+  AgentFloorNotInForceError,
   SessionPermissionMismatchError,
+  type PreTurnAgentCheck,
   type ServeProvider,
   type ServeRouter,
 } from "./client.js";
@@ -899,6 +901,12 @@ export interface LifecycleApproval {
 
 export interface LifecycleDeps {
   serve: ServeProvider;
+  /**
+   * The issue-#111 floor re-check, run INSIDE the turn's own serve lease (review A3). Absent ⇒
+   * nothing extra happens. Threaded rather than constructed here so the tools' single checker
+   * instance (and therefore its cache) is the one used.
+   */
+  preTurnCheck?: PreTurnAgentCheck;
   log: EvidenceLog;
   messageTimeoutMs?: number;
   /**
@@ -935,7 +943,7 @@ export type LifecycleOutcome =
       /** `approval-not-applied` is only reachable when the bridge is armed: the session this
        * turn would run in is not carrying the `ask` rules, so the turn was refused rather
        * than run ungated. No model was called. */
-      kind: "call-failed" | "agent-mismatch" | "approval-not-applied";
+      kind: "call-failed" | "agent-mismatch" | "approval-not-applied" | "agent-unhardened";
       /** Present on failure too — a black-box call that DIED is exactly the one whose
        * action trace matters most. */
       activity?: ActivitySummary;
@@ -1086,6 +1094,8 @@ export async function runAgentLifecycle(
       expectedAgent: p.agent,
     };
     if (recorder !== undefined) askOpts.activity = recorder;
+    // A3: re-verify the floor on the child that will actually serve this turn.
+    if (d.preTurnCheck !== undefined) askOpts.preTurnCheck = d.preTurnCheck;
     if (d.approval !== undefined && approver !== undefined) {
       askOpts.permission = d.approval.arming.ruleset;
       // Invariant 2 at the WIRE (review finding M4) and the ONE stored-ruleset predicate
@@ -1117,6 +1127,16 @@ export async function runAgentLifecycle(
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
     const ungated = err instanceof SessionPermissionMismatchError;
+    // A LATE FLOOR REFUSAL LANDS HERE, AND THAT IS WHY IT IS SAFE (issue #111, review A3).
+    // The in-lease re-check throws from inside `askViaAgent`, i.e. AFTER `log.expect()` and
+    // `log.started()`. C24 requires exactly one of expected/started/completed per call_id in
+    // BOTH directions, so a refusal that simply returned here would leave an `expected-call`
+    // and a `started` with no `completed` and fail `verify()` — an unverifiable run produced by
+    // a SAFETY check is the worst possible trade. It needs no special path: this catch already
+    // writes `completed` (exit 1, capture_state failed) for every thrown failure, so the late
+    // refusal is recorded exactly like a model failure and the run verifies clean. The EARLY
+    // gate is what keeps the common case free of any log footprint at all.
+    const unhardened = err instanceof AgentFloorNotInForceError;
     const reason = err instanceof Error ? err.message : String(err);
     await d.log.completed({
       ...common,
@@ -1132,7 +1152,13 @@ export async function runAgentLifecycle(
       ok: false,
       callId,
       reason,
-      kind: mismatch ? "agent-mismatch" : ungated ? "approval-not-applied" : "call-failed",
+      kind: mismatch
+        ? "agent-mismatch"
+        : ungated
+          ? "approval-not-applied"
+          : unhardened
+            ? "agent-unhardened"
+            : "call-failed",
     };
     if (recorder !== undefined) failed.activity = recorder.summary();
     if (approver !== undefined) failed.approval = approver.summary();
@@ -1281,6 +1307,12 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   }
   /** Carried onto every result below — see `ConsultOk.agentUnverified`. */
   const unverified = floor.unverified;
+  /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
+   * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    CONSULT_AGENT,
+    agentDefDirs,
+  );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does), so the
   //     approval pre-flight below still happens before any log entry exists. ---
@@ -1334,6 +1366,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     {
       serve,
       log,
+      preTurnCheck,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),

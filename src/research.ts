@@ -29,7 +29,7 @@
 import os from "node:os";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
-import { type AgentFloorChecker } from "./agentfloor.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -280,6 +280,12 @@ export async function research(
     };
   }
   const unverified = floor.unverified;
+  /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
+   * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    RESEARCH_AGENT,
+    agentDefDirs,
+  );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -327,6 +333,7 @@ export async function research(
     {
       serve,
       log,
+      preTurnCheck,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),

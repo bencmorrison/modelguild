@@ -17,7 +17,15 @@
  * assertion be decided by another's evidence.
  */
 
-import { mkdtempSync, writeFileSync, readdirSync, existsSync, rmSync, mkdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  rmSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -40,6 +48,7 @@ import {
   type FakeOpencode,
 } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
+import { EvidenceLog } from "../src/log.js";
 import { Checker, fixtureGitEnv, fakeServeHandle } from "./harness.js";
 
 const tmpDirs: string[] = [];
@@ -793,6 +802,130 @@ export async function run(): Promise<number> {
           "ordering: the FLOOR refusal wins over the approval-knob refusal — the bridge must never arm against a def that is not in force",
         );
       }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // =========================================================================
+  // 9b. A3 — THE IN-LEASE RE-CHECK, AND ITS EVIDENCE-LOG CARDINALITY.
+  //     The early gate runs on its own `withServe` lease; `GUILD_SERVE_PER_CALL=1` tears that
+  //     child down, so the turn ran on a child that was never checked. The re-check runs inside
+  //     `askViaAgent`'s lease, on the handle that will serve the turn.
+  //
+  //     THE CARDINALITY IS THE POINT. A late refusal lands AFTER `log.expect()`/`log.started()`,
+  //     and C24 requires exactly one of expected/started/completed per call_id in BOTH
+  //     directions — so a refusal that just returned would leave a run that FAILS `verify()`.
+  //     A safety check that produces an unverifiable audit trail is the worst possible trade,
+  //     so this asserts the run verifies CLEAN, with all three entries.
+  // =========================================================================
+  {
+    const logDir = tmp("m111-logs-");
+    const guildRoot = tmp("m111-guild-");
+    const env = envWith({
+      GUILD_ROOT: guildRoot,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDir("guild-read"),
+    });
+    // The child is HARDENED when the early gate asks and VOIDED when the turn's lease asks —
+    // exactly the per-call-mode shape (a different child serving the turn), forced
+    // deterministically rather than by spawning real children in an offline suite.
+    let asked = 0;
+    const checker = new AgentFloorChecker({
+      warn: () => {},
+      list: async () => {
+        asked += 1;
+        return [asked === 1 ? hardenedAgent("guild-read", ["read"]) : voidedAgent("guild-read")];
+      },
+    });
+    const fake = await startFakeOpencode({ historyText: "MUST NOT BE REACHED" });
+    // Distinct handles per lease, so the second lookup is a genuine cache MISS — the same thing
+    // a per-call respawn does via a fresh `instanceId`.
+    const handles = [fakeServeHandle(fake.baseUrl), fakeServeHandle(fake.baseUrl)];
+    let lease = 0;
+    const serve = { withServe: <T,>(fn: (h: typeof handles[0]) => Promise<T>): Promise<T> => fn(handles[Math.min(lease++, 1)]) };
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/m" },
+        { serve, env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(!r.ok, "A3: the LATE re-check refuses the call");
+      if (!r.ok) {
+        c.check(
+          r.error.kind === "agent-unhardened",
+          `A3: it is reported as agent-unhardened, not a generic call-failed (got ${r.error.kind})`,
+        );
+      }
+      c.check(asked === 2, `A3: the floor was checked on BOTH leases (got ${asked})`);
+      c.check(
+        fake.recorded.messageBodies.length === 0,
+        "A3: no model was called — the refusal lands before any message",
+      );
+      c.check(
+        fake.recorded.createBodies.length === 0,
+        "A3: and before the session is even created",
+      );
+      // THE CARDINALITY ASSERTION.
+      const runs = readdirSync(logDir).filter((d) => d !== "latest" && d !== "watchers");
+      c.check(runs.length === 1, `A3: the late refusal DID mint a run (got ${runs.length})`);
+      if (runs.length === 1) {
+        const entries = readFileSync(path.join(logDir, runs[0], "calls.jsonl"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        // An entry's identity is `type` + `status`: expected-call/expected, call/started,
+        // call/completed. C24 requires exactly one of each per call_id, in BOTH directions.
+        const ids = entries.map((e) => `${String(e.type)}/${String(e.status)}`).sort();
+        c.check(
+          JSON.stringify(ids) ===
+            JSON.stringify(["call/completed", "call/started", "expected-call/expected"]),
+          `A3: all three lifecycle entries are present (C22/C24) — got ${JSON.stringify(ids)}`,
+        );
+        c.check(
+          entries.every((e) => e.call_id === entries[0].call_id),
+          "A3: and they share ONE call_id, so they pair (C23)",
+        );
+        // THE VERDICT IS THE ORDINARY FAILED-CALL ONE, NOT A CARDINALITY GAP. A call whose turn
+        // failed always records `capture_state: failed`, and `verify()` reports that as code 7 —
+        // the intended loud failure, identical to what a model failure produces (the consult
+        // suite pins the same verdict). What must NEVER happen is a MISSING entry, which is a
+        // different code-7 message and is what a late refusal would have caused had it simply
+        // returned instead of flowing through the lifecycle's own catch.
+        const verdict = new EvidenceLog({ env }).verify(runs[0]);
+        c.check(
+          verdict.code === 7 && /incomplete evidence capture/.test(verdict.message),
+          `A3: verify reports the ORDINARY failed-capture verdict (got ${verdict.code}: ${verdict.message})`,
+        );
+        c.check(
+          !/expect|missing|require/i.test(verdict.message),
+          `A3: and NOT a missing-entry/cardinality failure — that is the outcome this path exists to avoid (${verdict.message})`,
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // A hardened child: the second lease is a cache HIT, so the re-check costs no extra GET.
+  {
+    const logDir = tmp("m111-logs-");
+    const env = envWith({
+      GUILD_ROOT: tmp("m111-guild-"),
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDir("guild-read"),
+    });
+    const fake = await startFakeOpencode({ historyText: "the answer" });
+    try {
+      const { checker } = collectingChecker();
+      const r = await consult(
+        { question: "q", model: "openai/m" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(r.ok, "A3: the shared-child path is unaffected");
+      c.check(
+        fake.recorded.agentGets === 1,
+        `A3: ONE GET across both leases — the same child is a cache hit (got ${fake.recorded.agentGets})`,
+      );
     } finally {
       await fake.close();
     }

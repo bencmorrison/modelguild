@@ -44,7 +44,7 @@
 import os from "node:os";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
-import { type AgentFloorChecker } from "./agentfloor.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -150,6 +150,14 @@ export type PanelMemberErrorKind =
   | "policy-ask"
   /** Only reachable under the opt-in `GUILD_APPROVE_EGRESS=ask` (issue #20 slice 4). */
   | "approval-not-applied"
+  /**
+   * The in-lease floor re-check refused on the child that was about to serve THIS member
+   * (issue #111, review A3). Per-member rather than panel-wide, unlike the up-front
+   * `agent-unhardened` refusal: by this point each member holds its own serve lease, and under
+   * `GUILD_SERVE_PER_CALL=1` those are genuinely different children, so one member can be
+   * refused while its siblings answer.
+   */
+  | "agent-unhardened"
   | "call-failed"
   | "agent-mismatch";
 
@@ -338,6 +346,13 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
   const unverified = floor.unverified;
+  /** A3: re-asked inside each member's own turn lease. Built ONCE from the same checker, so on
+   * the shared child every member is a cache hit; under `GUILD_SERVE_PER_CALL=1` each member's
+   * lease is a different child, so each gets a real check on the one that serves it. */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    PANEL_AGENT,
+    agentDefDirs,
+  );
 
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
@@ -412,6 +427,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         {
           serve,
           log,
+          preTurnCheck,
           messageTimeoutMs,
           activity,
           ...(armed.approval !== undefined ? { approval: armed.approval } : {}),

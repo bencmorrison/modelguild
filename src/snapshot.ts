@@ -597,20 +597,30 @@ export function scaffoldDigest(repoDir: string): string {
  * write path's evidence baseline to an undocumented lazy-load ordering in a dependency this
  * repo tracks unpinned, and buy only the suppression of a first-call-per-tree warning.
  *
- * THAT REJECTION WAS VIOLATED BY ACCIDENT AND IS NOW RESTORED BY ORDERING (issue #111 review,
- * maintainer decision 2026-07-30). The issue-#111 resolved-agent gate issues `GET /agent` before
- * the turn — and **`GET /agent` ALONE materializes the plugin runtime**. Re-probed on 1.18.7
- * (2026-07-30): a ready serve left idle for 12s with no request wrote nothing; ONE `GET /agent`
- * produced `.opencode/.gitignore` immediately and `node_modules` + both manifests within ~3s.
- * (The write is not synchronous with the response, so a check made too soon misses it — that
- * timing is why an earlier probe read as negative.) With the gate ahead of the baseline, the
- * scaffolding was already inside the baseline, `scaffoldChanged` stopped firing on a tree's
- * FIRST delegation, and the pre-warm this comment records as rejected was silently in force.
- * **The fix is to hoist THIS baseline above the gate, not to move the gate**: `snapshotScaffold`
- * captures the two scaffold fields before the gate runs, `snapshotWorktree` takes them as a
- * required parameter, and the git snapshot stays after the gate so a refusal still snapshots
- * nothing. Reading a directory writes nothing, so gap parity (C24) is untouched. Do not
- * "simplify" the two-phase shape back into a single call.
+ * THE BASELINE IS SPLIT SO THE SCAFFOLD HALF CAN BE TAKEN ABOVE THE #111 GATE — AND THE REASON
+ * IS A MISCLASSIFICATION, NOT A SILENCED FLAG (issue #111 review A1, maintainer decision
+ * 2026-07-30, correcting an earlier draft of this very comment).
+ *
+ * The earlier draft said the gate put the scaffolding inside the baseline so `scaffoldChanged`
+ * stopped firing. **That does not reproduce.** Measured on 1.18.7 (2026-07-30, three runs):
+ * `GET /agent` returns in ~200-270ms, and `node_modules` appears **+579ms / +581ms / +3680ms
+ * AFTER the response** — while the production gap between the gate returning and the baseline is
+ * a handful of synchronous fs calls. A post-gate baseline therefore would not have held
+ * `node_modules`, the before/after digests would still differ, and the flag would still fire.
+ *
+ * **What a post-gate baseline actually breaks is the WORDING BRANCH.**
+ * `.opencode/.gitignore` is written SYNCHRONOUSLY — it is already on disk at the instant the
+ * response returns — and it is in `isServeScaffold`'s set. So `before.scaffold` would be
+ * non-EMPTY, `scaffoldAppeared` (`scaffold changed && before === EMPTY_SCAFFOLD_DIGEST`) would be
+ * false, and `src/delegate.ts` would select the severe "existing plugin directory MODIFIED — no
+ * benign explanation, stop and review" branch on EVERY first delegation into a tree. #107's rule
+ * "never downgrade a case on the strength of the benign one" has an inverse, and this is it: a
+ * false severe alarm on a routine event is how a tamper signal dies.
+ *
+ * So `snapshotScaffold` captures the two scaffold fields before the gate runs, `snapshotWorktree`
+ * takes them as a REQUIRED parameter, and the git snapshot stays after the gate so a refusal
+ * still snapshots nothing. Reading a directory writes nothing, so gap parity (C24) is untouched.
+ * Do not "simplify" the two-phase shape back into a single call.
  */
 export const EMPTY_SCAFFOLD_DIGEST = createHash("sha256").update("").digest("hex");
 

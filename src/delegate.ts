@@ -50,7 +50,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
-import { type AgentFloorChecker } from "./agentfloor.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -435,17 +435,21 @@ export async function delegate(
     };
   }
 
-  // 4a. THE SCAFFOLD BASELINE IS HOISTED ABOVE THE GATE (issue #111 review; maintainer
+  // 4a. THE SCAFFOLD BASELINE IS HOISTED ABOVE THE GATE (issue #111 review A1; maintainer
   //     decision 2026-07-30). This is a READ of a directory tree — it writes nothing, runs no
   //     git and mints nothing — so it does not touch the rule that a refusal below snapshots
-  //     nothing (C24 gap parity). It is here because the gate's own `GET /agent`
-  //     MATERIALIZES opencode's plugin runtime into a cwd containing `.opencode/` (re-probed on
-  //     1.18.7, 2026-07-30: an idle serve writes nothing at 12s; one `GET /agent` writes
-  //     `.gitignore` at once and `node_modules` + manifests within ~3s). Taken AFTER the gate,
-  //     the scaffolding would already be inside the baseline, `scaffoldChanged` would stop
-  //     firing on a tree's first delegation, and the pre-warm that `src/snapshot.ts` and
-  //     AGENTS.md both record as REJECTED would have been silently in force. The git snapshot
-  //     stays below the gate, where a refusal never reaches it.
+  //     nothing (C24 gap parity).
+  //
+  //     WHY, PRECISELY — and an earlier version of this comment had it wrong. It is NOT that the
+  //     gate silences `scaffoldChanged`: measured on 1.18.7 (three runs), `GET /agent` returns in
+  //     ~200-270ms and `node_modules` lands +579ms/+581ms/+3680ms AFTER the response, so a
+  //     post-gate baseline would still differ from the after-tree and the flag would still fire.
+  //     It is that `.opencode/.gitignore` IS written synchronously, and it is in
+  //     `isServeScaffold`'s set — so a post-gate `before.scaffold` is non-EMPTY,
+  //     `scaffoldAppeared` below is false, and the SEVERE "plugin directory MODIFIED, no benign
+  //     explanation" wording fires on every first delegation into a tree. A false severe alarm on
+  //     a routine event is how a tamper signal dies. The git snapshot stays below the gate, where
+  //     a refusal never reaches it.
   const scaffoldBefore = snapshotScaffold(writeRoot);
 
   // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check, and the highest
@@ -471,6 +475,12 @@ export async function delegate(
     };
   }
   const unverified = floor.unverified;
+  /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
+   * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    DELEGATE_AGENT,
+    agentDefDirs,
+  );
 
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -531,6 +541,7 @@ export async function delegate(
     {
       serve,
       log,
+      preTurnCheck,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
