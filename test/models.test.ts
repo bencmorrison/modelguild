@@ -7,9 +7,8 @@
 
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
-import { Checker } from "./harness.js";
+import { Checker, fakeServeHandle } from "./harness.js";
 import { models, modelsToToolResult, parseProviders, type ServeRunner } from "../src/models.js";
-import type { ServeHandle } from "../src/lifecycle.js";
 
 // A trimmed but structurally faithful /config/providers body (opencode 1.18.4 shape).
 const FIXTURE = {
@@ -61,7 +60,7 @@ function startFixture(body: unknown, opts: { fail?: boolean } = {}): Promise<{ b
 }
 
 function stubServe(baseUrl: string): ServeRunner {
-  const handle: ServeHandle = { baseUrl, port: 0, pid: process.pid };
+  const handle = fakeServeHandle(baseUrl, process.pid);
   return { withServe: async (fn) => fn(handle) };
 }
 

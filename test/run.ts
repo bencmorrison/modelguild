@@ -21,6 +21,7 @@ import { run as modelsSuite } from "./models.test.js";
 import { run as initSuite } from "./init.test.js";
 import { run as doctorSuite } from "./doctor.test.js";
 import { run as worktreeSuite } from "./worktree.test.js";
+import { run as agentFloorSuite } from "./agentfloor.test.js";
 
 const suites: Array<[string, () => Promise<number>]> = [
   ["lifecycle", lifecycle],
@@ -41,6 +42,7 @@ const suites: Array<[string, () => Promise<number>]> = [
   ["init", initSuite],
   ["doctor", doctorSuite],
   ["worktree", worktreeSuite],
+  ["agentfloor", agentFloorSuite],
 ];
 
 let total = 0;

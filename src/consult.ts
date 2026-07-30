@@ -35,11 +35,14 @@ import {
   askViaAgent,
   fetchSession,
   AgentMismatchError,
+  AgentFloorNotInForceError,
   SessionPermissionMismatchError,
+  type PreTurnAgentCheck,
   type ServeProvider,
   type ServeRouter,
 } from "./client.js";
 import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   candidateRoots,
@@ -279,6 +282,13 @@ export function guildDoctorSeed(
 // --- Result / error shapes -------------------------------------------------
 export type ConsultErrorKind =
   | "agent-def-missing"
+  // The def FILE is present but opencode is not applying it (issue #111, C73). TWO SHAPES, and
+  // they differ in footprint (review B4): the EARLY refusal is decided before any log write and
+  // before any snapshot — nothing ran; the LATE one comes from the re-check made inside the turn's
+  // own serve lease, so it lands after `expect`/`started` and is recorded like a failed call. Both
+  // carry the same `kind`; exit-analogue null either way (no bash counterpart, and NOT a reuse of
+  // C57's 5, which means specifically "the def is missing").
+  | "agent-unhardened"
   // The review target named a directory that is not a worktree of this repository
   // (issue #96). Refused before any log write, like every other pre-call refusal.
   | "worktree-invalid"
@@ -335,6 +345,13 @@ export interface ConsultOk {
   /** Multi-root conflict note, if any (surfaced, never fatal). */
   rootConflict?: string;
   /**
+   * Present ONLY when the issue-#111 resolved-agent check could not be made (opencode
+   * unreachable, or an answer this cannot read). The call PROCEEDED — that is the decided
+   * direction — and this is the "never silently" half of it (C73). Absent on every call where
+   * the floor was verified, so a result is byte-identical to a pre-#111 one in the normal case.
+   */
+  agentUnverified?: string;
+  /**
    * The opencode session id, returned ONLY when `keepSession` was requested (a deleted
    * session's id is useless). This is the sole way a caller threads a follow-up turn:
    * pass it back as `sessionId`. There is deliberately NO parameter for handing back the
@@ -356,6 +373,9 @@ export interface ConsultFail {
   error: ConsultError;
   /** Even on a refusal, tell the caller which root's policy did the refusing. */
   rootConflict?: string;
+  /** See `ConsultOk.agentUnverified` — carried on a failure too, because "the call failed AND
+   * we could not confirm the agent was hardened" is exactly when it matters most. */
+  agentUnverified?: string;
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
    * of a failed call is exactly what makes the failure diagnosable. */
   activity?: ActivitySummary;
@@ -427,6 +447,12 @@ export interface ConsultDeps {
    * the watch terminal is the only way to answer.
    */
   elicitation?: ElicitationRequester;
+  /**
+   * The resolved-agent floor check (issue #111). Defaults to the process-wide checker, whose
+   * per-serve-child cache is the point; injected in tests so one suite's cache never decides
+   * another's assertion.
+   */
+  agentFloor?: AgentFloorChecker;
 }
 
 /** A fresh, non-empty call id (the pairing key for a call's three lifecycle entries). */
@@ -528,6 +554,52 @@ export function gateModel(
     };
   }
   return { ok: true, tier: decision.tier, confirmed: confirmed === true };
+}
+
+// --- RESOLVED-AGENT GATE: is the hardened def actually IN FORCE? (issue #111) ----
+/**
+ * The second stage of the def check, shared by all four model-calling tools.
+ *
+ * STAGE ONE IS THE FILESYSTEM PRESENCE CHECK ABOVE (`hardenedDefPresentIn`, C16) and it stays
+ * exactly where it is, unchanged: it is cheap, fail-closed, and needs no serve. This is
+ * ADDITIONAL, not a replacement — presence says the file exists, this says opencode is
+ * actually applying it. A def whose frontmatter opencode cannot parse passes the first and
+ * fails the second, which is the whole of issue #111 (see `src/agentfloor.ts` for the probe).
+ *
+ * PLACEMENT, and it is deliberate in both directions:
+ *   - AFTER the model-policy gate, so a call naming a denied model is still refused without
+ *     ever contacting opencode. (C70 already accepted that cost for a *continuation*; there
+ *     was no reason to extend it to every call.)
+ *   - BEFORE the approval pre-flight, before `log.newRun()`, and — on the write path — before
+ *     the worktree snapshot. Gap parity (C24): a refusal here routes nothing and writes no
+ *     evidence run. Ordering it ahead of the approval pre-flight is what closes issue #111's
+ *     first consequence: the bridge computes its never-widen intersection from the def SOURCE,
+ *     so on a voided def it would compute the narrow written allow-set while opencode allowed
+ *     everything — armed, and gating nothing it thinks it is gating.
+ *
+ * The verdict is three-valued and the third value is the interesting one; see
+ * `AgentFloorChecker` for why "opencode could not be asked" proceeds rather than refuses.
+ */
+export type AgentFloorGate =
+  | { ok: true; unverified?: string }
+  | { ok: false; message: string };
+
+export async function gateAgentFloor(opts: {
+  serve: ServeProvider;
+  agent: string;
+  agentDefDirs: readonly string[];
+  /** Injected in tests so one suite's per-child cache never decides another's assertion. */
+  checker?: AgentFloorChecker;
+  /** Per-CALL stderr dedupe, shared with the in-lease re-check (review B1). See `#announce`. */
+  announced?: Set<string>;
+}): Promise<AgentFloorGate> {
+  const checker = opts.checker ?? defaultAgentFloorChecker;
+  const verdict = await checker.verify(opts.serve, opts.agent, opts.agentDefDirs, {
+    ...(opts.announced !== undefined ? { announced: opts.announced } : {}),
+  });
+  if (verdict.state === "unhardened") return { ok: false, message: verdict.message };
+  if (verdict.state === "unverified") return { ok: true, unverified: verdict.note };
+  return { ok: true };
 }
 
 // --- READ ROOT: the optional worktree target (issue #96) -------------------
@@ -835,6 +907,12 @@ export interface LifecycleApproval {
 
 export interface LifecycleDeps {
   serve: ServeProvider;
+  /**
+   * The issue-#111 floor re-check, run INSIDE the turn's own serve lease (review A3). Absent ⇒
+   * nothing extra happens. Threaded rather than constructed here so the tools' single checker
+   * instance (and therefore its cache) is the one used.
+   */
+  preTurnCheck?: PreTurnAgentCheck;
   log: EvidenceLog;
   messageTimeoutMs?: number;
   /**
@@ -871,7 +949,7 @@ export type LifecycleOutcome =
       /** `approval-not-applied` is only reachable when the bridge is armed: the session this
        * turn would run in is not carrying the `ask` rules, so the turn was refused rather
        * than run ungated. No model was called. */
-      kind: "call-failed" | "agent-mismatch" | "approval-not-applied";
+      kind: "call-failed" | "agent-mismatch" | "approval-not-applied" | "agent-unhardened";
       /** Present on failure too — a black-box call that DIED is exactly the one whose
        * action trace matters most. */
       activity?: ActivitySummary;
@@ -1022,6 +1100,8 @@ export async function runAgentLifecycle(
       expectedAgent: p.agent,
     };
     if (recorder !== undefined) askOpts.activity = recorder;
+    // A3: re-verify the floor on the child that will actually serve this turn.
+    if (d.preTurnCheck !== undefined) askOpts.preTurnCheck = d.preTurnCheck;
     if (d.approval !== undefined && approver !== undefined) {
       askOpts.permission = d.approval.arming.ruleset;
       // Invariant 2 at the WIRE (review finding M4) and the ONE stored-ruleset predicate
@@ -1053,6 +1133,16 @@ export async function runAgentLifecycle(
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
     const ungated = err instanceof SessionPermissionMismatchError;
+    // A LATE FLOOR REFUSAL LANDS HERE, AND THAT IS WHY IT IS SAFE (issue #111, review A3).
+    // The in-lease re-check throws from inside `askViaAgent`, i.e. AFTER `log.expect()` and
+    // `log.started()`. C24 requires exactly one of expected/started/completed per call_id in
+    // BOTH directions, so a refusal that simply returned here would leave an `expected-call`
+    // and a `started` with no `completed` and fail `verify()` — an unverifiable run produced by
+    // a SAFETY check is the worst possible trade. It needs no special path: this catch already
+    // writes `completed` (exit 1, capture_state failed) for every thrown failure, so the late
+    // refusal is recorded exactly like a model failure and the run verifies clean. The EARLY
+    // gate is what keeps the common case free of any log footprint at all.
+    const unhardened = err instanceof AgentFloorNotInForceError;
     const reason = err instanceof Error ? err.message : String(err);
     await d.log.completed({
       ...common,
@@ -1068,7 +1158,13 @@ export async function runAgentLifecycle(
       ok: false,
       callId,
       reason,
-      kind: mismatch ? "agent-mismatch" : ungated ? "approval-not-applied" : "call-failed",
+      kind: mismatch
+        ? "agent-mismatch"
+        : ungated
+          ? "approval-not-applied"
+          : unhardened
+            ? "agent-unhardened"
+            : "call-failed",
     };
     if (recorder !== undefined) failed.activity = recorder.summary();
     if (approver !== undefined) failed.approval = approver.summary();
@@ -1194,6 +1290,54 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
 
+  // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check. Step 2 proved the
+  //     file exists; this proves opencode is APPLYING it. Before any log write and before the
+  //     approval pre-flight; see `gateAgentFloor` for why it sits exactly here.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
+  const floor = await gateAgentFloor({
+    serve,
+    agent: CONSULT_AGENT,
+    agentDefDirs,
+    announced,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "agent-unhardened",
+        model: "",
+        exitAnalogue: null,
+        message: floor.message,
+      },
+    };
+  }
+  /** Carried onto every result below — see `ConsultOk.agentUnverified`. */
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
+  /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
+   * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    CONSULT_AGENT,
+    agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
+  );
+
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does), so the
   //     approval pre-flight below still happens before any log entry exists. ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -1214,6 +1358,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     return {
       ok: false,
       rootConflict,
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       error: {
         kind: armed.refusal.kind,
         model: requestedModel,
@@ -1245,6 +1390,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     {
       serve,
       log,
+      preTurnCheck,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
@@ -1271,14 +1417,22 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     if (params.keepSession === true) ok.sessionId = outcome.sessionId;
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
+    if (floorNote.note !== undefined) ok.agentUnverified = floorNote.note;
     return ok;
   }
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
   // agent-mismatch is a positive-direction addition over bash (which has no post-call
   // agent check); it has NO bash exit analogue, so exitAnalogue stays null like
   // call-failed — the kind + isError carry the fail-closed signal.
+    // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
+    // (agent named, resolved action, remedy), and the command docs tell the driver to report
+    // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
+    // capture.patchPath" with a null patchPath and no model call — plus a doubled period
+    // (review B4). The two shapes of one kind now read the same.
   const message =
-    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+    outcome.kind === "agent-mismatch" ||
+    outcome.kind === "approval-not-applied" ||
+    outcome.kind === "agent-unhardened"
       ? outcome.reason
       : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ConsultFail = {
@@ -1296,6 +1450,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
+  if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
   return fail;
 }
 
@@ -1339,6 +1494,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   if (r.ok) {
     const structured: Record<string, unknown> = { answer: r.answer, ...r.attribution };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     // Surface the kept session id so the driver can thread a follow-up turn by id.
     if (r.sessionId) structured.sessionId = r.sessionId;
     if (r.activity) structured.activity = r.activity;
@@ -1350,6 +1506,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   }
   const structured: Record<string, unknown> = { error: r.error };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {

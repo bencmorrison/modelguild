@@ -459,6 +459,70 @@ export async function fetchSession(
   return raw;
 }
 
+// --- resolved agents (issue #111) ------------------------------------------
+/**
+ * One entry of `GET /agent` — an agent as opencode RESOLVED it, not as its def file reads.
+ *
+ * `permission` is the resolved rule ARRAY, in declaration order, evaluated last-match-wins.
+ * PROBED on opencode 1.18.7 (2026-07-29, live serve + `opencode agent list`, which prints the
+ * same structure): a hardened `guild-read` ends
+ * `[…builtins…, '*:*:deny', 'read:*:allow', 'grep:*:allow', 'glob:*:allow',
+ * 'webfetch:*:allow', 'websearch:*:allow', …]`, while the same def with ONE unparseable
+ * frontmatter defect resolves to the built-ins alone — no `*:deny` anywhere, so the last `*`
+ * rule is opencode's own `*:allow`. `description` comes back `null` on such a def and `mode`
+ * falls back to `all`, which is why neither field can be used as the tell.
+ *
+ * The fields are typed loosely on purpose: this is a diagnostic read of another project's
+ * schema, and the one consumer (`src/agentfloor.ts`) must be able to say "opencode answered
+ * in a shape I do not understand" rather than crash on it.
+ */
+export interface ResolvedAgent {
+  name?: unknown;
+  mode?: unknown;
+  description?: unknown;
+  permission?: unknown;
+}
+
+export interface ListAgentsOpts {
+  baseUrl: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * `GET /agent` — every agent opencode resolved for this serve child, with its resolved
+ * permission array.
+ *
+ * A CONTROL-PLANE call (`SHORT_HTTP_MS`, never the model-turn budget). It THROWS on a
+ * transport failure, a non-2xx, or a body that is not an array; the caller turns that into an
+ * "unverified" note, never into a call failure (see `src/agentfloor.ts` for why that
+ * direction).
+ *
+ * PER SERVE CHILD, and that is load-bearing: opencode resolves agents from the serve's CWD
+ * (probed for issue #96), so the answer for a worktree-rooted child is genuinely a different
+ * answer than the project-rooted one. Anything that caches this must key on the child.
+ */
+export async function listAgents(opts: ListAgentsOpts): Promise<ResolvedAgent[]> {
+  const ctx: RequestCtx = {
+    baseUrl: opts.baseUrl,
+    path: "/agent",
+    method: "GET",
+    timeoutMs: opts.timeoutMs ?? SHORT_HTTP_MS,
+  };
+  if (opts.signal !== undefined) ctx.signal = opts.signal;
+  if (opts.fetchImpl !== undefined) ctx.fetchImpl = opts.fetchImpl;
+  const raw = await requestJson(ctx);
+  if (!Array.isArray(raw)) {
+    throw new OpencodeHttpError(
+      `GET /agent did not return an array (got ${typeof raw}) — refusing to guess what opencode ` +
+        `resolved`,
+      { method: "GET", path: "/agent" },
+    );
+  }
+  return raw as ResolvedAgent[];
+}
+
 // --- pending permission requests (issue #91) -------------------------------
 /**
  * One entry of `GET /permission` — a permission request opencode is still holding open,
@@ -915,6 +979,47 @@ export interface ApprovalAttachable {
 }
 
 /**
+ * A PRE-TURN CHECK RUN INSIDE THE SERVE LEASE (issue #111, review A3).
+ *
+ * Structurally identical to `ActivityAttachable`/`ApprovalAttachable` and kept separate for the
+ * same reason: this module imports nothing from `src/agentfloor.ts` and stays the thin typed
+ * transport it is. What makes it a distinct seam rather than a caller-side gate is *when* it
+ * runs — inside the very `withServe` lease that will carry the session and the message, so the
+ * child it inspects is provably the child that serves the turn.
+ *
+ * WHY THAT MATTERS, and it is the whole of A3. The tools also check BEFORE the policy/approval
+ * gates, on a lease of their own, which is what keeps a refusal free of any evidence-log
+ * footprint. Under `GUILD_SERVE_PER_CALL=1` that early lease is torn down when it is released,
+ * so the turn then ran on a child that had never been checked — the verdict still transferred
+ * in practice (same cwd, same files) but the design claims soundness *by construction*, and in
+ * that mode it did not hold. On the shared long-lived child this second call is a cache hit and
+ * costs nothing.
+ *
+ * It MUST NOT throw for a "cannot tell" outcome — only a positive "the agent is not hardened"
+ * result may stop the turn, and everything else is the caller's problem to surface.
+ */
+export interface PreTurnAgentCheck {
+  verify(handle: ServeHandle): Promise<{ ok: true } | { ok: false; message: string }>;
+}
+
+/**
+ * Raised when the child that is about to serve the turn does NOT have the hardened agent's
+ * default-deny floor in force (issue #111, review A3).
+ *
+ * Thrown from inside `askViaAgent`'s serve lease, BEFORE the session is created and before any
+ * message is posted, so no model is ever called. It is a distinct class from
+ * `AgentMismatchError` because it is a different failure: that one is "opencode served a
+ * different agent than we asked for", this one is "the agent we asked for is not the hardened
+ * thing its def describes".
+ */
+export class AgentFloorNotInForceError extends Error {
+  constructor(readonly detail: string) {
+    super(detail);
+    this.name = "AgentFloorNotInForceError";
+  }
+}
+
+/**
  * Raised when the approval bridge is armed but the session this turn will run in is NOT
  * carrying the required `ask` rules — i.e. the gate the caller believes is on is not on.
  *
@@ -994,6 +1099,11 @@ export interface AskViaAgentOpts {
    * `SessionPermissionMismatchError` BEFORE the turn is sent.
    */
   permission?: readonly SessionPermissionRuleWire[];
+  /**
+   * Re-verify the hardened agent's floor INSIDE this lease, before any session work (issue
+   * #111, review A3). Absent ⇒ nothing extra happens. See `PreTurnAgentCheck`.
+   */
+  preTurnCheck?: PreTurnAgentCheck;
   /** The agent def's allow-set — forwarded to `createSession` for the wire-boundary check. */
   allowedTools?: readonly string[];
   /**
@@ -1043,6 +1153,14 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
   if (gated) assertAskOnlyRuleset(opts.permission!, opts.allowedTools);
 
   return serve.withServe(async (h) => {
+    // THE FLOOR RE-CHECK, INSIDE THIS LEASE (issue #111, review A3). First thing in the
+    // callback: before the session exists, before any message, so a refusal calls no model.
+    // `h` is by construction the handle this turn will use, which is the entire point — the
+    // caller's earlier check ran on a lease that `GUILD_SERVE_PER_CALL=1` has since torn down.
+    if (opts.preTurnCheck !== undefined) {
+      const verdict = await opts.preTurnCheck.verify(h);
+      if (!verdict.ok) throw new AgentFloorNotInForceError(verdict.message);
+    }
     // Continue an existing session (no create) or mint a fresh one. The approval ruleset can
     // ONLY be applied at creation (opencode stores it on the session), so a continuation
     // carries whatever it was created with — verified below rather than assumed.

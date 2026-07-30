@@ -50,10 +50,12 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
   resolveReadRoot,
+  gateAgentFloor,
   gateModel,
   runAgentLifecycle,
   activityLayerFor,
@@ -74,6 +76,7 @@ import {
   snapshotWorktree,
   captureDelegateDiff,
   scaffoldDigest,
+  snapshotScaffold,
   EMPTY_SCAFFOLD_DIGEST,
 } from "./snapshot.js";
 
@@ -135,6 +138,8 @@ export interface DelegateDeps {
    * only when the approval bridge is armed.
    */
   elicitation?: ElicitationRequester;
+  /** The resolved-agent floor check (issue #111); injected in tests. */
+  agentFloor?: AgentFloorChecker;
   /**
    * The DEFAULT root — the project dir the primary serve child is spawned from. Defaults to
    * `GUILD_PROJECT_DIR ?? cwd`, matching OpencodeLifecycle's own default. Injected in tests to
@@ -191,6 +196,17 @@ export interface DelegateCapture {
 // --- Result / error shapes -------------------------------------------------
 export type DelegateErrorKind =
   | "agent-def-missing"
+  // The def FILE is present but opencode is not applying it — the resolved config carries no
+  // default-deny floor (issue #111, C73). Worst here of anywhere: without the floor,
+  // `guild-build` resolves on opencode's built-in `"*": allow`, i.e. the UNRESTRICTED tool set,
+  // which is exactly what the def-missing refusal exists to prevent. TWO SHAPES, and the footprint
+  // differs (review B4 — an earlier comment claimed the early one's footprint for both): the EARLY
+  // refusal lands before `snapshotScaffold`, before the git snapshot and before any log write, so
+  // nothing ran and nothing was recorded; the LATE one comes from the re-check inside the turn's
+  // own serve lease, so it lands AFTER the scaffold baseline, AFTER `snapshotWorktree` and AFTER
+  // `expect`/`started`, and is recorded exactly like a failed call (three entries, one call_id).
+  // exitAnalogue null either way (no bash counterpart; NOT a reuse of C57's 5).
+  | "agent-unhardened"
   // The target named a directory that is not a worktree of this repository (issue #107,
   // reusing #96's kind and refusal shape verbatim). Refused before any log write AND before
   // any snapshot.
@@ -237,6 +253,9 @@ export interface DelegateOk {
   attribution: DelegateAttribution;
   capture: DelegateCapture;
   rootConflict?: string;
+  /** Present ONLY when the issue-#111 resolved-agent check could not be made; the delegation
+   * PROCEEDED and this is the "never silently" half of that decision (C73). */
+  agentUnverified?: string;
   /**
    * Bounded live-activity summary (issue #20); absent when the layer is off. It is a
    * READING AID, not a substitute for the diff review: it says what opencode reported the
@@ -258,6 +277,8 @@ export interface DelegateFail {
    * before failing is still captured and surfaced so the human can review/recover it. */
   capture?: DelegateCapture;
   rootConflict?: string;
+  /** See `DelegateOk.agentUnverified`. */
+  agentUnverified?: string;
   /** The tree that was targeted, present whenever one was — including on a refusal that
    * happened before anything ran. A failed delegation is exactly the case where "which tree
    * do I go and look at?" is urgent, and `attribution` (which carries it on success) does not
@@ -418,10 +439,78 @@ export async function delegate(
     };
   }
 
+  // 4a. THE SCAFFOLD BASELINE IS HOISTED ABOVE THE GATE (issue #111 review A1; maintainer
+  //     decision 2026-07-30). This is a READ of a directory tree — it writes nothing, runs no
+  //     git and mints nothing — so it does not touch the rule that a refusal below snapshots
+  //     nothing (C24 gap parity).
+  //
+  //     WHY, PRECISELY — and an earlier version of this comment had it wrong. It is NOT that the
+  //     gate silences `scaffoldChanged`: measured on 1.18.7 (three runs), `GET /agent` returns in
+  //     ~200-270ms and `node_modules` lands +579ms/+581ms/+3680ms AFTER the response, so a
+  //     post-gate baseline would still differ from the after-tree and the flag would still fire.
+  //     (A margin, not a certainty — review B5: the gap below contains `new EvidenceLog`, the
+  //     approval pre-flight and `log.newRun()`'s retention scan, so it is a race this wins wide,
+  //     not an impossibility.)
+  //     It is that `.opencode/.gitignore` IS written synchronously, and it is in
+  //     `isServeScaffold`'s set — so a post-gate `before.scaffold` is non-EMPTY,
+  //     `scaffoldAppeared` below is false, and the SEVERE "plugin directory MODIFIED, no benign
+  //     explanation" wording fires on every first delegation into a tree. A false severe alarm on
+  //     a routine event is how a tamper signal dies. The git snapshot stays below the gate, where
+  //     a refusal never reaches it.
+  const scaffoldBefore = snapshotScaffold(writeRoot);
+
+  // 4b. RESOLVED-AGENT GATE (issue #111, C73) — stage two of the def check, and the highest
+  //     stakes copy of it: step 2 proved `guild-build.md` exists, this proves opencode is
+  //     APPLYING it. Without the floor, `guild-build` resolves on opencode's built-in
+  //     `"*": allow` — the unrestricted tool set the def-missing refusal exists to keep this
+  //     path off. Placed before the approval pre-flight (which reads the def SOURCE and would
+  //     otherwise arm against a map that is not in force), before `newRun`, and before
+  //     `snapshotWorktree`: a refusal here leaves no run and takes no snapshot of a tree it
+  //     was never going to touch. See `gateAgentFloor`.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
+  const floor = await gateAgentFloor({
+    serve,
+    agent: DELEGATE_AGENT,
+    agentDefDirs,
+    announced,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+      error: { kind: "agent-unhardened", model: "", exitAnalogue: null, message: floor.message },
+    };
+  }
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
+  /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
+   * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    DELEGATE_AGENT,
+    agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
+  );
+
   // --- Past the gate. Constructing the log writes NOTHING (only `newRun` does). ---
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
 
-  // 4b. APPROVAL BRIDGE pre-flight (issue #20 slice 4). This is THE path the bridge exists
+  // 4c. APPROVAL BRIDGE pre-flight (issue #20 slice 4). This is THE path the bridge exists
   //     for. Refused here — before any log write AND before the worktree snapshot — so a
   //     refusal leaves nothing behind at all. Arming with no answering channel would
   //     DEADLOCK the turn rather than fail closed (probe P3), which is why this is a
@@ -438,6 +527,7 @@ export async function delegate(
     return {
       ok: false,
       rootConflict,
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
       error: {
         kind: armed.refusal.kind,
@@ -454,8 +544,9 @@ export async function delegate(
   // 5. Snapshot the RESOLVED root BEFORE the model runs (throwaway index; caller's index and
   //    worktree untouched — C36/C37). Nothing has been edited yet, so this is the baseline —
   //    of `writeRoot`, which is by construction the same directory the serve child below is
-  //    rooted at.
-  const before = snapshotWorktree(writeRoot);
+  //    rooted at. The SCAFFOLD half of the baseline was captured at step 4a, before the gate
+  //    touched opencode at all; everything taken here is git state, which the gate cannot move.
+  const before = snapshotWorktree(writeRoot, scaffoldBefore);
 
   // 6. The model turn, via the UNMODIFIED guild-build agent (shared spine + agent-mismatch).
   const outcome = await runAgentLifecycle(
@@ -475,6 +566,7 @@ export async function delegate(
     {
       serve,
       log,
+      preTurnCheck,
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
@@ -513,12 +605,20 @@ export async function delegate(
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
     if (outcome.approval !== undefined) ok.approval = outcome.approval;
+    if (floorNote.note !== undefined) ok.agentUnverified = floorNote.note;
     return ok;
   }
 
   const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
+    // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
+    // (agent named, resolved action, remedy), and the command docs tell the driver to report
+    // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
+    // capture.patchPath" with a null patchPath and no model call — plus a doubled period
+    // (review B4). The two shapes of one kind now read the same.
   const message =
-    outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+    outcome.kind === "agent-mismatch" ||
+    outcome.kind === "approval-not-applied" ||
+    outcome.kind === "agent-unhardened"
       ? outcome.reason
       : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
@@ -537,6 +637,7 @@ export async function delegate(
   };
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
+  if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
   return fail;
 }
 
@@ -824,6 +925,7 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
       capture: r.capture,
     };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
     return {
@@ -843,6 +945,7 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
   // the tree that was actually mutated.
   if (r.worktree) structured.worktree = r.worktree;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
   return {

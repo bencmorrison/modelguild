@@ -44,6 +44,7 @@
 import os from "node:os";
 import { type ServeProvider, type ServeRouter } from "./client.js";
 import { type GitRunner } from "./worktree.js";
+import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
   resolveRootWithConflict,
@@ -52,6 +53,7 @@ import {
   activityLayerFor,
   approvalFor,
   resolveReadRoot,
+  gateAgentFloor,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
@@ -137,6 +139,8 @@ export interface PanelDeps {
    * so its requests and decisions stay attributable to that member.
    */
   elicitation?: ElicitationRequester;
+  /** The resolved-agent floor check (issue #111); injected in tests. */
+  agentFloor?: AgentFloorChecker;
 }
 
 // --- Result / error shapes -------------------------------------------------
@@ -146,6 +150,14 @@ export type PanelMemberErrorKind =
   | "policy-ask"
   /** Only reachable under the opt-in `GUILD_APPROVE_EGRESS=ask` (issue #20 slice 4). */
   | "approval-not-applied"
+  /**
+   * The in-lease floor re-check refused on the child that was about to serve THIS member
+   * (issue #111, review A3). Per-member rather than panel-wide, unlike the up-front
+   * `agent-unhardened` refusal: by this point each member holds its own serve lease, and under
+   * `GUILD_SERVE_PER_CALL=1` those are genuinely different children, so one member can be
+   * refused while its siblings answer.
+   */
+  | "agent-unhardened"
   | "call-failed"
   | "agent-mismatch";
 
@@ -188,6 +200,10 @@ export interface PanelOk {
   /** resolvePanelModels warnings (dedup, <2 models, single-provider) — surfaced, C14. */
   warnings: string[];
   rootConflict?: string;
+  /** Present ONLY when the issue-#111 resolved-agent check could not be made; the panel
+   * PROCEEDED and this is the "never silently" half of that decision (C73). Panel-WIDE, like
+   * the def check itself — every member runs the same agent on the same serve child. */
+  agentUnverified?: string;
   /** The read root every member ran against; present only when one was targeted (#96). */
   worktree?: string;
 }
@@ -211,9 +227,16 @@ export interface PanelFail {
     // knob or a missing answering channel refuses the WHOLE panel up front — before any log
     // write, and before a single member is dispatched.
     | { kind: "approval-config"; message: string; exitAnalogue: null }
-    | { kind: "approval-channel-missing"; message: string; exitAnalogue: null };
+    | { kind: "approval-channel-missing"; message: string; exitAnalogue: null }
+    // The guild-read def FILE is present but opencode is not applying it — no default-deny
+    // floor in the resolved config (issue #111, C73). Panel-wide, like the presence check,
+    // and refused before any member runs. exitAnalogue null: no bash counterpart, and NOT a
+    // reuse of C57's 5 ("the def is missing").
+    | { kind: "agent-unhardened"; message: string; exitAnalogue: null };
   warnings: string[];
   rootConflict?: string;
+  /** See `PanelOk.agentUnverified`. */
+  agentUnverified?: string;
 }
 
 export type PanelResult = PanelOk | PanelFail;
@@ -302,6 +325,53 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
 
+  // 3b. RESOLVED-AGENT GATE for the WHOLE panel (issue #111, C73) — stage two of the def
+  //     check, and ONE check for every member exactly as the presence check is: they all run
+  //     `guild-read` on one serve child, so the answer is identical for all of them (and the
+  //     checker's per-child cache would collapse N identical asks anyway). Placed after the
+  //     model-set resolution so an empty set stays a cheap `no-models` refusal, and before the
+  //     approval pre-flight, `newRun` and any member dispatch. See `gateAgentFloor`.
+  /** ONE per call, shared by the early gate and the in-lease re-check: the stderr dedupe is
+   * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
+   * child warns again, and the next call starts fresh (review B1). */
+  const announced = new Set<string>();
+  const floor = await gateAgentFloor({
+    serve,
+    agent: PANEL_AGENT,
+    agentDefDirs,
+    announced,
+    ...(deps.agentFloor !== undefined ? { checker: deps.agentFloor } : {}),
+  });
+  if (!floor.ok) {
+    return {
+      ok: false,
+      warnings: panelRes.warnings,
+      rootConflict,
+      error: { kind: "agent-unhardened", message: floor.message, exitAnalogue: null },
+    };
+  }
+  /** THE EFFECTIVE cannot-ask NOTE, in a box because the late check fills it DURING the turn
+   * (review B1). Seeded from the early verdict; the in-lease re-check writes here when it is the
+   * one that could not verify — the case where the early gate said `verified` about a child that
+   * `GUILD_SERVE_PER_CALL=1`, a crash-revive or an idle-out has since replaced. Reads before the
+   * turn see only the early note, which is correct: the late one has not happened yet. */
+  const floorNote: { note?: string } = {};
+  if (floor.unverified !== undefined) floorNote.note = floor.unverified;
+  /** A3: re-asked inside each member's own turn lease. Built ONCE from the same checker, so on
+   * the shared child every member is a cache hit; under `GUILD_SERVE_PER_CALL=1` each member's
+   * lease is a different child, so each gets a real check on the one that serves it. */
+  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+    PANEL_AGENT,
+    agentDefDirs,
+    {
+      announced,
+      // Without this the late verdict reached NO channel when the early one was `verified`.
+      onUnverified: (note) => {
+        if (floorNote.note === undefined) floorNote.note = note;
+      },
+    },
+  );
+
   // 4. One run for the whole panel (C23/C43). Mint up front so every member logs into the
   //    same auditable unit; a threaded runId reuses that run.
   const log = deps.log ?? new EvidenceLog({ env, cwd, guildDir, guildDirs });
@@ -322,6 +392,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       ok: false,
       warnings: panelRes.warnings,
       rootConflict,
+      ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
       error: {
         kind: armed.refusal.kind,
         message: armed.refusal.message,
@@ -374,6 +445,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         {
           serve,
           log,
+          preTurnCheck,
           messageTimeoutMs,
           activity,
           ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
@@ -396,8 +468,13 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       // created), so there is no live session to continue; fabricating an id would send a
       // round-2 continuation at a dead/wrong session. The absent sessionId is exactly what
       // makes the round-2 consult loop skip this member.
+      // `agent-unhardened` carries its own actionable message (review B4) — same reasoning as the
+      // single-model tools: wrapping a refusal in "the call failed" loses the remedy the command
+      // docs tell the driver to report verbatim.
       const message =
-        outcome.kind === "agent-mismatch" || outcome.kind === "approval-not-applied"
+        outcome.kind === "agent-mismatch" ||
+        outcome.kind === "approval-not-applied" ||
+        outcome.kind === "agent-unhardened"
           ? outcome.reason
           : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
@@ -421,6 +498,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     results,
     warnings: panelRes.warnings,
     rootConflict,
+    ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
     ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
   };
 }
@@ -461,6 +539,7 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
   if (!r.ok) {
     const structured: Record<string, unknown> = { error: r.error, warnings: r.warnings };
     if (r.rootConflict) structured.rootConflict = r.rootConflict;
+    if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
     return {
       content: [{ type: "text", text: r.error.message }],
       structuredContent: structured,
@@ -473,6 +552,7 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
     warnings: r.warnings,
   };
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
+  if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.worktree) structured.worktree = r.worktree;
   return { content: [{ type: "text", text: renderPanelText(r) }], structuredContent: structured };
 }

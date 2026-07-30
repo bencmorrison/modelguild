@@ -38,7 +38,34 @@ export interface ServeHandle {
   baseUrl: string;
   port: number;
   pid: number;
+  /**
+   * IDENTITY OF THIS CHILD, unique for the life of THIS PROCESS (issue #111, review C2).
+   *
+   * Added because a caller that wants to remember something about "the serve it just talked
+   * to" has, until now, had only `baseUrl`/`port`/`pid` to key on, and **none of those is an
+   * identity**. The port is negotiated by bind-and-close and is not reserved, children are
+   * retired by the idle timer and by `GUILD_SERVE_PER_CALL=1`, and a crash-revive respawns at
+   * a freshly negotiated port — so a LATER child, at a DIFFERENT root with a different agent
+   * def, can perfectly well arrive on the port an earlier one used. `pid` narrows that but
+   * does not close it (pids wrap too), and neither says which lifecycle the child belongs to.
+   *
+   * This is a plain monotonic counter, so within a process it can never repeat: two handles
+   * carry the same id **iff they are the same child**. A cache keyed on it therefore cannot
+   * inherit a dead child's answer.
+   *
+   * WHAT IT IS EVIDENCE OF, exactly. For the agent-permission config it is a strong identity:
+   * a running child never re-reads its agent defs — probed on 1.18.7 (2026-07-30), for the
+   * resolved config AND for enforcement — so that config is fixed at spawn and this id is a
+   * complete key for it. An earlier version of this comment claimed the opposite ("opencode
+   * re-reads agent defs") and was refuted. It is still NOT a general freshness token: it says
+   * nothing about anything else a child might reload, so any cache keyed on it must state what
+   * it is retaining and why that particular answer cannot change under one child.
+   */
+  instanceId: number;
 }
+
+/** Source of `ServeHandle.instanceId`. Per PROCESS, never reset, never reused. */
+let nextInstanceId = 1;
 
 interface InternalHandle extends ServeHandle {
   proc: ChildProcess;
@@ -599,7 +626,7 @@ export class OpencodeLifecycle {
 
   // --- internals ------------------------------------------------------------
   #public(h: InternalHandle): ServeHandle {
-    return { baseUrl: h.baseUrl, port: h.port, pid: h.pid };
+    return { baseUrl: h.baseUrl, port: h.port, pid: h.pid, instanceId: h.instanceId };
   }
 
   /**
@@ -820,6 +847,8 @@ export class OpencodeLifecycle {
       baseUrl,
       port,
       pid: proc.pid,
+      // Minted per SPAWN, so a crash-revive is a different child to anything keyed on it.
+      instanceId: nextInstanceId++,
       exited: false,
       exitCode: null,
       exitSignal: null,

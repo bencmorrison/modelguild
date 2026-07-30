@@ -596,6 +596,34 @@ export function scaffoldDigest(repoDir: string): string {
  * warming the child before the baseline snapshot was considered and rejected: it would pin the
  * write path's evidence baseline to an undocumented lazy-load ordering in a dependency this
  * repo tracks unpinned, and buy only the suppression of a first-call-per-tree warning.
+ *
+ * THE BASELINE IS SPLIT SO THE SCAFFOLD HALF CAN BE TAKEN ABOVE THE #111 GATE — AND THE REASON
+ * IS A MISCLASSIFICATION, NOT A SILENCED FLAG (issue #111 review A1, maintainer decision
+ * 2026-07-30, correcting an earlier draft of this very comment).
+ *
+ * The earlier draft said the gate put the scaffolding inside the baseline so `scaffoldChanged`
+ * stopped firing. **That does not reproduce.** Measured on 1.18.7 (2026-07-30, three runs):
+ * `GET /agent` returns in ~200-270ms, and `node_modules` appears **+579ms / +581ms / +3680ms
+ * AFTER the response**. A post-gate baseline therefore would almost certainly not have held
+ * `node_modules`, the before/after digests would still differ, and the flag would still fire.
+ * **Stated as a MARGIN, not an impossibility (review B5): the gate→baseline gap is not "a handful
+ * of synchronous fs calls"** — it contains `new EvidenceLog`, the approval pre-flight (def reads
+ * plus a watcher-presence scan) and `log.newRun()`, which includes a retention scan over the logs
+ * root. Almost certainly far under 579ms, but it is a race, not a proof.
+ *
+ * **What a post-gate baseline actually breaks is the WORDING BRANCH.**
+ * `.opencode/.gitignore` is written SYNCHRONOUSLY — it is already on disk at the instant the
+ * response returns — and it is in `isServeScaffold`'s set. So `before.scaffold` would be
+ * non-EMPTY, `scaffoldAppeared` (`scaffold changed && before === EMPTY_SCAFFOLD_DIGEST`) would be
+ * false, and `src/delegate.ts` would select the severe "existing plugin directory MODIFIED — no
+ * benign explanation, stop and review" branch on EVERY first delegation into a tree. #107's rule
+ * "never downgrade a case on the strength of the benign one" has an inverse, and this is it: a
+ * false severe alarm on a routine event is how a tamper signal dies.
+ *
+ * So `snapshotScaffold` captures the two scaffold fields before the gate runs, `snapshotWorktree`
+ * takes them as a REQUIRED parameter, and the git snapshot stays after the gate so a refusal
+ * still snapshots nothing. Reading a directory writes nothing, so gap parity (C24) is untouched.
+ * Do not "simplify" the two-phase shape back into a single call.
  */
 export const EMPTY_SCAFFOLD_DIGEST = createHash("sha256").update("").digest("hex");
 
@@ -653,8 +681,59 @@ function hasOpencodeDir(repoDir: string): boolean {
   }
 }
 
-/** Take the BEFORE snapshot of `repoDir`. Cheap and non-mutating (C36). */
-export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
+/**
+ * The two SCAFFOLD-PRECONDITION fields, split out so they can be captured EARLIER than the rest
+ * of the snapshot (issue #111 review; maintainer decision 2026-07-30).
+ *
+ * WHY IT IS A SEPARATE CALL. `GET /agent` alone materializes opencode's plugin runtime into a
+ * serve cwd that already contains `.opencode/` (re-probed on 1.18.7 — see
+ * `EMPTY_SCAFFOLD_DIGEST`), and the issue-#111 resolved-agent gate issues exactly that request
+ * before the turn. So anything measuring "did the scaffolding change during this turn?" has to
+ * be measured **before the gate**, or the gate's own request lands inside the baseline and the
+ * tamper signal never fires on a tree's first delegation.
+ *
+ * WHAT STAYS BEHIND THE GATE: everything else. This only READS a directory tree — it writes
+ * nothing, creates nothing and runs no git — so hoisting it cannot violate the rule that a
+ * refusal takes no snapshot and mints no run (C24 gap parity). The git snapshot (`write-tree`
+ * against a throwaway index, the dirty check, the ignored fingerprint, the submodule state)
+ * stays strictly after the gate.
+ */
+export interface ScaffoldBaseline {
+  /** Tamper-signal digest of the excluded serve scaffolding (see `scaffoldDigest`). */
+  scaffold: string;
+  /** Did an `.opencode/` DIRECTORY exist BEFORE the turn? (see `WorktreeSnapshot.opencodeDir`) */
+  opencodeDir: boolean;
+}
+
+/**
+ * Capture the scaffold precondition. Call this BEFORE anything that talks to opencode.
+ *
+ * `scaffold` is `""` for a non-git tree, matching exactly what `snapshotWorktree` recorded
+ * before this split: the digest is only ever compared when `gitWorktree` is true
+ * (`src/delegate.ts`), so a non-git tree has nothing to compare and the empty string keeps the
+ * result shape identical.
+ */
+export function snapshotScaffold(repoDir: string): ScaffoldBaseline {
+  return {
+    scaffold: isGitWorktree(repoDir) ? scaffoldDigest(repoDir) : "",
+    opencodeDir: hasOpencodeDir(repoDir),
+  };
+}
+
+/**
+ * Take the BEFORE snapshot of `repoDir`. Cheap and non-mutating (C36).
+ *
+ * `scaffoldBaseline` is REQUIRED rather than optional, and that is deliberate: the caller must
+ * have captured it at a moment of its own choosing (before any `GET /agent`), and an optional
+ * parameter defaulting to "capture it now" would let a future call site silently reintroduce the
+ * pre-warm this split exists to prevent. `test/delegate.test.ts` pins the ordering
+ * behaviourally; the required parameter is what makes an omission a type error rather than a
+ * quiet regression.
+ */
+export function snapshotWorktree(
+  repoDir: string,
+  scaffoldBaseline: ScaffoldBaseline,
+): WorktreeSnapshot {
   const gitWorktree = isGitWorktree(repoDir);
   if (!gitWorktree) {
     return {
@@ -663,9 +742,11 @@ export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
       tree: null,
       ignored: "",
       submodules: "clean",
-      scaffold: "",
+      // #111: from the baseline captured ABOVE the gate ("" here by construction — a non-git
+      // tree has no digest to compare). #108: nothing to subtract, so exclude nothing.
+      scaffold: scaffoldBaseline.scaffold,
       trackedScaffold: null,
-      opencodeDir: hasOpencodeDir(repoDir),
+      opencodeDir: scaffoldBaseline.opencodeDir,
     };
   }
   // Resolved ONCE, before the baseline tree, and carried on the snapshot: the after-snapshot
@@ -678,9 +759,14 @@ export function snapshotWorktree(repoDir: string): WorktreeSnapshot {
     tree,
     ignored: ignoredFingerprint(repoDir),
     submodules: submoduleState(repoDir),
-    scaffold: scaffoldDigest(repoDir),
+    // #111: the scaffold PRECONDITION comes from `snapshotScaffold`, called before the
+    // resolved-agent gate — the gate's own `GET /agent` materializes the plugin runtime, so
+    // computing `scaffoldDigest(repoDir)` HERE would fold that write into the baseline and
+    // silence `scaffoldChanged` on a tree's first delegation. Do not put the call back.
+    scaffold: scaffoldBaseline.scaffold,
+    // #108: pinned above, and carried rather than re-derived — see the field's doc comment.
     trackedScaffold,
-    opencodeDir: hasOpencodeDir(repoDir),
+    opencodeDir: scaffoldBaseline.opencodeDir,
   };
 }
 

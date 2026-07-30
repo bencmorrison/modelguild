@@ -45,7 +45,7 @@ import { ServePool } from "../src/servepool.js";
 import { OpencodeLifecycle, type ServeHandle } from "../src/lifecycle.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
-import { Checker } from "./harness.js";
+import { Checker, fakeServeHandle } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m96-"): string {
@@ -89,7 +89,7 @@ function addWorktree(repo: string, branch: string): string {
 }
 
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 

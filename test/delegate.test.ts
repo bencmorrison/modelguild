@@ -44,8 +44,7 @@ import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker, fixtureGitEnv } from "./harness.js";
+import { Checker, fixtureGitEnv, fakeServeHandle } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m8-"): string {
@@ -93,21 +92,35 @@ function read(dir: string, rel: string): string {
   return readFileSync(path.join(dir, rel), "utf8");
 }
 
-/** A ServeProvider whose "model turn" applies `mutate` to the repo, THEN runs the fake HTTP
- * turn — so even a failing turn leaves the mutation on disk (partial-capture contract). */
+/** A ServeProvider whose "model turn" applies `mutate` to the repo, at the START of the fake's
+ * message POST — so even a failing turn leaves the mutation on disk (partial-capture contract).
+ *
+ * IT HOOKS THE TURN, NOT `withServe` (changed for issue #111). It used to mutate on every
+ * `withServe` entry, which was fine only while a delegation entered the provider exactly once.
+ * It no longer does: the resolved-agent check reads `GET /agent` off the same child BEFORE the
+ * baseline snapshot, so an entry-keyed mutation applied the "model's" edits pre-snapshot and
+ * every diff came out empty. That was the FIXTURE being wrong about when a model edits files —
+ * a real model edits during the turn — and the tempting alternative (move the product's check
+ * after the snapshot) is precisely what C73 forbids. Hooking the message POST makes the fixture
+ * independent of how many control-plane calls a tool makes. */
 function mutatingServe(fake: FakeOpencode, mutate: () => void): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
-  return {
-    withServe: async (fn) => {
-      mutate();
-      return fn(handle);
-    },
-  };
+  const handle = fakeServeHandle(fake.baseUrl);
+  fake.setOnMessage(mutate);
+  return { withServe: (fn) => fn(handle) };
 }
 
-/** A plain (non-mutating) ServeProvider for gate/refusal cases. */
+/** A plain (NON-mutating) ServeProvider for gate/refusal cases.
+ *
+ * IT CLEARS THE HOOK (review R6, 2026-07-30). `mutatingServe` installs `mutate` on the FAKE, not
+ * on the provider, so it outlives the provider that set it — and a later `fakeServe` over the
+ * same fake would then still mutate on a turn, quietly making a "non-mutating" provider
+ * mutating. Only one site pairs them today (`fakeServe` after a `mutatingServe` on the same
+ * fake) and it is benign because that call is refused before any message POST, so this is a
+ * latent trap rather than a live bug — which is exactly when it is cheap to close. Clearing here
+ * makes the name true regardless of what ran before. */
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
+  fake.setOnMessage(undefined);
   return { withServe: (fn) => fn(handle) };
 }
 
@@ -1412,10 +1425,19 @@ export async function run(): Promise<number> {
         src.includes("captureAndLog(before, {\n    writeRoot,\n"),
         "#107(i): captureAndLog is handed the `writeRoot` BINDING (shorthand), not an expression",
       );
+      // EXTENDED for issue #111's hoist (2026-07-30), not relaxed: the baseline is now taken in
+      // TWO calls (the scaffold precondition above the resolved-agent gate, the git state below
+      // it), so the property "every capture root is the `writeRoot` BINDING" has to be asserted
+      // on both. Loosening this to "at least one of them" is what would make it decorative.
       c.check(
         (src.match(/snapshotWorktree\(/g) || []).length === 1 &&
-          src.includes("snapshotWorktree(writeRoot)"),
-        "#107(i): the ONLY snapshot is of writeRoot",
+          src.includes("snapshotWorktree(writeRoot, scaffoldBefore)"),
+        "#107(i): the ONLY git snapshot is of writeRoot",
+      );
+      c.check(
+        (src.match(/snapshotScaffold\(/g) || []).length === 1 &&
+          src.includes("snapshotScaffold(writeRoot)"),
+        "#111(i): the ONLY scaffold baseline is of writeRoot, and there is exactly one",
       );
       c.check(
         (src.match(/scaffoldDigest\(/g) || []).length === 1 &&
@@ -1619,6 +1641,110 @@ export async function run(): Promise<number> {
         );
       } finally {
         await fake2.close();
+      }
+    }
+
+    // (l) THE GATE MUST NOT MISCLASSIFY THE SCAFFOLD SIGNAL (issue #111 review A1; maintainer
+    //     decision 2026-07-30, correcting review R2).
+    //
+    //     R2 CLAIMED the gate SILENCED `scaffoldChanged` on a tree's first delegation. **That
+    //     does not reproduce.** Measured on 1.18.7, three runs: `GET /agent` returns in
+    //     ~200-270ms, and `node_modules` appears +579ms / +581ms / +3680ms AFTER the response,
+    //     while the production gap between the gate returning and `snapshotWorktree` is a handful
+    //     of synchronous fs calls. So a post-gate baseline would not have contained
+    //     `node_modules`, the digests would still differ, and the flag would still have fired.
+    //
+    //     WHAT THE HOIST ACTUALLY PREVENTS is a MISCLASSIFICATION. `.opencode/.gitignore` is
+    //     written SYNCHRONOUSLY — present at the instant the response returns — and it is in
+    //     `isServeScaffold`'s set, so a post-gate baseline's `scaffold` is non-EMPTY. That makes
+    //     `scaffoldAppeared` false and selects the severe "existing plugin directory MODIFIED —
+    //     no benign explanation, stop and review" branch on EVERY first delegation into a tree.
+    //     #107's "never downgrade a case on the strength of the benign one" has an inverse, and
+    //     this is it: a false severe alarm on a routine event is how a tamper signal dies.
+    //
+    //     The fake therefore writes ONLY `.gitignore` in its `GET /agent` handler, mirroring what
+    //     was measured, and the assertions below are on the WORDING BRANCH.
+    {
+      const repo = initRepoWithDef("m111-scaffold-", { "a.txt": "A0\n" });
+      const wt = addWorktree(repo, "gatefirst");
+      const logDir = tmp("m111-logs-");
+      const env = envWith({
+        GUILD_ROOT: permissiveRoot(),
+        GUILD_LOG_DIR: logDir,
+        XDG_CONFIG_HOME: tmp("m111-xdg-"),
+      });
+      const fake = await startFakeOpencode({ historyText: "ok" });
+      try {
+        // THE MODEL TURN. It edits a tracked file, AND this is where `node_modules` lands —
+        // measured: it appears hundreds of ms to seconds after `GET /agent` returns, i.e. while
+        // the turn is running, never inside the gate's request. Modelling it here is what keeps
+        // `scaffoldChanged` TRUE on both sides of the fix, which is the measured behaviour; a
+        // fixture that omitted it made the flag look like the thing at stake, and it is not.
+        const provider = mutatingServe(fake, () => {
+          writeFileSync(path.join(wt, "a.txt"), "A1\n");
+          mkdirSync(path.join(wt, ".opencode", "node_modules", "plugin"), { recursive: true });
+          writeFileSync(
+            path.join(wt, ".opencode", "node_modules", "plugin", "index.js"),
+            "module.exports = {}\n",
+          );
+          writeFileSync(path.join(wt, ".opencode", "package.json"), "{}\n");
+        });
+        // WHAT THE GATE'S `GET /agent` ACTUALLY WRITES, measured on 1.18.7 (2026-07-30, three
+        // runs): `.opencode/.gitignore` appears SYNCHRONOUSLY — it is already there at the
+        // instant the response returns — while `node_modules` + the manifests land +579ms,
+        // +581ms and +3680ms AFTERWARDS. An earlier version of this fixture wrote the whole
+        // scaffolding synchronously and called it "as the real server does"; that was wrong, and
+        // it made a refuted hazard look reproduced. Only `.gitignore` goes here.
+        let agentGets = 0;
+        fake.setOnAgentList(() => {
+          agentGets += 1;
+          writeFileSync(path.join(wt, ".opencode", ".gitignore"), "node_modules\n");
+        });
+        const r = await delegate(
+          { task: "t", model: "openai/m", worktree: wt },
+          {
+            serve: provider,
+            router: spyRouter(repo, provider),
+            env,
+            cwd: repo,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(agentGets >= 1, "#111(l): fixture — the gate really did read GET /agent");
+        c.check(r.ok, "#111(l): the delegation still succeeds");
+        // The FLAG fires either way — `node_modules` lands during the turn, well after the
+        // baseline, so the digests differ whichever side of the gate the baseline is taken on.
+        // The flag is asserted so a regression that killed it outright would still be caught,
+        // but it is NOT what the hoist buys.
+        c.check(
+          r.ok && r.capture.scaffoldChanged === true,
+          "#111(l): scaffoldChanged fires (true on both sides of the fix — not the invariant)",
+        );
+        // THE INVARIANT IS THE WORDING BRANCH. `scaffoldAppeared` is
+        // `scaffoldChanged && before.scaffold === EMPTY_SCAFFOLD_DIGEST`, and
+        // `.opencode/.gitignore` IS in `isServeScaffold`'s set — so a baseline taken after the
+        // gate has a NON-empty digest, `scaffoldAppeared` is false, and the tool selects the
+        // severe "MODIFIED — no benign explanation, stop and review" branch on EVERY first
+        // delegation into a tree. A false severe alarm on a routine event is how a tamper signal
+        // dies. Taken before the gate the digest is empty and the correct benign-but-
+        // non-committal branch is selected.
+        c.check(
+          r.ok && (r.capture.scaffoldWarning ?? "").includes("APPEARED during this call"),
+          "#111(l): the warning takes the APPEARED branch — the pre-gate baseline is still EMPTY",
+        );
+        c.check(
+          r.ok && (r.capture.scaffoldWarning ?? "").includes("SUFFICIENT explanation"),
+          "#111(l): ...i.e. the benign-but-non-committal wording, not the severe MODIFIED one",
+        );
+        c.check(
+          r.ok && !/changed during this call — review it/.test(r.capture.scaffoldWarning ?? ""),
+          "#111(l): and NOT the severe branch a post-gate baseline would have selected on every first delegation",
+        );
+        // And the git half of the capture is unaffected: the model's edit is still the patch.
+        c.check(r.ok && r.capture.filesChanged === 1, "#111(l): the model's own edit is still captured");
+      } finally {
+        await fake.close();
       }
     }
 

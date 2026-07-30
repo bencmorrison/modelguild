@@ -16,12 +16,11 @@ import { panel, panelToToolResult, type PanelResult } from "../src/panel.js";
 import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker } from "./harness.js";
+import { Checker, fakeServeHandle } from "./harness.js";
 
 /** A `ServeProvider` pointing `withServe` at an already-running fake (no opencode). */
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 

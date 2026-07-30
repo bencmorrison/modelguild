@@ -29,14 +29,13 @@ import {
 import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
-import type { ServeHandle } from "../src/lifecycle.js";
-import { Checker } from "./harness.js";
+import { Checker, fakeServeHandle } from "./harness.js";
 
 const SHA256_EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /** A `ServeProvider` pointing `withServe` at an already-running fake (no opencode). */
 function fakeServe(fake: FakeOpencode): ServeProvider {
-  const handle: ServeHandle = { baseUrl: fake.baseUrl, port: 0, pid: 0 };
+  const handle = fakeServeHandle(fake.baseUrl);
   return { withServe: (fn) => fn(handle) };
 }
 
