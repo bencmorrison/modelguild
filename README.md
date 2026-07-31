@@ -6,6 +6,37 @@ Works in any stdio MCP client. **Claude Code is the first-class — and currentl
 
 Claude Code stays the driver. You add ModelGuild to **your own project**, and Claude gains a few slash commands backed by a small local **MCP server**. opencode handles model access and auth, so this works off **whatever providers your opencode auth gives you — paid subscriptions or free tiers — with no API keys stored or managed by this tool**.
 
+## Quickstart
+
+Needs [Node.js](https://nodejs.org), [Claude Code](https://claude.com/claude-code), and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](#1-prerequisites).
+
+```bash
+opencode auth login
+cd /path/to/your/project
+npx modelguild init
+claude mcp add modelguild -s user -- npx -y modelguild serve
+npx modelguild doctor
+```
+
+Restart Claude Code, then run `/guild:configure` inside it. What each command does, and why steps 2 and 3 are separate: [Setup](#setup).
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Usage](#usage) — the eight `/guild:*` commands
+- [Setup](#setup) — the six steps, in order
+- [Troubleshooting](#troubleshooting) — including [common failures by name](#common-failures-by-name)
+- [Safety](#safety) — what is and is not a boundary
+- [Watch it live](#watch-it-live) — and the opt-in approval bridge
+- [The record it keeps](#the-record-it-keeps)
+- [Uninstall](#uninstall)
+- [Skip the permission prompts](#skip-the-permission-prompts)
+- [Notes & limits](#notes--limits)
+- [Bugs & feedback](#bugs--feedback)
+- [Working on ModelGuild itself](#working-on-modelguild-itself)
+
+Installing from source, globally, or by hand — plus upgrade drift and payload skew — is in **[INSTALL.md](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md)**.
+
 ## How it works
 
 Claude Code cannot itself run a non-Anthropic model (its agent and subagents are always Claude). So it calls a **local MCP server** — `modelguild`, a small TypeScript stdio server you register with Claude Code (per-project or global, your choice) — which fronts `opencode serve`, model-agnostic, over its HTTP API:
@@ -22,189 +53,9 @@ ModelGuild adds to a project:
 |---|---|
 | The `modelguild` MCP server | Registered with Claude Code by you (`claude mcp add`, launched on demand as `npx -y modelguild serve`). It exposes the tools the slash commands call: `guild_consult`, `guild_panel`, `guild_research`, `guild_delegate`, `guild_models`. |
 | The slash commands | `.claude/commands/guild/*.md` — thin prompts that drive those tools. They appear as `/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`, `/guild:research`, `/guild:delegate`, `/guild:collaborate`, `/guild:configure` — so they can't clash with commands you already have. |
-| Three **hardened** opencode agents | `.opencode/agent/` — `guild-read` (read-only reviewer + web), `guild-build` (the `/guild:delegate` write path), `guild-research` (the `/guild:research` source-backed path). `opencode serve` enforces their permission maps. |
+| Three **hardened** opencode agents | `.opencode/agent/` — `guild-read` (read-only reviewer + web), `guild-build` (the `/guild:delegate` write path), `guild-research` (the `/guild:research` source-backed path). `opencode serve` enforces their permission maps. What each one may do is in [Safety](#the-three-hardened-agents). |
 | The model policy + config template | `modelguild/models.policy` and `modelguild/modelguild.conf.example`. |
 | The record | `modelguild/logs/` (git-ignored) — every model call, on disk and yours to read (see [The record it keeps](#the-record-it-keeps)). |
-
-- `guild-read` → read-only **ROLE** for opinions and planning (`/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`): a default-deny allowlist (`"*": deny` at opencode's permission layer) granting exactly a Claude review subagent's tools — `read` + `grep` + `glob` + `webfetch`/`websearch`; mutation and sub-agent spawning (`task`) are denied. **Not a confidentiality boundary: trusted repos only** — it can read any file including your secrets (`.env`, keys, `.aws`/`.ssh`) and reach the web, so a secret can leave to a third-party model. Verified by `modelguild/verify-guild-read.sh`.
-- `guild-build` → can edit files for `/guild:delegate`: same allowlist construction, re-allowing edit/write/patch/bash and `read`; sub-agents, `grep`/`glob` and the web are denied. Because `bash` is allowed those remaining denies are defense-in-depth, not a guarantee — **review the diff**. **Not a confidentiality boundary either: trusted repos only** — its secret-glob read-denies were removed on 2026-07-29 (they were a fence `bash` walked through with `cat`), so it can read any file including your secrets. Verified by `modelguild/verify-guild-build.sh`.
-- `guild-research` → the source-backed `/guild:research` path: **same allow-set as `guild-read`** (`read` + `grep` + `glob` + web); mutation and `task` denied. Same posture — **not a confidentiality boundary, trusted repos only**. Verified by `modelguild/verify-guild-research.sh`.
-
-## Setup
-
-Exactly what you do, start to finish. It's six steps: **(1)** prerequisites, **(2)** install the payload (`init`), **(3)** register the MCP server yourself, **(4)** restart Claude Code so it loads it, **(5)** verify, **(6)** configure which models it uses. Steps 2 and 3 are **separate**: `init` copies the command docs / agent defs / policy template but **does not touch `.mcp.json`** — *you* register the server (step 3), so you choose global vs per-project scope. Step 6 configures *which models* it uses. You want all of them.
-
-### 1. Prerequisites
-
-- **[Node.js](https://nodejs.org)** (ships with `npm`/`npx`) — ModelGuild is a TypeScript CLI + MCP server; you need Node to build and run it.
-- **[opencode](https://opencode.ai)** on your PATH, **authenticated to at least one provider**. The MCP server fronts `opencode serve`, so this is what gives Claude access to other models:
-  ```bash
-  opencode auth login     # interactive OAuth — subscription or free tier, no API keys stored by this tool
-  ```
-  Repeat it for each provider you want (OpenAI / ChatGPT, GitHub Copilot, Google Gemini, …). `opencode models` lists what your auth actually offers.
-- **[Claude Code](https://claude.com/claude-code)** — the driver. ModelGuild is loaded by Claude Code as a project MCP server.
-- A **git repo** for the project you install into, so you can review `/guild:delegate` diffs. Not strictly required for the read-only commands.
-
-**Your own MCP servers:** opencode supports MCP, but ModelGuild's hardened agents will **not** use your MCP tools — every agent is a default-deny allowlist (`"*": deny`), and that floor covers MCP tools too (verified: an agent under the floor can't even see them). To let a delegated model reach an MCP tool you must explicitly allow it in the agent def, and that is a security decision, not a convenience one.
-
-### 2. Install the payload (`init`)
-
-This is what makes the `/guild:*` commands exist. `init` copies the command docs / agent defs / policy template into your project, records each written file's SHA-256, and upgrades or removes a file only while its bytes still match that ownership record — files you edited are left alone. **`init` does not write `.mcp.json`** — that's step 3, and it's yours to do. (When it finishes, it prints the exact register command for step 3.)
-
-#### 2a. Recommended — from npm
-
-```bash
-cd /path/to/your/project
-npx modelguild init
-```
-Or the one-liner bootstrap (a thin `install.sh` that runs `npx modelguild init` for you, for the classic `curl | bash` habit):
-```bash
-curl -fsSL https://raw.githubusercontent.com/bencmorrison/modelguild/main/install.sh | bash
-```
-The bootstrap installs into the current directory; pass `-s -- --dir /path/to/project` to target another. Pin a version with `-s -- --ref 0.5.0` (or `MODELGUILD_REF=0.5.0`).
-
-#### 2b. From source (contributors, or to run an unreleased build)
-
-Clone and build the CLI once:
-```bash
-git clone https://github.com/bencmorrison/modelguild.git
-cd modelguild
-npm install && npm run build      # produces dist/cli.js
-```
-Then place the payload into **your** project:
-```bash
-node dist/cli.js init --dir /path/to/your/project
-```
-(Or `cd /path/to/your/project` first and run `node /path/to/modelguild/dist/cli.js init` — `--dir` defaults to the current directory.)
-
-#### 2c. Global (all projects) — one install, no per-project `init`
-
-Instead of installing into each project, install the payload **once** into your global config so `/guild:*` and the hardened agents work in **every** project:
-```bash
-npx modelguild init --global
-# node dist/cli.js init --global      # from a source build
-```
-This is the payload analogue of a user-scoped MCP registration. It places the same files, only at global locations:
-- **Commands** → `~/.claude/commands/guild/*.md` (Claude Code reads user-level slash commands from `~/.claude/commands/`, so `/guild:*` exists in every project).
-- **Agent defs** → the opencode **global** agent dir, `${XDG_CONFIG_HOME:-~/.config}/opencode/agent/guild-*.md` (SINGULAR `agent`; opencode resolves `--agent` there from any project).
-- **Policy/config** → `~/.claude/modelguild/` (where the server already falls back to read the policy + config when a project has no local `modelguild/`).
-
-It records ownership in a **separate** record (`~/.claude/modelguild/.modelguild-install.json`), so global and per-project installs never disturb each other. `--global` takes no `--dir` (there is no project target) and writes no `.gitignore` block. Uninstall with `npx modelguild init --uninstall --global`. You still register the MCP server once, globally — step 3 with `-s user`. Verify with `npx modelguild doctor --global` (checks the global locations). Keep the per-project install (2a/2b) if you'd rather scope the payload to specific repos.
-
-### 3. Register the MCP server yourself
-
-`init` deliberately leaves `.mcp.json` alone so **you** pick the scope. Register the `modelguild` server with Claude Code's CLI — `-s` chooses the scope:
-
-- **`-s user`** — global: available in *all* your projects (written to `~/.claude.json`). The server resolves the active project from its working directory, so one global registration works everywhere.
-- **`-s project`** — committed to *this* repo's `.mcp.json` (shared with anyone who clones it).
-- **`-s local`** — this project only, private to you (not committed).
-
-> **Commit `.mcp.json`, or gitignore it? Your call, by scope.** A `-s project` registration (and `--write-mcp`, below) writes `.mcp.json` **to be committed** — that's the point: everyone who clones the repo gets the server. If instead it's a *personal* local registration (a machine-specific launch path, `-s local`, or a hand-placed file you don't want to share), add `.mcp.json` to your `.gitignore` so a stray `git add -A` can't commit it. `init` does **not** gitignore `.mcp.json` for you — it can't know which of the two you intend. (This repo itself gitignores its own `.mcp.json`, because our dogfood registration is personal and path-specific.)
-
-#### 3a. Recommended — from npm
-
-```bash
-claude mcp add modelguild -s user -- npx -y modelguild serve
-```
-
-#### 3b. From source — absolute launch line
-
-If you installed from source (2b), point the registration at your local build instead:
-```bash
-claude mcp add modelguild -s user -- node /path/to/modelguild/dist/cli.js serve
-```
-If you move or delete the ModelGuild checkout, re-run this with the new path.
-
-**The MCP server key must be exactly `modelguild`** — the slash commands grant `mcp__modelguild__*` and won't find the tools under any other key.
-
-**Hand-written alternative** (any scope, no CLI): paste a `modelguild` block into the relevant `.mcp.json` yourself — for a project-scoped file that's the block `init` prints when it finishes:
-```json
-{
-  "mcpServers": {
-    "modelguild": {
-      "command": "npx",
-      "args": ["-y", "modelguild", "serve"],
-      "env": { "GUILD_PROJECT_DIR": "/path/to/your/project" }
-    }
-  }
-}
-```
-(From a source build instead, use `"command": "node"` with `"args": ["/path/to/modelguild/dist/cli.js", "serve"]`.)
-
-**Opt-in shortcut:** if you *want* `init` to write the project `.mcp.json` for you (the old behavior), pass `--write-mcp` — e.g. `npx modelguild init --write-mcp --dir /path/to/your/project`. That writes a project-scoped entry (equivalent to `-s project`) and skips the manual register.
-
-### 4. Restart Claude Code
-
-Claude Code reads its MCP registrations **at session start**, so it will not see the server you just registered until you restart it in that project. Quit and reopen Claude Code (or start a fresh session) in `/path/to/your/project`.
-
-### 5. Verify
-
-Run the token-free `doctor` — it checks opencode is present, the MCP registration, the agent defs, and the policy, without calling any model:
-```bash
-npx modelguild doctor --dir /path/to/your/project
-# node /path/to/modelguild/dist/cli.js doctor --dir <project>   # if you installed from source
-```
-`doctor` detects the registration in **any** scope by asking the Claude CLI (`claude mcp get modelguild`), so a global (`-s user`) registration passes even though it isn't in the project `.mcp.json`. Plain `doctor` likewise detects a **global payload install** (`init --global`): it counts the command docs, agent defs, and policy as present if they are found in **either** the project location or the global one (`~/.claude/commands/guild/`, the opencode global agent dir, `~/.claude/modelguild/`) — mirroring how each actually resolves at runtime. You do **not** need `--global` unless you want to check *only* the global locations (an explicit "verify my global install"). A healthy result looks like:
-```
-✓ MCP server 'modelguild' registered (found via `claude mcp get`, any scope)
-✓ 8/8 command docs present in .claude/commands/guild/ or ~/.claude/commands/guild/ [found: project]
-✓ 3/3 hardened agent defs present in .opencode/agent/ or ~/.config/opencode/agent/ [found: project]
-✓ model policy present (modelguild/models.policy or ~/.claude/modelguild/models.policy) [found: project]
-✓ config/policy layers (most-specific first): project /repo/modelguild  →  global ~/.claude/modelguild  →  default-allow
-  • local     /repo/modelguild/models.policy.local
-  • committed /repo/modelguild/models.policy
-  - committed ~/.claude/modelguild/models.policy (absent)
-✓ no upgrade drift: every installed file matches the version it was written from
-✓ opencode present (…)
-
-doctor: OK
-```
-(The `[found: …]` tag reports whether the payload was located in the project, globally, or a mix. The **layers** line shows the whole config/policy chain that actually binds — see [Global vs project config](#global-vs-project-config) — with `•` for a file that exists and `-` for one that doesn't.)
-
-**Upgrade drift.** Because `init` never overwrites a file you edited, an upgrade *skips* it — so you can end up running a stale command without noticing. Both `init` and `doctor` now tell you:
-```
-! 1 file(s) you edited are STALE — this release ships a newer version of them, and init never
-  overwrites your edits, so your copy stayed behind:
-    .claude/commands/guild/consult.md
-      diff "<the shipped file>" "<your copy>"
-  Keeping your version? Nothing to do. Want the current one? Save your copy, delete the file, and
-  re-run `npx modelguild init` (init rewrites a file only while it can prove the file is unedited).
-```
-It is a **warning, not a failure** — `doctor` still exits OK, because editing a command is a supported thing to do and your file is never touched. If a file differs from the shipped version but no install record covers it (you placed it there by hand, or the record was removed), `doctor` says it *cannot tell* an intentional edit from a stale leftover and names the missing record, rather than guessing.
-
-If the `claude` CLI isn't on PATH, `doctor` can't see a global registration and instead reports a warning (not a failure) telling you to verify with `claude mcp get modelguild`. Inside the restarted Claude Code, the `/guild:*` commands now appear in the slash-command list and the `guild_*` MCP tools are available. **The first time** Claude Code calls one, it asks a one-time permission for that tool (e.g. `mcp__modelguild__guild_consult`) — approve it (see [Skip the permission prompts](#skip-the-permission-prompts) to pre-approve them all).
-
-### 6. Configure which models it uses
-
-Registering the server (step 3) does not choose *which* models it talks to or what your policy allows — that's this step, and it's separate. Two ways, both effective immediately (no restart):
-
-- **Interactive:** run **`/guild:configure`** inside Claude Code. It asks whether you're configuring **globally** or **for this project**, interviews you, and writes your model policy (deny/ask/allow) and preferred-model defaults to the git-ignored config files.
-- **By hand:** edit the two git-ignored files under your chosen root (`~/.claude/modelguild/` for global, `<repo>/modelguild/` for this project only):
-  - `models.policy.local` — per-model `deny`/`ask`/`allow` rules (the committed `models.policy` is default-allow).
-  - `modelguild.conf.local` (copy from `modelguild/modelguild.conf.example`) — your default single model and panel set:
-    ```
-    GUILD_MODEL=openai/gpt-5
-    GUILD_MODELS=openai/gpt-5 google/gemini-2.5-pro
-    ```
-
-Prefer a **non-Claude** model for consults so the second opinion is genuinely independent. This step is optional — without it, commands use opencode's default model — but setting a policy and defaults is what makes day-to-day use smooth.
-
-#### Global vs project config
-
-Config is **layered**, not either/or. Your global root `~/.claude/modelguild/` is the **baseline**, and a project's own `<repo>/modelguild/` is overlaid **on top** of it:
-
-- **Preferences** (`modelguild.conf.local`) merge key by key. A key set in the project wins; a key you only set globally still applies in that project.
-- **Model policy** rules are evaluated **project first, then global**, first match wins, default-allow. So a project can add a stricter `deny` or a looser `allow` without disturbing the rest of your global policy — and a global `deny` keeps binding in every project that doesn't override it.
-
-Set it once globally and it works everywhere; add a project root only when that repo needs something different. (`$GUILD_ROOT` is the exception: it pins **one** root and layers nothing under it — a deliberate escape hatch for fixtures and CI, not a normal setting. `doctor` tells you when it's leaving a real root unlayered.)
-
-### Updating
-
-Re-run `init` (`npx modelguild init --dir <project>`; from a source build: `node dist/cli.js init --dir <project>`). It's idempotent: it upgrades files you haven't touched (bytes still matching the recorded hash), leaves any file you edited locally alone, and adds new payload files. `init` never touches your MCP registration, so re-running it won't disturb the server you registered in step 3. After a local rebuild (`npm run build`), re-running `init` refreshes the project's payload. There is no separate update mode.
-
-**And it now tells you when you need to.** The MCP *server* updates itself — your registration runs `npx -y modelguild serve`, which resolves the current release on every launch — but the payload above lives in your repo and does **not** move with it, so you can end up running a new server against last release's commands and agent defs without noticing. When the server starts and finds files that are ours, **unedited**, and different from what it ships, it writes one block to stderr naming them, with the fix **pinned to the version running** (`npx modelguild@<version> init` — plain `npx modelguild init` installs the *latest* payload, which doesn't converge if you're deliberately on an older server). It won't claim which side is older: two hashes can't say, and while normally it's your payload that's behind, a pinned older server puts it ahead. `npx modelguild doctor` (and the `guild_status` tool) report the same thing whenever you ask, alongside files you *edited* that have since fallen behind — those are never overwritten. Neither is a failure: being behind a release doesn't make `doctor` exit non-zero.
-
-The start-up line appears **once per server version**, not once per session; what it has already said is recorded in `~/.claude/modelguild/`, never in your repo, so nothing untracked appears in your working tree (delete that file to be told again). `GUILD_PAYLOAD_NOTICE=off` in `modelguild/modelguild.conf.local` turns the line off entirely — `doctor` keeps reporting either way.
 
 ## Usage
 
@@ -246,23 +97,141 @@ GUILD_MESSAGE_TIMEOUT_MS=1800000
 ```
 Only the model-turn call uses it; the fast control-plane calls keep their own short timeout. A value of 0, negative, or non-numeric falls back to the default; the literal `max` uses the longest timeout Node can honour (~24.8 days). This is the default — for a single long-running call, the assistant can also pass a `timeoutMs` (a number of ms, or `"max"`) directly to `guild_consult`/`guild_panel`/`guild_research`/`guild_delegate`, which overrides it for that call.
 
+## Setup
+
+> **Installing from source, globally, or into a repo you don't control?** → **[INSTALL.md](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md)** covers the from-source build, `init --global`, registering by hand, and `--write-mcp`. The six steps below are the npm happy path.
+
+Exactly what you do, start to finish. It's six steps: **(1)** prerequisites, **(2)** install the payload (`init`), **(3)** register the MCP server yourself, **(4)** restart Claude Code so it loads it, **(5)** verify, **(6)** configure which models it uses. Steps 2 and 3 are **separate**: `init` copies the command docs / agent defs / policy template but **does not touch `.mcp.json`** — *you* register the server (step 3), so you choose global vs per-project scope. Step 6 configures *which models* it uses. You want all of them.
+
+### 1. Prerequisites
+
+- **[Node.js](https://nodejs.org)** (ships with `npm`/`npx`) — ModelGuild is a TypeScript CLI + MCP server; you need Node to build and run it.
+- **[opencode](https://opencode.ai)** on your PATH, **authenticated to at least one provider**. The MCP server fronts `opencode serve`, so this is what gives Claude access to other models:
+  ```bash
+  opencode auth login     # interactive OAuth — subscription or free tier, no API keys stored by this tool
+  ```
+  Repeat it for each provider you want (OpenAI / ChatGPT, GitHub Copilot, Google Gemini, …). `opencode models` lists what your auth actually offers.
+- **[Claude Code](https://claude.com/claude-code)** — the driver. ModelGuild is loaded by Claude Code as a project MCP server.
+- A **git repo** for the project you install into, so you can review `/guild:delegate` diffs. Not strictly required for the read-only commands.
+
+**Your own MCP servers:** opencode supports MCP, but ModelGuild's hardened agents will **not** use your MCP tools — every agent is a default-deny allowlist (`"*": deny`), and that floor covers MCP tools too (verified: an agent under the floor can't even see them). To let a delegated model reach an MCP tool you must explicitly allow it in the agent def, and that is a security decision, not a convenience one.
+
+### 2. Install the payload (`init`)
+
+This is what makes the `/guild:*` commands exist. `init` copies the command docs / agent defs / policy template into your project, records each written file's SHA-256, and upgrades or removes a file only while its bytes still match that ownership record — files you edited are left alone. **`init` does not write `.mcp.json`** — that's step 3, and it's yours to do. (When it finishes, it prints the exact register command for step 3.)
+
+```bash
+cd /path/to/your/project
+npx modelguild init
+```
+Or the one-liner bootstrap (a thin `install.sh` that runs `npx modelguild init` for you, for the classic `curl | bash` habit):
+```bash
+curl -fsSL https://raw.githubusercontent.com/bencmorrison/modelguild/main/install.sh | bash
+```
+The bootstrap installs into the current directory; pass `-s -- --dir /path/to/project` to target another. Pin a version with `-s -- --ref 0.5.0` (or `MODELGUILD_REF=0.5.0`).
+
+Building from a checkout instead, or installing once for every project? → [INSTALL.md](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#from-source-contributors-or-to-run-an-unreleased-build).
+
+### 3. Register the MCP server yourself
+
+`init` deliberately leaves `.mcp.json` alone so **you** pick the scope. Register the `modelguild` server with Claude Code's CLI — `-s` chooses the scope:
+
+- **`-s user`** — global: available in *all* your projects (written to `~/.claude.json`). The server resolves the active project from its working directory, so one global registration works everywhere.
+- **`-s project`** — committed to *this* repo's `.mcp.json` (shared with anyone who clones it).
+- **`-s local`** — this project only, private to you (not committed).
+
+```bash
+claude mcp add modelguild -s user -- npx -y modelguild serve
+```
+
+**The MCP server key must be exactly `modelguild`** — the slash commands grant `mcp__modelguild__*` and won't find the tools under any other key.
+
+Registering a source build, pasting the block by hand, letting `init` write it (`--write-mcp`), or deciding whether to commit `.mcp.json` → [INSTALL.md](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#register-a-source-build).
+
+### 4. Restart Claude Code
+
+Claude Code reads its MCP registrations **at session start**, so it will not see the server you just registered until you restart it in that project. Quit and reopen Claude Code (or start a fresh session) in `/path/to/your/project`.
+
+### 5. Verify
+
+Run the token-free `doctor` — it checks opencode is present, the MCP registration, the agent defs, and the policy, without calling any model:
+```bash
+npx modelguild doctor --dir /path/to/your/project
+```
+What a healthy run prints, and how `doctor` finds a global install → [INSTALL.md](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#a-healthy-doctor-run).
+
+If the `claude` CLI isn't on PATH, `doctor` can't see a global registration and instead reports a warning (not a failure) telling you to verify with `claude mcp get modelguild`. Inside the restarted Claude Code, the `/guild:*` commands now appear in the slash-command list and the `guild_*` MCP tools are available. **The first time** Claude Code calls one, it asks a one-time permission for that tool (e.g. `mcp__modelguild__guild_consult`) — approve it (see [Skip the permission prompts](#skip-the-permission-prompts) to pre-approve them all).
+
+### 6. Configure which models it uses
+
+Registering the server (step 3) does not choose *which* models it talks to or what your policy allows — that's this step, and it's separate. Two ways, both effective immediately (no restart):
+
+- **Interactive:** run **`/guild:configure`** inside Claude Code. It asks whether you're configuring **globally** or **for this project**, interviews you, and writes your model policy (deny/ask/allow) and preferred-model defaults to the git-ignored config files.
+- **By hand:** edit the two git-ignored files under your chosen root (`~/.claude/modelguild/` for global, `<repo>/modelguild/` for this project only):
+  - `models.policy.local` — per-model `deny`/`ask`/`allow` rules (the committed `models.policy` is default-allow).
+  - `modelguild.conf.local` (copy from `modelguild/modelguild.conf.example`) — your default single model and panel set:
+    ```
+    GUILD_MODEL=openai/gpt-5
+    GUILD_MODELS=openai/gpt-5 google/gemini-2.5-pro
+    ```
+
+Prefer a **non-Claude** model for consults so the second opinion is genuinely independent. This step is optional — without it, commands use opencode's default model — but setting a policy and defaults is what makes day-to-day use smooth.
+
+#### Global vs project config
+
+Config is **layered**, not either/or. Your global root `~/.claude/modelguild/` is the **baseline**, and a project's own `<repo>/modelguild/` is overlaid **on top** of it:
+
+- **Preferences** (`modelguild.conf.local`) merge key by key. A key set in the project wins; a key you only set globally still applies in that project.
+- **Model policy** rules are evaluated **project first, then global**, first match wins, default-allow. So a project can add a stricter `deny` or a looser `allow` without disturbing the rest of your global policy — and a global `deny` keeps binding in every project that doesn't override it.
+
+Set it once globally and it works everywhere; add a project root only when that repo needs something different. (`$GUILD_ROOT` is the exception: it pins **one** root and layers nothing under it — a deliberate escape hatch for fixtures and CI, not a normal setting. `doctor` tells you when it's leaving a real root unlayered.)
+
+### Updating
+
+Re-run `init` (`npx modelguild init --dir <project>`; from a source build: `node dist/cli.js init --dir <project>`). It's idempotent: it upgrades files you haven't touched (bytes still matching the recorded hash), leaves any file you edited locally alone, and adds new payload files. `init` never touches your MCP registration, so re-running it won't disturb the server you registered in step 3. After a local rebuild (`npm run build`), re-running `init` refreshes the project's payload. There is no separate update mode.
+
+The server also tells you when your installed payload has fallen behind the release it is running, and when a file you edited has been superseded → [upgrade drift](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#upgrade-drift) and [payload skew](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#payload-skew).
+
 ## Troubleshooting
 
-- **`npx modelguild …` says "package not found".** `modelguild` is published to npm, so check spelling and your network (or a stale npm cache — `npm cache verify`). If you're intentionally running an unreleased build, use the from-source path instead: `npm run build` in the checkout, then `node dist/cli.js init --dir <project>` (see [Setup step 2b](#2b-from-source-contributors-or-to-run-an-unreleased-build)).
+- **`npx modelguild …` says "package not found".** `modelguild` is published to npm, so check spelling and your network (or a stale npm cache — `npm cache verify`). If you're intentionally running an unreleased build, use the from-source path instead: `npm run build` in the checkout, then `node dist/cli.js init --dir <project>` (see [INSTALL.md § From source](https://github.com/bencmorrison/modelguild/blob/main/INSTALL.md#from-source-contributors-or-to-run-an-unreleased-build)).
 - **The `/guild:*` commands don't appear in Claude Code.** Restart Claude Code — it only reads its MCP registrations at session start (Setup step 4). Still missing? Confirm the server is registered — `claude mcp get modelguild` (any scope) — and run `doctor` (step 5) to check registration and payload.
 - **A `guild_*` tool call errors about opencode.** opencode isn't installed on PATH or isn't authenticated. Run `opencode auth login`, and `opencode models` to confirm at least one provider answers. If you built locally and moved the checkout, the launch `args` path is stale — re-run `claude mcp add` (or edit the registration) with the new path.
 - **A model is denied / not allowed.** That's the model policy. Run `/guild:configure`, or edit `models.policy.local` (Setup step 6). Remember the policy is **layered** — the rule denying it may live in your *global* root even though you're in a project; `doctor` prints the whole chain, and the error names the exact file that decided.
 - **Not sure what's wrong.** Run `doctor` — it reports each check with `✓`/`✗` and needs no model call.
 
+### Common failures by name
+
+A refused or stalled call names its failure. Search for the name you were given:
+
+| Name | What it means | Detail |
+|---|---|---|
+| `agent-def-missing` | The hardened agent def isn't in a directory opencode resolves from, and the tool refuses rather than falling back to an unrestricted agent. Re-run `init`. | [SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md#what-is-guaranteed-and-how) |
+| `agent-unhardened` | The def file is there, but opencode did not resolve its permission floor (usually frontmatter opencode can't parse). Fixing the def is not enough — a running `opencode serve` never re-reads it, so you need a fresh one. | [SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md#what-is-guaranteed-and-how) |
+| `worktree-invalid` | The `worktree` path passed to a command isn't in `git worktree list` for this repository. Refused by name rather than silently falling back to the project root. | [CONTRACT.md § C](https://github.com/bencmorrison/modelguild/blob/main/CONTRACT.md#c-agent-selection) |
+| `approval-not-applied` | The approval bridge is armed but the session's `ask` ruleset isn't in force — typically continuing a session created before you armed it. Refused rather than run ungated. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
+| `empty-answer` | A read-path turn produced no answer at all. Refused rather than returned as a blank success. | [CONTRACT.md § D](https://github.com/bencmorrison/modelguild/blob/main/CONTRACT.md#d-evidence-layer) |
+| `policy-deny` / `policy-ask` | Your model policy denies this model, or gates it behind your approval and you weren't asked. Edit it with `/guild:configure`. | [Picking the model](#picking-the-model) |
+| `model-id` | The `provider/model` id is malformed. `npx modelguild doctor` and `guild_models` list what your auth actually reaches. | [Picking the model](#picking-the-model) |
+| `agent-mismatch` | opencode served the turn with a different agent than the one asked for. | [Safety](#the-three-hardened-agents) |
+| `approval-config` / `approval-channel-missing` | `GUILD_APPROVE` has an unrecognised value, or the bridge is armed with no way to ask you. Refused up front rather than hanging the turn. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
+| `unsettled` / `contested` / `refused` / `undelivered` | How an approval reply that didn't land is reported. `unsettled` means nobody's decision took effect and the request is still open — that is the one that explains a hung call. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
+
 ## Safety
 
-ModelGuild has real, verifiable guardrails — but it is **not a sandbox**. Use it on trusted repositories. See **[SECURITY.md](SECURITY.md)** for the full threat model; the essentials:
+ModelGuild has real, verifiable guardrails — but it is **not a sandbox**. Use it on trusted repositories. See **[SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md)** for the full threat model; the essentials:
 
 - **Read-only commands (`/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`, `/guild:collaborate`)** run under a default-deny allowlist agent with a review subagent's tools — read, grep/glob, and the web; it cannot mutate, shell out, or spawn subagents. It is **not a confidentiality boundary**: it can read any repo file **including your secrets** and reach the network, so a secret can leave to a third-party model. **Trusted repos only.** Proven by `modelguild/verify-guild-read.sh`.
 - **`/guild:research` is the source-backed web path.** Same read + web exposure and same "trusted repos only" posture; its value is the workflow requiring citations and Claude verification. Proven by `modelguild/verify-guild-research.sh`.
 - **`/guild:delegate` can edit files and run shell.** Its remaining restrictions are defense-in-depth, not a guarantee (a coding task needs `bash`, and `bash` can reach around them), so **the trust boundary is you reviewing the diff.** It reads your repo unfenced, secrets included — the read-tool carve-outs came off on 2026-07-29 because `bash` bypassed them anyway. The tool snapshots the worktree first and records the model's patch separately, so dirty worktrees are allowed. Since 2026-07-29 it can also be pointed at a **sibling git worktree** of the same repository (validated against `git worktree list`), so that exposure — and the shell — extend to the tree you name; the diff review remains the boundary, of a diff that is of the tree actually edited.
 - **External model output is treated as data, not instructions** — a consulted model can't smuggle commands into Claude's control flow.
 - Run `doctor` (step 5 of [Setup](#setup)) to check your setup before relying on any of this.
+
+### The three hardened agents
+
+- `guild-read` → read-only **ROLE** for opinions and planning (`/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`): a default-deny allowlist (`"*": deny` at opencode's permission layer) granting exactly a Claude review subagent's tools — `read` + `grep` + `glob` + `webfetch`/`websearch`; mutation and sub-agent spawning (`task`) are denied. **Not a confidentiality boundary: trusted repos only** — it can read any file including your secrets (`.env`, keys, `.aws`/`.ssh`) and reach the web, so a secret can leave to a third-party model. Verified by `modelguild/verify-guild-read.sh`.
+- `guild-build` → can edit files for `/guild:delegate`: same allowlist construction, re-allowing edit/write/patch/bash and `read`; sub-agents, `grep`/`glob` and the web are denied. Because `bash` is allowed those remaining denies are defense-in-depth, not a guarantee — **review the diff**. **Not a confidentiality boundary either: trusted repos only** — its secret-glob read-denies were removed on 2026-07-29 (they were a fence `bash` walked through with `cat`), so it can read any file including your secrets. Verified by `modelguild/verify-guild-build.sh`.
+- `guild-research` → the source-backed `/guild:research` path: **same allow-set as `guild-read`** (`read` + `grep` + `glob` + web); mutation and `task` denied. Same posture — **not a confidentiality boundary, trusted repos only**. Verified by `modelguild/verify-guild-research.sh`.
 
 ## Watch it live
 
@@ -300,7 +269,7 @@ GUILD_APPROVE_TIMEOUT_MS=120000
 - **If your "yes" doesn't get through, the result says so.** opencode refuses a reply to a request it has already settled — which is what a healthy race looks like when your terminal and your MCP client both answer, and also what a *broken* approval path would look like. So whenever opencode refuses a reply — whatever the status, not just a 404 — the bridge asks a second question: is that request still open? Still open means nobody's decision landed, and it shows up as `unsettled` on the result with a plain-language reason, instead of as a stall you have to guess at. (`unsettled` also covers the rarer case where opencode *accepted* the reply and it still did not take effect; a reply merely still in flight is never counted as one.) Refused with nothing left open is `contested` if it was a 404 (the race) and `refused` otherwise — reported, not diagnosed; only a reply that never reached opencode at all is `undelivered`. Each request lands in exactly one of those four. (The endpoint that delivers an *approval* is the one opencode has marked deprecated; when it goes, approvals will fail while rejections keep working, and that is the failure this exists to name — it need not present as a 404, which is why the check is not keyed on one.) It will not quietly convert your approval into a rejection to get the turn moving again.
 - **Claude cannot approve on your behalf.** There is no tool argument that grants approval — the decision only ever comes from your terminal or your MCP client's own prompt.
 - **Web egress on the read paths** can be gated separately with `GUILD_APPROVE_EGRESS=ask` (also off by default), which puts `webfetch`/`websearch` behind the same prompt for `/guild:consult`, `/guild:panel`, `/guild:research` and friends. It exists because reads on those paths leave your machine for a third-party model — the one asymmetry between them and a Claude subagent that this project treats as real.
-- A session's ruleset is fixed when the session is created, so turning the knob on mid-conversation doesn't retro-gate an existing session: continuing one that wasn't created gated is **refused**, not silently run ungated.
+- A session's ruleset is fixed when the session is created, so turning the knob on mid-conversation doesn't retro-gate an existing session: continuing one that wasn't created gated is **refused** (`approval-not-applied`), not silently run ungated.
 
 ## The record it keeps
 
@@ -353,8 +322,8 @@ What helps most in a bug report:
 - Which command you ran, and the model it used.
 - Your OS. macOS and BSD support is newer and less exercised than Linux, so please say if you're on one.
 
-**Security issues are the exception — do not open a public issue for them.** Report those privately via the [Security tab](https://github.com/bencmorrison/modelguild/security), as described in **[SECURITY.md](SECURITY.md)**. That file also documents what this tool deliberately does *not* guarantee: the read-only agents reach the web by design and can read your secrets, and `/guild:delegate` allows `bash`, so neither is an exfiltration boundary.
+**Security issues are the exception — do not open a public issue for them.** Report those privately via the [Security tab](https://github.com/bencmorrison/modelguild/security), as described in **[SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md)**. That file also documents what this tool deliberately does *not* guarantee: the read-only agents reach the web by design and can read your secrets, and `/guild:delegate` allows `bash`, so neither is an exfiltration boundary.
 
 ## Working on ModelGuild itself
 
-Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code and opencode in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[AGENTS.md](AGENTS.md)**.
+Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code and opencode in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)** and **[AGENTS.md](https://github.com/bencmorrison/modelguild/blob/main/AGENTS.md)**.
