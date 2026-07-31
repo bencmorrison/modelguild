@@ -226,14 +226,27 @@ if [ "$self_test" -eq 1 ]; then
   ok() { printf 'PASS: %s\n' "$1"; }
   no() { printf 'FAIL: %s\n' "$1" >&2; st_failed=1; }
 
+  # NEVER pipe `run` into a filter that exits early (`awk … exit`, `grep -q`). The filter
+  # closes the pipe while the reporter is still writing, the reporter takes SIGPIPE, and
+  # `pipefail` turns that into a non-zero pipeline — which inside `$(…)` makes `set -e`
+  # abort the WHOLE self-test silently, before any case reports, and inside an `if` gives
+  # a wrong verdict. It fits in the pipe buffer on an idle machine and loses the race on a
+  # loaded one: this passed locally and failed on both CI platforms with no output at all.
+  # So: capture once, then match the variable with bash's own `[[ == ]]` (no process, no
+  # pipe) and extract with awk over a here-string that has no early `exit`.
+  cap() { captured="$(run "$@")"; }
+  has() { case "$captured" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
   # --- THE LOAD-BEARING ASSERTION: counts by ITEM, not by LINE ----------------------
   # Two fixtures with the SAME clause words: one physical line, and the same text
   # reflowed across many short lines. A line-length lint passes the second. This must
   # report the same true count for both, and flag both.
   { printf -- '- **C1** — '; filler 800; } > "$st/one-line.md"
   { printf -- '- **C1** — '; filler_reflowed 800; } > "$st/reflowed.md"
-  flat_words="$(run "$st/one-line.md" | awk '$0 ~ /^  *[0-9]+ / { print $1; exit }')"
-  reflow_words="$(run "$st/reflowed.md" | awk '$0 ~ /^  *[0-9]+ / { print $1; exit }')"
+  cap "$st/one-line.md"
+  flat_words="$(awk '!f && $0 ~ /^  *[0-9]+ / { print $1; f = 1 }' <<<"$captured")"
+  cap "$st/reflowed.md"
+  reflow_words="$(awk '!f && $0 ~ /^  *[0-9]+ / { print $1; f = 1 }' <<<"$captured")"
   # Independent oracle: each fixture is exactly one item, so `wc -w` of the whole file
   # is that item's word count without reusing this script's own parser.
   oracle="$(wc -w < "$st/one-line.md" | tr -d ' ')"
@@ -248,7 +261,8 @@ if [ "$self_test" -eq 1 ]; then
   else
     no "reflowed fixture is not actually reflowed (longest line $longest_line)"
   fi
-  if run "$st/reflowed.md" | grep -q 'WARN: 1 item(s) over'; then
+  cap "$st/reflowed.md"
+  if has 'WARN: 1 item(s) over'; then
     ok "the reflowed over-threshold item is reported"
   else
     no "the reflowed over-threshold item was not reported"
@@ -264,8 +278,9 @@ if [ "$self_test" -eq 1 ]; then
     printf '  tail after the fence\n'
   } > "$st/fenced.md"
   fence_oracle="$(wc -w < "$st/fenced.md" | tr -d ' ')"
-  fence_items="$(run "$st/fenced.md" | awk '/^fenced\.md/ { print $3; exit }')"
-  fence_words="$(run "$st/fenced.md" | awk '/largest under threshold/ { print $(NF-3); exit }')"
+  cap "$st/fenced.md"
+  fence_items="$(awk '!a && /^fenced\.md/ { print $3; a = 1 }' <<<"$captured")"
+  fence_words="$(awk '!b && /largest under threshold/ { print $(NF-3); b = 1 }' <<<"$captured")"
   if [ "$fence_items" = "1" ] && [ "$fence_words" = "$fence_oracle" ]; then
     ok "a fenced block's column-0 lines stay in the open item ($fence_oracle words, 1 item)"
   else
@@ -274,7 +289,8 @@ if [ "$self_test" -eq 1 ]; then
 
   # --- under threshold is not flagged ----------------------------------------------
   { printf -- '- **C1** — '; filler 300; } > "$st/small.md"
-  if run "$st/small.md" | grep -q 'OK: no unexempted item'; then
+  cap "$st/small.md"
+  if has 'OK: no unexempted item'; then
     ok "an item under the threshold is not flagged"
   else
     no "an under-threshold item was flagged"
@@ -282,16 +298,16 @@ if [ "$self_test" -eq 1 ]; then
 
   # --- escape hatch: cite an issue --------------------------------------------------
   { printf -- '- **C1** — <!-- doc-size-exempt: #126 --> '; filler 800; } > "$st/exempt.md"
-  out="$(run "$st/exempt.md")"
-  if printf '%s\n' "$out" | grep -q 'OK: no unexempted item' \
-     && printf '%s\n' "$out" | grep -q '\[exempt: #126\]'; then
+  cap "$st/exempt.md"
+  if has 'OK: no unexempted item' && has '[exempt: #126]'; then
     ok "an item citing an issue is exempted AND still printed with its size"
   else
     no "the escape hatch did not exempt-and-print"
   fi
   # And a bare issue reference is NOT an exemption (otherwise every clause is exempt).
   { printf -- '- **C1** — (issue #126) '; filler 800; } > "$st/bare-issue.md"
-  if run "$st/bare-issue.md" | grep -q 'WARN: 1 item(s) over'; then
+  cap "$st/bare-issue.md"
+  if has 'WARN: 1 item(s) over'; then
     ok "a bare issue reference does not exempt"
   else
     no "a bare issue reference wrongly exempted the item"
@@ -302,7 +318,8 @@ if [ "$self_test" -eq 1 ]; then
     printf -- '  - nested: '; filler 400
     printf -- '  - nested: '; filler 400
   } > "$st/nested.md"
-  if run "$st/nested.md" | grep -q 'WARN: 1 item(s) over'; then
+  cap "$st/nested.md"
+  if has 'WARN: 1 item(s) over'; then
     ok "a top-level bullet carries its nested sub-bullets' words"
   else
     no "nested sub-bullets were not counted into the parent item"
@@ -311,7 +328,8 @@ if [ "$self_test" -eq 1 ]; then
   { printf -- '- first bullet: '; filler 400
     printf -- '- second bullet: '; filler 400
   } > "$st/two-bullets.md"
-  if run "$st/two-bullets.md" | grep -q 'OK: no unexempted item'; then
+  cap "$st/two-bullets.md"
+  if has 'OK: no unexempted item'; then
     ok "a following top-level bullet closes the previous item"
   else
     no "two 400-word bullets were merged into one item"
