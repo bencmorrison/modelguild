@@ -69,6 +69,18 @@ markers=(
 failed=0
 bad() { printf 'FAIL: %s\n' "$*" >&2; failed=1; }
 
+# Each marker must still MATCH AGENTS.md, or the tripwire below greps for a string that exists
+# NOWHERE: reword the sentence there and that rule's guard dies silently with CI green. Four of
+# the seven occur exactly once today. Case-INSENSITIVE to match the search below — AGENTS.md
+# writes one as "**Vendor is not a threat model.**", so a case-SENSITIVE assert would fail on day
+# one against a marker that is working. AGENTS.md absent ⇒ grep fails ⇒ this fails, deliberately:
+# same rule the V1 PIN record check learned the hard way (check-v1-permission-pin.sh), where
+# guarding on a filename let DELETING the file make the whole check vacuous.
+for m in ${markers[@]+"${markers[@]}"}; do
+  grep -Fiq -- "$m" AGENTS.md 2>/dev/null \
+    || bad "the shared-rule marker '$m' no longer appears in AGENTS.md, so the CLAUDE.md tripwire for that rule now guards nothing. Restore the wording in AGENTS.md, or update this marker list to the new phrasing — do not simply drop the marker."
+done
+
 if [ -L CLAUDE.md ]; then
   bad "CLAUDE.md is a symlink; it must be a regular file (a symlink to AGENTS.md was the OLD construction, retired at M12)"
 elif [ ! -f CLAUDE.md ]; then
@@ -118,7 +130,8 @@ if [ "${1:-}" = "--self-test" ]; then
   baseline="$tmp/baseline"
   mkdir -p "$baseline"
   cp -a CLAUDE.md "$baseline/"
-  # AGENTS.md is only needed so the symlink fixture has a real target to point at.
+  # AGENTS.md is checked (every marker must still appear in it) and is also the symlink
+  # fixture's real target.
   cp -a AGENTS.md "$baseline/"
 
   self_test_failed=0
@@ -152,6 +165,15 @@ if [ "${1:-}" = "--self-test" ]; then
     printf '\nA restated shared rule: %s\n' "$m" >> "$fixture/CLAUDE.md"
     expect_rejected "CLAUDE.md restating the shared-rule marker '$m'" "$fixture"
   done
+
+  # The tripwires are tripwires only while AGENTS.md still SAYS these things. REWORDING is the
+  # realistic shape — a reflow rewrites a short bullet heading — not deleting the file, so that
+  # is what is fixtured. (Dropping this sentence removes exactly one marker: verified.)
+  fixture="$tmp/marker-reworded-in-agents"
+  cp -a "$baseline" "$fixture"
+  sed 's/State the capability cost\./State what a change costs in capability./' \
+    "$baseline/AGENTS.md" > "$fixture/AGENTS.md"
+  expect_rejected "AGENTS.md rewording away the shared-rule marker 'State the capability cost.'" "$fixture"
 
   fixture="$tmp/second-import"
   cp -a "$baseline" "$fixture"
