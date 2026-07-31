@@ -18,6 +18,7 @@ user_files=(
   .devcontainer/postCreate.sh
   AGENTS.md
   CONTRIBUTING.md
+  INSTALL.md
   README.md
   SECURITY.md
   modelguild/modelguild.conf.example
@@ -159,7 +160,7 @@ if [ "${1:-}" = "--self-test" ]; then
     "$baseline/.opencode" "$baseline/modelguild"
   cp -a .claude/commands/guild "$baseline/.claude/commands/"
   cp -a .opencode/agent "$baseline/.opencode/"
-  cp -a AGENTS.md CONTRIBUTING.md README.md SECURITY.md install.sh "$baseline/"
+  cp -a AGENTS.md CONTRIBUTING.md INSTALL.md README.md SECURITY.md install.sh "$baseline/"
   cp -a .devcontainer/Dockerfile .devcontainer/devcontainer.json \
     .devcontainer/postCreate.sh "$baseline/.devcontainer/"
   cp -a modelguild/modelguild.conf.example modelguild/models.policy "$baseline/modelguild/"
