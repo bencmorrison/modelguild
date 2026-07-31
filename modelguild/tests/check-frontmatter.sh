@@ -19,7 +19,14 @@ bad()  { printf '\033[31mFAIL\033[0m %s — %s\n' "$1" "$2"; fail=1; }
 # has_frontmatter <file> : true if line 1 is `---` and a closing `---` exists after it.
 has_frontmatter() {
   [ "$(sed -n '1p' "$1")" = "---" ] || return 1
-  sed -n '2,$p' "$1" | grep -qxF -- "---"
+  # ONE process reading the file directly — NOT `sed … | grep -qxF`. `grep -q` exits at
+  # the closing fence (line 5 of a command doc) while sed still has the whole rest of the
+  # file to write; once that remainder exceeds the pipe buffer sed blocks, then takes
+  # SIGPIPE, and `pipefail` reports the pipeline as failed. delegate.md is 17,490 bytes
+  # against macOS's 16 KiB initial pipe buffer, so it failed CI there while passing on
+  # Linux's 64 KiB — a false "unterminated frontmatter fence" on a file that is fine, and
+  # one that gets likelier as any doc grows.
+  awk 'NR > 1 && $0 == "---" { found = 1; exit } END { exit found ? 0 : 1 }' "$1"
 }
 # fm_has_key <file> <key> : true if `key:` appears within the frontmatter block only.
 fm_has_key() {
