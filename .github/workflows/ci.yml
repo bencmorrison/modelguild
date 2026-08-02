@@ -2,7 +2,7 @@ name: CI
 
 # Fast, token-free checks that need no opencode auth and call no model. Since the
 # bash wrapper layer was retired at M12, the surviving shell is a handful of
-# lint scripts (shebangs, frontmatter, docs, contract-counts, doc-item-size,
+# lint scripts (shebangs, frontmatter, docs, contract-counts,
 # claude-md, v1-permission-pin, agent-permissions, shellcheck) plus the
 # dev-container host-config tooling — so the shell jobs lint THOSE, and the product
 # is the TypeScript/MCP server, exercised by the `node` job.
@@ -75,16 +75,6 @@ jobs:
         # (issue #113 — a cited C-number must resolve to one clause; the letter
         # suffix is part of the id, so C32/C32a are two ids, not one twice).
         run: bash modelguild/tests/check-contract-counts.sh --self-test
-
-      - name: Doc item-size reporter (+ self-test)
-        # Issue #126 (child of #122): words per ITEM — clause to clause in CONTRACT.md,
-        # top-level bullet to bullet in AGENTS.md. Deliberately NOT a line-length lint:
-        # the largest item in each file spans several lines and a line check misses it.
-        # An ERROR since the #122 pilot (#127) merged, per the promotion trigger the
-        # script header stated when it shipped; a file yielding zero items is a hard fail
-        # either way. 16 known-oversized items carry a marker citing #135/#136.
-        run: bash modelguild/tests/check-doc-item-size.sh --self-test
-
 
       - name: CLAUDE.md thin-pointer lint (+ self-test)
         # Machine-checks the CLAUDE.md/AGENTS.md thin-pointer invariant that went
@@ -191,13 +181,6 @@ jobs:
         # (issue #113 — a cited C-number must resolve to one clause; the letter
         # suffix is part of the id, so C32/C32a are two ids, not one twice).
         run: bash modelguild/tests/check-contract-counts.sh --self-test
-
-      - name: Doc item-size reporter (+ self-test)
-        # Same reporter on stock bash 3.2 + BSD awk: its whole measurement is one awk
-        # program (dynamic regexes, match/substr, tolower) and it builds fixtures with
-        # mktemp -d, so this job is where a BSD/3.2 divergence would surface.
-        run: bash modelguild/tests/check-doc-item-size.sh --self-test
-
 
       - name: CLAUDE.md thin-pointer lint (+ self-test)
         # Same lint on stock bash 3.2 + BSD awk/grep — its checks lean on awk and

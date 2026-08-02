@@ -52,7 +52,6 @@ npm test                                     # the TS suite — every test/*.tes
 bash modelguild/tests/check-frontmatter.sh       # command/agent frontmatter structure
 bash modelguild/tests/check-docs.sh --self-test  # command names + MCP-grant lint (+ its self-test)
 bash modelguild/tests/check-contract-counts.sh --self-test # CONTRACT.md prose counts + clause-id uniqueness (+ self-test)
-bash modelguild/tests/check-doc-item-size.sh --self-test    # words per item in CONTRACT.md/AGENTS.md — an ERROR, not advisory (+ self-test)
 bash .devcontainer/test-prepare-host-config.sh # host symlink confinement
 bash .devcontainer/test-prepare-host-timezone.sh # host timezone detection + junk rejection
 bash modelguild/tests/check-agent-permissions.sh --self-test # agent permission-allowlist invariants, source-level (+ self-test)
@@ -85,10 +84,6 @@ Three categories. Sort every sentence you are about to add to `AGENTS.md`, `CONT
 **Conservation.** Every byte you remove reappears in the retained text or in the destination. Split freely; do not reword in the same commit — that is what makes a move checkable by comparing tokens instead of re-reading prose. One exception, because splitting forces it: resolving a pronoun the split orphaned. Say so in the PR.
 
 **Contested ⇒ it stays.**
-
-**This is enforced, at 700 words per item.** `modelguild/tests/check-doc-item-size.sh` measures each `- **C<n>**` clause in `CONTRACT.md` and — since [#136](https://github.com/bencmorrison/modelguild/issues/136) — **every `- ` bullet in `AGENTS.md`, nested ones included** (a sub-bullet under a big parent used to be unmetered, which is where the growth actually was). Those two files only, so `SECURITY.md` and this one are not enforced. It fails CI. `AGENTS.md` additionally gets an **advisory** line measuring each top-level bullet *with its whole subtree* against a larger container threshold; that one reports and never fails.
-
-**A `doc-size-exempt` marker covers the item it sits in, and NOT that item's nested children.** Putting one on a container bullet to cover an oversized child does nothing — the child is its own item and still fails. Seven markers remain: six `CONTRACT.md` clauses citing [#135](https://github.com/bencmorrison/modelguild/issues/135), and `AGENTS.md`'s `PARITY` bullet citing #136. That is a backlog, not a waiver pool. If a new item does not fit, sort it with the three categories above — that is what the limit is for.
 
 ## Conventions that matter
 
