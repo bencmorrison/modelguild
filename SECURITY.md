@@ -63,6 +63,8 @@ The third case is reachable and is why the precondition is checked rather than i
 
 Delegate only on trusted repositories, and always review the diff — **of the tree that was actually edited.**
 
+The permission map itself is verified by `bash modelguild/verify-guild-build.sh` (asserts the `"*"` floor, `edit`/`write`/`patch`/`bash`/`read` allow, everything else — `task`/`grep`/`glob`/`webfetch`/`websearch` — deny, and that no former secret-glob read-deny remains, plus a runtime edit-path probe). What it proves is the resolved allow-set, never that this path is contained: `bash` is allowed by design, so the diff review is still the boundary.
+
 ### `guild-research` — the source-backed `/guild:research` workflow: **cannot mutate, is NOT a confidentiality boundary**
 Used by `/guild:research`: the `guild_research` MCP tool names the `guild-research` agent directly (`src/research.ts`) — there is no flag that selects it, and a missing hardened def is an `agent-def-missing` refusal, never a downgrade to a weaker agent. It has the **same allow-set as `guild-read`** — `read` + `grep` + `glob` + `webfetch`/`websearch` — with `bash`, `edit`/`write`/`patch`, and `task` denied. The no-write/no-`task` scoping is the read-only ROLE; the secret-glob read-denies and the `grep`/`glob` denials were removed in the 2026-07-22 realignment for the same reason as `guild-read` (vendor-asymmetry bias — see that section).
 

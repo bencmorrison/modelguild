@@ -10,6 +10,8 @@ Exactly what you do, start to finish, plus every variant off the happy path. Bac
 
 ## The six steps
 
+> **Installing from source, globally, or into a repo you don't control?** → **[Installation variants](#installation-variants)** covers the from-source build, `init --global`, registering by hand, and `--write-mcp`. The six steps below are the npm happy path; step 2 hands you `npx modelguild init`, which is the wrong command if you are running an unreleased build.
+
 **(1)** prerequisites, **(2)** install the payload (`init`), **(3)** register the MCP server yourself, **(4)** restart Claude Code so it loads it, **(5)** verify, **(6)** configure which models it uses. Steps 2 and 3 are **separate**: `init` copies the command docs / agent defs / policy template but **does not touch `.mcp.json`** — *you* register the server (step 3), so you choose global vs per-project scope. Step 6 configures *which models* it uses. You want all of them.
 
 ### 1. Prerequisites
