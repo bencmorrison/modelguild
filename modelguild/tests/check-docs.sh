@@ -18,9 +18,9 @@ user_files=(
   .devcontainer/postCreate.sh
   AGENTS.md
   CONTRIBUTING.md
-  INSTALL.md
   README.md
   SECURITY.md
+  docs
   modelguild/modelguild.conf.example
   modelguild/models.policy
 )
@@ -92,6 +92,7 @@ lifecycle_files=(
   README.md
   SECURITY.md
   CONTRIBUTING.md
+  docs
   modelguild/modelguild.conf.example
   .claude/commands/guild
   .opencode/agent
@@ -108,7 +109,9 @@ while IFS= read -r lifecycle_line; do
       ;;
   esac
 done < <(grep -RInE 'started[[:space:]]*[/+&][[:space:]]*completed([^[:alnum:]]|$)' "${lifecycle_files[@]}" || true)
-for file in AGENTS.md README.md SECURITY.md; do
+# The user-facing account of the evidence log moved from README.md to docs/operations.md
+# when the human docs were carved into docs/ (issue #122); the requirement follows the prose.
+for file in AGENTS.md docs/operations.md SECURITY.md; do
   grep -Fq 'expected-call' "$file" || bad "$file must document the expected-call lifecycle entry"
 done
 
@@ -160,7 +163,7 @@ if [ "${1:-}" = "--self-test" ]; then
     "$baseline/.opencode" "$baseline/modelguild"
   cp -a .claude/commands/guild "$baseline/.claude/commands/"
   cp -a .opencode/agent "$baseline/.opencode/"
-  cp -a AGENTS.md CONTRIBUTING.md INSTALL.md README.md SECURITY.md install.sh "$baseline/"
+  cp -a AGENTS.md CONTRIBUTING.md README.md SECURITY.md install.sh docs "$baseline/"
   cp -a .devcontainer/Dockerfile .devcontainer/devcontainer.json \
     .devcontainer/postCreate.sh "$baseline/.devcontainer/"
   cp -a modelguild/modelguild.conf.example modelguild/models.policy "$baseline/modelguild/"

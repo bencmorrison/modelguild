@@ -1,5 +1,5 @@
 /**
- * The opt-in approval bridge (issue #20, slice 4 of DESIGN-live-visibility.md).
+ * The opt-in approval bridge (slice 4 of the issue #20 design record).
  *
  * WHAT IT IS. Slices 1–3 made a guild call *watchable*: `src/activity.ts` streams what the
  * external model is DOING as it happens. This slice turns "see what it did" into "see what
