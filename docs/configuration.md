@@ -8,7 +8,7 @@ Everything you can set, and where it lives. Back to [README.md](../README.md).
 - [Timeouts](#timeouts)
 - [Skip the permission prompts](#skip-the-permission-prompts)
 
-The two files everything below is written to are **git-ignored** and both take effect **immediately — no restart**. They live under your chosen guild root: `~/.claude/modelguild/` for global, `<repo>/modelguild/` for one project. Roots are layered — see [Global vs project config](setup.md#global-vs-project-config).
+Most of what follows lives in two files under your chosen **guild root** — `~/.claude/modelguild/` for global, `<repo>/modelguild/` for one project: `modelguild.conf.local` (preferences and knobs) and `models.policy.local` (per-model rules). Both are **git-ignored** and both take effect **immediately — no restart**; roots are layered, so see [Global vs project config](setup.md#global-vs-project-config). The exceptions are named where they appear: the committed `models.policy` is tracked, not git-ignored, and [Skip the permission prompts](#skip-the-permission-prompts) is a Claude Code setting in a different file entirely.
 
 ## Picking the model
 
@@ -33,7 +33,7 @@ The same file carries the knobs for the operating features: `GUILD_ACTIVITY` / `
 
 `models.policy.local` in your chosen root holds per-model `deny`/`ask`/`allow` rules; the committed `models.policy` is default-allow. `/guild:configure` writes it for you, or edit it directly.
 
-Rules are first-match globs, and resolution is **layered the same way preferences are** — project rules are evaluated before global ones, first match anywhere wins, default-allow. `npx modelguild doctor` prints the whole chain, so what actually binds is visible rather than guessed; a refusal names the exact file that decided. A `deny` model is refused outright; an `ask` model requires your explicit approval before the call proceeds.
+Rules are first-match globs, and resolution is **layered analogously to preferences but merged differently** — preferences overlay key by key, whereas the policy is one chain: project rules are evaluated before global ones and the **first match anywhere wins**, falling through to default-allow if nothing matches. It is **fail-closed chain-wide**: a malformed or unreadable policy file in *any* layer denies, naming the file. `npx modelguild doctor` prints the whole chain, so what actually binds is visible rather than guessed; a refusal names the exact file that decided. A `deny` model is refused outright; an `ask` model requires your explicit approval before the call proceeds.
 
 ## Timeouts
 

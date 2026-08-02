@@ -33,7 +33,7 @@ if [ -n "$obsolete_matches" ]; then
   bad "obsolete unnamespaced command reference found; use /guild:<name>"
 fi
 
-if grep -RIn --include='*.md' 'Bash(bash collab/log\.sh:\*)' .claude/commands/guild README.md; then
+if grep -RIn --include='*.md' 'Bash(bash collab/log\.sh:\*)' .claude/commands/guild README.md docs; then
   bad "broad log.sh grant found; allow only required subcommands"
 fi
 
@@ -188,6 +188,19 @@ if [ "${1:-}" = "--self-test" ]; then
   cp -a "$baseline" "$fixture"
   printf '\nRun `/review` for details.\n' >> "$fixture/README.md"
   expect_rejected "obsolete command name" "$fixture"
+
+  # docs/ joined the linted set when the human docs left the repo root (issue #122).
+  # Both greps that cover README.md must cover the pages its content moved into, or the
+  # reorganisation would have quietly retired most of this lint's surface.
+  fixture="$tmp/obsolete-command-in-docs"
+  cp -a "$baseline" "$fixture"
+  printf '\nRun `/review` for details.\n' >> "$fixture/docs/setup.md"
+  expect_rejected "obsolete command name in a docs/ page" "$fixture"
+
+  fixture="$tmp/broad-log-grant-in-docs"
+  cp -a "$baseline" "$fixture"
+  printf '\n`Bash(bash collab/log.sh:*)`\n' >> "$fixture/docs/operations.md"
+  expect_rejected "broad log grant in a docs/ page" "$fixture"
 
   fixture="$tmp/missing-mcp-grant"
   cp -a "$baseline" "$fixture"
