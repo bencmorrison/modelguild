@@ -9,31 +9,83 @@
 #     CONTRACT.md  C73                  2958 words over 7 lines, 288 on its first
 #     AGENTS.md    `src/init.ts`        3601 words over 10 lines,  27 on its first
 # So an item runs from its start line to the next start line: `- **C<n>**` in
-# CONTRACT.md, a top-level `- ` bullet elsewhere. Blank and indented lines (nested
-# sub-bullets, continuation paragraphs) belong to the open item; the first non-blank
-# column-0 line closes it. Words are whitespace-separated tokens, as `wc -w` counts.
-# The --self-test asserts a reflowed item reports its true count; that assertion is
-# what stops this degrading into a formatter.
+# CONTRACT.md, ANY `- ` bullet (top-level or nested) in AGENTS.md. Blank lines and
+# indented continuation paragraphs belong to the open item; the next bullet, or the
+# first non-blank column-0 line, closes it. Words are whitespace-separated tokens, as
+# `wc -w` counts. The --self-test asserts a reflowed item reports its true count; that
+# assertion is what stops this degrading into a formatter.
 #
-# THRESHOLDS (measured at 935f8f1; re-measure before changing either).
-#   CONTRACT.md 700 — curve-fitted to the six clauses #122 targets, and it holds under
-#     item measurement: over-threshold is C73 2958, C68 2289, C69a 1483, C71 1283,
-#     C72 1133, C70 970, C33a 752; next largest C37 654, a 46-word margin. It is a
-#     TRIPWIRE FITTED TO SEVEN POINTS, not a law — hence the escape hatch below. (C33a
-#     was extracted by #127 and is now 467; the figures above are the 935f8f1 sample the
-#     threshold was fitted to, deliberately left as measured rather than re-stated.)
-#   AGENTS.md 700 — PROVISIONAL. That file has no target set to fit, so this is not an
-#     independent derivation and is not presented as one. What the distribution says:
-#     56 items, median 145, mean 410, p75 376, p90 909, max 3601. 700 sits at the 82nd
-#     percentile and inside a real gap (any value in 638..708 selects the same 10
-#     bullets), which is why it is tolerable rather than why it is right. RE-DERIVE
-#     from the then-current distribution once AGENTS.md extraction lands.
+# WHY AGENTS.md COUNTS NESTED BULLETS AS ITEMS (issue #136, closing the gap #122's pilot
+# exposed). Until #136 an AGENTS.md item ran top-level bullet to top-level bullet, so a
+# sub-bullet under an exempt parent was UNMETERED — and the three biggest bullets in the
+# file (`src/approve.ts`, `src/init.ts`, PARITY) are multi-sub-bullet CONTAINERS, which is
+# exactly where #94/#96/#107/#111 all landed. The pilot is the proof: #127 cut the #111
+# sub-bullet 1398 -> 439 words and this reporter's output was byte-identical apart from the
+# parent's total, which was exempt and still over. A success metric of "words per item
+# falling and staying down" could not see its own pilot. Now it can: that sub-bullet is its
+# own item and reads 439 (it would have read 1398 before), and both numbers are gated.
+#   THE COST, STATED. Nesting is now a way to pass: split a 1400-word bullet into two
+#   700-word children and every item clears. The CONTAINER line below is what keeps that
+#   visible — it reports each top-level bullet WITH its whole subtree, on the pre-#136
+#   measurement, so an aggregate that only got rearranged still shows its true size.
+#
+# THRESHOLDS.
+#   CONTRACT.md 700 (measured at 935f8f1; re-measure before changing it) — curve-fitted to
+#     the six clauses #122 targets, and it holds under item measurement: over-threshold is
+#     C73 2958, C68 2289, C69a 1483, C71 1283, C72 1133, C70 970, C33a 752; next largest
+#     C37 654, a 46-word margin. It is a TRIPWIRE FITTED TO SEVEN POINTS, not a law — hence
+#     the escape hatch below. (C33a was extracted by #127 and is now 467; the figures above
+#     are the 935f8f1 sample the threshold was fitted to, deliberately left as measured.)
+#   AGENTS.md 700 — RE-DERIVED for issue #136 and KEPT at 700, which is a different claim
+#     from the provisional 700 it replaces. Measured after #136's nine extractions landed,
+#     under the nested-bullet item rule above: 125 items, median 90, mean 151, p75 186,
+#     p90 358, p95 451, max 670, total 18902. Every item is under 700; the three largest
+#     (670/666/664) are the worktree READ ROOT, the WRITE ROOT and the SCAFFOLD bullets.
+#     PERCENTILE CONVENTION, stated because the first cut mixed two: rank = ceil(n·(1−p))+1
+#     in the descending-sorted list, which is the convention the 935f8f1 figures above were
+#     derived under (verified by re-deriving them: p75 376 at rank 15, p90 909 at rank 7 for
+#     n=56 — floor+1 would give 1052 there). `mean 151` is the value the script itself prints.
+#     WHY NOT LOWER. The one natural gap in the tail is 595 -> 470, so any threshold in
+#     471..595 would select the top six: READ ROOT 670, WRITE ROOT 666, SCAFFOLD 664,
+#     `src/activity.ts` 637, `src/server.ts` 626, `src/log.ts` 595. THREE of those were
+#     extracted by #136 and their residue is normative spec (what the code does, the stated
+#     capability costs, the priced guards); the OTHER THREE were never over 700 and were
+#     never touched, so lowering would newly fail three bullets nobody has sorted. Either way
+#     it means deleting specification or minting six exemptions, and a backlog nobody intends
+#     to clear is the waiver pool #127's promotion note warns about. So 700 stays.
+#     WHAT IT IS NOW, HONESTLY. It is a CEILING 30 words above the largest item rather than
+#     a percentile inside a gap: nothing is over it today, and the next 30 words added to
+#     the biggest bullet fail CI. That is a ratchet, and it is weaker than a threshold that
+#     bites on existing text. Note too that the top of this distribution is threshold-shaped
+#     rather than natural — those three items sit at 664-670 because extraction stopped once
+#     they cleared 700. Re-derive again after the next bulk extraction.
+#   AGENTS.md CONTAINER 1000 — WARN-ONLY, and deliberately not promoted here. A container is
+#     a top-level bullet plus its whole subtree (the pre-#136 measurement, kept alongside the
+#     item rule so nesting cannot hide an aggregate). Three are over it after #136:
+#     PARITY 2271, `src/init.ts` 2122, `src/approve.ts` 1880 — all three are CONTAINERS whose
+#     children are individually fine, so the remedy is structural (they are sections, not
+#     bullets), not more extraction. That is a maintainer decision and a separate change, so
+#     this line REPORTS and never fails; promote it in the PR that restructures them, the
+#     way STRICT_DEFAULT was promoted for items.
+#     PARITY'S SURVIVING `doc-size-exempt: #136` MARKER IS INERT FOR THE ENFORCED CHECK, and
+#     that is said here rather than left to be discovered. PARITY's own item is 112 words and
+#     its largest child is 317, so nothing under it is exempt FROM anything — the marker only
+#     annotates the advisory container line above, where PARITY really is 2271. It is kept as
+#     an intent signal (the largest container has a pointer to the work that owns it) and NOT
+#     as a waiver: if a PARITY child ever crosses 700, that child fails CI and this marker
+#     will not save it. #136 extracted the other nine bullets and left PARITY by decision.
 #
 # ESCAPE HATCH. An item may cite an issue to be exempted: put `doc-size-exempt: #<n>`
 # anywhere in it, conventionally an HTML comment so it does not render. Requiring an
 # explicit marker is deliberate — nearly every clause already cites an issue number,
 # so "cites an issue" would exempt everything. Exempt items are still PRINTED with
 # their size and their issue; an escape hatch that hides the item kills the tripwire.
+#   A MARKER IS NOT INHERITED. `flush()` searches only the item's own text, and since #136
+#   an AGENTS.md parent item ENDS at its first nested bullet — so a marker on a container
+#   bullet does NOT exempt that container's children. Putting one there to cover an
+#   oversized child is a red build with no explanation; mark the CHILD. (Before #136 the
+#   parent's item spanned the whole subtree, so a parent marker did cover everything under
+#   it. That is the semantic #136 changed, and CONTRIBUTING.md says so too.)
 #
 # PROMOTION — DONE (issue #127, the #122 pilot). The stated trigger was "the PR that
 # merges #127 sets STRICT_DEFAULT=1, in that same PR", and that PR did. From here an
@@ -64,7 +116,8 @@ set -euo pipefail
 STRICT_DEFAULT=1   # PROMOTED by the PR that merged #127 (the #122 pilot). See header.
 
 CONTRACT_THRESHOLD=700
-AGENTS_THRESHOLD=700   # provisional; see header
+AGENTS_THRESHOLD=700             # re-derived for #136; see header
+AGENTS_CONTAINER_THRESHOLD=1000  # WARN-ONLY (top-level bullet + subtree); see header
 
 script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -96,7 +149,7 @@ measure() {
     function mklabel(l,   t, i, n, out, arr) {
       if (mode == "clause") { t = l; sub(/^- [*][*]/, "", t); sub(/[*][*].*/, "", t); return t }
       t = l
-      sub(/^-[ \t]+/, "", t)
+      sub(/^[ \t]*-[ \t]+/, "", t)
       gsub(/[*`]/, "", t)
       n = split(t, arr, /[ \t]+/)
       out = ""
@@ -151,7 +204,9 @@ report_file() {
     threshold="$CONTRACT_THRESHOLD"
   else
     mode=bullet
-    startpat='^- '
+    # ANY bullet, at any indent (issue #136). A sub-bullet under an exempt parent used to
+    # be unmetered, which is where the growth actually was — see the header.
+    startpat='^[ \t]*- '
     threshold="$AGENTS_THRESHOLD"
   fi
 
@@ -172,7 +227,7 @@ report_file() {
   fi
 
   printf '\n%s — %s items (%s), threshold %s words\n' "$base" "$n" \
-    "$([ "$mode" = clause ] && echo 'clause `- **C<n>**` to next clause' || echo 'top-level `- ` bullet to next')" \
+    "$([ "$mode" = clause ] && echo 'clause `- **C<n>**` to next clause' || echo 'any `- ` bullet, nested included, to the next')" \
     "$threshold"
   awk -F'\t' '
     { w[NR] = $1; s += $1 }
@@ -204,8 +259,38 @@ report_file() {
   fi
 }
 
+# The CONTAINER view (issue #136), AGENTS.md only: each top-level bullet WITH its whole
+# subtree — the pre-#136 measurement — so that splitting an oversized bullet into
+# sub-bullets cannot make an aggregate disappear from this report. WARN-ONLY by decision:
+# the three over-threshold containers are structural (a section, not a bullet), which is a
+# maintainer call and a separate change. Promote it there, as STRICT_DEFAULT was promoted.
+report_containers() {
+  local path="$1" base rows n over
+  base="$(basename "$path")"
+  [ "$base" = "CONTRACT.md" ] && return 0
+  [ -r "$path" ] || return 0
+
+  rows="$tmp/$base.containers.tsv"
+  measure "$path" bullet '^- ' | sort -rn > "$rows"
+  n="$(awk 'END { print NR + 0 }' "$rows")"
+  [ "$n" -eq 0 ] && return 0
+
+  over="$(awk -F'\t' -v t="$AGENTS_CONTAINER_THRESHOLD" '$1 >= t { c++ } END { print c + 0 }' "$rows")"
+  printf '  containers (top-level bullet + subtree), advisory threshold %s words: ' \
+    "$AGENTS_CONTAINER_THRESHOLD"
+  if [ "$over" -eq 0 ]; then
+    printf 'none over\n'
+    return 0
+  fi
+  printf '%d over — report only, never a failure\n' "$over"
+  awk -F'\t' -v t="$AGENTS_CONTAINER_THRESHOLD" '$1 >= t {
+    printf "    %7d  %5d  %-5d  %s%s\n", $1, $2, $3, $5, ($4 == "-" ? "" : "   [exempt: #" $4 "]")
+  }' "$rows"
+}
+
 for f in "${files[@]}"; do
   report_file "$f"
+  report_containers "$f"
 done
 
 echo
@@ -342,16 +427,49 @@ if [ "$self_test" -eq 1 ]; then
     no "a bare issue reference wrongly exempted the item"
   fi
 
-  # --- bullet mode: nested sub-bullets belong to their parent item -------------------
+  # --- bullet mode: a NESTED sub-bullet is its own item (issue #136) -----------------
+  # This inverts the pre-#136 rule on purpose. A sub-bullet under an exempt parent used
+  # to be invisible, which is precisely where the growth was (see the header). Two
+  # 400-word children now report as two items, neither over the threshold...
   { printf -- '- top level bullet with a short first line\n'
     printf -- '  - nested: '; filler 400
     printf -- '  - nested: '; filler 400
   } > "$st/nested.md"
   cap "$st/nested.md"
-  if has '1 item(s) over'; then
-    ok "a top-level bullet carries its nested sub-bullets' words"
+  nested_items="$(awk '!a && /^nested\.md/ { print $3; a = 1 }' <<<"$captured")"
+  if [ "$nested_items" = "3" ] && has 'OK: no unexempted item'; then
+    ok "a nested sub-bullet is its OWN item: 3 items, neither 400-word child over threshold"
   else
-    no "nested sub-bullets were not counted into the parent item"
+    no "nested-as-item: items=$nested_items (expected 3), and the file should be under threshold"
+  fi
+  # ...and an OVER-threshold nested sub-bullet is caught, which the pre-#136 rule could
+  # only see by way of its parent's total.
+  { printf -- '- top level bullet with a short first line\n'
+    printf -- '  - nested: '; filler 800
+  } > "$st/nested-big.md"
+  cap "$st/nested-big.md"
+  if has '1 item(s) over'; then
+    ok "an over-threshold NESTED sub-bullet fails on its own account"
+  else
+    no "an 800-word nested sub-bullet was not flagged"
+  fi
+  # ...and the CONTAINER view still reports the aggregate, so splitting one oversized
+  # bullet into passing children cannot make the total disappear. Warn-only by decision.
+  { printf -- '- container bullet\n'
+    printf -- '  - nested: '; filler 600
+    printf -- '  - nested: '; filler 600
+  } > "$st/AGENTS.md"
+  cap "$st/AGENTS.md"
+  if has 'OK: no unexempted item' && has 'containers (top-level bullet + subtree)' && has '1 over'; then
+    ok "the container view reports a 1200-word aggregate whose children each pass"
+  else
+    no "the container view did not report the split aggregate"
+  fi
+  # And it is ADVISORY: an over-threshold container alone must not fail the run.
+  if run "$st/AGENTS.md" >/dev/null 2>&1; then
+    ok "an over-threshold container is exit 0 (report only, per the header)"
+  else
+    no "the container threshold failed the run — it is documented as warn-only"
   fi
   # ...and the next top-level bullet starts a new item rather than extending it.
   { printf -- '- first bullet: '; filler 400

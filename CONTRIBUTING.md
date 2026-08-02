@@ -86,7 +86,9 @@ Three categories. Sort every sentence you are about to add to `AGENTS.md`, `CONT
 
 **Contested ⇒ it stays.**
 
-**This is enforced, at 700 words per item.** `modelguild/tests/check-doc-item-size.sh` measures each `- **C<n>**` clause in `CONTRACT.md` and each top-level bullet in `AGENTS.md` — those two files only, so `SECURITY.md` and this one are not enforced — and fails CI. Sixteen items that were already over when it was promoted carry a `doc-size-exempt` marker citing the issue that owns their extraction ([#135](https://github.com/bencmorrison/modelguild/issues/135), [#136](https://github.com/bencmorrison/modelguild/issues/136)); that is a backlog, not a waiver pool. If a new item does not fit, sort it with the three categories above — that is what the limit is for.
+**This is enforced, at 700 words per item.** `modelguild/tests/check-doc-item-size.sh` measures each `- **C<n>**` clause in `CONTRACT.md` and — since [#136](https://github.com/bencmorrison/modelguild/issues/136) — **every `- ` bullet in `AGENTS.md`, nested ones included** (a sub-bullet under a big parent used to be unmetered, which is where the growth actually was). Those two files only, so `SECURITY.md` and this one are not enforced. It fails CI. `AGENTS.md` additionally gets an **advisory** line measuring each top-level bullet *with its whole subtree* against a larger container threshold; that one reports and never fails.
+
+**A `doc-size-exempt` marker covers the item it sits in, and NOT that item's nested children.** Putting one on a container bullet to cover an oversized child does nothing — the child is its own item and still fails. Seven markers remain: six `CONTRACT.md` clauses citing [#135](https://github.com/bencmorrison/modelguild/issues/135), and `AGENTS.md`'s `PARITY` bullet citing #136. That is a backlog, not a waiver pool. If a new item does not fit, sort it with the three categories above — that is what the limit is for.
 
 ## Conventions that matter
 
