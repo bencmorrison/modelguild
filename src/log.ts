@@ -4,6 +4,13 @@
  * WHY A PORT, NOT A REWRITE. The log is the ONLY data source that can be audited instead
  * of Claude's own summary, so its integrity is the whole honesty story. (The automated
  * witness that once read it retired at M12; the receipts remain, for the developer to read.)
+ *
+ * WHY THE WITNESS WENT AND THE LOG STAYED (maintainer, 2026-07-22 → M12). The *log* is
+ * justified: receipts — the other model's actual words kept locally, which found real bugs.
+ * The automated witness apparatus was model-recommended machinery the maintainer never
+ * demanded, and the parity observation cuts against it (Claude-subagent summaries got no
+ * witness and nobody proposed one). So the log is framed receipts-first, and a proposal to
+ * re-add an automated auditor has to answer that parity question first.
  * The bash `log.sh` is the oracle (CONTRACT.md area D, C22–C35); this module mirrors its
  * schema, hashing, and verify semantics BYTE-FOR-BYTE so that:
  *   - a TS-written run passes `bash log.sh verify`, and

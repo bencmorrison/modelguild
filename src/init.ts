@@ -17,6 +17,10 @@
  * writing/merging the project-scoped `.mcp.json` entry under the KEY `modelguild` (the
  * exact key the command grants `mcp__modelguild__<tool>` require).
  *
+ * A registered MCP server is global by nature — one registration works in every project —
+ * so the byte-templating and multi-root ownership machinery the old `--global` bash
+ * installer needed no longer exists. Don't reintroduce it (issue #19).
+ *
  * OWNERSHIP is ported from `install.sh`'s SHA-256 model, not reinvented: every file we
  * write records the sha256 of its written bytes in `modelguild/.modelguild-install.json`.
  * A re-install UPGRADES a file only while its current bytes still match the hash we
@@ -100,6 +104,18 @@ export function packageVersion(packageRoot: string = PACKAGE_ROOT): string {
 // Payload inventory — explicit, like install.sh's PAYLOAD_FILES (no dir walk: a
 // source tree can hold ignored/personal files a walk would sweep in).
 // ---------------------------------------------------------------------------
+/**
+ * The command docs, installed to `.claude/commands/guild/` — the subdirectory is the
+ * NAMESPACE, not tidiness (AGENTS.md carries the rule; this is the evidence for it).
+ *
+ * Our `/review` was found colliding with a bundled `review` skill in a live session
+ * (2026-07-15); the namespace is what fixes that. The collision is silent — the installer
+ * keeps the user's file — so nothing surfaces it but a human noticing the wrong command ran.
+ *
+ * The published Claude Code docs claim subdirectories do NOT namespace a command. Observed
+ * behaviour is `/guild:consult`, verified live. Check the live skill list before trusting a
+ * doc claim about command naming.
+ */
 const COMMAND_DOCS = [
   "consult",
   "panel",
