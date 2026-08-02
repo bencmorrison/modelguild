@@ -19,7 +19,9 @@
 #   CONTRACT.md 700 — curve-fitted to the six clauses #122 targets, and it holds under
 #     item measurement: over-threshold is C73 2958, C68 2289, C69a 1483, C71 1283,
 #     C72 1133, C70 970, C33a 752; next largest C37 654, a 46-word margin. It is a
-#     TRIPWIRE FITTED TO SEVEN POINTS, not a law — hence the escape hatch below.
+#     TRIPWIRE FITTED TO SEVEN POINTS, not a law — hence the escape hatch below. (C33a
+#     was extracted by #127 and is now 467; the figures above are the 935f8f1 sample the
+#     threshold was fitted to, deliberately left as measured rather than re-stated.)
 #   AGENTS.md 700 — PROVISIONAL. That file has no target set to fit, so this is not an
 #     independent derivation and is not presented as one. What the distribution says:
 #     56 items, median 145, mean 410, p75 376, p90 909, max 3601. 700 sits at the 82nd
@@ -33,19 +35,33 @@
 # so "cites an issue" would exempt everything. Exempt items are still PRINTED with
 # their size and their issue; an escape hatch that hides the item kills the tripwire.
 #
-# PROMOTION TRIGGER (the condition for becoming an error — concrete, in the same
-# commit as the warning, because a warning with no stated promotion condition is a
-# convention with a shell script attached, which is the failure #122 exists to avoid):
-#   This is warn-only (exit 0) until the #122 pilot extraction, issue #127, MERGES.
-#   The PR that merges #127 sets STRICT_DEFAULT=1 below, in that same PR; from then on
-#   an over-threshold, unexempted item is exit 1 and the escape hatch is the marker.
-#   If #127 is closed unmerged, this script is DELETED rather than left warning forever.
-#   `--strict` runs the promoted behaviour today, so the flip is a tested one-line change.
-# Two things are hard failures NOW, warn-only or not: a file that yields zero items
+# PROMOTION — DONE (issue #127, the #122 pilot). The stated trigger was "the PR that
+# merges #127 sets STRICT_DEFAULT=1, in that same PR", and that PR did. From here an
+# over-threshold, UNEXEMPTED item is exit 1.
+#   Honouring the trigger on the day meant 16 items already over the threshold would each
+#   have failed CI — six CONTRACT.md clauses and ten AGENTS.md bullets. Fifteen are
+#   wholly outside the pilot's scope; the sixteenth, AGENTS.md's `src/init.ts` item, is
+#   the CONTAINER of the sub-bullet the pilot extracted, which is why it dropped 3601 ->
+#   2646 words and is still over. They carry a marker instead, which is what the escape
+#   hatch is for: they stay PRINTED with their size, so the backlog is visible rather
+#   than silenced.
+#   Each cites the bulk-extraction issue that OWNS it — #135 for CONTRACT.md, #136 for
+#   AGENTS.md — filed as the pilot landed, per #122's own sequence. Not #122 itself: its
+#   target set names six clauses and C73 is not among them (#122's table was derived by
+#   counting words on each clause's FIRST PHYSICAL LINE, the proxy this script exists to
+#   replace, so the largest item in the repo was missing from it entirely). A marker is a
+#   pointer to work; pointing it at an issue that does not own the item is how a backlog
+#   becomes a waiver pool. Each marker's removal is that item's extraction landing.
+#   `--strict` still forces this behaviour explicitly. Warn-only survives only by editing
+#   the `STRICT_DEFAULT` assignment below — it is NOT an environment variable, despite
+#   this script taking `DOC_ITEM_SIZE_ROOT` from the environment.
+# Two things are hard failures regardless of strictness: a file that yields zero items
 # (the start-line anchor drifted and this lint has gone vacuous), and an unreadable file.
+# The self-test exercises them in the promoted default only — nothing drives warn-only
+# any more, so treat `STRICT_DEFAULT=0` as a debugging aid rather than a tested mode.
 set -euo pipefail
 
-STRICT_DEFAULT=0   # PROMOTION TRIGGER: set to 1 in the PR that merges #127.
+STRICT_DEFAULT=1   # PROMOTED by the PR that merged #127 (the #122 pilot). See header.
 
 CONTRACT_THRESHOLD=700
 AGENTS_THRESHOLD=700   # provisional; see header
@@ -195,10 +211,19 @@ done
 echo
 if [ "$failed" -ne 0 ]; then
   echo "doc item-size: FAIL"
+  # Name the remedy in the OUTPUT, not only in this file's header. A contributor meets
+  # this lint as a red CI line, and a hard failure whose fix is undiscoverable from the
+  # failure gets worked around rather than fixed.
+  cat <<'HINT'
+  Split the item, or route its rationale per CONTRIBUTING.md "Where rationale goes".
+  The escape hatch is an issue that OWNS the work: add `<!-- doc-size-exempt: #<n> -->`
+  inside the item. Do not point it at a tracker that does not own the item, and do not
+  reach for it to turn a red build green — that is what the limit is for.
+HINT
   exit 1
 fi
 if [ "$warned" -ne 0 ]; then
-  echo "doc item-size: WARN (reporting only — becomes an error in the PR that merges #127; see this script's header)"
+  echo "doc item-size: WARN (reporting only — STRICT_DEFAULT is 0; the promotion is described in this script's header)"
 else
   echo "doc item-size: PASS"
 fi
@@ -234,7 +259,11 @@ if [ "$self_test" -eq 1 ]; then
   # loaded one: this passed locally and failed on both CI platforms with no output at all.
   # So: capture once, then match the variable with bash's own `[[ == ]]` (no process, no
   # pipe) and extract with awk over a here-string that has no early `exit`.
-  cap() { captured="$(run "$@")"; }
+  # `|| true` INSIDE the substitution, not on `run` itself: since the #127 promotion the
+  # default is strict, so a `run` over an over-threshold fixture exits 1 and `set -e`
+  # would abort the whole self-test at the assignment. The exit-code assertions below
+  # call `run` directly and must keep seeing the true status, so the tolerance lives here.
+  cap() { captured="$(run "$@" || true)"; }
   has() { case "$captured" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 
   # --- THE LOAD-BEARING ASSERTION: counts by ITEM, not by LINE ----------------------
@@ -262,7 +291,7 @@ if [ "$self_test" -eq 1 ]; then
     no "reflowed fixture is not actually reflowed (longest line $longest_line)"
   fi
   cap "$st/reflowed.md"
-  if has 'WARN: 1 item(s) over'; then
+  if has '1 item(s) over'; then
     ok "the reflowed over-threshold item is reported"
   else
     no "the reflowed over-threshold item was not reported"
@@ -307,7 +336,7 @@ if [ "$self_test" -eq 1 ]; then
   # And a bare issue reference is NOT an exemption (otherwise every clause is exempt).
   { printf -- '- **C1** — (issue #126) '; filler 800; } > "$st/bare-issue.md"
   cap "$st/bare-issue.md"
-  if has 'WARN: 1 item(s) over'; then
+  if has '1 item(s) over'; then
     ok "a bare issue reference does not exempt"
   else
     no "a bare issue reference wrongly exempted the item"
@@ -319,7 +348,7 @@ if [ "$self_test" -eq 1 ]; then
     printf -- '  - nested: '; filler 400
   } > "$st/nested.md"
   cap "$st/nested.md"
-  if has 'WARN: 1 item(s) over'; then
+  if has '1 item(s) over'; then
     ok "a top-level bullet carries its nested sub-bullets' words"
   else
     no "nested sub-bullets were not counted into the parent item"
@@ -335,7 +364,7 @@ if [ "$self_test" -eq 1 ]; then
     no "two 400-word bullets were merged into one item"
   fi
 
-  # --- vacuity guard: zero items is a hard FAIL even in warn-only mode ---------------
+  # --- vacuity guard: zero items is a hard FAIL regardless of strictness -------------
   printf 'no items here at all, just a paragraph.\n' > "$st/CONTRACT.md"
   if run "$st/CONTRACT.md" >/dev/null 2>&1; then
     no "a file with zero items passed (the lint would be silently vacuous)"
@@ -343,16 +372,35 @@ if [ "$self_test" -eq 1 ]; then
     ok "a file with zero items is a hard FAIL (anchor-drift guard)"
   fi
 
-  # --- warn-only today, exit 1 under --strict ---------------------------------------
+  # --- THE PROMOTION (#127): strict is the DEFAULT, no flag required -----------------
+  # This is the assertion that makes the ratchet real. If someone sets STRICT_DEFAULT
+  # back to 0, this case is what fails — not a doc claim about it.
   if run "$st/reflowed.md" >/dev/null 2>&1; then
-    ok "warn-only: an over-threshold item exits 0 today"
+    no "an over-threshold item exited 0 with NO flag — the #127 promotion has been undone"
   else
-    no "warn-only mode exited non-zero"
+    ok "promoted: an over-threshold, unexempted item is exit 1 by DEFAULT (no --strict)"
+  fi
+  # `--strict` is a no-op while STRICT_DEFAULT is 1, so "it exits non-zero on an
+  # over-threshold item" no longer distinguishes the flag WORKING from the flag being
+  # DELETED — an unrecognised `-*` is a usage error, exit 2, which also passes. Deleting
+  # the `--strict` case and running this suite gave 14/14 PASS (proved in review). So the
+  # flag is asserted to be ACCEPTED as well, on a file that must exit 0.
+  if run --strict "$st/small.md" >/dev/null 2>&1; then
+    ok "--strict is still a recognised flag (exit 0 on an under-threshold file, not a usage error)"
+  else
+    no "--strict is no longer accepted — it now falls through to the usage error"
   fi
   if run --strict "$st/reflowed.md" >/dev/null 2>&1; then
     no "--strict accepted an over-threshold item"
   else
-    ok "--strict exits 1 on an over-threshold item (the promoted behaviour, tested today)"
+    ok "--strict still forces the same behaviour explicitly"
+  fi
+  # An EXEMPT item is exit 0 even under the promoted default — otherwise the escape
+  # hatch the 16 out-of-scope items rely on would not actually be an escape.
+  if run "$st/exempt.md" >/dev/null 2>&1; then
+    ok "an exempted over-threshold item is exit 0 under the promoted default"
+  else
+    no "the escape hatch does not exempt under the promoted default"
   fi
 
   # --- the real documents parse ------------------------------------------------------
