@@ -1,5 +1,5 @@
 /**
- * Live-activity layer (issue #20, slice 1 of DESIGN-live-visibility.md).
+ * Live-activity layer (slice 1 of the issue #20 design record).
  *
  * WHAT PROBLEM THIS SOLVES. Everything an external model does happens inside one
  * blocking `POST /session/{id}/message` (`src/client.ts` `sendMessage`), and nothing
