@@ -228,14 +228,21 @@ export function confGet(contents: string, key: string): string {
 // Run-id grammar (issue #73)
 //
 // A run id is a DIRECTORY NAME under the resolved logs root — `#runDir` joins it, and
-// `#ensureRun` mkdirs it and writes calls.jsonl / activity.jsonl / approvals.jsonl /
-// delegate patches inside. Before this it was taken verbatim from the caller (an MCP
-// tool's `runId` input) or from `$GUILD_RUN_ID`, so `../../..` wrote outside the root.
+// everything the layer records lands inside: calls.jsonl, activity.jsonl,
+// approvals.jsonl, meta.json, the delegate patches and a `reports/` subdirectory, every
+// one of them at `path.join(logsRoot, runId)`. (Written by several callers, not by one —
+// `#ensureRun` makes the directory and `reports/`, `newRun` writes meta.json, the entry
+// methods append calls.jsonl. The COMMON factor is the join, which is what this grammar
+// guards.) `latest` and `watchers/` are SIBLINGS of the run dir, not contents of it,
+// which is exactly why they are reserved names below. Before this the id was taken
+// verbatim from the caller (an MCP tool's `runId` input) or from `$GUILD_RUN_ID`, so
+// `../../..` wrote outside the root.
 //
 // The grammar is deliberately STRICT rather than merely traversal-proof: every run id in
 // the wild was minted by `newRun()` (`<UTC stamp>-<hex>`), so a conservative
 // single-segment shape costs nothing real, and an allowlist does not have to enumerate
-// what a filesystem finds special. Anything outside it is an ERROR, never a fresh-run
+// what a filesystem finds special — but a hand-written label must be a conservative
+// segment. Anything outside it is an ERROR, never a fresh-run
 // fallback — a caller who believes it threaded a run must not silently get a different one.
 // ---------------------------------------------------------------------------
 
@@ -308,7 +315,8 @@ export function isRunId(value: unknown): value is string {
 /**
  * Validate a run id supplied as tool INPUT, returning a result rather than throwing —
  * the same shape (and the same posture) as `parsePerCallTimeoutMs` in `config.ts`, so an
- * MCP handler turns it into a clear tool input error instead of an exception.
+ * MCP handler turns it into a clear tool input error instead of an exception. An explicit
+ * ask that is wrong is an error, not a silent default.
  */
 export function parseRunId(
   value: unknown,
@@ -318,7 +326,8 @@ export function parseRunId(
 }
 
 /** Throwing form, for the internal choke point. `source` names where the bad value came
- * from (the `runId` argument vs the `GUILD_RUN_ID` env var) so the failure is diagnosable. */
+ * from (the `runId` argument vs the `GUILD_RUN_ID` env var) so the failure is diagnosable
+ * and the operator is sent to the right knob. */
 export function assertRunId(value: unknown, source: string): string {
   if (isRunId(value)) return value;
   throw new Error(`modelguild: ${source} '${showRunId(value)}' is invalid — ${RUN_ID_RULE}.`);
