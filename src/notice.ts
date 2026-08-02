@@ -73,16 +73,29 @@
  *     not once per Claude Code session. Acting on it removes the skew entirely; consciously
  *     ignoring it costs one line, then silence until the next version.
  *
- * THE KEY IS THE VERSION STRING ALONE, AND THAT IS A STATED LIMIT (review finding L4). Nothing
- * about the payload's own bytes enters the suppression key, so a republish under the same
- * version, a `next`/`latest` dist-tag that moves, or development from a source checkout can move
- * the shipped payload while the notice stays silent — `doctor` and `guild_status` still report,
- * which is the backstop. A payload fingerprint in the key would close it; that is the
- * maintainer's call and is deliberately NOT done here.
+ * THE KEY IS VERSION + PAYLOAD FINGERPRINT (issue #145, maintainer decision 2026-08-02). This
+ * used to be the version string alone (review finding L4), and that was a stated limit: a
+ * republish under the same version, a `next`/`latest` dist-tag that moves, or development from a
+ * source checkout could move the shipped payload while the notice stayed silent. The fix folds a
+ * digest over the SHIPPED-payload hashes `scanInstalledPayload` already computed for the current
+ * scan's skewed files (`payloadFingerprint`, below) into the suppression key beside the version —
+ * no rescan, no second read of the payload. Suppression now requires BOTH to match; either one
+ * failing to compute (an unreadable version, or a fingerprint `payloadFingerprint` could not form)
+ * means the notice fires — same direction as the old unreadable-version case, never a guess.
+ * **Cost, accepted with the decision:** someone iterating on the payload from a source checkout
+ * sees the notice re-fire on every payload change, not just every version bump — the population
+ * most likely to hit this, and `GUILD_PAYLOAD_NOTICE=off` remains the escape. **Stored as two
+ * separate fields, not a concatenation** (`NoticeStateEntry`), so the state file stays
+ * inspectable — you can read which version and which payload a suppression is keyed on without
+ * decoding anything. **Backward compatibility:** a state file written before this change recorded
+ * the bare version string as the value. Read as `{ version, fingerprint: undefined }` — an absent
+ * fingerprint never equals a freshly computed one, so a legacy entry does NOT suppress the new
+ * key: the notice fires once more (the safe direction, consistent with "tell again, never guess a
+ * match") and the entry is rewritten with both fields on that same run.
  */
 
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -120,9 +133,51 @@ export function noticeKeyFor(skewed: PayloadFileState[]): string {
   return [...new Set(skewed.map((s) => s.recordPath))].sort().join("\n");
 }
 
+/**
+ * A digest over the SHIPPED-payload hashes `scanInstalledPayload` already computed for the
+ * skewed files in THIS scan — not a rescan, not a second read of the payload. Sorted by `dest`
+ * (paired with its hash) before hashing, so the fingerprint does not depend on scan order —
+ * mirrors `noticeKeyFor`.
+ *
+ * Scoped to the currently-skewed set rather than the whole payload: those are exactly the
+ * shipped hashes this call already has in hand, and a file that already matches the shipped
+ * bytes contributes nothing to "is the user out of sync" anyway.
+ *
+ * Returns `null` — "could not be computed" — for an empty set (the caller only ever calls this
+ * when there IS skew, so this is defensive, not a real path) or a malformed entry (missing/empty
+ * `dest`/`shippedHash`, which the type rules out but a corrupted scan should still not be
+ * trusted). The caller (`emitPayloadSkewNotice`) must treat `null` exactly like an unreadable
+ * version: it may never be used to suppress anything (issue #145).
+ */
+export function payloadFingerprint(skewed: PayloadFileState[]): string | null {
+  try {
+    if (!Array.isArray(skewed) || skewed.length === 0) return null;
+    const parts: string[] = [];
+    for (const s of skewed) {
+      if (!s || typeof s.dest !== "string" || s.dest.length === 0) return null;
+      if (typeof s.shippedHash !== "string" || s.shippedHash.length === 0) return null;
+      parts.push(`${s.dest}:${s.shippedHash}`);
+    }
+    parts.sort();
+    return createHash("sha256").update(parts.join("\n")).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/** What a suppression is keyed on for one install record: the server version AND a fingerprint
+ * of the shipped payload that skew was judged against (issue #145). Two separate fields, not a
+ * concatenation, so the state file stays inspectable. `fingerprint` is absent for an entry
+ * written before this change (or when it could not be computed) — see the header. */
+export interface NoticeStateEntry {
+  version: string;
+  fingerprint?: string;
+}
+
 export interface NoticeState {
-  /** record-key → the package version whose skew notice has already been shown for it. */
-  seen: Record<string, string>;
+  /** record-key → the version (+ payload fingerprint) whose skew notice has already been shown
+   * for it. */
+  seen: Record<string, NoticeStateEntry>;
 }
 
 /** Cap on the map, so a long-lived home config cannot grow a state file without bound. Entries
@@ -142,9 +197,26 @@ export function readNoticeState(file: string): NoticeState {
     const parsed = JSON.parse(readFileSync(file, "utf8")) as { seen?: unknown };
     const seen = parsed.seen;
     if (!seen || typeof seen !== "object" || Array.isArray(seen)) return { seen: {} };
-    const out: Record<string, string> = {};
+    const out: Record<string, NoticeStateEntry> = {};
     for (const [k, v] of Object.entries(seen as Record<string, unknown>)) {
-      if (typeof v === "string" && v.length > 0) out[k] = v;
+      // LEGACY shape (pre-#145): the value was the bare version string. Normalized to an entry
+      // with NO fingerprint — which never equals a freshly computed one, so this alone is what
+      // makes a legacy entry fail to suppress the new key (issue #145's backward-compat call).
+      if (typeof v === "string" && v.length > 0) {
+        out[k] = { version: v };
+        continue;
+      }
+      // Current shape: { version, fingerprint? }.
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const obj = v as Record<string, unknown>;
+        if (typeof obj.version === "string" && obj.version.length > 0) {
+          const entry: NoticeStateEntry = { version: obj.version };
+          if (typeof obj.fingerprint === "string" && obj.fingerprint.length > 0) {
+            entry.fingerprint = obj.fingerprint;
+          }
+          out[k] = entry;
+        }
+      }
     }
     return { seen: out };
   } catch {
@@ -179,7 +251,11 @@ export function writeNoticeState(file: string, state: NoticeState): boolean {
     // Trim oldest-first (insertion order) before writing, so the cap is enforced on disk.
     const entries = Object.entries(state.seen);
     const kept = entries.length > MAX_SEEN_ENTRIES ? entries.slice(-MAX_SEEN_ENTRIES) : entries;
-    writeFileSync(tmp, JSON.stringify({ version: 1, seen: Object.fromEntries(kept) }, null, 2) + "\n");
+    // File-format version bumped 1 → 2 for issue #145 (seen values became {version,
+    // fingerprint?} objects instead of bare strings). `readNoticeState` does not gate on this
+    // number — it distinguishes the two shapes structurally — so it is informational only, for
+    // a human reading the file, not a compatibility switch.
+    writeFileSync(tmp, JSON.stringify({ version: 2, seen: Object.fromEntries(kept) }, null, 2) + "\n");
     renameSync(tmp, file);
     return true;
   } catch {
@@ -272,6 +348,9 @@ export interface SkewNoticeResult {
   statePath: string;
   /** The record-derived key this announcement is filed under (`""` when there is no skew). */
   key: string;
+  /** The payload fingerprint this call computed (issue #145), or `null` when there was no skew
+   * to fingerprint or it could not be computed — see `payloadFingerprint`. */
+  fingerprint: string | null;
   /** True when the state write was attempted and failed. The notice then repeats on EVERY
    * start, not once — see `writeNoticeState` (review finding L5). */
   stateWriteFailed?: boolean;
@@ -293,6 +372,10 @@ export function emitPayloadSkewNotice(
     packageRoot?: string;
     /** Sink for the notice. Defaults to stderr — NEVER stdout (the MCP transport). */
     write?: (text: string) => void;
+    /** Test injection point for `payloadFingerprint` (issue #145) — lets the suite simulate an
+     * uncomputable fingerprint without corrupting real scan data. Defaults to the real
+     * function; production never overrides it. */
+    computeFingerprint?: (skewed: PayloadFileState[]) => string | null;
   } = {},
 ): SkewNoticeResult {
   const empty = (outcome: SkewNoticeOutcome, statePath = ""): SkewNoticeResult => ({
@@ -302,6 +385,7 @@ export function emitPayloadSkewNotice(
     version: "",
     statePath,
     key: "",
+    fingerprint: null,
   });
   try {
     const env = opts.env ?? process.env;
@@ -343,10 +427,17 @@ export function emitPayloadSkewNotice(
     // and what counts as already-announced cannot disagree — see the header (L1/L2).
     const key = noticeKeyFor(scan.skewed);
     const state = readNoticeState(statePath);
-    // An unnameable version must not suppress: we cannot claim the user was told about a
-    // release we cannot identify.
-    if (version.length > 0 && state.seen[key] === version) {
-      return { outcome: "already-shown", skewed: scan.skewed, lines: [], version, statePath, key };
+    // The fingerprint is computed from THIS scan's own skewed entries — no rescan (issue #145).
+    const fingerprint = (opts.computeFingerprint ?? payloadFingerprint)(scan.skewed);
+    const seenEntry = state.seen[key];
+    // Suppression requires BOTH the version and the payload fingerprint to be nameable AND to
+    // match the recorded entry. Either half missing — an unreadable version, an uncomputable
+    // fingerprint, or a legacy entry recorded before #145 with no fingerprint field at all —
+    // means we cannot prove the user was told about exactly this payload, so the safe direction
+    // is to tell them again rather than guess a match.
+    const canSuppress = version.length > 0 && fingerprint !== null;
+    if (canSuppress && seenEntry?.version === version && seenEntry?.fingerprint === fingerprint) {
+      return { outcome: "already-shown", skewed: scan.skewed, lines: [], version, statePath, key, fingerprint };
     }
 
     const lines = formatSkewNote({ skewed: scan.skewed, version, maxFiles: 8, unsolicited: true });
@@ -356,13 +447,14 @@ export function emitPayloadSkewNotice(
     write(
       lines.map((l, i) => (i === 0 ? `modelguild: ${l.replace(/^! /, "")}` : l)).join("\n") + "\n",
     );
-    // No version ⇒ nothing to key suppression on, so no write is ATTEMPTED (and the notice will
-    // repeat next start-up — the honest outcome when the release cannot be identified).
-    const attempted = version.length > 0;
+    // Nothing nameable to key suppression on ⇒ no write is ATTEMPTED (and the notice will repeat
+    // next start-up — the honest outcome when either half cannot be identified).
+    const attempted = canSuppress;
     // Read-modify-write of a shared map. Two servers starting at once can lose one entry, whose
     // only cost is one extra notice — the safe direction, and cheaper than a lock for a nag.
     const wrote =
-      attempted && writeNoticeState(statePath, { seen: { ...state.seen, [key]: version } });
+      attempted &&
+      writeNoticeState(statePath, { seen: { ...state.seen, [key]: { version, fingerprint: fingerprint as string } } });
     return {
       outcome: null,
       skewed: scan.skewed,
@@ -370,6 +462,7 @@ export function emitPayloadSkewNotice(
       version,
       statePath,
       key,
+      fingerprint,
       ...(attempted && !wrote ? { stateWriteFailed: true } : {}),
     };
   } catch {

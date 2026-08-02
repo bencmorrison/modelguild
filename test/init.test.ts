@@ -32,9 +32,10 @@ import {
   payloadFiles,
   resolveGlobalDirs,
   scanInstalledPayload,
+  type PayloadFileState,
   type ServerLaunch,
 } from "../src/init.js";
-import { emitPayloadSkewNotice, noticeStatePath, readNoticeState } from "../src/notice.js";
+import { emitPayloadSkewNotice, noticeStatePath, payloadFingerprint, readNoticeState } from "../src/notice.js";
 
 // The shipped default launch line: portable, non-interactive npx form.
 const LAUNCH: ServerLaunch = { command: "npx", args: ["-y", "modelguild", "serve"] };
@@ -237,6 +238,15 @@ export async function run(): Promise<number> {
   const bumpConsult = (root: string) => {
     writeFileSync(path.join(root, CONSULT), readFileSync(path.join(root, CONSULT), "utf8") + "\n<!-- next release -->\n");
   };
+  // A DIFFERENT payload mutation than `bumpConsult` — used to simulate a republish/moving
+  // dist-tag/source-checkout iteration that changes the shipped BYTES without bumping the
+  // version string (issue #145).
+  const bumpConsultDifferently = (root: string) => {
+    writeFileSync(
+      path.join(root, CONSULT),
+      readFileSync(path.join(root, CONSULT), "utf8") + "\n<!-- a DIFFERENT follow-up release -->\n",
+    );
+  };
 
   const PKG_V1 = fakePackage("1.0.0");
   const PKG_V2 = fakePackage("2.0.0", bumpConsult);
@@ -374,8 +384,18 @@ export async function run(): Promise<number> {
       "notice: the suppression key is the ownership record the skew was judged against",
     );
     c.check(
-      readNoticeState(statePath).seen[n1.key] === "2.0.0",
+      readNoticeState(statePath).seen[n1.key]?.version === "2.0.0",
       "notice: records the server VERSION it announced, under that key (not a session marker)",
+    );
+    // issue #145: the suppression key also carries a payload FINGERPRINT, as a separate field.
+    c.check(
+      typeof readNoticeState(statePath).seen[n1.key]?.fingerprint === "string" &&
+        (readNoticeState(statePath).seen[n1.key]?.fingerprint?.length ?? 0) > 0,
+      "notice: the recorded entry also carries a payload fingerprint, alongside the version",
+    );
+    c.check(
+      n1.fingerprint !== null && n1.fingerprint === readNoticeState(statePath).seen[n1.key]?.fingerprint,
+      "notice: the result reports the same fingerprint that was recorded",
     );
     // The suppression state must NOT live in — or disturb — the ownership record: that file is
     // the sole basis for never-clobber and hash-verified uninstall.
@@ -539,6 +559,179 @@ export async function run(): Promise<number> {
           path.join(pinned, ".modelguild-notice.json"),
         "notice: $GUILD_ROOT takes the suppression state (an explicitly pinned root stays the whole answer)",
       );
+    }
+
+    // --- issue #145: the payload FINGERPRINT joins the suppression key -------------------
+    // Each of these gets its own fresh home/project so it cannot be perturbed by — or perturb —
+    // the version-only assertions above.
+
+    // (11) Same version, IDENTICAL shipped payload ⇒ suppressed, same as before #145 — but now
+    //      because BOTH fields match, not just the version.
+    {
+      const fpHome = tempProject();
+      const fpProj = tempProject();
+      init({ targetDir: fpProj, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      const fpBase = {
+        env: {} as NodeJS.ProcessEnv,
+        cwd: fpProj,
+        home: fpHome,
+        xdgConfigHome: tempProject(),
+        write: (t: string) => { out.push(t); },
+      };
+      const fpStatePath = noticeStatePath({ env: {}, home: fpHome });
+
+      out = [];
+      const fp1 = emitPayloadSkewNotice({ ...fpBase, packageRoot: PKG_V2 });
+      c.check(fp1.outcome === null, `notice/fingerprint: fires on a fresh skew (outcome ${fp1.outcome})`);
+      const entry1 = readNoticeState(fpStatePath).seen[fp1.key];
+      c.check(
+        entry1?.version === "2.0.0" && typeof entry1?.fingerprint === "string" && entry1.fingerprint.length > 0,
+        "notice/fingerprint: the recorded entry carries version and fingerprint as separate fields",
+      );
+
+      out = [];
+      const fp2 = emitPayloadSkewNotice({ ...fpBase, packageRoot: PKG_V2 });
+      c.check(
+        fp2.outcome === "already-shown",
+        `notice/fingerprint: identical version+payload stays suppressed (outcome ${fp2.outcome})`,
+      );
+
+      // (12) Same version, DIFFERENT shipped payload — a republish, a moving dist-tag, or
+      //      source-checkout iteration. The version alone would have suppressed this; the
+      //      fingerprint is exactly what makes it fire again.
+      const PKG_V2_REPUBLISH = fakePackage("2.0.0", bumpConsultDifferently);
+      out = [];
+      const fp3 = emitPayloadSkewNotice({ ...fpBase, packageRoot: PKG_V2_REPUBLISH });
+      c.check(
+        fp3.outcome === null,
+        `notice/fingerprint: a same-version republish with different shipped bytes re-fires (outcome ${fp3.outcome})`,
+      );
+      const entry3 = readNoticeState(fpStatePath).seen[fp3.key];
+      c.check(
+        typeof entry3?.fingerprint === "string" && entry3.fingerprint !== entry1?.fingerprint,
+        "notice/fingerprint: the stored fingerprint changed to match the new shipped bytes",
+      );
+
+      // And it is suppressed again once the new fingerprint is the recorded one.
+      out = [];
+      const fp4 = emitPayloadSkewNotice({ ...fpBase, packageRoot: PKG_V2_REPUBLISH });
+      c.check(
+        fp4.outcome === "already-shown",
+        `notice/fingerprint: suppressed again once the new fingerprint is recorded (outcome ${fp4.outcome})`,
+      );
+    }
+
+    // (13) BACKWARD COMPATIBILITY: a state file written before #145 held the bare version
+    //      string. That must NOT suppress the new key (my instruction: err toward telling) —
+    //      the notice fires once more and the entry is upgraded to carry both fields.
+    {
+      const legHome = tempProject();
+      const legProj = tempProject();
+      init({ targetDir: legProj, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      const legBase = {
+        env: {} as NodeJS.ProcessEnv,
+        cwd: legProj,
+        home: legHome,
+        xdgConfigHome: tempProject(),
+        write: (t: string) => { out.push(t); },
+      };
+      const legStatePath = noticeStatePath({ env: {}, home: legHome });
+      const legKey = path.join(legProj, "modelguild/.modelguild-install.json");
+
+      mkdirSync(path.dirname(legStatePath), { recursive: true });
+      writeFileSync(legStatePath, JSON.stringify({ version: 1, seen: { [legKey]: "2.0.0" } }, null, 2) + "\n");
+      c.check(
+        readNoticeState(legStatePath).seen[legKey]?.version === "2.0.0" &&
+          readNoticeState(legStatePath).seen[legKey]?.fingerprint === undefined,
+        "notice/fingerprint: a hand-written legacy entry reads back as version-only, no fingerprint",
+      );
+
+      out = [];
+      const leg1 = emitPayloadSkewNotice({ ...legBase, packageRoot: PKG_V2 });
+      c.check(
+        leg1.outcome === null,
+        `notice/fingerprint: a legacy version-only entry does NOT suppress the new key (outcome ${leg1.outcome})`,
+      );
+      const upgraded = readNoticeState(legStatePath).seen[legKey];
+      c.check(
+        upgraded?.version === "2.0.0" && typeof upgraded?.fingerprint === "string" && upgraded.fingerprint.length > 0,
+        "notice/fingerprint: the legacy entry is rewritten to carry both fields on this same run",
+      );
+
+      // Once upgraded, the identical payload is suppressed as normal.
+      out = [];
+      const leg2 = emitPayloadSkewNotice({ ...legBase, packageRoot: PKG_V2 });
+      c.check(
+        leg2.outcome === "already-shown",
+        `notice/fingerprint: the upgraded entry suppresses normally afterwards (outcome ${leg2.outcome})`,
+      );
+    }
+
+    // (14) An UNCOMPUTABLE fingerprint must suppress NOTHING — same direction as an unreadable
+    //      version — and it fires on EVERY start while it stays uncomputable, never recording a
+    //      half-formed entry.
+    {
+      const uHome = tempProject();
+      const uProj = tempProject();
+      init({ targetDir: uProj, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      const uBase = {
+        env: {} as NodeJS.ProcessEnv,
+        cwd: uProj,
+        home: uHome,
+        xdgConfigHome: tempProject(),
+        write: (t: string) => { out.push(t); },
+        computeFingerprint: () => null,
+      };
+
+      out = [];
+      const u1 = emitPayloadSkewNotice({ ...uBase, packageRoot: PKG_V2 });
+      c.check(
+        u1.outcome === null,
+        `notice/fingerprint: an uncomputable fingerprint still announces, never silences (outcome ${u1.outcome})`,
+      );
+      c.check(u1.fingerprint === null, "notice/fingerprint: the result reports the uncomputable fingerprint as null");
+      c.check(
+        readNoticeState(noticeStatePath({ env: {}, home: uHome })).seen[u1.key] === undefined,
+        "notice/fingerprint: nothing is recorded when the fingerprint could not be computed",
+      );
+
+      out = [];
+      const u2 = emitPayloadSkewNotice({ ...uBase, packageRoot: PKG_V2 });
+      c.check(
+        u2.outcome === null,
+        `notice/fingerprint: it keeps firing on every start while the fingerprint stays uncomputable (outcome ${u2.outcome})`,
+      );
+    }
+
+    // (15) Direct unit coverage of `payloadFingerprint` itself, independent of the emitter.
+    {
+      const validEntry: PayloadFileState = {
+        dest: "x",
+        installedPath: "/a",
+        shippedPath: "/b",
+        installedHash: "h1",
+        shippedHash: "h2",
+        recordPath: "/r",
+      };
+      c.check(
+        payloadFingerprint([]) === null,
+        "payloadFingerprint: an empty skew set is uncomputable (defensive — the emitter never calls it this way)",
+      );
+      c.check(
+        payloadFingerprint([{ ...validEntry, shippedHash: "" }]) === null,
+        "payloadFingerprint: a malformed entry (empty shipped hash) is uncomputable rather than guessed",
+      );
+      const fpA = payloadFingerprint([validEntry]);
+      const fpB = payloadFingerprint([validEntry]);
+      c.check(typeof fpA === "string" && fpA === fpB, "payloadFingerprint: deterministic for the same input");
+      const other: PayloadFileState = { ...validEntry, dest: "y", shippedHash: "h3" };
+      const comboAB = payloadFingerprint([validEntry, other]);
+      const comboBA = payloadFingerprint([other, validEntry]);
+      c.check(
+        typeof comboAB === "string" && comboAB === comboBA,
+        "payloadFingerprint: order-independent (sorted before hashing, mirrors noticeKeyFor)",
+      );
+      c.check(comboAB !== fpA, "payloadFingerprint: a different skewed set produces a different fingerprint");
     }
   }
 
