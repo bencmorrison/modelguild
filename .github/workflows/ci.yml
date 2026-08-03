@@ -237,11 +237,11 @@ jobs:
     #
     # `doctor` was MISSING from this list (it ran only under a local `npm test`, so its
     # coverage — including the issue-#22 upgrade-drift checks — was never enforced here).
-    # It is offline and belongs. NOTE its one environment dependency: doctor hard-fails the
-    # MCP-registration check when the `claude` CLI IS on PATH and answers "not registered"
-    # (real product behaviour). This runner has no `claude`, so that check degrades to the
-    # documented warning and the suite is green; on a dev box that HAS `claude`, expect the
-    # registration-dependent checks to fail locally.
+    # It is offline and belongs. Since issue #151 it no longer depends on this runner's PATH
+    # at all: `doctor` hard-fails on a missing `opencode` (which this runner deliberately does
+    # not install) and on the `claude` CLI answering "not registered" (which a dev box does),
+    # so the suite shadows PATH with a stub `opencode` and no `claude` for its whole run. It is
+    # therefore green here and on a dev box alike — a local red is a real red.
     steps:
       - uses: actions/checkout@v4
 

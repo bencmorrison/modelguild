@@ -4,8 +4,8 @@
  * The published npm package's `bin`. Subcommands:
  *   serve   (default) — start the MCP stdio server (what `.mcp.json` launches).
  *   init              — place the MCP-era payload into a project (see init.ts).
- *   doctor            — a token-free health check (opencode present, MCP registration,
- *                       command docs + agent defs present, config/policy roots).
+ *   doctor            — a token-free health check (opencode present AND authenticated, MCP
+ *                       registration, command docs + agent defs present, config/policy roots).
  *   watch             — tail the live activity of guild model calls (issue #20): the
  *                       external model's reads/greps/fetches/edits/commands as they happen.
  *   logs clean        — apply log retention by hand (issue #23): delete run dirs older
@@ -255,6 +255,90 @@ function printRegisterInstructions(targetDir: string, launch: ServerLaunch, glob
   console.log("");
 }
 
+/**
+ * What `opencode auth list` says about this machine's credentials (issue #151).
+ *
+ * PROBED on opencode 1.18.11 (2026-08-03) rather than inferred:
+ *
+ *   authed (GitHub Copilot oauth):  "┌  Credentials …" / "●  GitHub Copilot oauth" / "└  1 credentials", exit 0
+ *   empty  (XDG_DATA_HOME=/tmp/…):  "┌  Credentials …" / "└  0 credentials",                             exit 0
+ *   env keys (OPENAI_API_KEY etc.): the same, PLUS a second "Environment" section ending
+ *                                   "└  2 environment variables"
+ *
+ * Two facts shape the parse. (1) The EXIT CODE carries nothing — it is 0 in every state, so the
+ * printed counts are the only signal. (2) There are TWO credential sources and both count:
+ * `auth.json` and provider API-key env vars. Reading only the first would flag a user who
+ * authenticates entirely through `OPENAI_API_KEY`, which works fine. The `Environment` section
+ * is printed only when non-empty, so its absence means zero.
+ *
+ * BLIND SPOTS — PLURAL, and they are why the caller WARNS rather than fails (maintainer
+ * decision, 2026-08-03). A provider declared directly in `opencode.json` is invisible to
+ * `auth list` in at least two shapes, both probed on 1.18.11: an `apiKey` written into the
+ * provider's options, and a local or OpenAI-compatible endpoint that needs no credential at all
+ * (an ollama-style base URL). Both print "0 credentials" with no `Environment` section while
+ * models answer perfectly well. So a zero here is a report about what `auth list` can SEE, not
+ * a proof that nothing can answer — and because the verdict is a warning, those configurations
+ * produce a false ALARM rather than a false failure.
+ *
+ * Anything unparseable returns `unknown`: a doctor that cannot read the output has learned
+ * nothing, and reporting nothing-learned as unauthenticated would be a lie.
+ */
+export type OpencodeAuthState =
+  | { kind: "authed"; credentials: number; envVars: number }
+  | { kind: "none" }
+  | { kind: "unknown"; why: string };
+
+type SpawnSyncish = (
+  cmd: string,
+  args: string[],
+  opts: { encoding: "utf8"; timeout?: number },
+) => { status: number | null; stdout?: string | null; stderr?: string | null; error?: Error };
+
+/**
+ * The LAST end-of-line match of `re` in `text`, or null.
+ *
+ * Both counts are read as LINE FOOTERS, not as the first substring that looks like one. The
+ * unanchored `\b` search this replaces took whichever came first and could match inside a
+ * longer word — an earlier "0 credentials-migrated" note would be read as the credential count
+ * and silently produce a "no credentials" verdict. Anchoring to end-of-line rejects the
+ * hyphenated shape outright, and taking the LAST match keeps the real footer authoritative when
+ * something legitimately precedes it. A format change that leaves no line-final count degrades
+ * to `unknown` — the safe direction — rather than to a false zero.
+ */
+function lastLineFinalCount(re: RegExp, text: string): number | null {
+  let last: number | null = null;
+  for (const m of text.matchAll(re)) last = parseInt(m[1], 10);
+  return last;
+}
+
+export function opencodeAuthState(spawnSyncFn: SpawnSyncish): OpencodeAuthState {
+  let res: ReturnType<SpawnSyncish>;
+  try {
+    // Bounded: `auth list` is a local read, so anything slow is a hang, and doctor must not
+    // become the thing that never returns.
+    res = spawnSyncFn("opencode", ["auth", "list"], { encoding: "utf8", timeout: 15000 });
+  } catch (e) {
+    return { kind: "unknown", why: `\`opencode auth list\` could not be run (${String(e)})` };
+  }
+  if (res.error) return { kind: "unknown", why: `\`opencode auth list\` could not be run (${res.error.message})` };
+  if (res.status !== 0) {
+    return { kind: "unknown", why: `\`opencode auth list\` exited ${res.status ?? "on a signal"}` };
+  }
+  // ANSI first: opencode colourizes the provider/detail columns, and a colour reset sits
+  // between the glyph and the count on some lines.
+  const text = `${res.stdout ?? ""}\n${res.stderr ?? ""}`.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+  const credentials = lastLineFinalCount(/(\d+)[ \t]+credentials?[ \t]*\r?$/gm, text);
+  if (credentials === null) {
+    return {
+      kind: "unknown",
+      why: "`opencode auth list` printed no credential count (its output format may have changed)",
+    };
+  }
+  const envVars = lastLineFinalCount(/(\d+)[ \t]+environment variables?[ \t]*\r?$/gm, text) ?? 0;
+  if (credentials === 0 && envVars === 0) return { kind: "none" };
+  return { kind: "authed", credentials, envVars };
+}
+
 /** A light, token-free doctor: no model call. Confirms the MCP-era payload is present
  * and coherent. This is the deep check — the bash `doctor.sh` was retired at M12. */
 export async function runDoctor(
@@ -361,12 +445,14 @@ export async function runDoctor(
   const docsWhere = new Set<Found>();
   const agentsWhere = new Set<Found>();
   const missingDocs: string[] = [];
+  const missingAgents: string[] = [];
   for (const { dest } of payloadFiles()) {
     const isDoc = dest.startsWith(".claude/commands/");
     if (isDoc) docsTotal++;
     const where = locate(dest);
     if (where === "none") {
       if (isDoc) missingDocs.push(path.basename(dest, ".md"));
+      else if (dest.startsWith(".opencode/agent/")) missingAgents.push(path.basename(dest, ".md"));
       continue;
     }
     if (isDoc) { docsPresent++; docsWhere.add(where); }
@@ -389,7 +475,16 @@ export async function runDoctor(
       ? `${docsPresent}/${docsTotal} command docs present in ${docsLoc}${whereSuffix(docsWhere)}`
       : `${docsPresent}/${docsTotal} command docs present in ${docsLoc} — missing: ${missingDocs.join(", ")}`;
   line(missingDocs.length === 0, docsMsg);
-  line(agentsPresent === 3, `${agentsPresent}/3 hardened agent defs present in ${agentsLoc}${whereSuffix(agentsWhere)}`);
+  // NEGATIVE FORMS, not one positive sentence under a ✗ (issue #151). `line(ok, msg)` picks the
+  // glyph but cannot rewrite the words, so a single "present in …" string produced the outright
+  // contradiction `✗ model policy present (…)` and the near-one `✗ 0/3 … present in …`. Each
+  // failing line now says what is MISSING and where it looked — mirroring the command-docs
+  // line's `— missing:` pattern, which already had it right.
+  const agentsMsg =
+    missingAgents.length === 0
+      ? `${agentsPresent}/3 hardened agent defs present in ${agentsLoc}${whereSuffix(agentsWhere)}`
+      : `${agentsPresent}/3 hardened agent defs present in ${agentsLoc} — missing: ${missingAgents.join(", ")}`;
+  line(missingAgents.length === 0, agentsMsg);
 
   // Policy / config template present — project `modelguild/models.policy` OR global.
   const globalPolicy = payloadDest("modelguild/models.policy", globalOpts);
@@ -400,7 +495,9 @@ export async function runDoctor(
     : `modelguild/models.policy or ${globalPolicyPath}`;
   line(
     policyWhere !== "none",
-    `model policy present (${policyLoc})${whereSuffix(new Set([policyWhere]))}`,
+    policyWhere !== "none"
+      ? `model policy present (${policyLoc})${whereSuffix(new Set([policyWhere]))}`
+      : `model policy MISSING — looked in: ${policyLoc}`,
   );
 
   // LAYERED config/policy resolution (issue #19) — report BOTH layers, not just the winner.
@@ -533,12 +630,77 @@ export async function runDoctor(
     );
   }
 
-  // opencode binary (best-effort; a missing binary is a warning, not a hard fail here).
+  // opencode binary — a HARD FAIL since issue #151. It used to be a `!` warning under
+  // `doctor: OK`, which inverted the severity ordering: a merely-unregistered MCP server failed
+  // (exit 1) while the one condition that guarantees NO model can ever answer passed. There is
+  // nothing degraded about this state — every `guild_*` tool spawns `opencode serve` — so it is
+  // a ✗, and unlike the auth check below it has no blind spot to soften the claim: no opencode,
+  // no `opencode serve`, no call. NOTE the scope: C72's "skew and drift never change the exit
+  // code" is untouched, and deliberately so. That rule is about the state of the installed
+  // PAYLOAD (behind a release is not broken); this is about the binary the system runs on.
   const oc = spawnSync("opencode", ["--version"], { encoding: "utf8" });
-  if (oc.status === 0) {
+  const opencodePresent = oc.status === 0;
+  if (opencodePresent) {
     console.log(`✓ opencode present (${(oc.stdout || "").trim()})`);
+  } else if (oc.error) {
+    // A spawn error is NOT synonymous with "not on PATH" — EACCES (present, not executable) and
+    // EPERM reach here too, and telling that user to install opencode sends them at the wrong
+    // problem. Only ENOENT earns the not-found wording; every other errno is named as itself.
+    const code = (oc.error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      line(false, "opencode not found on PATH — install it (https://opencode.ai) and run `opencode auth login`");
+    } else {
+      line(
+        false,
+        `could not execute opencode (${code ?? oc.error.message}) — it is on PATH but would not ` +
+          "run; check its permissions and reinstall if needed, then run `opencode auth login`",
+      );
+    }
   } else {
-    console.warn("! opencode not found on PATH — run its install and `opencode auth login`");
+    line(
+      false,
+      `opencode is on PATH but \`opencode --version\` failed (exit ${oc.status ?? "?"}) — ` +
+        "reinstall it, then run `opencode auth login`",
+    );
+  }
+
+  // AUTH PRESENCE (issue #151). `--version` proves the binary exists and nothing more; a user
+  // who never ran `opencode auth login` passed every documented verification step and met the
+  // failure at their first `/guild:consult`, inside Claude Code. Skipped whenever the binary
+  // CHECK failed — not-found and on-PATH-but-broken alike — because in both cases the line
+  // above already named the cause and `auth list` could tell us nothing anyway.
+  //
+  // A WARNING, NOT A FAILURE (maintainer decision, 2026-08-03, after two independent reviews
+  // reached the same position). The probe cannot see every way this state could be fine — see
+  // the blind spots on `opencodeAuthState` — so a zero is evidence, not proof. That is the rule
+  // this file already follows elsewhere: the MCP-registration check downgrades to a warning
+  // when `claude` is absent rather than call a working global setup broken, and C72 keeps
+  // payload skew/drift report-only. The binary checks stay hard failures because they have no
+  // such blind spot: no opencode, no `opencode serve`, no call.
+  if (opencodePresent) {
+    const auth = opencodeAuthState(spawnSync);
+    if (auth.kind === "authed") {
+      console.log(
+        `✓ opencode authenticated (${auth.credentials} stored credential(s), ` +
+          `${auth.envVars} provider env var(s))`,
+      );
+    } else if (auth.kind === "none") {
+      console.warn(
+        "! opencode has NO credentials and no provider API-key env vars — run `opencode auth " +
+          "login`. Until you do, every guild tool call reaches a provider that will refuse it. " +
+          "(If your provider is configured directly in opencode.json — an apiKey, or a local " +
+          "endpoint needing no credential — `opencode auth list` cannot see it and this line is " +
+          "a false alarm.)",
+      );
+    } else {
+      // FAIL-OPEN on an unreadable probe: "could not determine" must never be reported as
+      // "unauthenticated". A future opencode that reformats `auth list` lands here, and a
+      // warning is the honest verdict — doctor did not learn anything either way.
+      console.warn(
+        `! could not determine whether opencode is authenticated — ${auth.why}. ` +
+          "Check by hand with `opencode auth list`.",
+      );
+    }
   }
 
   console.log(ok ? "\ndoctor: OK" : "\ndoctor: problems found (see ✗ above)");

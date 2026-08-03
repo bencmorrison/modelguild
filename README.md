@@ -18,7 +18,7 @@ claude mcp add modelguild -s user -- npx -y modelguild serve
 npx modelguild doctor
 ```
 
-Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:consult` — `doctor` calls no model, so that consult is what proves your opencode auth actually works. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
+Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:consult` — `doctor` warns when opencode has no credentials at all, but it calls no model, so that consult is what proves your opencode auth actually works. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
 
 ## Contents
 

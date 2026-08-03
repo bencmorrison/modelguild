@@ -5,6 +5,8 @@
  * call; it only reads /doc, /global/health, /agent).
  */
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Checker, pidAlive, waitFor, tsxBin, serverEntry, repoRoot } from "./harness.js";
@@ -26,6 +28,26 @@ export async function run(): Promise<number> {
   let servePid: number | undefined;
   try {
     await client.connect(transport);
+
+    // serverInfo (issue #151). This is the only test that sees the real MCP handshake, and the
+    // version there was hardcoded "0.0.0" — so the one surface every client sees identified
+    // nothing. It must now be the RUNNING package's version, which this checkout's
+    // package.json is the oracle for.
+    const info = client.getServerVersion();
+    c.check(info?.name === "modelguild", `serverInfo.name is 'modelguild' (got ${String(info?.name)})`);
+    c.check(
+      typeof info?.version === "string" && info.version !== "0.0.0",
+      `serverInfo.version is not the hardcoded placeholder (got ${String(info?.version)})`,
+    );
+    {
+      const pkg = JSON.parse(
+        readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+      ) as { version?: string };
+      c.check(
+        info?.version === pkg.version,
+        `serverInfo.version matches package.json (${String(info?.version)} vs ${String(pkg.version)})`,
+      );
+    }
 
     const tools = await client.listTools();
     const tool = tools.tools.find((t) => t.name === "guild_status");
