@@ -6,25 +6,171 @@
  * 0/3 agents, a missing policy, and exited 1 — even though everything resolves fine globally.
  *
  * `runDoctor` returns 0/1 and takes an `inject?: { homeDir, xdgConfigHome }`, so we drive it
- * with injected temp dirs and NEVER touch the real `~/.claude` / `~/.config`. Offline: the
- * MCP-registration and opencode-binary checks are warnings (not failures) when the tools are
- * absent, so the pass/fail is driven only by the docs/agents/policy payload checks under test.
+ * with injected temp dirs and NEVER touch the real `~/.claude` / `~/.config`. Offline
+ * throughout: no model is called and no opencode process is spawned.
  *
- * ENVIRONMENT DEPENDENCY, stated because it bites locally: that "warning, not failure" holds
- * only while the `claude` CLI is ABSENT. When `claude` IS on PATH and answers "modelguild is not
- * registered", doctor hard-fails that check (correctly) and every absolute `code === 0`
- * assertion here fails — a dev-container fact, not a regression. CI has no `claude`, so the
- * suite is green there. The issue-#22 drift checks below deliberately assert against a BASELINE
- * doctor run in the same environment rather than a literal 0, so they hold either way.
+ * THE ENVIRONMENT DEPENDENCY THIS SUITE USED TO CARRY IS GONE, and the reason it had to go is
+ * worth knowing. It used to run under the ambient PATH, which made the verdict depend on two
+ * host facts: whether the `claude` CLI was present (present-and-answering-"not registered" is a
+ * hard fail, so every absolute `code === 0` assertion went red on a dev box and green in CI),
+ * and — since issue #151 made a missing opencode a hard fail too — whether opencode was
+ * installed at all, which CI deliberately does not do. Both are now shadowed: `run()` wraps the
+ * whole suite in a PATH holding a stub `opencode` and nothing else. The BASELINE-RELATIVE
+ * pattern is kept regardless (the issue-#22/#94 drift and skew cases compare against a `base`
+ * doctor run rather than a literal 0) — it costs nothing and it is the honest assertion: what
+ * those cases claim is that drift does not CHANGE the verdict.
  */
 
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Checker, repoRoot } from "./harness.js";
 import { init, type ServerLaunch } from "../src/init.js";
 import { runDoctor } from "../src/cli.js";
+
+/**
+ * A fake `opencode` placed FIRST on PATH — the same injection point `test/serve-stderr.test.ts`
+ * uses, and for the same reason: it drives the real `spawnSync("opencode", …)` rather than a
+ * test-only command knob production would never take.
+ *
+ * `authList` is the byte-exact output `opencode auth list` should produce; `versionFails` makes
+ * `--version` exit non-zero (an installed-but-broken opencode, a different message from an
+ * absent one); `notExecutable` produces EACCES instead of ENOENT. Everything else exits 1, so an
+ * unexpected invocation is loud rather than silently fine.
+ */
+function opencodeStub(opts: {
+  versionFails?: boolean;
+  authList?: AuthListFixture;
+  notExecutable?: boolean;
+}): string {
+  const dir = realpathSync(mkdtempSync(path.join(os.tmpdir(), "cc-doctor-oc-")));
+  // The `auth list` payload goes to a FILE the stub `cat`s, never through `printf` in the
+  // script. That is not tidiness: `printf '%s\n' "…\n…"` emits the backslash-n LITERALLY, so
+  // every fixture was really one physical line. The old unanchored parser matched anyway; the
+  // line-anchored one (correctly) did not, and the fixture — not the product — was what was
+  // wrong. A file keeps the bytes exactly as `opencode auth list` writes them.
+  const listPath = path.join(dir, "authlist.txt");
+  writeFileSync(listPath, opts.authList?.out ?? "");
+  const errLine = opts.authList?.err !== undefined ? `  printf '%s' ${shq(opts.authList.err)} >&2` : "  :";
+  const body = [
+    "#!/usr/bin/env bash",
+    'if [ "$1" = "--version" ]; then',
+    opts.versionFails === true
+      ? "  echo 'opencode: fatal' >&2\n  exit 3"
+      : "  printf '9.9.9-fake\\n'\n  exit 0",
+    "fi",
+    'if [ "$1" = "auth" ] && [ "$2" = "list" ]; then',
+    `  cat ${shq(listPath)}`,
+    errLine,
+    `  exit ${opts.authList?.exit ?? 0}`,
+    "fi",
+    "exit 1",
+  ].join("\n");
+  // `notExecutable` drops the exec bits, which makes `spawnSync` fail with EACCES rather than
+  // ENOENT — the case that proves the not-found wording is gated on the errno, not on "any
+  // spawn error" (issue #151 review, D3).
+  writeFileSync(path.join(dir, "opencode"), body + "\n", {
+    mode: opts.notExecutable === true ? 0o644 : 0o755,
+  });
+  return dir;
+}
+
+/** Single-quote a string for the stub's bash. */
+const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** What a stubbed `opencode auth list` writes: stdout bytes, optional stderr, optional exit. */
+interface AuthListFixture {
+  out: string;
+  err?: string;
+  exit?: number;
+}
+
+/** The real `opencode auth list` shapes, transcribed from a live probe on 1.18.11 (issue #151).
+ *  Written with the ANSI colour codes it actually emits, because stripping them is part of what
+ *  the parse has to get right — and as raw bytes, `cat`'d by the stub (see `opencodeStub`). */
+const ESC = String.fromCharCode(27);
+const AUTH_LIST: Record<string, AuthListFixture> = {
+  /** One stored credential (GitHub Copilot oauth), no provider env vars. */
+  authed: {
+    out:
+      `${ESC}[0m\n┌  Credentials ${ESC}[90m~/.local/share/opencode/auth.json\n│\n` +
+      `●  GitHub Copilot ${ESC}[90moauth\n│\n└  1 credentials\n`,
+  },
+  /** An empty auth store — note the exit code is 0 here too, which is why it cannot be used. */
+  empty: {
+    out: `${ESC}[0m\n┌  Credentials ${ESC}[90m~/.local/share/opencode/auth.json\n│\n└  0 credentials\n`,
+  },
+  /** No stored credentials, but two provider API-key env vars — a WORKING setup. */
+  envOnly: {
+    out:
+      `${ESC}[0m\n┌  Credentials ${ESC}[90m~/.local/share/opencode/auth.json\n│\n└  0 credentials\n\n` +
+      `┌  Environment\n│\n●  Anthropic ${ESC}[90mANTHROPIC_API_KEY\n│\n` +
+      `●  OpenAI ${ESC}[90mOPENAI_API_KEY\n│\n└  2 environment variables\n`,
+  },
+  /** A future opencode that reformats the output: parseable by nothing here. */
+  unreadable: { out: "credentials: none of your business\n" },
+  /** The subcommand itself failing. */
+  fails: { out: "", err: "auth: boom\n", exit: 4 },
+  /** SINGULAR — "1 credential", not "1 credentials". */
+  singular: { out: `┌  Credentials\n│\n●  GitHub Copilot ${ESC}[90moauth\n│\n└  1 credential\n` },
+  /** A misleading EARLIER line-final count, then the real footer. The last one must win. */
+  misleadingEarlier: {
+    out:
+      "note: migrated 0 credentials\n" +
+      `┌  Credentials\n│\n●  GitHub Copilot ${ESC}[90moauth\n│\n└  2 credentials\n`,
+  },
+  /** The hyphenated shape an unanchored `\b` matched INSIDE: not a footer, must not read as one. */
+  hyphenatedOnly: { out: "note: 0 credentials-migrated during upgrade\n" },
+};
+
+/**
+ * A directory holding exactly the two commands the stubs need: `bash` (their
+ * `#!/usr/bin/env bash` resolves it through PATH) and `cat` (the stub prints its `auth list`
+ * fixture from a file). Listing them EXPLICITLY, rather than keeping `/usr/bin:/bin` on PATH,
+ * makes the shadowing total for the binaries under test: no `opencode` and no `claude` can be
+ * reached however the host is laid out.
+ *
+ * Both entries are load-bearing and were each found the hard way — a PATH without `bash` makes
+ * every stub invocation a spawn error, and a PATH without `cat` makes the stub print nothing,
+ * which the parser correctly reports as "could not determine" and every authed assertion fails.
+ */
+const SHELL_TOOLS: Record<string, string[]> = {
+  bash: ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"],
+  cat: ["/bin/cat", "/usr/bin/cat"],
+};
+let shellDirCache: string | null = null;
+function shellOnlyDir(): string {
+  if (shellDirCache !== null) return shellDirCache;
+  const dir = realpathSync(mkdtempSync(path.join(os.tmpdir(), "cc-doctor-sh-")));
+  for (const [name, candidates] of Object.entries(SHELL_TOOLS)) {
+    const found = candidates.find((p) => existsSync(p));
+    if (found === undefined) {
+      throw new Error(`doctor.test: no ${name} found for the PATH-shadowed cases`);
+    }
+    symlinkSync(found, path.join(dir, name));
+  }
+  shellDirCache = dir;
+  return dir;
+}
+
+/**
+ * Run `fn` with PATH replaced by `dir` plus the bash-only dir — `null` means the bash-only dir
+ * alone, i.e. no `opencode` on PATH at all. `claude` is absent either way, which puts the MCP
+ * check on its documented warning branch; that is what lets these cases assert ABSOLUTE exit
+ * codes where the rest of this suite has to compare against `base`.
+ */
+async function withPath<T>(dir: string | null, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.PATH;
+  const sh = shellOnlyDir();
+  process.env.PATH = dir === null ? sh : `${dir}:${sh}`;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.PATH;
+    else process.env.PATH = prev;
+  }
+}
 
 const LAUNCH: ServerLaunch = { command: "npx", args: ["-y", "modelguild", "serve"] };
 
@@ -56,7 +202,25 @@ async function captureDoctor(
   }
 }
 
+/**
+ * The WHOLE suite runs with PATH shadowed by a stub `opencode` that reports itself present and
+ * authenticated (issue #151). This is not decoration — it is what keeps the suite offline AND
+ * environment-independent now that both opencode checks are hard failures:
+ *
+ *   - CI has no opencode at all, so without a stub every absolute `code === 0` assertion in
+ *     cases (a)-(r) would fail there for a reason those cases are not about.
+ *   - A dev box HAS opencode and may or may not be logged in, so the verdict would differ
+ *     between machines.
+ *   - `claude` is off PATH here too, which puts the MCP-registration check on its documented
+ *     warning branch — the same state CI has always had.
+ *
+ * Cases (s)-(z) nest their own `withPath` inside this one to vary the opencode state.
+ */
 export async function run(): Promise<number> {
+  return withPath(opencodeStub({ authList: AUTH_LIST.authed }), runCases);
+}
+
+async function runCases(): Promise<number> {
   const c = new Checker();
   console.log("== doctor.test ==");
 
@@ -297,6 +461,210 @@ export async function run(): Promise<number> {
   c.check(
     skewLines(r.out).every((l) => !l.includes("✗")),
     "(r) global skew is a ! warning line too, never a ✗",
+  );
+
+  // ---- issue #151: opencode presence + AUTH are HARD failures — cases (s)-(z) --------
+  // These cases replace PATH with a stub dir containing only a fake `opencode`, so `claude` is
+  // absent too and the MCP check takes its warning branch. The verdict is then a pure function
+  // of the payload (a full, pristine install) plus the two opencode checks — which is what lets
+  // them assert absolute exit codes where the rest of this suite must go through `base`.
+  const projOc = tempDir();
+  init({ targetDir: projOc, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const ocInject = { homeDir: tempDir(), xdgConfigHome: tempDir() };
+  const runOc = (stubDir: string | null) =>
+    withPath(stubDir, () => captureDoctor(["--dir", projOc], ocInject));
+
+  // (s) The reference point for the rest: binary present, authed ⇒ a clean exit 0.
+  const sOk = await runOc(opencodeStub({ authList: AUTH_LIST.authed }));
+  c.check(sOk.code === 0, `(s) opencode present + authed: doctor PASSES (exit ${sOk.code})`);
+  c.check(!sOk.out.includes("✗"), "(s) a healthy install with an authed opencode prints NO ✗ line");
+  c.check(sOk.out.includes("✓ opencode present (9.9.9-fake)"), "(s) reports the opencode version");
+  c.check(
+    sOk.out.includes("✓ opencode authenticated (1 stored credential(s), 0 provider env var(s))"),
+    "(s) reports the credential counts it parsed",
+  );
+
+  // (t) MISSING BINARY: was a `!` warning under `doctor: OK`. Now a ✗ / exit 1 — the severity
+  // inversion issue #151 is named for. Nothing else about the install has changed from (s).
+  const tMissing = await runOc(null);
+  c.check(tMissing.code === 1, `(t) opencode missing: doctor FAILS (exit ${tMissing.code})`);
+  c.check(
+    tMissing.out.includes("✗ opencode not found on PATH"),
+    "(t) the missing binary is a ✗ line, not a ! warning",
+  );
+  c.check(
+    tMissing.out.includes("opencode auth login") && tMissing.out.includes("opencode.ai"),
+    "(t) the refusal keeps the actionable remedy (install, then auth login)",
+  );
+  c.check(
+    !tMissing.out.includes("doctor: OK"),
+    "(t) doctor does not print OK when opencode is missing",
+  );
+  // AND the auth check is SKIPPED — one cause must not produce two lines.
+  c.check(
+    !tMissing.out.includes("authenticated") && !tMissing.out.includes("NO credentials"),
+    "(t) no auth line at all when the binary itself is missing",
+  );
+
+  // (u) On PATH but `--version` fails: same verdict, distinct message (different remedy).
+  const uBroken = await runOc(opencodeStub({ versionFails: true }));
+  c.check(uBroken.code === 1, `(u) opencode --version failing: doctor FAILS (exit ${uBroken.code})`);
+  c.check(
+    uBroken.out.includes("✗ opencode is on PATH but") && uBroken.out.includes("exit 3"),
+    "(u) an installed-but-broken opencode is named as such, with its exit status",
+  );
+
+  // (v) ZERO credentials AND zero provider env vars ⇒ a `!` WARNING, exit UNCHANGED
+  // (maintainer decision 2026-08-03; both review rounds independently reached it). The probe
+  // has real blind spots — a provider configured straight into opencode.json, whether by
+  // apiKey or as a local endpoint needing no credential, is invisible to `auth list` while
+  // models answer — so a zero is evidence, not proof, and doctor must not call that setup
+  // broken. Same posture as the claude-absent registration downgrade and C72's report-only
+  // skew/drift rule.
+  const vNoAuth = await runOc(opencodeStub({ authList: AUTH_LIST.empty }));
+  c.check(
+    vNoAuth.code === sOk.code,
+    `(v) no credentials does NOT change doctor's verdict (${vNoAuth.code} vs authed ${sOk.code})`,
+  );
+  c.check(
+    vNoAuth.out.includes("! opencode has NO credentials"),
+    "(v) the unauthenticated state is a ! warning line",
+  );
+  c.check(
+    !vNoAuth.out.includes("✗ opencode has NO credentials"),
+    "(v) it is NOT a ✗ (the probe cannot see every working configuration)",
+  );
+  c.check(vNoAuth.out.includes("doctor: OK"), "(v) doctor still reports OK");
+  c.check(vNoAuth.out.includes("opencode auth login"), "(v) names the remedy");
+  c.check(vNoAuth.out.includes("Until you do"), "(v) the remedy sentence reads grammatically");
+  c.check(
+    vNoAuth.out.includes("opencode.json") &&
+      vNoAuth.out.includes("apiKey") &&
+      vNoAuth.out.includes("local endpoint needing no credential"),
+    "(v) names BOTH blind-spot shapes, not just the apiKey one",
+  );
+  c.check(
+    vNoAuth.out.includes("✓ opencode present"),
+    "(v) the binary line still passes — the two checks are independent",
+  );
+
+  // (w) ZERO stored credentials but provider API-key ENV VARS ⇒ a working setup, so ✓.
+  // The false-✗ guard: reading only the `Credentials` section would fail this user.
+  const wEnv = await runOc(opencodeStub({ authList: AUTH_LIST.envOnly }));
+  c.check(wEnv.code === 0, `(w) env-var-only auth PASSES (exit ${wEnv.code})`);
+  c.check(
+    wEnv.out.includes("✓ opencode authenticated (0 stored credential(s), 2 provider env var(s))"),
+    "(w) both credential sources are counted, and reported separately",
+  );
+
+  // (x) UNPARSEABLE output ⇒ a `!` "could not determine", never a "no credentials" claim.
+  // Both are warnings now, but they say different things: one reports a state, the other
+  // reports that no state could be read.
+  const xUnknown = await runOc(opencodeStub({ authList: AUTH_LIST.unreadable }));
+  c.check(
+    xUnknown.out.includes("! could not determine whether opencode is authenticated"),
+    "(x) unparseable `auth list` output is reported as could-not-determine",
+  );
+  c.check(
+    !xUnknown.out.includes("NO credentials"),
+    "(x) could-not-determine is NOT reported as unauthenticated",
+  );
+  c.check(xUnknown.code === 0, `(x) an unreadable probe does not fail doctor (exit ${xUnknown.code})`);
+
+  // (y) `auth list` itself failing ⇒ same fail-open verdict, naming the exit status.
+  const yFails = await runOc(opencodeStub({ authList: AUTH_LIST.fails }));
+  c.check(
+    yFails.out.includes("! could not determine") && yFails.out.includes("exited 4"),
+    "(y) a failing `auth list` is a warning naming its exit status",
+  );
+  c.check(yFails.code === 0, `(y) a failing auth probe does not fail doctor (exit ${yFails.code})`);
+
+  // ---- (y2) D3: a spawn error that is NOT ENOENT must not say "not found on PATH" ----------
+  // An opencode that is present but not executable sets EACCES. Telling that user to install
+  // opencode sends them at the wrong problem; it is still a hard failure, with its own wording.
+  const y2Eacces = await runOc(opencodeStub({ notExecutable: true }));
+  c.check(y2Eacces.code === 1, `(y2) a non-executable opencode still FAILS (exit ${y2Eacces.code})`);
+  c.check(
+    y2Eacces.out.includes("✗ could not execute opencode") && y2Eacces.out.includes("EACCES"),
+    "(y2) the errno is named rather than guessed at",
+  );
+  c.check(
+    !y2Eacces.out.includes("not found on PATH"),
+    "(y2) EACCES is NOT reported as 'not found on PATH' (the wording is gated on ENOENT)",
+  );
+  c.check(
+    !y2Eacces.out.includes("authenticated") && !y2Eacces.out.includes("NO credentials"),
+    "(y2) the auth check is skipped whenever the BINARY check failed, not only when it is missing",
+  );
+
+  // ---- (y3) PARSER ANCHORING: the counts are LINE FOOTERS ---------------------------------
+  // The first cut used an unanchored `\b` search and took the FIRST match, so a stray earlier
+  // count — or a hyphenated word the `\b` matched inside — was read as the credential total.
+  {
+    const singular = await runOc(opencodeStub({ authList: AUTH_LIST.singular }));
+    c.check(
+      singular.out.includes("✓ opencode authenticated (1 stored credential(s), 0 provider env var(s))"),
+      "(y3) the SINGULAR footer '1 credential' parses",
+    );
+
+    const earlier = await runOc(opencodeStub({ authList: AUTH_LIST.misleadingEarlier }));
+    c.check(
+      earlier.out.includes("✓ opencode authenticated (2 stored credential(s), 0 provider env var(s))"),
+      "(y3) a misleading EARLIER '0 credentials' line loses to the real footer (last match wins)",
+    );
+    c.check(
+      !earlier.out.includes("NO credentials"),
+      "(y3) ...and does not produce a false 'no credentials' warning",
+    );
+
+    const hyphen = await runOc(opencodeStub({ authList: AUTH_LIST.hyphenatedOnly }));
+    c.check(
+      hyphen.out.includes("! could not determine whether opencode is authenticated"),
+      "(y3) '0 credentials-migrated' is not a footer — it degrades to could-not-determine",
+    );
+    c.check(
+      !hyphen.out.includes("NO credentials"),
+      "(y3) ...never to a false 'no credentials' (the whole point of anchoring)",
+    );
+  }
+
+  // (z) NEGATIVE WORDING (issue #151 finding 3): `line(ok, msg)` picks the glyph but cannot
+  // rewrite the words, so a single positive sentence produced `✗ model policy present (…)`.
+  // Reuses (c)'s nothing-installed fixture shape.
+  const zEmpty = await withPath(opencodeStub({ authList: AUTH_LIST.authed }), () =>
+    captureDoctor(["--dir", tempDir()], { homeDir: tempDir(), xdgConfigHome: tempDir() }),
+  );
+  c.check(zEmpty.code === 1, `(z) nothing installed still FAILS (exit ${zEmpty.code})`);
+  c.check(
+    !zEmpty.out.includes("✗ model policy present"),
+    "(z) the policy failure no longer contradicts itself",
+  );
+  c.check(
+    zEmpty.out.includes("✗ model policy MISSING"),
+    "(z) the policy failure states a negative, naming where it looked",
+  );
+  c.check(
+    zEmpty.out.includes("modelguild/models.policy"),
+    "(z) the policy failure still names the locations it searched",
+  );
+  c.check(
+    zEmpty.out.includes("0/3 hardened agent defs") && zEmpty.out.includes("missing: guild-"),
+    "(z) the agent-def failure mirrors the command-docs `— missing:` pattern, naming each def",
+  );
+  // Asserted on the agent-def LINE, not on the whole output: the def names must appear in its
+  // `— missing:` list, not merely somewhere on screen.
+  {
+    const agentLine = zEmpty.out.split("\n").find((l) => l.includes("hardened agent defs")) ?? "";
+    const missingPart = agentLine.split("— missing:")[1] ?? "";
+    c.check(
+      ["guild-read", "guild-build", "guild-research"].every((n) => missingPart.includes(n)),
+      `(z) all three missing agent defs are named on that line (got "${missingPart.trim()}")`,
+    );
+  }
+  // And the positive forms are untouched when everything IS present (regression guard on (s)).
+  c.check(
+    sOk.out.includes("✓ model policy present (") && sOk.out.includes("✓ 3/3 hardened agent defs present in"),
+    "(z) the passing forms are unchanged",
   );
 
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);

@@ -65,7 +65,7 @@ Claude Code reads its MCP registrations **at session start**, so it will not see
 
 ### 5. Verify
 
-Run the token-free `doctor` — it checks opencode is present, the MCP registration, the agent defs, and the policy, without calling any model:
+Run the token-free `doctor` — it checks opencode is present (and warns if it finds no credentials), the MCP registration, the agent defs, and the policy, without calling any model:
 ```bash
 npx modelguild doctor --dir /path/to/your/project
 ```
@@ -90,7 +90,7 @@ Prefer a **non-Claude** model for consults so the second opinion is genuinely in
 
 ### 7. Run a first consult
 
-Step 5 is token-free by design: `doctor` never logs in and never queries a provider, so it cannot tell you whether your opencode auth is still valid — an unauthenticated setup passes it and fails at the first model call. The only thing that proves the whole path works is a real call, so make a small one inside Claude Code:
+Step 5 is token-free by design: `doctor` never logs in and never queries a provider. It does check whether opencode has any credentials at all — and warns when it finds none — but it cannot tell you whether those credentials are still **valid**, whether the provider is reachable, or whether the model you picked will answer. It also can't see a provider configured directly in `opencode.json`, so it stays quiet in some working setups and warns in others. The only thing that proves the whole path is a real call, so make a small one inside Claude Code:
 
 ```
 /guild:consult In one sentence, what is a git worktree?
@@ -179,12 +179,25 @@ Whichever route you take, the key must be exactly `modelguild` — see [step 3](
   • local     /repo/modelguild/models.policy.local
   • committed /repo/modelguild/models.policy
   - committed ~/.claude/modelguild/models.policy (absent)
-✓ no upgrade drift: every installed file matches the version it was written from
+✓ approval bridge: OFF (default) — GUILD_APPROVE=off, GUILD_APPROVE_EGRESS=off; no tool call is gated
+✓ no payload skew, no upgrade drift: every installed file matches what this release ships
 ✓ opencode present (…)
+✓ opencode authenticated (1 stored credential(s), 0 provider env var(s))
 
 doctor: OK
 ```
 (The `[found: …]` tag reports whether the payload was located in the project, globally, or a mix. The **layers** line shows the whole config/policy chain that actually binds — see [Global vs project config](#global-vs-project-config) — with `•` for a file that exists and `-` for one that doesn't.)
+
+### Reading the glyphs
+
+A `✗` is a broken piece and sets the exit code; a `!` is something `doctor` couldn't judge, or a state that's behind but working. The registration, payload, agent-def and policy `✗`s have always been failures. Issue #151 added **one new hard failure** and **one new warning**:
+
+- **New hard failure — `✗ opencode not found on PATH …`.** Every guild tool call spawns `opencode serve`, so a missing binary is not a degraded state, it is a broken one. (It used to be a `!` under `doctor: OK`.) Two neighbouring shapes get their own message: a binary that *is* on PATH but whose `--version` fails, and one that can't be executed at all (`✗ could not execute opencode (EACCES) …`) — different problems, different fixes.
+- **New warning — `! opencode has NO credentials …`.** `opencode --version` only proves the binary exists, so this line runs `opencode auth list` (token-free, no model call) and counts both credential sources it reports: what `opencode auth login` stored, and provider API-key environment variables. It's a **warning, not a failure**, because the check can't see every working setup: a provider configured directly in `opencode.json` — an `apiKey`, or a local endpoint that needs no credential — is invisible to `opencode auth list` while models answer fine. If you're on one of those, this line is a false alarm and `doctor` still exits OK. If the output can't be read at all, doctor says `! could not determine …` rather than guessing.
+
+Payload skew and upgrade drift are always warnings too — being behind a release is not a broken install, and they never change the exit code.
+
+**What `doctor` still can't tell you:** whether your credentials are *valid* or your provider is *reachable*. It never logs in and never calls a model. [Step 7](#7-run-a-first-consult) is what proves the whole path.
 
 ## Global vs project config
 

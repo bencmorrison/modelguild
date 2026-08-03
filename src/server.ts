@@ -30,6 +30,9 @@ import { enforceRetentionOnStart, resolveRunIdArg } from "./log.js";
 // The payload-skew notice (issue #94). Its own module so it is unit-testable: importing THIS
 // file constructs the MCP server and connects the stdio transport at module top level.
 import { emitPayloadSkewNotice } from "./notice.js";
+// `PACKAGE_ROOT`/`packageVersion` for the MCP handshake's serverInfo (issue #151) — the same
+// derivation the payload-skew scan uses, imported rather than recomputed.
+import { PACKAGE_ROOT, packageVersion } from "./init.js";
 // The progress channel lives in its own module so it can be tested: importing THIS file
 // constructs the MCP server and connects the stdio transport at module top level.
 import { withProgress, type ProgressCapableExtra } from "./progress.js";
@@ -157,8 +160,18 @@ async function httpJson(url: string): Promise<unknown> {
 // ---------------------------------------------------------------------------
 // Server wiring.
 // ---------------------------------------------------------------------------
+// The MCP handshake's `serverInfo` — the ONE surface every client sees, and the version
+// README's bug-report checklist asks for. It was hardcoded "0.0.0" (issue #151), so it
+// identified nothing. `packageVersion`/`PACKAGE_ROOT` are reused rather than reimplemented:
+// PACKAGE_ROOT derives from `import.meta.url`, so it names the package the RUNNING code was
+// loaded from under `npx`, `npm i -g` and a source checkout alike, and cannot be redirected by
+// a cwd or an env var. `packageVersion` never throws — an unreadable package.json returns "",
+// and the `||` falls back to the old literal, because start-up must not break over a version
+// string. (`guild_status` already reports the same value via `guildDoctorSeed`.)
+const SERVER_VERSION = packageVersion(PACKAGE_ROOT) || "0.0.0";
+
 const server = new Server(
-  { name: "modelguild", version: "0.0.0" },
+  { name: "modelguild", version: SERVER_VERSION },
   { capabilities: { tools: {} } },
 );
 
