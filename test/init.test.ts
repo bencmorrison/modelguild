@@ -329,7 +329,7 @@ export async function run(): Promise<number> {
   c.check(!isSkewed("a", "a", "a"), "isSkewed: identical to the shipped bytes ⇒ not skew");
   c.check(!isDrifted("a", "a", "b"), "isDrifted: an untouched file behind the release is skew, NOT drift");
 
-  // --- issue #94: the START-UP NOTICE — once per server version, silenceable --------
+  // --- issue #94: the START-UP NOTICE — once per server version + payload state, silenceable -
   {
     const noticeHome = tempProject();
     let out: string[] = [];
@@ -737,8 +737,8 @@ export async function run(): Promise<number> {
 
   // --- issue #94: the WIRING — a REAL `src/server.ts` emits the notice on stderr ----
   // The block above proves the emitter; only this proves server.ts actually calls it, that the
-  // line lands on STDERR (stdout is the MCP transport), and that the per-version suppression
-  // survives across PROCESSES — which is the whole point of putting it in a file.
+  // line lands on STDERR (stdout is the MCP transport), and that the suppression survives
+  // across PROCESSES — which is the whole point of putting it in a file.
   //
   // Offline: the notice (like the #23 retention prune) happens before `connect`, no opencode
   // child is ever spawned, and the process exits on the stdin EOF we hand it. "Shipped" for a

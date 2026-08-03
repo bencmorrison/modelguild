@@ -2,21 +2,21 @@
 
 Exactly what you do, start to finish, plus every variant off the happy path. Back to [README.md](../README.md).
 
-- [The six steps](#the-six-steps)
+- [The seven steps](#the-seven-steps)
 - [Installation variants](#installation-variants) — from source, `--global`, registering by hand
 - [Global vs project config](#global-vs-project-config)
 - [Keeping it up to date](#keeping-it-up-to-date) — updating, upgrade drift, payload skew
 - [Uninstall](#uninstall)
 
-## The six steps
+## The seven steps
 
-> **Installing from source, globally, or into a repo you don't control?** → **[Installation variants](#installation-variants)** covers the from-source build, `init --global`, registering by hand, and `--write-mcp`. The six steps below are the npm happy path; step 2 hands you `npx modelguild init`, which is the wrong command if you are running an unreleased build.
+> **Installing from source, globally, or into a repo you don't control?** → **[Installation variants](#installation-variants)** covers the from-source build, `init --global`, registering by hand, and `--write-mcp`. The seven steps below are the npm happy path; step 2 hands you `npx modelguild init`, which is the wrong command if you are running an unreleased build.
 
-**(1)** prerequisites, **(2)** install the payload (`init`), **(3)** register the MCP server yourself, **(4)** restart Claude Code so it loads it, **(5)** verify, **(6)** configure which models it uses. Steps 2 and 3 are **separate**: `init` copies the command docs / agent defs / policy template but **does not touch `.mcp.json`** — *you* register the server (step 3), so you choose global vs per-project scope. Step 6 configures *which models* it uses. You want all of them.
+**(1)** prerequisites, **(2)** install the payload (`init`), **(3)** register the MCP server yourself, **(4)** restart Claude Code so it loads it, **(5)** verify, **(6)** configure which models it uses, **(7)** run a first consult. Steps 2 and 3 are **separate**: `init` copies the command docs / agent defs / policy template but **does not touch `.mcp.json`** — *you* register the server (step 3), so you choose global vs per-project scope. Step 6 configures *which models* it uses. You want all of them.
 
 ### 1. Prerequisites
 
-- **[Node.js](https://nodejs.org)** (ships with `npm`/`npx`) — ModelGuild is a TypeScript CLI + MCP server; you need Node to build and run it.
+- **[Node.js](https://nodejs.org) 20 or newer** (ships with `npm`/`npx`) — ModelGuild is a TypeScript CLI + MCP server; you need Node to build and run it.
 - **[opencode](https://opencode.ai)** on your PATH, **authenticated to at least one provider**. The MCP server fronts `opencode serve`, so this is what gives Claude access to other models:
   ```bash
   opencode auth login     # interactive OAuth — subscription or free tier, no API keys stored by this tool
@@ -87,6 +87,16 @@ Registering the server (step 3) does not choose *which* models it talks to or wh
     ```
 
 Prefer a **non-Claude** model for consults so the second opinion is genuinely independent. This step is optional — without it, commands use opencode's default model — but setting a policy and defaults is what makes day-to-day use smooth. The full detail is in [docs/configuration.md](configuration.md).
+
+### 7. Run a first consult
+
+Step 5 is token-free by design: `doctor` never logs in and never queries a provider, so it cannot tell you whether your opencode auth is still valid — an unauthenticated setup passes it and fails at the first model call. The only thing that proves the whole path works is a real call, so make a small one inside Claude Code:
+
+```
+/guild:consult In one sentence, what is a git worktree?
+```
+
+The first time it runs, Claude Code asks the one-time tool permission step 5 mentions (`mcp__modelguild__guild_consult`) — approve it. If the call then fails with an auth or provider error, the install is fine and the auth is not: re-run `opencode auth login`, and `opencode models` to see what your auth actually offers.
 
 ## Installation variants
 
@@ -208,7 +218,7 @@ It is a **warning, not a failure** — `doctor` still exits OK, because editing 
 
 The MCP *server* updates itself — your registration runs `npx -y modelguild serve`, which resolves the current release on every launch — but the payload above lives in your repo and does **not** move with it, so you can end up running a new server against last release's commands and agent defs without noticing. When the server starts and finds files that are ours, **unedited**, and different from what it ships, it writes one block to stderr naming them, with the fix **pinned to the version running** (`npx modelguild@<version> init` — plain `npx modelguild init` installs the *latest* payload, which doesn't converge if you're deliberately on an older server; the published versions are listed on the [releases page](https://github.com/bencmorrison/modelguild/releases)). It won't claim which side is older: two hashes can't say, and while normally it's your payload that's behind, a pinned older server puts it ahead. `npx modelguild doctor` (and the `guild_status` tool) report the same thing whenever you ask, alongside files you *edited* that have since fallen behind — those are never overwritten. Neither is a failure: being behind a release doesn't make `doctor` exit non-zero.
 
-The start-up line appears **once per server version**, not once per session; what it has already said is recorded in `~/.claude/modelguild/`, never in your repo, so nothing untracked appears in your working tree (delete that file to be told again). `GUILD_PAYLOAD_NOTICE=off` in `modelguild/modelguild.conf.local` turns the line off entirely — `doctor` keeps reporting either way.
+The start-up line appears **once per server version and skew state**, not once per session: it fires again when the version changes, or when the set of out-of-sync files it named — or the bytes this server ships for them — changes. That is why a republished version, a moving dist-tag, or a source checkout you keep rebuilding brings it back; a shipped change confined to files you *edited* (that is upgrade drift) or to files with no ownership record does not. What it has already said is recorded in `~/.claude/modelguild/`, or under `$GUILD_ROOT` if you pinned one — so nothing untracked appears in your working tree unless you pointed `$GUILD_ROOT` at a repo yourself (delete that file to be told again). `GUILD_PAYLOAD_NOTICE=off` in `modelguild/modelguild.conf.local` turns the line off entirely — `doctor` keeps reporting either way.
 
 ## Uninstall
 

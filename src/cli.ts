@@ -485,10 +485,10 @@ export async function runDoctor(
   // PAYLOAD SKEW (issue #94) — ours, UNTOUCHED, and behind the release: a clean install the
   // server has moved past, which #22's drift predicate is deliberately silent about and which
   // therefore had no surface at all. Reported here (and by `guild_status`, and once per version
-  // at server start) — and, like drift, it is a WARNING that does not touch the exit code:
-  // being behind a release is not a broken install, and a user who has chosen not to upgrade
-  // must not have `doctor` call their setup broken. `GUILD_PAYLOAD_NOTICE=off` silences the
-  // start-up notice, NOT this: doctor was asked for (issue #23's `logs clean` precedent).
+  // + payload state at server start) — and, like drift, it is a WARNING that does not touch the
+  // exit code: being behind a release is not a broken install, and a user who has chosen not to
+  // upgrade must not have `doctor` call their setup broken. `GUILD_PAYLOAD_NOTICE=off` silences
+  // the start-up notice, NOT this: doctor was asked for (issue #23's `logs clean` precedent).
   if (drift.skewed.length > 0) {
     for (const l of formatSkewNote({ skewed: drift.skewed, version: packageVersion(PACKAGE_ROOT) })) {
       console.warn(l);
