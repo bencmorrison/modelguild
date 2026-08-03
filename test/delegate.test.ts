@@ -39,7 +39,15 @@ import {
 import { tmpdir } from "node:os";
 import { realpathSync } from "node:fs";
 import path from "node:path";
-import { delegate, delegateToToolResult, type DelegateResult } from "../src/delegate.js";
+import {
+  delegate,
+  delegateToToolResult,
+  nothingDelivered,
+  type DelegateCapture,
+  type DelegateFail,
+  type DelegateResult,
+} from "../src/delegate.js";
+import { turnToolCallCount, toolParts } from "../src/client.js";
 import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
@@ -90,6 +98,17 @@ function initRepo(files: Record<string, string>, prefix = "m8-repo-"): string {
 
 function read(dir: string, rel: string): string {
   return readFileSync(path.join(dir, rel), "utf8");
+}
+
+/** opencode's own materialization — every path in the excluded set, `bun.lock` included.
+ * Module-scope since issue #121: section K(i) needs the same shape section I does, and two
+ * copies of "what opencode writes" would be free to drift apart. */
+function scaffoldInto(root: string): void {
+  mkdirSync(path.join(root, ".opencode", "node_modules", "pkg"), { recursive: true });
+  writeFileSync(path.join(root, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
+  writeFileSync(path.join(root, ".opencode", "package.json"), '{"scaffold":true}\n');
+  writeFileSync(path.join(root, ".opencode", "package-lock.json"), '{"lock":true}\n');
+  writeFileSync(path.join(root, ".opencode", "bun.lock"), "bunlock\n");
 }
 
 /** A ServeProvider whose "model turn" applies `mutate` to the repo, at the START of the fake's
@@ -1786,15 +1805,6 @@ export async function run(): Promise<number> {
   {
     console.log("-- I. serve scaffolding never reaches the patch (#108) --");
 
-    /** opencode's own materialization — every path in the excluded set, `bun.lock` included. */
-    const scaffoldInto = (root: string): void => {
-      mkdirSync(path.join(root, ".opencode", "node_modules", "pkg"), { recursive: true });
-      writeFileSync(path.join(root, ".opencode", "node_modules", "pkg", "index.js"), "x\n");
-      writeFileSync(path.join(root, ".opencode", "package.json"), '{"scaffold":true}\n');
-      writeFileSync(path.join(root, ".opencode", "package-lock.json"), '{"lock":true}\n');
-      writeFileSync(path.join(root, ".opencode", "bun.lock"), "bunlock\n");
-    };
-
     // (a) THE REPRODUCTION: a committed `.opencode/.gitignore` with unrelated content, so
     //     nothing ignores what opencode writes. The turn edits one tracked file AND one
     //     hardened def, and the scaffolding appears alongside.
@@ -2159,6 +2169,455 @@ export async function run(): Promise<number> {
       c.check(fake.recorded.deletes.length === 1, "#117(J): the session was deleted (unchanged behaviour)");
     } finally {
       await fake.close();
+    }
+  }
+
+  // =========================================================================
+  // SECTION K (issue #121, C74 amended) — A DELEGATION THAT PRODUCED NOTHING IS A FAILURE.
+  //
+  // Section J above is the other half of this rule and stays exactly as it was: an empty report
+  // beside a REAL PATCH is a success. What is refused is only "nothing on any channel" — an
+  // empty report from a turn that made NO TOOL CALLS.
+  //
+  // THE PREDICATE'S DECIDING COLUMN IS THE TURN'S, NOT THE CAPTURE'S, and section K(e) is why.
+  // The first cut required `captureComplete`, which `ignoredFingerprint` sets false for ANY
+  // repository containing a wholly-ignored directory — `node_modules/` included — so the refusal
+  // was unreachable in most real repos. That case is pinned here as a regression, because it is
+  // invisible to every fixture whose repo happens to have no ignored directory.
+  //
+  // TEST SHAPE (review round 2026-08-03): a refusal case must never let its assertions SKIP.
+  // `asFail` records the ok/not-ok check itself and, when the result was wrongly ok, hands back a
+  // sentinel so every following assertion FAILS on its own rather than being guarded away. A
+  // neutered predicate must light up the whole block, not one line of it.
+  // =========================================================================
+  {
+    const asFail = (r: DelegateResult, label: string): DelegateFail => {
+      c.check(!r.ok, `${label}: expected a REFUSAL, got ok:true`);
+      if (!r.ok) return r;
+      return {
+        ok: false,
+        error: {
+          kind: "call-failed",
+          message: "<no refusal was produced>",
+          exitAnalogue: null,
+          model: "",
+        },
+        capture: r.capture,
+      };
+    };
+
+    // --- K(a): the headline case. A provider-rejected turn: no text, NO TOOL CALLS, an
+    //           `info.error` on the assistant message — and nothing edited.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        turnShapes: ["rejected"],
+        rejectionError: { name: "APIError", message: "The requested model is not supported.", statusCode: 400 },
+      });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-a): no report, no tool calls, no changes");
+        c.check(f.error.kind === "empty-delegation", "#121(K-a): the kind names the condition distinctly");
+        c.check(f.error.exitAnalogue === null, "#121(K-a): exit-analogue null (no bash counterpart)");
+        c.check(f.error.model === "github-copilot/gpt-5.5", "#121(K-a): the refused model id is on the error");
+        c.check(
+          f.error.message.includes("The requested model is not supported.") &&
+            f.error.message.includes("APIError") &&
+            f.error.message.includes("HTTP 400"),
+          "#121(K-a): the provider's own whitelisted info.error is QUOTED (name/message/statusCode)",
+        );
+        c.check(
+          !f.error.message.includes("isRetryable"),
+          "#121(K-a): ...and only that — the whitelist is not widened to the raw error object",
+        );
+        c.check(
+          f.error.message.includes("no tool calls"),
+          "#121(K-a): the message states the actual condition (no tool calls), not a capture claim",
+        );
+        c.check(
+          f.error.message.includes("structuredContent.capture"),
+          "#121(K-a): ...and points at the capture record, scaffoldWarning included",
+        );
+        // CAPTURE STAYS HONEST AND RIDES OUT ON THE FAILURE.
+        c.check(f.capture !== undefined, "#121(K-a): the capture is attached to the failure");
+        c.check(f.capture?.gitWorktree === true, "#121(K-a): the capture ran (git worktree)");
+        c.check(f.capture?.filesChanged === 0, "#121(K-a): it found no change");
+        c.check(f.capture?.preTree !== null, "#121(K-a): the baseline snapshot still happened");
+        // THE EVIDENCE RUN IS INTACT.
+        const runs = readdirSync(logDir).filter((n) => n !== "latest" && n !== "watchers");
+        c.check(runs.length === 1, "#121(K-a): exactly one evidence run was minted");
+        const runId = runs[0] as string;
+        const entries = readFileSync(path.join(logDir, runId, "calls.jsonl"), "utf8")
+          .split("\n")
+          .filter((l) => l.length > 0)
+          .map((l) => JSON.parse(l) as Record<string, unknown>);
+        c.check(
+          entries.filter((e) => e.type === "expected-call").length === 1 &&
+            entries.filter((e) => e.type === "call" && e.status === "started").length === 1 &&
+            entries.filter((e) => e.type === "call" && e.status === "completed").length === 1,
+          "#121(K-a): the expected-call → started → completed lifecycle is complete (C24)",
+        );
+        const completed = entries.find((e) => e.type === "call" && e.status === "completed");
+        // DOCUMENTED, NOT AN OVERSIGHT: the receipts record the TURN, which succeeded. The
+        // judgement is the tool's, made one layer above the spine that wrote this entry.
+        c.check(
+          completed?.exit_code === 0,
+          "#121(K-a): the completed entry records the TURN (exit 0) — the refusal is the tool's judgement, later",
+        );
+        c.check(completed?.capture_state === "complete", "#121(K-a): capture_state complete");
+        c.check(completed?.raw_response === "", "#121(K-a): the blank answer is recorded byte-exactly");
+        // The delegate-diff ABSENCE is what separates this from #120's success in the log alone
+        // — the argument the exit_code:0 comment now rests on, so it is asserted, not assumed.
+        c.check(
+          entries.every((e) => e.type !== "delegate-diff"),
+          "#121(K-a): NO delegate-diff entry — which is how calls.jsonl alone tells this from #120's success",
+        );
+        c.check(new EvidenceLog({ env }).verify(runId).code === 0, "#121(K-a): the run VERIFIES clean");
+        // THE WIRE SHAPE: a driver must see an error, not a blank text block (the #121 report).
+        const wire = delegateToToolResult(f);
+        c.check(wire.isError === true, "#121(K-a): the MCP result is isError:true");
+        const text = (wire.content[0] as { text: string }).text;
+        c.check(text.length > 0 && text === f.error.message, "#121(K-a): the text block names the failure (was '')");
+        c.check(
+          (wire.structuredContent as Record<string, unknown>).capture !== undefined,
+          "#121(K-a): the capture is still on structuredContent for review/recovery",
+        );
+        c.check(fake.recorded.deletes.length === 1, "#121(K-a): the single-shot session was still deleted");
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(b): NO provider error. The refusal must stay useful without one — it names what to
+    //           check instead of asserting a cause it does not have (C74's wording rule). The
+    //           `silent` fixture is zero-parts like `rejected` but carries no `info.error`.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["silent"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-b): a silent turn with no error still refuses");
+        c.check(f.error.kind === "empty-delegation", "#121(K-b): kind is empty-delegation");
+        c.check(
+          f.error.message.includes("opencode reported no error") && f.error.message.includes("guild_models"),
+          "#121(K-b): with no info.error the message says so and names what to check",
+        );
+        c.check(
+          !f.error.message.includes("The provider reported"),
+          "#121(K-b): ...and does not invent a provider message",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(c): WHITESPACE-ONLY is empty. C74 parity: a one-newline report must not be the
+    //           difference between a refusal and a silent empty success.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "  \n\t \n", turnShapes: ["silent"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-c): a whitespace-only report is no report");
+        c.check(f.error.kind === "empty-delegation", "#121(K-c): kind is empty-delegation");
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(d): PRESERVED SUCCESS — a REAL report with ZERO edits. Probed live 2026-08-02: a
+    //           model whose gated writes the approval bridge rejected returns a report explaining
+    //           why nothing was written. (The other preserved success — empty report, real patch
+    //           — is section J, deliberately left untouched.)
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "Every edit I attempted was rejected at the approval prompt, so I changed nothing.",
+      });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#121(K-d): a NON-EMPTY report with zero edits is still a SUCCESSFUL delegation");
+        if (r.ok) {
+          c.check(r.report.includes("rejected at the approval prompt"), "#121(K-d): the report is returned as-is");
+          c.check(r.capture.filesChanged === 0, "#121(K-d): ...with an honest empty capture");
+          c.check(new EvidenceLog({ env }).verify(r.attribution.runId).code === 0, "#121(K-d): the run verifies clean");
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(e): THE CRITICAL REGRESSION (review round 2026-08-03). A repository containing a
+    //     WHOLLY-IGNORED DIRECTORY — which is nearly all of them; this repo's own `node_modules/`
+    //     qualifies — makes `git status --ignored` collapse it to one `!! dir/` entry, which
+    //     `ignoredFingerprint` cannot represent, so the capture comes back
+    //     `captureComplete:false, incompleteReason:"ignored-state-incomplete"` with a NON-NULL
+    //     `patchPath` (an empty patch file is written; only `nothingToReview` nulls the path).
+    //     The first cut of this fix required BOTH `captureComplete` and `patchPath === null`, so
+    //     issue #121's defect survived it untouched here — probed, `ok:true`, `report:""`.
+    //     Zero tool calls settles it without consulting the capture at all.
+    {
+      const repo = initRepo({ "a.txt": "A\n", ".gitignore": "node_modules/\n" });
+      mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+      writeFileSync(path.join(repo, "node_modules", "pkg", "index.js"), "x\n");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-e): a wholly-ignored dir must NOT make the refusal unreachable");
+        c.check(f.error.kind === "empty-delegation", "#121(K-e): kind is empty-delegation");
+        // Assert the fixture really is in the state that defeated the first cut, or this case
+        // silently stops testing anything the day the fingerprint changes.
+        c.check(
+          f.capture?.captureComplete === false && f.capture?.incompleteReason === "ignored-state-incomplete",
+          "#121(K-e): the capture really is INCOMPLETE here — the condition that defeated the first predicate",
+        );
+        c.check(
+          f.capture?.patchPath !== null,
+          "#121(K-e): ...and patchPath is NON-NULL, which is why that column had to go too",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(f): PRESERVED SUCCESS — a SILENT TOOL-USING turn (the gemini-3.1-pro review's
+    //     finding). The model ran a command, changed nothing and said nothing. It DID something;
+    //     the activity trace and the approval record are where that shows. This is the new stated
+    //     residual and it must not be refused. (The fake's default turn shape carries exactly one
+    //     tool part, so `historyText: ""` is precisely this shape.)
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "" });
+      try {
+        const r = await delegate(
+          { task: "run the tests", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          r.ok,
+          "#121(K-f): a silent turn that MADE TOOL CALLS and changed nothing is a SUCCESS, not a refusal",
+        );
+        c.check(r.ok && r.report === "", "#121(K-f): ...and its empty report is returned as-is");
+        c.check(r.ok && r.capture.filesChanged === 0, "#121(K-f): ...beside an honestly empty capture");
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(g): `GUILD_LOG=off`. Under the redesign this is now REFUSED — a zero-tool-call turn
+    //     could not have edited anything, so the capture's inability to measure is irrelevant.
+    //     That is the behaviour change to embrace: the old residual dissolves.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG: "off", GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-g): logging off no longer hides the empty delegation");
+        c.check(f.error.kind === "empty-delegation", "#121(K-g): kind is empty-delegation");
+        c.check(
+          f.capture?.incompleteReason === "logging-off",
+          "#121(K-g): the capture still reports honestly that it recorded nothing",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(h): NOT A GIT WORKTREE. Same reasoning as K(g): the turn made no tool calls, so
+    //     there is nothing a diff could have shown even if one had been possible.
+    {
+      const notARepo = tmp("m8-nogit-");
+      writeFileSync(path.join(notARepo, "a.txt"), "A\n");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: notARepo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#121(K-h): outside a git worktree an empty turn is still refused");
+        c.check(f.capture?.gitWorktree === false, "#121(K-h): ...and the capture says why it measured nothing");
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(i): SCAFFOLDING-ONLY + empty report + zero tool calls (review round 2026-08-03).
+    //     opencode materializes its plugin runtime on the first request that loads it, so a
+    //     PROVIDER-REJECTED turn still leaves scaffolding behind. The model produced nothing, so
+    //     this is refused — and the tamper signal must ride out on the failure, because a
+    //     scaffolding write is invisible to the patch by design and this refusal is now the
+    //     surface carrying it.
+    {
+      const repo = initRepo({ ".opencode/.gitignore": "*.log\n", "a.txt": "A0\n" }, "m121-scaffold-only-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          {
+            serve: mutatingServe(fake, () => scaffoldInto(repo)),
+            env,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        const f = asFail(r, "#121(K-i): a scaffolding-only rejected turn produced nothing");
+        c.check(f.error.kind === "empty-delegation", "#121(K-i): kind is empty-delegation");
+        c.check(
+          f.capture?.scaffoldChanged === true && f.capture?.scaffoldWarning !== null,
+          "#121(K-i): the tamper signal RIDES OUT on the refusal — it is the only surface carrying it",
+        );
+        c.check(
+          (delegateToToolResult(f).structuredContent as { capture?: { scaffoldWarning?: string | null } })
+            .capture?.scaffoldWarning != null,
+          "#121(K-i): ...and reaches the wire, not just the internal result",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(j): THE `filesChanged` GUARD, BEHAVIOURALLY (review round 2 — K-edges asserted it
+    //     only as a unit call). A turn with ZERO tool calls beside a tree that changed anyway:
+    //     the mutation is external to the model (a concurrent writer; a tracked path opencode
+    //     itself touched), so the first two columns both say "produced nothing" and only the
+    //     guard stands between the caller and a refusal returned while a real patch sits on
+    //     disk. It must stay a success WITH the patch, because the whole point of the guard is
+    //     that a refusal may never hide reviewable work.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          {
+            serve: mutatingServe(fake, () => writeFileSync(path.join(repo, "a.txt"), "A-CHANGED\n")),
+            env,
+            repoDir: repo,
+            messageTimeoutMs: 5_000,
+          },
+        );
+        c.check(
+          r.ok,
+          "#121(K-j): zero tool calls + an empty report but a CHANGED TREE is a success — the guard holds",
+        );
+        c.check(r.ok && r.capture.filesChanged === 1, "#121(K-j): the change is counted");
+        c.check(r.ok && r.capture.patchPath !== null, "#121(K-j): ...and the patch was recorded");
+        c.check(
+          r.ok && r.capture.patchPath !== null &&
+            readFileSync(r.capture.patchPath, "utf8").includes("+A-CHANGED"),
+          "#121(K-j): ...carrying the change, so nothing reviewable was hidden behind a refusal",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K-edges: the predicate, column by column. EVERY column is mutated here, so a change to
+    //     any one of them fails at least one assertion — the property the first cut lacked
+    //     (`patchPath === null` was dead: mutating it left the suite green).
+    {
+      const base: DelegateCapture = {
+        gitWorktree: true,
+        patchPath: null,
+        preTree: "t",
+        afterTree: "t",
+        filesChanged: 0,
+        captureComplete: true,
+        incompleteReason: "",
+        recordFailed: false,
+        recoveryHint: null,
+        scaffoldChanged: false,
+        scaffoldWarning: null,
+      };
+      // Column 1: the report.
+      c.check(nothingDelivered("", 0, base), "#121(K-edges): empty report + no tool calls + no changes ⇒ refuse");
+      c.check(nothingDelivered("   \n ", 0, base), "#121(K-edges): whitespace-only counts as empty");
+      c.check(!nothingDelivered("I did X", 0, base), "#121(K-edges): a report saves it (K-d's shape)");
+      // Column 2: tool calls — the deciding one.
+      c.check(!nothingDelivered("", 1, base), "#121(K-edges): ONE tool call saves it (K-f's shape)");
+      // Column 3: the guard. It may only ever SUPPRESS a refusal.
+      c.check(
+        !nothingDelivered("", 0, { ...base, filesChanged: 1, patchPath: "/p.patch" }),
+        "#121(K-edges): a real patch saves it — the guard against refusing while work sits on disk",
+      );
+      // The three states the OLD predicate excluded and this one deliberately does not.
+      c.check(
+        nothingDelivered("", 0, { ...base, captureComplete: false, incompleteReason: "ignored-state-incomplete", patchPath: "/p.patch" }),
+        "#121(K-edges): an INCOMPLETE capture no longer blocks the refusal (K-e — the critical fix)",
+      );
+      c.check(
+        nothingDelivered("", 0, { ...base, captureComplete: false, incompleteReason: "capture-crashed" }),
+        "#121(K-edges): a crashed capture no longer blocks it either — zero tool calls is enough",
+      );
+      c.check(
+        nothingDelivered("", 0, { ...base, gitWorktree: false }),
+        "#121(K-edges): nor does being outside a git worktree (K-h)",
+      );
+      // The guard is on CONTENT, not on the path: an empty patch file hides nothing.
+      c.check(
+        nothingDelivered("", 0, { ...base, patchPath: "/p.patch" }),
+        "#121(K-edges): a patch PATH with zero changed files does not save it — the guard is filesChanged",
+      );
+    }
+
+    // --- K-bound: `turnToolCallCount` is TURN-scoped, like finalAssistantText/Error. Unit-tested
+    //     directly because `guild_delegate` mints a fresh session per call, so no behavioural
+    //     fixture on this path can tell a bounded walk from an unbounded one — which is exactly
+    //     how the BANANA defect (issue #117) survived its own test. An unbounded count would fail
+    //     OPEN here: a silent turn would inherit an earlier turn's tool calls and escape refusal.
+    {
+      const tool = { id: "p1", type: "tool", tool: "bash", state: { status: "completed" } };
+      const history = {
+        messages: [
+          { role: "user", info: { id: "u1" }, parts: [{ id: "a", type: "text", text: "q1" }] },
+          { role: "assistant", info: { id: "a1" }, parts: [tool] },
+          { role: "assistant", info: { id: "a2" }, parts: [{ id: "b", type: "text", text: "answer 1" }] },
+          { role: "user", info: { id: "u2" }, parts: [{ id: "c", type: "text", text: "q2" }] },
+          { role: "assistant", info: { id: "a3" }, parts: [] },
+        ],
+      };
+      c.check(
+        turnToolCallCount(history) === 0,
+        "#121(K-bound): the LAST turn made no tool calls, even though an earlier turn did",
+      );
+      c.check(
+        toolParts(history).length === 1,
+        "#121(K-bound): ...while session-wide toolParts still counts the earlier turn — the two differ, which is the point",
+      );
+      c.check(
+        turnToolCallCount({ messages: [...history.messages, { role: "assistant", info: { id: "a4" }, parts: [tool] }] }) === 1,
+        "#121(K-bound): a tool call INSIDE the last turn is counted",
+      );
     }
   }
 

@@ -974,6 +974,33 @@ export class AgentMismatchError extends Error {
   }
 }
 
+/**
+ * HOW MANY TOOL CALLS THIS TURN MADE (issue #121) — the signal that separates "the model did
+ * nothing" from "the model did something the capture could not measure".
+ *
+ * TURN-SCOPED, like `finalAssistantText` and `finalAssistantError` and for the same reason. It
+ * is deliberately NOT `toolParts(history).length`: that walk is unbounded and counts the WHOLE
+ * session, so on a continuation an earlier turn's tool calls would make this turn look busy —
+ * the exact shape of the BANANA defect issue #117's review found on the text extractor, and it
+ * would fail OPEN here (a silent turn inheriting a previous turn's tool calls escapes the
+ * refusal). `guild_delegate` mints a fresh session per call and takes no `sessionId`, so the two
+ * are equal TODAY; the bound is what keeps them equal if that ever changes. Do not unbound it.
+ *
+ * Every tool part is counted whatever its `state.status` — a `pending`/`error` call still means
+ * the model reached for a tool, which is all this needs to answer.
+ *
+ * This reads the HISTORY payload's `part.type === "tool"` shape, and doing so carries a stated
+ * dependency on an opencode bump — recorded once, in CONTRACT.md C74, not restated here.
+ */
+export function turnToolCallCount(history: SessionHistory): number {
+  const start = turnStartIndex(history);
+  let n = 0;
+  for (let i = start; i < history.messages.length; i++) {
+    for (const p of history.messages[i].parts) if (p.type === "tool") n++;
+  }
+  return n;
+}
+
 /** Every tool invocation across the exchange, flattened to `ToolPartView`. */
 export function toolParts(history: SessionHistory): ToolPartView[] {
   const out: ToolPartView[] = [];
@@ -1126,6 +1153,13 @@ export class AgentFloorNotInForceError extends Error {
  * does not — an empty report beside a real patch is a successful delegation, so the same
  * text means opposite things on the two paths.
  *
+ * THAT IS STILL TRUE AND IS NOT THE WHOLE STORY SINCE ISSUE #121. The write path refuses the
+ * NARROWER combination — an empty report AND a turn that made NO TOOL CALLS — as
+ * `empty-delegation`, decided in `src/delegate.ts`. It stays read-path-only by construction:
+ * this class throws before the after-snapshot, so opting `guild_delegate` in here would fail
+ * the terse-but-productive delegation whose edits are already on disk. The write path's own
+ * inputs (`toolCallCount`, `providerError`) ride out on the SUCCESS result instead.
+ *
  * Thrown from INSIDE `askViaAgent`'s try, before `succeeded` is set, exactly like
  * `AgentMismatchError` — so the existing ownership × outcome deletion matrix tears a
  * session we created down rather than orphaning it, and no second cleanup path exists.
@@ -1223,8 +1257,10 @@ export interface AskViaAgentOpts {
   /**
    * REQUIRE AN ANSWER (issue #117, C74). When set, a turn whose final assistant text is
    * empty or whitespace-only throws `EmptyAnswerError` instead of returning `text: ""`.
-   * Left unset (the default, and `guild_delegate`'s deliberate choice) the empty text is
-   * returned as before.
+   * Left unset (the default, and `guild_delegate`'s deliberate choice — issue #121 did not
+   * change it; the write path judges the same turn one layer up, after this spine returns, from
+   * `toolCallCount` and `providerError`, which is the only place an empty report can be told
+   * apart from an empty DELEGATION) the empty text is returned as before.
    */
   requireAnswer?: boolean;
   /**
@@ -1267,6 +1303,30 @@ export interface AskViaAgentOpts {
 export interface AskResult {
   /** Byte-exact final text, from history (never the sync body). */
   text: string;
+  /**
+   * THE TURN'S OWN `info.error`, whitelisted and bounded by `finalAssistantError` — present
+   * only when opencode carried one for this turn.
+   *
+   * It rides on the SUCCESS result because of issue #121: `guild_delegate` does not set
+   * `requireAnswer` (its answer is the patch), so a provider-rejected turn reaches it as a
+   * NORMAL result with `text: ""` and never becomes an `EmptyAnswerError` whose `providerError`
+   * it could read. Without this field the write path's own empty-delegation refusal would have
+   * to say "opencode reported nothing" while the history held the provider's exact words.
+   *
+   * Computed unconditionally rather than only for a blank turn: a turn that produced text CAN
+   * also carry an error (a partial failure), and a field whose presence depended on the text
+   * being empty would be a second rule to remember. Nothing on the read paths reads it.
+   */
+  providerError?: string;
+  /**
+   * TOOL CALLS MADE BY THIS TURN (issue #121), turn-scoped — see `turnToolCallCount`.
+   *
+   * Distinct from `toolParts.length`, which is session-wide, and the difference is the point.
+   * `guild_delegate` uses this to tell "produced nothing at all" from "did something the
+   * capture could not measure": zero tool calls means the model cannot have edited a file or
+   * run a command, whatever the capture's own representability state turned out to be.
+   */
+  toolCallCount: number;
   sessionId: string;
   /** Completion metadata from the sync response (cost/tokens/ids/finish). */
   metadata: SendResult;
@@ -1436,8 +1496,9 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // silent turn inherited the PREVIOUS turn's answer, `text.trim()` was non-empty, and this
       // line never fired — the guard failed open on exactly the drivers that continue sessions
       // (`/guild:collaborate`, `/guild:workshop` round 2). Do not unbound that walk.
+      const providerError = finalAssistantError(history);
       if (opts.requireAnswer === true && text.trim() === "") {
-        throw new EmptyAnswerError(sessionId, text, finalAssistantError(history));
+        throw new EmptyAnswerError(sessionId, text, providerError);
       }
 
       const result: AskResult = {
@@ -1445,7 +1506,12 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         sessionId,
         metadata,
         toolParts: toolParts(history),
+        toolCallCount: turnToolCallCount(history),
         history,
+        // OPTIONAL-FIELD DISCIPLINE (C29's rule, applied to a wire-adjacent shape): written only
+        // when opencode carried an error, so a normal turn's result is shaped exactly as it was
+        // before issue #121.
+        ...(providerError !== undefined ? { providerError } : {}),
       };
       succeeded = true;
       return result;

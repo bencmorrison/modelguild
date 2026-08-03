@@ -40,6 +40,14 @@
  * hashed another, and then reported `captureComplete:true`. Do not add a second way to reach
  * the project dir below the resolution; `deps.repoDir` is an input to it, not a fallback.
  *
+ * A DELEGATION THAT PRODUCED NOTHING IS A FAILURE (issue #121, C74 amended). An empty report is
+ * not itself an error here — the answer is the patch — but an empty report from a turn that made
+ * NO TOOL CALLS means nothing was produced on any channel, which is #117's failure mode on the
+ * write path and is reachable the same way (a provider rejecting the model id ends the turn with
+ * no text and no tool calls). Refused as `empty-delegation`. See `nothingDelivered` for the exact
+ * predicate, for why the deciding half is the turn's tool-call count rather than the capture's
+ * completeness, and for the three shapes that must stay successes.
+ *
  * Everything else mirrors guild_research: gate (leading-dash → policy tier) BEFORE any log
  * write so a refusal logs nothing (C24 gap parity), then the shared expect→started→completed
  * lifecycle spine (src/consult.ts runAgentLifecycle), reused not forked.
@@ -221,6 +229,14 @@ export type DelegateErrorKind =
   | "approval-channel-missing"
   | "approval-not-applied"
   | "call-failed"
+  // THE TURN PRODUCED NOTHING ON ANY CHANNEL (issue #121, C74). NOT the read paths'
+  // `empty-answer`, and the different name is the point: this path's answer is the PATCH, so an
+  // empty report is only a failure when the turn ALSO made no tool calls — a model that reached
+  // for no tool cannot have edited a file or run a command. Evaluated after the capture (the
+  // `filesChanged` guard reads it), which changes nothing about it: the patch, the recovery hint
+  // and the `delegate-diff` entry are exactly what they would have been. exitAnalogue null (no
+  // bash counterpart). See `nothingDelivered`.
+  | "empty-delegation"
   | "agent-mismatch";
 
 export interface DelegateAttribution {
@@ -290,6 +306,70 @@ export interface DelegateFail {
   approval?: ApprovalSummary;
 }
 export type DelegateResult = DelegateOk | DelegateFail;
+
+/** How a model id is named in an error message; `""` means "opencode picked". */
+function modelLabel(requestedModel: string): string {
+  return requestedModel === "" ? "(opencode default)" : requestedModel;
+}
+
+/**
+ * DID THIS DELEGATION PRODUCE ANYTHING AT ALL? (issue #121, C74 amended.) True ⇒ the call is
+ * refused as `empty-delegation` instead of returning an empty success. Exported for the tests,
+ * which assert every column, because each one is either a way to fail a working delegation or a
+ * way to let the defect back through.
+ *
+ * THE QUESTION IS ABOUT THE TURN, NOT ABOUT THE CAPTURE — and that is the whole of the redesign
+ * (review round, 2026-08-03; coordinator's decision, maintainer to ratify). "Nothing was
+ * produced on any channel" means the model said nothing AND reached for no tool. **Zero tool
+ * calls is the load-bearing half: a model that made no tool call cannot have edited a file or
+ * run a command**, so it settles the question without asking the capture whether it was ABLE to
+ * measure. `toolCallCount` is turn-scoped (`turnToolCallCount`), not session-wide.
+ *
+ * THE FIRST CUT ASKED THE CAPTURE INSTEAD, AND IT WAS UNREACHABLE IN THIS VERY REPOSITORY.
+ * It required `captureComplete` (plus `gitWorktree`), reasoning that only a completed capture
+ * may claim "no change". But `ignoredFingerprint` marks the capture INCOMPLETE
+ * (`ignored-state-incomplete`) whenever `git status --ignored` collapses a wholly-ignored
+ * directory into one `!! dir/` entry — which it does for any such directory, `node_modules/`
+ * included. Probed 2026-08-03 on a fixture repo with one ignored dir: the rejected turn came
+ * back `ok:true`, `report:""`, `captureComplete:false` — issue #121's exact defect, unfixed, in
+ * the common case. Capture representability is orthogonal to "did the turn produce anything",
+ * and conflating them cost the fix.
+ *
+ * `filesChanged === 0` IS THE ONE CAPTURE COLUMN, AND IT IS PURELY A GUARD: a refusal must never
+ * be returned while a patch with real content sits on disk. It cannot enable a refusal, only
+ * suppress one.
+ *
+ * `patchPath === null` IS DELIBERATELY ABSENT, and this is a knowing deviation from the
+ * predicate as specified to me — recorded because it inverts the outcome on the finding above.
+ * The same probe showed the ignored-directory case returns `filesChanged: 0` with a **non-null**
+ * `patchPath` (the patch file is written and empty; only `nothingToReview` nulls the path, and
+ * that requires `captureComplete`). So keeping the column would have left the CRITICAL finding
+ * unfixed by a different route. It also cannot serve the guard purpose it was given:
+ * `patchPath === null` holds ONLY where `filesChanged === 0` already holds, so it can never stop
+ * a refusal from hiding a real patch — it can only produce false negatives, which is exactly
+ * what it did.
+ *
+ * TRIMMED-empty, not `=== ""`, mirroring C74: a turn that produced one newline has said nothing
+ * either, and a one-whitespace-character difference must not decide this.
+ *
+ * THREE SHAPES STAY SUCCESSES, all live:
+ *   (a) an empty report beside a REAL PATCH — a terse model that edited files and wrote no
+ *       prose has delivered. It made tool calls, so the second column is false, and its patch
+ *       makes the third false too. PR #120 pinned this; it must never be caught here.
+ *   (b) a NON-EMPTY report beside ZERO edits — probed live 2026-08-02: a model whose writes the
+ *       approval bridge rejected returns a real report explaining why nothing was written.
+ *   (c) a SILENT BASH-ONLY turn — the model ran commands, changed nothing and said nothing
+ *       (found by the gemini-3.1-pro guild review). It did something; the activity trace and the
+ *       approval record are where that shows. This is the NEW stated residual: a turn with ≥1
+ *       tool call, an empty report and no captured change stays a success, deliberately.
+ */
+export function nothingDelivered(
+  report: string,
+  toolCallCount: number,
+  capture: DelegateCapture,
+): boolean {
+  return report.trim() === "" && toolCallCount === 0 && capture.filesChanged === 0;
+}
 
 /**
  * The DEFAULT root, matching OpencodeLifecycle's own default (`$GUILD_PROJECT_DIR` else cwd).
@@ -588,6 +668,65 @@ export async function delegate(
     callId: outcome.callId,
   });
 
+  if (outcome.ok && nothingDelivered(outcome.text, outcome.toolCallCount, capture)) {
+    // NOTHING WAS PRODUCED ON ANY CHANNEL (issue #121, C74 amended). Placed after the capture
+    // because the `filesChanged` guard reads it; the DECIDING half — zero tool calls — is a fact
+    // about the turn and would be available earlier. Everything above is deliberately left
+    // alone: the snapshots, the patch decision, the recovery hint, the scaffold tamper signal
+    // and the `delegate-diff` bookkeeping are byte-for-byte what they would be if this branch
+    // did not exist. The refusal reads the capture; it does not shape it.
+    //
+    // THE EVIDENCE SAYS THE TURN SUCCEEDED, AND THAT IS CORRECT, NOT AN OVERSIGHT. `completed`
+    // is written by the spine before this line runs, and it records what the TURN did: it
+    // completed, history was read, and the byte-exact answer is `""` — `exit_code: 0`,
+    // `capture_state: "complete"`. C74's read-path row records `exit_code: 1` because there the
+    // failure IS the turn's, thrown from inside `askViaAgent`. Here the turn is a success that
+    // delivered nothing, and the judgement is the tool's, made one layer up and one step later.
+    // Making the receipts say otherwise would mean deferring the `completed` write out of the
+    // shared spine for all four tools — a far larger change than this defect earns. And the log
+    // does NOT lose the distinction meanwhile: #120's success (empty report, real patch) writes
+    // a `delegate-diff` entry and this refusal's usual shape writes none, so `calls.jsonl` alone
+    // separates them. (An earlier version of this comment claimed the opposite — that they were
+    // indistinguishable without the capture — which was simply false; review round 2026-08-03.
+    // The one case that also writes a `delegate-diff` is a CRASHED capture, via the patch-less
+    // `diffUncaptured`, and that entry carries `capture_complete:false`, so it is not confusable
+    // with #120's either.) The run still verifies clean.
+    //
+    // NOTHING TO CLEAN UP ON THE SESSION, EITHER. `guild_delegate` takes no `sessionId`, mints a
+    // fresh session per call and never keeps it, so by the time this runs `askViaAgent`'s
+    // deletion matrix has already torn it down under `created here + success + !keepSession`.
+    // C74's continued-session row — a caller's id kept alive because the caller owns it — has no
+    // counterpart here and no new row is added to that matrix.
+    const fail: DelegateFail = {
+      ok: false,
+      rootConflict,
+      error: {
+        kind: "empty-delegation",
+        model: requestedModel,
+        // No bash counterpart (the wrapper never judged this), so null rather than a number
+        // that would collide with the area-H table — the same choice C74 made for `empty-answer`.
+        exitAnalogue: null,
+        message:
+          `The delegation to '${modelLabel(requestedModel)}' produced NOTHING: the turn made no ` +
+          `tool calls, wrote no report, and no file changes were captured. Refusing to return an ` +
+          `empty success — there is no work to review and nothing was said about why. The full ` +
+          `capture record is attached (structuredContent.capture), including any scaffoldWarning. ` +
+          (outcome.providerError !== undefined
+            ? `The provider reported: ${outcome.providerError}`
+            : `opencode reported no error for the turn, so the cause is not in the history — ` +
+              `check the model id (guild_models lists the authed provider CONFIGURATION, and a ` +
+              `provider can still reject a listed id at call time) and, if the activity layer is ` +
+              `on, the call's activity errors.`),
+      },
+      capture,
+      ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+    };
+    if (outcome.activity !== undefined) fail.activity = outcome.activity;
+    if (outcome.approval !== undefined) fail.approval = outcome.approval;
+    if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
+    return fail;
+  }
+
   if (outcome.ok) {
     const ok: DelegateOk = {
       ok: true,
@@ -609,7 +748,6 @@ export async function delegate(
     return ok;
   }
 
-  const modelLabel = requestedModel === "" ? "(opencode default)" : requestedModel;
     // `agent-unhardened` joins these: it is a REFUSAL carrying its own actionable message
     // (agent named, resolved action, remedy), and the command docs tell the driver to report
     // it verbatim. Wrapping it produced "the call to X failed: <message>. Any changes ... see
@@ -620,13 +758,15 @@ export async function delegate(
     outcome.kind === "approval-not-applied" ||
     outcome.kind === "agent-unhardened"
       ? outcome.reason
-      : `The delegate call to '${modelLabel}' failed: ${outcome.reason}. ` +
+      : `The delegate call to '${modelLabel(requestedModel)}' failed: ${outcome.reason}. ` +
         `Any changes the model made before failing are captured for review (see capture.patchPath).`;
-  // ISSUE #117 IS DELIBERATELY NOT WIRED HERE, and this line is where that shows. The shared
-  // spine can report `empty-answer`, but only for a caller that asked for it with
-  // `requireAnswer` — and this tool does not, because an empty report beside a real patch is a
-  // successful delegation, not a failure. So the kind is unreachable on this path and is mapped
-  // defensively rather than widening this tool's wire contract with a kind it never emits.
+  // ISSUE #117'S `requireAnswer` IS STILL DELIBERATELY NOT WIRED HERE, and this line is where
+  // that shows. The shared spine can report `empty-answer`, but only for a caller that asked for
+  // it — and this tool does not, because an empty report beside a real patch is a successful
+  // delegation. So the kind is unreachable on this path and is mapped defensively rather than
+  // widening this tool's wire contract with a kind it never emits. Issue #121's own refusal is a
+  // DIFFERENT kind (`empty-delegation`) decided above; do not collapse the two — one is "the turn
+  // said nothing", the other is "the turn said nothing AND made no tool calls".
   const kind: DelegateErrorKind =
     outcome.kind === "empty-answer" ? "call-failed" : outcome.kind;
   const fail: DelegateFail = {

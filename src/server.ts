@@ -198,10 +198,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "under the model policy; the per-call tool enforces that. And the config is " +
         "PER-PROVIDER, not per-model entitlement: a listed id can still be REJECTED by the " +
         "provider at call time (issue #117). On the READ tools (guild_consult, guild_panel, " +
-        "guild_research) that now surfaces as an empty-answer error rather than a blank " +
-        "answer; guild_delegate deliberately does NOT opt in, so a rejected id there returns " +
-        "a successful call with an empty report and no patch — check both before trusting " +
-        "it. If an id fails either way, pick another and say so.",
+        "guild_research) that surfaces as an empty-answer error rather than a blank answer; on " +
+        "guild_delegate it surfaces as an empty-delegation error (issue #121) — no report AND " +
+        "no tool calls. An empty report on its own is NOT an error there: the answer is the " +
+        "patch, so a terse model that edited files has still delivered. If an id fails either " +
+        "way, pick another and say so.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {
@@ -430,6 +431,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "and recoverable via capture.recoveryHint. Subject to the model policy (deny/ask/" +
         "allow) like guild_consult. If the hardened guild-build agent def is missing this " +
         "tool REFUSES (no fallback to the unrestricted editor) rather than silently degrading. " +
+        "A delegation that produced NOTHING — no report AND no tool calls, which is what a " +
+        "provider rejecting the model id looks like — is refused as 'empty-delegation' (issue " +
+        "#121) rather than returned as an empty success; report it and pick another model. An " +
+        "empty report on its own is NOT a failure: the answer is the patch, and a silent turn " +
+        "that ran commands did work too — check capture.patchPath and structuredContent.activity " +
+        "before calling a terse delegation useless. " +
         "OPTIONAL APPROVAL BRIDGE (off unless the USER set GUILD_APPROVE): when armed, the " +
         "model's edit/write/patch (and, at 'all', bash) calls are put to the user for approval " +
         "before opencode runs them, and the result carries structuredContent.approval. You " +

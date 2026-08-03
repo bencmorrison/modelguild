@@ -390,7 +390,12 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
  * turn still renders ONE default turn, so the low-level fixtures that call `fetchHistory`
  * without posting anything are unchanged.
  */
-export type TurnShape = "text" | "rejected" | "non-string-text" | "preamble-then-textless";
+export type TurnShape =
+  | "text"
+  | "rejected"
+  | "silent"
+  | "non-string-text"
+  | "preamble-then-textless";
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -466,6 +471,13 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
       user,
       { info: asst(`msg_asst_${n}`, { finish: null, error: rejectionError(opts) }), parts: [] },
     ];
+  }
+  // A SILENT turn (issue #121): zero parts and zero tool calls like `rejected`, but NO
+  // `info.error` — the model simply said nothing and opencode reported no reason. It exists to
+  // fixture the branch of `guild_delegate`'s empty-delegation message that fires when there is
+  // no provider error to quote, which `rejected` can never reach because it always carries one.
+  if (turn.shape === "silent") {
+    return [user, { info: asst(`msg_asst_${n}`, { finish: "stop" }), parts: [] }];
   }
   // Every other shape keeps the MULTI-MESSAGE turn the backward walk exists for: a tool-call
   // assistant message with no text, then the text-bearing one.
