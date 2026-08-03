@@ -198,7 +198,7 @@ export interface PayloadDoctorInfo {
   /** Whether the START-UP notice is enabled. `doctor`/`guild_status` report skew either way —
    * the knob governs the unsolicited surface only. */
   noticeEnabled: boolean;
-  /** Where the notice's per-version suppression state lives (review finding L6: nothing
+  /** Where the notice's suppression state lives (review finding L6: nothing
    * reported it, so a user who wanted to reset or inspect it had nowhere to look). */
   noticeStatePath: string;
 }

@@ -8,7 +8,7 @@ Works in any stdio MCP client. **Claude Code is the first-class — and currentl
 
 ## Quickstart
 
-Needs [Node.js](https://nodejs.org), [Claude Code](https://claude.com/claude-code), and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
+Needs [Node.js](https://nodejs.org) 20 or newer, [Claude Code](https://claude.com/claude-code), and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
 
 ```bash
 opencode auth login
@@ -18,7 +18,7 @@ claude mcp add modelguild -s user -- npx -y modelguild serve
 npx modelguild doctor
 ```
 
-Restart Claude Code, then run `/guild:configure` inside it. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
+Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:consult` — `doctor` calls no model, so that consult is what proves your opencode auth actually works. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
 
 ## Contents
 

@@ -786,12 +786,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 }
 
 // ---------------------------------------------------------------------------
-// Payload-skew notice, once per SERVER VERSION (issue #94).
+// Payload-skew notice, once per SERVER VERSION + skew state (issues #94, #145).
 //
 // The server updates itself via npx; the `/guild:*` commands, hardened agent defs and
 // templates it installed into the user's repo do not move with it. Nobody who never runs
 // `doctor` would ever learn that — so the one moment the server is guaranteed to reach says
-// it, once per release, and then goes quiet (`GUILD_PAYLOAD_NOTICE=off` silences it outright;
+// it once, and then goes quiet until the version or the reported skew moves
+// (`GUILD_PAYLOAD_NOTICE=off` silences it outright;
 // `doctor`/`guild_status` keep reporting regardless, per issue #23's `logs clean` precedent).
 //
 // STDERR ONLY — stdout is the MCP protocol channel — and NON-FATAL by construction:

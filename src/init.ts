@@ -515,7 +515,7 @@ export interface PayloadFileState {
   /**
    * The ownership record this file was JUDGED AGAINST — project or global, whichever location
    * it was found in. Carried because it is the only value that identifies *which install* the
-   * verdict is about: `src/notice.ts` keys its per-version suppression on it, so a global-only
+   * verdict is about: `src/notice.ts` keys its suppression on it, so a global-only
    * payload is announced once across every project that shares it rather than once per project.
    */
   recordPath: string;

@@ -21,10 +21,11 @@
  *     `src/approve.ts` posture).
  *  2. IT MAY NEVER WRITE TO STDOUT. Stdout is the MCP transport; a stray line there corrupts
  *     the protocol stream. The sink is injectable and defaults to stderr.
- *  3. IT MUST NOT NAG. Suppressed per SERVER VERSION, not per session (maintainer decision,
- *     2026-07-29): a user who has deliberately not run `init` should be told once per release,
- *     not once per Claude Code session. Acting on it removes the skew entirely; consciously
- *     ignoring it costs one line, then silence until the next version.
+ *  3. IT MUST NOT NAG. Suppressed per SERVER VERSION + PAYLOAD STATE, not per session
+ *     (maintainer decisions, 2026-07-29 and — for the payload half — issue #145, 2026-08-02): a
+ *     user who has deliberately not run `init` should be told once per change, not once per
+ *     Claude Code session. Acting on it removes the skew entirely; consciously ignoring it costs
+ *     one line, then silence until the version or the reported skew moves.
  *
  * WHERE THE SUPPRESSION STATE LIVES — and the two things it must NOT be.
  *
@@ -68,10 +69,11 @@
  *     file away in `src/init.ts`.
  *  2. IT MAY NEVER WRITE TO STDOUT. Stdout is the MCP transport; a stray line there corrupts
  *     the protocol stream. The sink is injectable and defaults to stderr.
- *  3. IT MUST NOT NAG. Suppressed per SERVER VERSION, not per session (maintainer decision,
- *     2026-07-29): a user who has deliberately not run `init` should be told once per release,
- *     not once per Claude Code session. Acting on it removes the skew entirely; consciously
- *     ignoring it costs one line, then silence until the next version.
+ *  3. IT MUST NOT NAG. Suppressed per SERVER VERSION + PAYLOAD STATE, not per session
+ *     (maintainer decisions, 2026-07-29 and — for the payload half — issue #145, 2026-08-02): a
+ *     user who has deliberately not run `init` should be told once per change, not once per
+ *     Claude Code session. Acting on it removes the skew entirely; consciously ignoring it costs
+ *     one line, then silence until the version or the reported skew moves.
  *
  * THE KEY IS VERSION + PAYLOAD FINGERPRINT (issue #145, maintainer decision 2026-08-02). This
  * used to be the version string alone (review finding L4), and that was a stated limit: a
@@ -273,7 +275,8 @@ export function writeNoticeState(file: string, state: NoticeState): boolean {
  * cannot word the same fact differently (the same reason `printDriftNote` is shared).
  *
  * `unsolicited` adds the two lines that only make sense on the nag: how to silence it, and the
- * fact that it appears once per server version while `doctor` will always report it.
+ * fact that it appears once per server version + payload state while `doctor` will always
+ * report it.
  */
 export function formatSkewNote(opts: {
   skewed: PayloadFileState[];
@@ -328,7 +331,8 @@ export function formatSkewNote(opts: {
   );
   if (opts.unsolicited) {
     out.push(
-      `${indent}  This appears once per server version. \`npx modelguild doctor\` always ` +
+      `${indent}  This appears once per server version, and again when the list above or the ` +
+        `bytes this server ships for those files change. \`npx modelguild doctor\` always ` +
         `reports it; GUILD_PAYLOAD_NOTICE=off in modelguild.conf.local silences THIS line only.`,
     );
   }

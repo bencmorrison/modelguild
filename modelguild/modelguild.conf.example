@@ -72,13 +72,18 @@
 # payload is behind (the server moves, it does not), but a deliberately pinned older server
 # puts it ahead. The pinned command above converges either way.
 #
-# The notice appears ONCE PER SERVER VERSION, not once per session: after you have seen it,
-# acting on it or deciding to stay put both leave you in silence until the next release. What
-# it has already told you is recorded OUTSIDE your repo — in ~/.claude/modelguild/, or in
-# $GUILD_ROOT if you pinned one — so nothing untracked ever appears in your working tree;
-# delete that file to be told again. One known limit of keying on the version: a republished
-# version, a moving dist-tag, or running from a source checkout can move the payload without
-# moving the version, and the notice then stays quiet. `npx modelguild doctor` still reports it.
+# The notice appears ONCE PER SERVER VERSION AND SKEW STATE, not once per session: after you
+# have seen it, acting on it or deciding to stay put both leave you in silence until the version
+# changes, or until the set of files it named — or the bytes this server ships for them — does.
+# What it has already told you is recorded in ~/.claude/modelguild/, or in $GUILD_ROOT if you
+# pinned one, so nothing untracked appears in your working tree unless you pointed $GUILD_ROOT
+# at a repo yourself; delete that file to be told again. Keying on those files as well as the
+# version is what stops a republished version, a moving dist-tag, or a source checkout from
+# going quiet: they move the shipped bytes without moving the version. The accepted cost is that
+# each such change re-fires the notice, so if you iterate on the payload yourself, set
+# GUILD_PAYLOAD_NOTICE=off below. The scope is exactly what it reports — a shipped change
+# confined to files you EDITED (that is upgrade drift) or to files with no ownership record
+# never enters it. `npx modelguild doctor` reports skew either way.
 # GUILD_PAYLOAD_NOTICE=off        # on (default) | off. Turns off the START-UP notice only.
 #                                 # `npx modelguild doctor` and the guild_status tool keep
 #                                 # reporting skew regardless — you asked those a question,
