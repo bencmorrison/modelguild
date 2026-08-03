@@ -521,30 +521,30 @@ async function runCases(): Promise<number> {
   // models answer — so a zero is evidence, not proof, and doctor must not call that setup
   // broken. Same posture as the claude-absent registration downgrade and C72's report-only
   // skew/drift rule.
-  const vNoAuth = await runOc(opencodeStub({ authList: AUTH_LIST.empty }));
+  const vEmptyList = await runOc(opencodeStub({ authList: AUTH_LIST.empty }));
   c.check(
-    vNoAuth.code === sOk.code,
-    `(v) no credentials does NOT change doctor's verdict (${vNoAuth.code} vs authed ${sOk.code})`,
+    vEmptyList.code === sOk.code,
+    `(v) no credentials does NOT change doctor's verdict (${vEmptyList.code} vs authed ${sOk.code})`,
   );
   c.check(
-    vNoAuth.out.includes("! opencode has NO credentials"),
+    vEmptyList.out.includes("! opencode has NO credentials"),
     "(v) the unauthenticated state is a ! warning line",
   );
   c.check(
-    !vNoAuth.out.includes("✗ opencode has NO credentials"),
+    !vEmptyList.out.includes("✗ opencode has NO credentials"),
     "(v) it is NOT a ✗ (the probe cannot see every working configuration)",
   );
-  c.check(vNoAuth.out.includes("doctor: OK"), "(v) doctor still reports OK");
-  c.check(vNoAuth.out.includes("opencode auth login"), "(v) names the remedy");
-  c.check(vNoAuth.out.includes("Until you do"), "(v) the remedy sentence reads grammatically");
+  c.check(vEmptyList.out.includes("doctor: OK"), "(v) doctor still reports OK");
+  c.check(vEmptyList.out.includes("opencode auth login"), "(v) names the remedy");
+  c.check(vEmptyList.out.includes("Until you do"), "(v) the remedy sentence reads grammatically");
   c.check(
-    vNoAuth.out.includes("opencode.json") &&
-      vNoAuth.out.includes("apiKey") &&
-      vNoAuth.out.includes("local endpoint needing no credential"),
+    vEmptyList.out.includes("opencode.json") &&
+      vEmptyList.out.includes("apiKey") &&
+      vEmptyList.out.includes("local endpoint needing no credential"),
     "(v) names BOTH blind-spot shapes, not just the apiKey one",
   );
   c.check(
-    vNoAuth.out.includes("✓ opencode present"),
+    vEmptyList.out.includes("✓ opencode present"),
     "(v) the binary line still passes — the two checks are independent",
   );
 
