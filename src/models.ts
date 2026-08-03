@@ -25,10 +25,13 @@
  * per model and goes stale the same way. So the honest fix is the description: this enumerates
  * configuration, and an unreachable id is caught at CALL time — how loudly depends on the tool.
  * An id absent from the catalog answers HTTP 500 ⇒ `call-failed`, everywhere. A LISTED id the
- * provider rejects ends the turn empty, and only the READ tools refuse that (`empty-answer`,
- * C74); `guild_delegate` does not opt in, so there it is `ok:true` with an empty `report` and a
- * null `patchPath` — silent, by design, because an empty report beside a real patch is a
- * successful delegation and this path cannot tell the two apart.
+ * provider rejects ends the turn empty, and the READ tools refuse that as `empty-answer` (C74).
+ * `guild_delegate` still does not opt into that check — an empty report beside a real patch is a
+ * successful delegation — but since issue #121 it refuses the narrower combination itself: an
+ * empty report from a turn that ALSO made no tool calls is `empty-delegation`, `isError:true`,
+ * quoting the provider's own message. A rejected id is therefore loud on every model-calling
+ * tool. The stated residual is the other direction — a turn that DID make tool calls, said
+ * nothing and changed nothing stays a success, because it did something.
  *
  * This is the LAST thing the migrated command docs shelled out to the `opencode`
  * binary for (`Bash(opencode models:*)`): a read-only enumeration of the caller's

@@ -914,6 +914,11 @@ export interface LifecycleParams {
    * the opt-in is the point: `guild_consult`/`guild_panel`/`guild_research` set it, because a
    * read path with no text produced nothing at all. `guild_delegate` does NOT — its answer is
    * the patch, and an empty report beside real edits is a successful delegation.
+   *
+   * Issue #121 did not change that: the write path refuses only the narrower "no report AND no
+   * TOOL CALLS", which it decides itself from `LifecycleOutcome.toolCallCount`. Do not "tidy" it
+   * by setting this flag on the delegate path; that would throw before the after-snapshot and
+   * fail exactly the case #120 pinned as a success.
    */
   requireAnswer?: boolean;
 }
@@ -957,6 +962,21 @@ export type LifecycleOutcome =
       callId: string;
       actualModel: string;
       sessionId: string;
+      /**
+       * The turn's own `info.error`, whitelisted by `finalAssistantError` — present only when
+       * opencode carried one. Threaded for issue #121: `guild_delegate` decides its
+       * `empty-delegation` refusal AFTER this outcome and after its capture, so this is the only
+       * route by which the provider's own words reach that message. The read paths never read it
+       * (they refuse inside `askViaAgent` and quote it from `EmptyAnswerError`).
+       */
+      providerError?: string;
+      /**
+       * Tool calls made by THIS turn, turn-scoped (issue #121; see `turnToolCallCount`).
+       * `guild_delegate`'s refusal rests on it: zero tool calls means the model cannot have
+       * edited a file or run a command, which is a fact about the TURN and therefore
+       * independent of whatever the capture was able to measure afterwards.
+       */
+      toolCallCount: number;
       /** Bounded activity summary for this call; absent when the layer is off. */
       activity?: ActivitySummary;
       /** Approval record for this call; absent unless the bridge was armed. */
@@ -1154,9 +1174,11 @@ export async function runAgentLifecycle(
       callId,
       actualModel: actualModel(p.requestedModel, result.metadata.providerID, result.metadata.modelID),
       sessionId: result.sessionId,
+      toolCallCount: result.toolCallCount,
     };
     if (recorder !== undefined) ok.activity = recorder.summary();
     if (approver !== undefined) ok.approval = approver.summary();
+    if (result.providerError !== undefined) ok.providerError = result.providerError;
     return ok;
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
