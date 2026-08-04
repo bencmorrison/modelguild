@@ -228,14 +228,11 @@ jobs:
     # opencode, so those three cannot run honestly here — and they have NO graceful
     # skip when the binary is absent (they FAIL: a missing opencode is now a clean
     # `failed to spawn` rejection rather than the uncaught 'error' crash it used to be
-    # — issue #75 — but a failure either way, never a skip). So this job runs the OFFLINE suites
-    # individually BY NAME (each supports standalone `tsx test/<name>.test.ts`) and
-    # states which three are excluded and why, so a green run here always means
-    # those suites actually executed — never a skipped-everything pass. The loop's
-    # name list below is the source of truth; deliberately no count is stated
-    # anywhere in prose, because a count drifts the moment a suite is added.
+    # — issue #75 — but a failure either way, never a skip). So this job uses the runner's
+    # `--offline` mode, which excludes exactly those three while running all remaining suites
+    # in bounded parallel child processes. The runner owns both lists, preventing CI drift.
     #
-    # `doctor` was MISSING from this list (it ran only under a local `npm test`, so its
+    # `doctor` was MISSING from the offline suite roster (it ran only under a local `npm test`, so its
     # coverage — including the issue-#22 upgrade-drift checks — was never enforced here).
     # It is offline and belongs. Since issue #151 it no longer depends on this runner's PATH
     # at all: `doctor` hard-fails on a missing `opencode` (which this runner deliberately does
@@ -258,15 +255,4 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Offline test suites
-        run: |
-          echo "Running the offline test/*.test.ts suites individually."
-          echo "SKIPPED (need the real opencode binary; this CI never installs it):"
-          echo "  lifecycle, orphan, mcp-client — see job comment; run them locally."
-          echo
-          rc=0
-          for suite in serve-stderr client activity approve log policy config consult panel research delegate models init doctor worktree agentfloor; do
-            echo "=== test/${suite}.test.ts ==="
-            npx tsx "test/${suite}.test.ts" || rc=1
-            echo
-          done
-          exit "$rc"
+        run: npm run test:offline

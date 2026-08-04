@@ -50,6 +50,7 @@
     "typecheck": "tsc --noEmit",
     "start": "tsx src/server.ts",
     "test": "tsx test/run.ts",
+    "test:offline": "tsx test/run.ts --offline",
     "test:live": "tsx test/client.live.ts && tsx test/consult.live.ts && tsx test/panel.live.ts && tsx test/research.live.ts && tsx test/delegate.live.ts && tsx test/session.live.ts",
     "prepublishOnly": "npm run build && npm test"
   },
