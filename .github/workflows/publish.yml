@@ -14,9 +14,9 @@ name: Publish to npm
 #
 # OPENCODE-FREE like the rest of CI (see ci.yml): the full `npm test` spawns a real
 # `opencode serve` in three suites with no graceful skip, and this runner never
-# installs or authenticates opencode. So this job runs the TEN offline suites, then
-# publishes with `--ignore-scripts` (which also skips prepublishOnly's opencode-bound
-# full test) AFTER an explicit `npm run build`.
+# installs or authenticates opencode. So this job uses the canonical `--offline`
+# selection, then publishes with `--ignore-scripts` (which also skips prepublishOnly's
+# opencode-bound full test) AFTER an explicit `npm run build`.
 
 on:
   push:
@@ -62,16 +62,8 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      - name: Offline test suites (10 of 13 — opencode-free, see ci.yml)
-        run: |
-          echo "Running 10/13 offline suites; lifecycle/orphan/mcp-client need the real"
-          echo "opencode binary and are excluded here (this runner never installs it)."
-          rc=0
-          for suite in client log policy config consult panel research delegate models init; do
-            echo "=== test/${suite}.test.ts ==="
-            npx tsx "test/${suite}.test.ts" || rc=1
-          done
-          exit "$rc"
+      - name: Offline test suites
+        run: npm run test:offline
 
       - name: Build (produces dist/ + prepends the node shebang to dist/cli.js)
         run: npm run build
