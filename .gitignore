@@ -54,3 +54,10 @@ modelguild/logs/
 
 # Logs / temp
 *.log
+
+# Machine-local dev container variant: mounts personal credentials and names
+# host paths that exist on one machine.  Never commit it.
+.devcontainer/local/
+
+# agent worktrees created by the Claude Code harness
+.claude/worktrees/

@@ -48,6 +48,31 @@
  * entry point (`scanInstalledPayload`) feeds all three surfaces — `doctor`, `guild_status`,
  * and the server's start-up notice (`src/notice.ts`). Same posture as drift: REPORT only,
  * never a failure, never an exit-code change.
+ *
+ * SYMLINKS AT A DESTINATION differ BY MODE (issue #156, maintainer decision 2026-08-05).
+ * PROJECT mode is unchanged: `safeJoin` refuses a symlink at any existing component.
+ * `--global` writes into the user's OWN config (`~/.claude`, `<xdg>/opencode`), and a
+ * dotfiles manager (GNU stow, chezmoi, a hand-rolled `ln -s`) makes those DIRECTORIES
+ * symlinks — so `--global` uses `globalJoin`, which keeps the `..`/absolute guard and
+ * FOLLOWS directory links, landing the payload in the backing store. Before this, such a
+ * layout threw at the FIRST linked destination: nothing installed when `~/.claude` was the
+ * link (`planFor` resolves the record path under it EAGERLY, before the loop), a PARTIAL
+ * install with no ownership record when only `<xdg>/opencode` was. In GLOBAL mode a LEAF payload file that is a symlink is not
+ * written through and not refused: it takes the existing never-clobber path — skipped
+ * with a warning, `init` completes, the ownership record is still written. (Project mode
+ * still REFUSES a live leaf link; only the dangling case changed there.) The RECORD's own
+ * path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
+ * there is written THROUGH — deliberately, since only init writes the record and there is
+ * no user content to preserve, but never silently (`recordSymlinkWarning`). TWO enumerated
+ * shapes of record link are REFUSED instead, at plan time and before any byte is written
+ * (`assertRecordLinkWritable`): a DANGLING one whose target's directory does not exist
+ * (`ENOENT`) or is not a directory (`ENOTDIR`). Either write used to throw a raw errno after
+ * the whole payload was already installed — no record, so a re-run crashed the same way and
+ * uninstall could remove nothing. Two named conditions, not a general can-this-write predicate.
+ * Capability cost, stated: `--global` now writes wherever those directory links point,
+ * including outside `$HOME`, and uninstall's `pruneEmptyDirs` may `rmdir` now-empty dirs in the
+ * backing store. Provenance: the ask and the global-only scope are the maintainer's
+ * (issue #156); the shape is Claude's.
  */
 
 import { createHash } from "node:crypto";
@@ -57,7 +82,9 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -177,8 +204,10 @@ const MCP_KEY = "modelguild";
 //
 // A payload entry's project-relative `dest` (e.g. `.claude/commands/guild/consult.md`) is
 // the stable RECORD KEY in BOTH modes; only the on-disk base changes. `payloadDest` maps a
-// dest-rel to `{ base, rel }` so callers pick `safeJoin(base, rel)` (symlink-safe writes,
-// init) or `path.join(base, rel)` (plain existence check, doctor) as they need.
+// dest-rel to `{ base, rel }` so callers pick the rule for their question: `safeJoin(base,
+// rel)` (project writes — refuse any symlinked component), `globalJoin(base, rel)` (global
+// writes — follow directory links, issue #156) or `path.join(base, rel)` (plain existence
+// check, doctor, which follows links and so already saw a dotfiles-managed layout).
 // ---------------------------------------------------------------------------
 export interface GlobalDirs {
   /** Resolved home dir (defaults to os.homedir()). */
@@ -264,11 +293,15 @@ function planFor(opts: InitOptions): InstallPlan {
     return {
       destFor: (rel) => {
         const { base, rel: r } = payloadDest(rel, destOpts);
-        return safeJoin(base, r);
+        return globalJoin(base, r);
       },
       recordPath: (() => {
         const { base, rel } = payloadDest(RECORD_REL, destOpts);
-        return safeJoin(base, rel);
+        const p = globalJoin(base, rel);
+        // Only an INSTALL writes the record; `--uninstall` reads it and unlinks the link, so
+        // a link the write could not have followed must not stop a removal.
+        if (!opts.uninstall) assertRecordLinkWritable(p);
+        return p;
       })(),
       pruneDirs: [
         path.join(g.homeDir, ".claude", "commands", "guild"),
@@ -397,7 +430,9 @@ function validRel(rel: string): boolean {
 /**
  * Resolve `<base>/<rel>` refusing a symlink at ANY existing component — the
  * safe_dest_rel guard: a planted symlink (payload file or intermediate dir) must not
- * redirect a write outside `base`.
+ * redirect a write outside `base`. PROJECT MODE ONLY since issue #156; `--global` uses
+ * `globalJoin` below (maintainer decision 2026-08-05 — the project target is somebody's
+ * source repo, the global target is the user's own config).
  */
 function safeJoin(base: string, rel: string): string {
   if (!validRel(rel)) throw new Error(`refusing unsafe path: ${rel}`);
@@ -409,6 +444,32 @@ function safeJoin(base: string, rel: string): string {
     }
   }
   return cur;
+}
+
+/**
+ * Resolve `<base>/<rel>` for a GLOBAL install (issue #156): the `..`/absolute/empty guard
+ * still applies, but a symlinked DIRECTORY component is followed rather than refused — a
+ * dotfiles-managed `~/.claude` or `<xdg>/opencode` is a symlink, and refusing it made
+ * `--global` install nothing at all. The LEAF is deliberately not decided here: the install
+ * loop's existing never-clobber branch skips a destination that is not a regular file.
+ */
+function globalJoin(base: string, rel: string): string {
+  if (!validRel(rel)) throw new Error(`refusing unsafe path: ${rel}`);
+  return path.join(base, rel);
+}
+
+/**
+ * True when a path has an entry of its own — a DANGLING symlink included, which `existsSync`
+ * (it follows) reports as absent. The install loop gates its never-clobber check on this so a
+ * dangling leaf link reaches the not-a-regular-file branch instead of being written THROUGH.
+ */
+function entryExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readRecords(recordPath: string): Records {
@@ -449,6 +510,104 @@ function readMcpRecord(recordPath: string): McpRecord | undefined {
     /* unreadable/corrupt → undefined (conservative: nothing is "owned") */
   }
   return undefined;
+}
+
+/**
+ * The record path's own symlink, resolved: `{ target, live }`, or `undefined` when the path
+ * holds no entry or is not a link — the normal case. `live` comes from `existsSync`, which
+ * FOLLOWS the link, so `false` means DANGLING. Never throws: an unreadable link resolves to
+ * `undefined`, the same as no link at all. Shared by the plan-time refusal below and the
+ * pre-write warning, so the two can never describe the same link differently.
+ */
+function resolveRecordLink(recordPath: string): { target: string; live: boolean } | undefined {
+  let linkText: string;
+  try {
+    if (!lstatSync(recordPath).isSymbolicLink()) return undefined;
+    linkText = readlinkSync(recordPath);
+  } catch {
+    return undefined; // nothing there (the normal case), or unreadable — nothing to say
+  }
+  return {
+    target: path.resolve(path.dirname(recordPath), linkText),
+    live: existsSync(recordPath),
+  };
+}
+
+/**
+ * REFUSE — at PLAN time, before a single payload byte is written — a DANGLING record symlink
+ * the write could not have followed (issue #156). `writeRecords` creates `dirname(recordPath)`,
+ * which is the LINK's directory and not the TARGET's, so such a write raised a raw errno — and
+ * raised it AFTER the whole payload was on disk, leaving an install with NO ownership record: a
+ * re-run crashed identically and `--uninstall` could prove nothing was ours, so nothing was
+ * removable. That is the unrepairable partial install this whole change exists to avoid, and
+ * `safeJoin` refused these layouts cleanly before global mode stopped using it. Checked HERE
+ * because the record path is the one destination `planFor` already resolves eagerly, so the
+ * refusal lands where the mode's other record-path decisions do.
+ *
+ * TWO NAMED CONDITIONS, ENUMERATED — NOT a general "can this write succeed?" predicate
+ * (maintainer decision 2026-08-05): the target's directory is ABSENT (`ENOENT`), or it is
+ * present but NOT A DIRECTORY (`ENOTDIR`). Both were regressions against `origin/main` by the
+ * same route, so both are refused, with distinct wording naming which it is. Anything else —
+ * an unreadable target directory, a symlink loop, a read-only one — is left to fail from the
+ * write as it does today; try-and-report is a separate design question this does not settle.
+ * The stat is therefore POSITIVE evidence only: a stat that cannot be taken refuses nothing.
+ *
+ * Creating (or replacing) the target's directory was considered and REJECTED: init making
+ * directories wherever a user's link happens to point is a bigger step than declining. The
+ * working cases are untouched — a LIVE link, and a dangling link whose target directory EXISTS,
+ * are both still written through with `recordSymlinkWarning`'s warning.
+ */
+function assertRecordLinkWritable(recordPath: string): void {
+  const link = resolveRecordLink(recordPath);
+  if (!link || link.live) return; // no link, or one that resolves to an existing file
+  const targetDir = path.dirname(link.target);
+  // The shared middle of both refusals: what it costs, and that nothing has been written yet.
+  const why =
+    ` — the record cannot be written there, and an install with no record leaves nothing for a ` +
+    `re-run or --uninstall to verify. Nothing was installed. `;
+  if (!existsSync(targetDir)) {
+    throw new Error(
+      `the ownership record ${recordPath} is a symlink to ${link.target}, whose directory ` +
+        `${targetDir} does not exist${why}Create ${targetDir}, or remove the link, then re-run init.`,
+    );
+  }
+  // `statSync` FOLLOWS links, so a symlinked directory is fine and a link to a file is not.
+  // Refuse only on POSITIVE evidence: a stat that throws leaves the write to report it.
+  let isDir: boolean;
+  try {
+    isDir = statSync(targetDir).isDirectory();
+  } catch {
+    return;
+  }
+  if (isDir) return; // dangling, but the write will create the target
+  throw new Error(
+    `the ownership record ${recordPath} is a symlink to ${link.target}, but ${targetDir} is not ` +
+      `a directory${why}Replace ${targetDir} with a directory, or remove the link, then re-run init.`,
+  );
+}
+
+/**
+ * The ownership record's own path is a SYMLINK: say so (issue #156, maintainer decision
+ * 2026-08-05). It is not skipped, and — except for the two shapes `assertRecordLinkWritable`
+ * refuses above — not refused either: the record is written THROUGH the link,
+ * because only init writes this file, so there is no user content it is expected to
+ * preserve, and a dotfiles manager that links files individually (GNU stow does, when the
+ * parent directory already exists) legitimately puts a link here. But a user CAN point that
+ * path at a file of their own, and then the bytes land somewhere they did not expect — so
+ * name the link and the file the bytes actually go to, the same way the install loop names a
+ * skipped payload file. Must be called BEFORE the write: afterwards a dangling link and a
+ * live one are indistinguishable. Returns `undefined` for the normal case (no entry, or a
+ * regular file). Never throws — a warning that cannot be computed must not fail the install.
+ */
+function recordSymlinkWarning(recordPath: string): string | undefined {
+  const link = resolveRecordLink(recordPath);
+  if (!link) return undefined;
+  const { target, live } = link;
+  return (
+    `writing the ownership record through a symlink — ${recordPath} links to ${target}, so the record ` +
+    (live ? `replaced that file's contents` : `created that file (the link was dangling)`) +
+    `. Remove the link and re-run init to keep the record at ${recordPath} itself.`
+  );
 }
 
 function writeRecords(recordPath: string, records: Records, mcp?: McpRecord): void {
@@ -922,7 +1081,10 @@ export function init(opts: InitOptions): InitResult {
     const payloadHash = sha256(payloadBytes);
     const destAbs = plan.destFor(dest);
 
-    if (existsSync(destAbs)) {
+    // `entryExists`, not `existsSync`: a DANGLING symlink at the destination is an entry the
+    // user put there, and `existsSync` follows the link and calls it absent — which sent the
+    // write straight through it (issue #156). The branch below is unchanged.
+    if (entryExists(destAbs)) {
       if (!lstatSync(destAbs).isFile()) {
         result.warnings.push(`skipping ${dest} — a non-file exists there; left untouched.`);
         result.skipped.push(dest);
@@ -987,6 +1149,10 @@ export function init(opts: InitOptions): InitResult {
     // that init wrote the key (mirrors carrying an unchanged file's record forward).
     mcpRecord = ownedMcp;
   }
+  // Warn BEFORE the write: it is the only moment a dangling link is distinguishable from a
+  // live one, and the write settles that either way (issue #156).
+  const recordWarning = recordSymlinkWarning(plan.recordPath);
+  if (recordWarning) result.warnings.push(recordWarning);
   writeRecords(plan.recordPath, newRecords, mcpRecord);
   // A project `.gitignore` block only makes sense for a project install.
   if (plan.gitignoreDir) addGitignoreBlock(plan.gitignoreDir);

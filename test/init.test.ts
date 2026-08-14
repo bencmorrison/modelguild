@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -47,6 +48,50 @@ function tempProject(): string {
 
 function readJson(p: string): any {
   return JSON.parse(readFileSync(p, "utf8"));
+}
+
+/**
+ * `init`, with a throw SCORED as a failed check instead of aborting the process. A regression
+ * on the issue-#156 paths makes `init` throw, and an uncaught throw mid-file leaves every
+ * later assertion in this suite unevaluated — a coarser failure mode than the rest of the
+ * file. The empty result keeps the caller's follow-on assertions typed and failing.
+ */
+/** The ownership record's `files` key count, or -1 when the path is absent or does not hold the
+ *  record JSON — so an assertion ABOUT the record fails rather than throwing out of the suite
+ *  (the same reason `initScored` exists: a regression must score, not abort). */
+function recordedFileCount(p: string): number {
+  try {
+    return Object.keys(readJson(p).files).length;
+  } catch {
+    return -1;
+  }
+}
+
+/** Regular files under `dir`, recursively; 0 when `dir` does not exist. Symlinks are NOT
+ *  counted — they are what the caller planted, not what init wrote. Used to assert that a
+ *  refusal wrote NOTHING, which is the whole claim of a plan-time refusal. */
+function countFiles(dir: string): number {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const e of entries) {
+    if (e.isDirectory()) n += countFiles(path.join(dir, e.name));
+    else if (e.isFile()) n += 1;
+  }
+  return n;
+}
+
+function initScored(c: Checker, label: string, opts: Parameters<typeof init>[0]): ReturnType<typeof init> {
+  try {
+    return init(opts);
+  } catch (e) {
+    c.check(false, `${label} — init threw: ${(e as Error).message}`);
+    return { installed: [], skipped: [], removed: [], shadowed: [], drifted: [], warnings: [], mcpAction: "skipped" };
+  }
 }
 
 export async function run(): Promise<number> {
@@ -997,6 +1042,370 @@ export async function run(): Promise<number> {
   c.check(existsSync(gConsult), "uninstall --global keeps the user-edited file (hash mismatch)");
   c.check(!existsSync(path.join(mgDir, ".modelguild-install.json")), "uninstall --global removes the global ownership record");
   c.check(resgu.mcpAction === "unchanged", "uninstall --global does not touch any .mcp.json");
+
+  // --- issue #156: --global through a DOTFILES-MANAGED (symlinked) config ---
+  // `~/.claude` and `<xdg>/opencode` are symlinks under GNU stow / chezmoi / a hand-rolled
+  // `ln -s`. Global mode follows those DIRECTORY links; project mode still refuses (below).
+  const N_PAYLOAD = payloadFiles().length;
+  {
+    const linkHome = tempProject();
+    const linkXdg = tempProject();
+    const store = tempProject(); // the dotfiles backing store
+    const storeClaude = path.join(store, "claude");
+    const storeOpencode = path.join(store, "opencode");
+    mkdirSync(storeClaude, { recursive: true });
+    mkdirSync(storeOpencode, { recursive: true });
+    // RELATIVE targets — what a dotfiles manager actually emits.
+    const relClaude = path.relative(linkHome, storeClaude);
+    const relOpencode = path.relative(linkXdg, storeOpencode);
+    c.check(!path.isAbsolute(relClaude) && !path.isAbsolute(relOpencode), "symlink: the fixture links are RELATIVE");
+    symlinkSync(relClaude, path.join(linkHome, ".claude"));
+    symlinkSync(relOpencode, path.join(linkXdg, "opencode"));
+
+    const linkOpts = { homeDir: linkHome, xdgConfigHome: linkXdg };
+    const resL = initScored(c, "symlink: --global install through the directory links", {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true,
+      ...linkOpts,
+    });
+    c.check(
+      resL.installed.length === N_PAYLOAD,
+      `symlink: --global through symlinked ~/.claude + <xdg>/opencode installs all ${N_PAYLOAD} files (got ${resL.installed.length}, warnings: ${resL.warnings.join(" | ")})`,
+    );
+    // Assert on the BACKING STORE's real paths, not through the link — that is the claim.
+    c.check(
+      existsSync(path.join(storeClaude, "commands/guild/consult.md")),
+      "symlink: a command doc lands in the dotfiles backing store",
+    );
+    c.check(
+      existsSync(path.join(storeOpencode, "agent/guild-read.md")),
+      "symlink: an agent def lands in the backing store via the <xdg>/opencode link",
+    );
+    const linkRecord = path.join(storeClaude, "modelguild/.modelguild-install.json");
+    c.check(existsSync(linkRecord), "symlink: the ownership record is written into the backing store");
+    c.check(
+      recordedFileCount(linkRecord) === N_PAYLOAD,
+      `symlink: the record covers all ${N_PAYLOAD} payload files (got ${recordedFileCount(linkRecord)})`,
+    );
+    // The links themselves must survive — replaced by a real directory would break the dotfiles setup.
+    c.check(
+      lstatSync(path.join(linkHome, ".claude")).isSymbolicLink() &&
+        lstatSync(path.join(linkXdg, "opencode")).isSymbolicLink(),
+      "symlink: the directory links are followed, never replaced",
+    );
+
+    // Uninstall through the same links.
+    const resLu = initScored(c, "symlink: --uninstall --global through the directory links", {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true,
+      uninstall: true,
+      ...linkOpts,
+    });
+    c.check(
+      resLu.removed.length === N_PAYLOAD,
+      `symlink: uninstall --global removes all ${N_PAYLOAD} files through the links (got ${resLu.removed.length})`,
+    );
+    c.check(
+      !existsSync(path.join(storeClaude, "commands/guild/consult.md")) && !existsSync(path.join(storeOpencode, "agent/guild-read.md")),
+      "symlink: uninstall deletes the files from the backing store",
+    );
+    c.check(!existsSync(linkRecord), "symlink: uninstall removes the ownership record from the backing store");
+    c.check(
+      lstatSync(path.join(linkHome, ".claude")).isSymbolicLink(),
+      "symlink: uninstall leaves the directory link in place",
+    );
+  }
+
+  // A LEAF payload-file symlink is SKIPPED with a warning — never written through, never a
+  // throw: the install completes and still writes the ownership record. Both the live and the
+  // DANGLING link (which `existsSync` calls absent) take that same path.
+  {
+    const leafHome = tempProject();
+    const leafXdg = tempProject();
+    const store = tempProject();
+    const outside = tempProject();
+    const storeClaude = path.join(store, "claude");
+    const storeOpencode = path.join(store, "opencode");
+    mkdirSync(path.join(storeClaude, "commands/guild"), { recursive: true });
+    mkdirSync(path.join(storeOpencode, "agent"), { recursive: true });
+    symlinkSync(path.relative(leafHome, storeClaude), path.join(leafHome, ".claude"));
+    symlinkSync(path.relative(leafXdg, storeOpencode), path.join(leafXdg, "opencode"));
+
+    const kept = path.join(outside, "my-consult.md");
+    writeFileSync(kept, "MY OWN FILE\n");
+    const missing = path.join(outside, "never-created.md");
+    symlinkSync(kept, path.join(storeClaude, "commands/guild/consult.md")); // live leaf link
+    symlinkSync(missing, path.join(storeOpencode, "agent/guild-read.md")); // DANGLING leaf link
+
+    const resLeaf = initScored(c, "symlink leaf: --global install over leaf links", {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true,
+      homeDir: leafHome,
+      xdgConfigHome: leafXdg,
+    });
+    c.check(
+      resLeaf.installed.length === N_PAYLOAD - 2,
+      `symlink leaf: the other ${N_PAYLOAD - 2} files still install (got ${resLeaf.installed.length})`,
+    );
+    c.check(
+      resLeaf.skipped.includes(".claude/commands/guild/consult.md") && resLeaf.skipped.includes(".opencode/agent/guild-read.md"),
+      `symlink leaf: both linked destinations are reported skipped (got ${resLeaf.skipped.join(", ")})`,
+    );
+    c.check(
+      resLeaf.warnings.includes("skipping .claude/commands/guild/consult.md — a non-file exists there; left untouched."),
+      `symlink leaf: the live link warns by name (got ${resLeaf.warnings.join(" | ")})`,
+    );
+    c.check(
+      resLeaf.warnings.includes("skipping .opencode/agent/guild-read.md — a non-file exists there; left untouched."),
+      `symlink leaf: the DANGLING link warns by name rather than being written through (got ${resLeaf.warnings.join(" | ")})`,
+    );
+    c.check(readFileSync(kept, "utf8") === "MY OWN FILE\n", "symlink leaf: the live link's target is not overwritten");
+    c.check(!existsSync(missing), "symlink leaf: the dangling link's target is NOT created by the write");
+    c.check(
+      existsSync(path.join(storeClaude, "modelguild/.modelguild-install.json")),
+      "symlink leaf: a skipped leaf does not stop the ownership record being written",
+    );
+  }
+
+  // PROJECT mode is UNCHANGED: a symlink at any existing component is refused by name.
+  {
+    const P = tempProject();
+    const outside = tempProject();
+    const target = path.join(outside, "x.md");
+    writeFileSync(target, "OUTSIDE\n");
+    mkdirSync(path.join(P, ".opencode/agent"), { recursive: true });
+    symlinkSync(target, path.join(P, ".opencode/agent/guild-read.md"));
+    let msg = "";
+    try {
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    c.check(
+      msg === "refusing destination symlink: .opencode/agent/guild-read.md",
+      `project mode still refuses a leaf symlink, naming the path (got: ${msg || "<no throw>"})`,
+    );
+    c.check(readFileSync(target, "utf8") === "OUTSIDE\n", "project mode: the refused link's target is untouched");
+
+    // A symlinked DIRECTORY component is refused the same way.
+    const P2 = tempProject();
+    symlinkSync(outside, path.join(P2, ".opencode"));
+    let msg2 = "";
+    try {
+      init({ targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    } catch (e) {
+      msg2 = (e as Error).message;
+    }
+    c.check(
+      msg2.startsWith("refusing destination symlink: .opencode/agent/"),
+      `project mode still refuses a symlinked directory component (got: ${msg2 || "<no throw>"})`,
+    );
+
+    // A DANGLING leaf link in project mode used to be written THROUGH — `existsSync` follows,
+    // so the guard did not see it and the payload bytes landed outside the project. It now
+    // reaches the same skip-with-warning branch a live link does.
+    const P3 = tempProject();
+    const escaped = path.join(outside, "escaped.md");
+    mkdirSync(path.join(P3, ".opencode/agent"), { recursive: true });
+    symlinkSync(escaped, path.join(P3, ".opencode/agent/guild-read.md"));
+    const res3 = init({ targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    c.check(!existsSync(escaped), "project mode: a DANGLING leaf link is not written through (nothing created outside)");
+    c.check(
+      res3.skipped.includes(".opencode/agent/guild-read.md") && res3.installed.length === N_PAYLOAD - 1,
+      `project mode: the dangling leaf is skipped and the rest installs (got ${res3.installed.length} installed, skipped ${res3.skipped.join(", ")})`,
+    );
+  }
+
+  // The OWNERSHIP RECORD's own path is the exception to the leaf rule: `writeRecords` sits
+  // outside the install loop, so a symlink there is written THROUGH — live or dangling —
+  // rather than skipped. Deliberate (only init writes the record, so there is no user content
+  // it is expected to preserve), but never silent: it warns, naming the link and the file the
+  // bytes actually landed in. The realistic trigger is a dotfiles manager that links files
+  // individually — GNU stow does, when the parent directory already exists.
+  {
+    // (a) a LIVE record symlink pointing at a file of the user's own.
+    const recHome = tempProject();
+    const recXdg = tempProject();
+    const outside = tempProject();
+    const userFile = path.join(outside, "my-record.json");
+    writeFileSync(userFile, "MY OWN FILE\n");
+    const recLink = path.join(recHome, ".claude/modelguild/.modelguild-install.json");
+    mkdirSync(path.dirname(recLink), { recursive: true });
+    symlinkSync(userFile, recLink);
+
+    const resR = initScored(c, "record symlink: --global install over a live record link", {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true,
+      homeDir: recHome,
+      xdgConfigHome: recXdg,
+    });
+    c.check(
+      resR.installed.length === N_PAYLOAD,
+      `record symlink: the payload still installs in full (got ${resR.installed.length})`,
+    );
+    c.check(
+      resR.warnings.includes(
+        `writing the ownership record through a symlink — ${recLink} links to ${userFile}, so the record ` +
+          `replaced that file's contents. Remove the link and re-run init to keep the record at ${recLink} itself.`,
+      ),
+      `record symlink: the live link warns, naming BOTH the link and the file written (got ${resR.warnings.join(" | ")})`,
+    );
+    c.check(
+      lstatSync(recLink).isSymbolicLink(),
+      "record symlink: the link itself survives (written through, not replaced)",
+    );
+    c.check(
+      recordedFileCount(userFile) === N_PAYLOAD,
+      `record symlink: the record bytes land in the link's target, replacing the user's file (got ${recordedFileCount(userFile)})`,
+    );
+
+    // (b) a DANGLING record symlink: `existsSync` calls it absent, so it is written through
+    // too — the write CREATES the target. Same warning shape, different clause.
+    const dngHome = tempProject();
+    const dngXdg = tempProject();
+    const dngOutside = tempProject();
+    const missing = path.join(dngOutside, "never-created.json");
+    const dngLink = path.join(dngHome, ".claude/modelguild/.modelguild-install.json");
+    mkdirSync(path.dirname(dngLink), { recursive: true });
+    symlinkSync(missing, dngLink);
+    c.check(!existsSync(missing), "record symlink: the dangling link's target does not exist before the install");
+
+    const resD = initScored(c, "record symlink: --global install over a dangling record link", {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true,
+      homeDir: dngHome,
+      xdgConfigHome: dngXdg,
+    });
+    c.check(
+      resD.installed.length === N_PAYLOAD,
+      `record symlink: the payload still installs in full over a dangling record link (got ${resD.installed.length})`,
+    );
+    c.check(
+      resD.warnings.includes(
+        `writing the ownership record through a symlink — ${dngLink} links to ${missing}, so the record ` +
+          `created that file (the link was dangling). Remove the link and re-run init to keep the record at ${dngLink} itself.`,
+      ),
+      `record symlink: the DANGLING link warns, naming BOTH paths and saying the file was created (got ${resD.warnings.join(" | ")})`,
+    );
+    c.check(
+      existsSync(missing) && recordedFileCount(missing) === N_PAYLOAD,
+      "record symlink: the record bytes land in the dangling link's target, which the write creates",
+    );
+    c.check(lstatSync(dngLink).isSymbolicLink(), "record symlink: the dangling link itself survives");
+
+    // (c) a dangling record symlink whose TARGET'S DIRECTORY does not exist is REFUSED at plan
+    // time. `writeRecords` creates the LINK's directory, not the target's, so the write through
+    // such a link raised a raw ENOENT — AFTER the whole payload was on disk, leaving an install
+    // with no ownership record (a re-run crashed identically, and `--uninstall` could prove
+    // nothing was ours). `origin/main` refused this same layout cleanly via `safeJoin`; the
+    // refusal is back, and it lands before a single byte is written.
+    const badHome = tempProject();
+    const badXdg = tempProject();
+    const badOutside = tempProject();
+    const missingDir = path.join(badOutside, "no-such-dir");
+    const badTarget = path.join(missingDir, "rec.json");
+    const badLink = path.join(badHome, ".claude/modelguild/.modelguild-install.json");
+    mkdirSync(path.dirname(badLink), { recursive: true });
+    symlinkSync(badTarget, badLink);
+    c.check(!existsSync(missingDir), "record symlink: the link's target DIRECTORY does not exist before the install");
+
+    const badOpts = {
+      targetDir: tempProject(),
+      packageRoot: repoRoot,
+      serverLaunch: LAUNCH,
+      global: true as const,
+      homeDir: badHome,
+      xdgConfigHome: badXdg,
+    };
+    let badMsg = "";
+    try {
+      init(badOpts);
+    } catch (e) {
+      badMsg = (e as Error).message;
+    }
+    c.check(
+      badMsg ===
+        `the ownership record ${badLink} is a symlink to ${badTarget}, whose directory ` +
+          `${missingDir} does not exist — the record cannot be written there, and an install with ` +
+          `no record leaves nothing for a re-run or --uninstall to verify. Nothing was installed. ` +
+          `Create ${missingDir}, or remove the link, then re-run init.`,
+      `record symlink: a dangling link into a MISSING directory is refused, naming the record, the target and the missing dir (got: ${badMsg || "<no throw>"})`,
+    );
+    const badWritten = countFiles(path.join(badHome, ".claude")) + countFiles(path.join(badXdg, "opencode"));
+    c.check(
+      badWritten === 0,
+      `record symlink: the refusal writes ZERO of the ${N_PAYLOAD} payload files (got ${badWritten})`,
+    );
+    c.check(!existsSync(missingDir), "record symlink: the refusal creates no directory at the link's target");
+
+    // (d) the sibling errno, and the second of the TWO enumerated conditions: the target's
+    // parent is PRESENT but not a directory, so the write raised a raw ENOTDIR — same shape,
+    // same cost (the whole payload installed, no record), and the same regression against
+    // `origin/main`, which refused this layout too. Distinct wording, same three paths.
+    const ndHome = tempProject();
+    const ndXdg = tempProject();
+    const ndOutside = tempProject();
+    const notADir = path.join(ndOutside, "i-am-a-file");
+    writeFileSync(notADir, "NOT A DIRECTORY\n");
+    const ndTarget = path.join(notADir, "rec.json");
+    const ndLink = path.join(ndHome, ".claude/modelguild/.modelguild-install.json");
+    mkdirSync(path.dirname(ndLink), { recursive: true });
+    symlinkSync(ndTarget, ndLink);
+
+    let ndMsg = "";
+    try {
+      init({
+        targetDir: tempProject(),
+        packageRoot: repoRoot,
+        serverLaunch: LAUNCH,
+        global: true,
+        homeDir: ndHome,
+        xdgConfigHome: ndXdg,
+      });
+    } catch (e) {
+      ndMsg = (e as Error).message;
+    }
+    c.check(
+      ndMsg ===
+        `the ownership record ${ndLink} is a symlink to ${ndTarget}, but ${notADir} is not ` +
+          `a directory — the record cannot be written there, and an install with no record leaves ` +
+          `nothing for a re-run or --uninstall to verify. Nothing was installed. Replace ${notADir} ` +
+          `with a directory, or remove the link, then re-run init.`,
+      `record symlink: a dangling link whose target's parent is NOT A DIRECTORY is refused, naming the record, the target and that path (got: ${ndMsg || "<no throw>"})`,
+    );
+    const ndWritten = countFiles(path.join(ndHome, ".claude")) + countFiles(path.join(ndXdg, "opencode"));
+    c.check(
+      ndWritten === 0,
+      `record symlink: the not-a-directory refusal writes ZERO of the ${N_PAYLOAD} payload files (got ${ndWritten})`,
+    );
+    c.check(
+      readFileSync(notADir, "utf8") === "NOT A DIRECTORY\n",
+      "record symlink: the file standing where a directory was needed is untouched",
+    );
+
+    // `--uninstall` writes no record, so the refusal must not block it: the removal path is the
+    // user's way out of a layout init declined to install into.
+    let badUninstallMsg = "";
+    try {
+      init({ ...badOpts, uninstall: true });
+    } catch (e) {
+      badUninstallMsg = (e as Error).message;
+    }
+    c.check(
+      badUninstallMsg === "",
+      `record symlink: --uninstall --global is NOT blocked by the refused link (got: ${badUninstallMsg})`,
+    );
+  }
 
   console.log(`init.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;
