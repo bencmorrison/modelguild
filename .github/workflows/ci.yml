@@ -64,8 +64,14 @@ jobs:
       - name: Shebang conformance (#!/usr/bin/env bash everywhere)
         run: bash modelguild/tests/check-shebangs.sh
 
-      - name: Frontmatter validation
-        run: bash modelguild/tests/check-frontmatter.sh
+      - name: Frontmatter validation (+ self-test)
+        # --self-test (issue #166) short-circuits like check-agent-permissions.sh's
+        # does (exits before the normal per-file scan), so both invocations are
+        # needed: the first validates the real repo, the second proves the lint
+        # still catches a dropped fence or a missing key.
+        run: |
+          bash modelguild/tests/check-frontmatter.sh
+          bash modelguild/tests/check-frontmatter.sh --self-test
 
       - name: Documentation workflow lint (+ self-test)
         run: bash modelguild/tests/check-docs.sh --self-test
@@ -170,8 +176,15 @@ jobs:
           bash modelguild/tests/check-shebangs.sh
           bash modelguild/tests/check-shebangs.sh --self-test
 
-      - name: Frontmatter validation
-        run: bash modelguild/tests/check-frontmatter.sh
+      - name: Frontmatter validation (+ self-test)
+        # --self-test (issue #166) short-circuits like check-agent-permissions.sh's
+        # does (exits before the normal per-file scan), so both invocations are
+        # needed: the first validates the real repo, the second proves the lint
+        # still catches a dropped fence or a missing key — on BSD awk/sed, the
+        # platform difference the Linux job can't exercise.
+        run: |
+          bash modelguild/tests/check-frontmatter.sh
+          bash modelguild/tests/check-frontmatter.sh --self-test
 
       - name: Documentation workflow lint (+ self-test)
         run: bash modelguild/tests/check-docs.sh --self-test
