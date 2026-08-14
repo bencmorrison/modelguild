@@ -50,7 +50,10 @@
 
   "customizations": {
     "vscode": {
-      "extensions": ["anthropic.claude-code"]
+      // Both agents' editor extensions, so the container matches the CLIs
+      // postCreate.sh installs. sst-dev.opencode is the official one (publisher
+      // SST, source github.com/sst/opencode — same repo as the CLI).
+      "extensions": ["anthropic.claude-code", "sst-dev.opencode"]
     }
   },
 
