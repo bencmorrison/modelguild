@@ -2619,6 +2619,83 @@ export async function run(): Promise<number> {
         "#121(K-bound): a tool call INSIDE the last turn is counted",
       );
     }
+
+    // --- K(#168): the empty-delegation refusal carries the same diagnostics the read paths do.
+    //     The tool-call half is a tautology on this path (the refusal requires zero), so the
+    //     load-bearing half is the COMPLETION metadata: a provider that returned a zero-output
+    //     completion and one opencode recorded nothing for are different failures, and until
+    //     #168 the refusal said the same sentence for both.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        turnShapes: ["rejected"],
+        assistantTokens: { input: 1234, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#168(K): a produced-nothing delegation");
+        c.check(f.error.kind === "empty-delegation", "#168(K): still empty-delegation (C74's write path unchanged)");
+        c.check(f.error.diagnostics?.toolCallCount === 0, "#168(K): the turn's tool-call count rides out");
+        c.check(
+          f.error.diagnostics?.completion?.tokens?.input === 1234 &&
+            f.error.diagnostics?.completion?.tokens?.output === 0,
+          "#168(K): the provider's completion metadata rides out",
+        );
+        c.check(
+          /input=1234/.test(f.error.message) && /made NO tool calls/.test(f.error.message),
+          "#168(K): both facts are in the message a human reads",
+        );
+        c.check(
+          f.error.message.includes("structuredContent.capture"),
+          "#168(K): the existing pointer to the capture record is not displaced",
+        );
+        const err = (delegateToToolResult(f).structuredContent as {
+          error: { diagnostics?: { completion?: { tokens?: { input?: number } } } };
+        }).error;
+        c.check(
+          err.diagnostics?.completion?.tokens?.input === 1234,
+          "#168(K): diagnostics survive the MCP boundary on structuredContent.error",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(#168-none): opencode recorded no completion metadata. Reported as absent, never as
+    //     a fabricated zero — a zero output-token count is evidence and must stay one.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        turnShapes: ["rejected"],
+        omitCompletionMetadata: true,
+      });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        const f = asFail(r, "#168(K-none): a produced-nothing delegation with no metadata");
+        c.check(
+          f.error.diagnostics !== undefined && f.error.diagnostics.completion === undefined,
+          "#168(K-none): completion is absent, not zero-filled",
+        );
+        c.check(
+          /recorded no completion metadata/.test(f.error.message),
+          "#168(K-none): the message says so plainly",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
   }
 
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });

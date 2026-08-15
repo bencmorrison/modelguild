@@ -246,6 +246,50 @@ export async function run(): Promise<number> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 5b. EMPTY-ANSWER DIAGNOSTICS (issue #168). The read paths share one spine, so what is
+  //     asserted exhaustively in `consult.test.ts` is asserted here as a WIRING check: the
+  //     research refusal really does carry the two facts, on the structured surface and in
+  //     the message. Without this, a plumbing point could quietly drop them on this path only.
+  // -------------------------------------------------------------------------
+  {
+    const root = tmp("m7r-guild-");
+    const logDir = tmp("m7r-logs-");
+    const env = envWith({
+      GUILD_ROOT: root,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDirWithResearch(),
+    });
+    const fake = await startFakeOpencode({
+      historyText: "",
+      assistantTokens: { input: 777, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r: ResearchResult = await research(
+        { question: "cite X", model: "openai/web-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 research: still an empty-answer refusal");
+      if (!r.ok) {
+        c.check(r.error.diagnostics?.toolCallCount === 1, "#168 research: the turn's tool-call count is carried");
+        c.check(
+          r.error.diagnostics?.completion?.tokens?.input === 777,
+          "#168 research: the completion metadata is carried",
+        );
+        c.check(
+          /1 tool call before it ended/.test(r.error.message) && /input=777/.test(r.error.message),
+          "#168 research: the message carries both facts",
+        );
+        const err = (researchToToolResult(r).structuredContent as {
+          error: { diagnostics?: { toolCallCount: number } };
+        }).error;
+        c.check(err.diagnostics?.toolCallCount === 1, "#168 research: diagnostics survive the MCP boundary");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
   console.log(`research.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

@@ -42,7 +42,7 @@
  */
 
 import os from "node:os";
-import { type ServeProvider, type ServeRouter } from "./client.js";
+import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
 import { type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
@@ -174,6 +174,13 @@ export interface PanelMemberError {
   exitAnalogue: number | null;
   /** Present on policy errors: the tier that refused. */
   tier?: PolicyTier;
+  /**
+   * Present ONLY on `empty-answer` (issue #168), PER MEMBER like `activity`: the silent
+   * member's own tool-call count and completion metadata. A panel is exactly where merging
+   * these would destroy the finding — the reported failure had one member read five files and
+   * go quiet while the other answered normally.
+   */
+  diagnostics?: TurnDiagnostics;
 }
 
 /** One panel member's outcome — exactly one of `text` / `error` is set. `model` is the
@@ -496,6 +503,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           kind: outcome.kind,
           exitAnalogue: null,
           message,
+          ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
         },
       };
       if (outcome.activity !== undefined) failed.activity = outcome.activity;

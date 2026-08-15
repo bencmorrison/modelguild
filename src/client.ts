@@ -952,6 +952,185 @@ export function finalAssistantError(history: SessionHistory): string | undefined
 }
 
 /**
+ * THE PROVIDER'S COMPLETION METADATA for this turn (issue #168).
+ *
+ * A turn that answered nothing and a turn whose answer the provider truncated look IDENTICAL
+ * from `raw_response` alone — both are the empty string, both hash to e3b0c442…. opencode
+ * carries the distinguishing facts on the assistant message itself and this repo was throwing
+ * them away: the OpenAPI document the running serve publishes (`GET /doc`, opencode 1.18.18)
+ * declares `AssistantMessage` with `tokens` and `cost` REQUIRED and `finish` optional —
+ * `tokens` being `{input, output, reasoning, cache:{read,write}, total?}`. Nothing here is
+ * inferred from a provider's own API: these are opencode's own field names, read off the same
+ * history envelope every other extractor in this file reads.
+ *
+ * `finish` is deliberately typed as an opaque `string`. opencode's schema does not constrain
+ * it to an enum, so no vocabulary is asserted — a value is reported verbatim, and reading
+ * meaning into a particular one is the human's job.
+ */
+export interface TurnTokens {
+  input?: number;
+  output?: number;
+  reasoning?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  total?: number;
+}
+
+export interface TurnCompletion {
+  /** opencode's `info.finish` verbatim; absent when opencode did not record one. */
+  finish?: string;
+  tokens?: TurnTokens;
+  cost?: number;
+}
+
+/** The facts issue #168 asked for, travelling together: what the turn DID before it went
+ * quiet, and what the provider said about the completion that ended it. */
+export interface TurnDiagnostics {
+  /** Turn-scoped — `turnToolCallCount`, never the session-wide walk. */
+  toolCallCount: number;
+  completion?: TurnCompletion;
+  /**
+   * PART TYPES the turn's assistant messages carried, counted (issue #168).
+   *
+   * Beyond the two the issue asked for, and here because it is the one column that separates
+   * "the provider emitted nothing" from "the provider emitted something this extractor does
+   * not read as an answer". `finalAssistantText` reconstructs from `type === "text"` parts
+   * ONLY, and opencode 1.18.18's `Part` union (probed at `GET /doc`) also contains `reasoning`,
+   * which carries its own `text` — so a turn whose visible output was reasoning alone
+   * reconstructs to `""` here while opencode's own TUI renders it as a full answer. That is a
+   * live candidate for #168's reported failure and it was previously invisible from the
+   * receipts. Absent when the turn carried no assistant parts at all.
+   */
+  partTypes?: Record<string, number>;
+}
+
+function numberOrUndefined(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * The completion metadata of the assistant message THAT ENDED THIS TURN (issue #168).
+ *
+ * TURN-SCOPED like every other extractor here, and taking the turn's LAST assistant message
+ * rather than its last TEXT-BEARING one — the two differ precisely in the case this exists
+ * for. On an empty answer there is no text-bearing message at all, and the message that ended
+ * the turn is the one carrying the provider's verdict (`finish: null` plus `info.error` on the
+ * probed rejection shape). Reading `finalAssistantText`'s message would report nothing.
+ *
+ * Returns `undefined` when the turn's last assistant message carries none of the three fields
+ * — "opencode did not say", never a fabricated zero. A zero token count is a real observation
+ * and must stay distinguishable from an absent one.
+ */
+export function finalAssistantCompletion(history: SessionHistory): TurnCompletion | undefined {
+  const start = turnStartIndex(history);
+  for (let i = history.messages.length - 1; i >= start; i--) {
+    const m = history.messages[i];
+    if (m.role !== "assistant") continue;
+    const finish = typeof m.info.finish === "string" && m.info.finish.length > 0 ? m.info.finish : undefined;
+    const cost = numberOrUndefined(m.info.cost);
+    const raw = (typeof m.info.tokens === "object" && m.info.tokens !== null ? m.info.tokens : {}) as Record<
+      string,
+      unknown
+    >;
+    const cache = (typeof raw.cache === "object" && raw.cache !== null ? raw.cache : {}) as Record<
+      string,
+      unknown
+    >;
+    const tokens: TurnTokens = {};
+    const input = numberOrUndefined(raw.input);
+    const output = numberOrUndefined(raw.output);
+    const reasoning = numberOrUndefined(raw.reasoning);
+    const total = numberOrUndefined(raw.total);
+    const cacheRead = numberOrUndefined(cache.read);
+    const cacheWrite = numberOrUndefined(cache.write);
+    if (input !== undefined) tokens.input = input;
+    if (output !== undefined) tokens.output = output;
+    if (reasoning !== undefined) tokens.reasoning = reasoning;
+    if (total !== undefined) tokens.total = total;
+    if (cacheRead !== undefined) tokens.cacheRead = cacheRead;
+    if (cacheWrite !== undefined) tokens.cacheWrite = cacheWrite;
+    const hasTokens = Object.keys(tokens).length > 0;
+    if (finish === undefined && cost === undefined && !hasTokens) return undefined;
+    const out: TurnCompletion = {};
+    if (finish !== undefined) out.finish = finish;
+    if (hasTokens) out.tokens = tokens;
+    if (cost !== undefined) out.cost = cost;
+    return out;
+  }
+  return undefined;
+}
+
+/**
+ * THE TURN'S ASSISTANT PART TYPES, counted (issue #168).
+ *
+ * TURN-SCOPED like its neighbours. Assistant messages only: a `user` message's parts are the
+ * caller's own prompt and say nothing about what the model produced.
+ *
+ * The type is read verbatim off the wire and NOT validated against a known set — opencode's
+ * `Part` union has twelve members on 1.18.18 and a bump may add more, and the whole value of
+ * this field is naming a type the extractor did not expect. A non-string `type` is counted
+ * under `"(unknown)"` rather than dropped, for the same reason.
+ */
+export function turnAssistantPartTypes(history: SessionHistory): Record<string, number> {
+  const start = turnStartIndex(history);
+  const out: Record<string, number> = {};
+  for (let i = start; i < history.messages.length; i++) {
+    const m = history.messages[i];
+    if (m.role !== "assistant") continue;
+    for (const p of m.parts) {
+      const t = typeof p.type === "string" && p.type.length > 0 ? p.type : "(unknown)";
+      out[t] = (out[t] ?? 0) + 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * One line a human reads, rendered from `TurnDiagnostics` (issue #168).
+ *
+ * It is appended to the refusal MESSAGE as well as attached structurally, because the reporter
+ * of #168 read the message and the structured record separately and neither carried either
+ * fact. "Read five files then said nothing" and "said nothing at all" have to be one glance
+ * apart, and a zero-token completion has to be distinguishable from a truncated one.
+ *
+ * An ABSENT number is never rendered as 0 — the whole point is that a real zero is evidence.
+ */
+export function describeTurnDiagnostics(d: TurnDiagnostics): string {
+  const calls =
+    d.toolCallCount === 0
+      ? "the turn made NO tool calls"
+      : `the turn made ${d.toolCallCount} tool call${d.toolCallCount === 1 ? "" : "s"} before it ended`;
+  // Rendered last in both branches: it is the column that says WHERE the output went, and it
+  // is only ever a hint — naming the part types, never interpreting them.
+  const shape =
+    d.partTypes === undefined || Object.keys(d.partTypes).length === 0
+      ? ""
+      : ` Parts this turn: ${Object.keys(d.partTypes)
+          .sort()
+          .map((k) => `${k}=${d.partTypes![k]}`)
+          .join(" ")}.`;
+  const c = d.completion;
+  if (c === undefined) {
+    return `Turn diagnostics: ${calls}; opencode recorded no completion metadata for it.${shape}`;
+  }
+  const bits: string[] = [];
+  bits.push(c.finish !== undefined ? `finish=${JSON.stringify(c.finish)}` : "finish=(not recorded)");
+  if (c.tokens !== undefined) {
+    const t = c.tokens;
+    const parts: string[] = [];
+    if (t.input !== undefined) parts.push(`input=${t.input}`);
+    if (t.output !== undefined) parts.push(`output=${t.output}`);
+    if (t.reasoning !== undefined) parts.push(`reasoning=${t.reasoning}`);
+    if (t.total !== undefined) parts.push(`total=${t.total}`);
+    if (t.cacheRead !== undefined) parts.push(`cacheRead=${t.cacheRead}`);
+    if (t.cacheWrite !== undefined) parts.push(`cacheWrite=${t.cacheWrite}`);
+    if (parts.length > 0) bits.push(`tokens ${parts.join(" ")}`);
+  }
+  if (c.cost !== undefined) bits.push(`cost=${c.cost}`);
+  return `Turn diagnostics: ${calls}; opencode recorded ${bits.join(", ")}.${shape}`;
+}
+
+/**
  * Raised when opencode served a DIFFERENT agent than the one requested — e.g. a silent
  * fallback to the full-access built-in `build` when a hardened def didn't resolve, which
  * would be full-access output masquerading as the read-only/hardened agent's. Thrown from
@@ -1179,6 +1358,14 @@ export class EmptyAnswerError extends Error {
     readonly sessionId: string,
     readonly text: string,
     readonly providerError?: string,
+    /**
+     * WHAT THE TURN DID AND WHAT THE PROVIDER SAID (issue #168). Carried and rendered into the
+     * message because the two states this refusal cannot otherwise tell apart — a model that
+     * read five files and then said nothing, versus one that said nothing at all — reached the
+     * reporter as the same sentence. Optional so the low-level client tests that construct
+     * this class directly are unaffected; absent ⇒ the message is exactly what it was.
+     */
+    readonly diagnostics?: TurnDiagnostics,
   ) {
     super(
       "the model completed its turn and produced NO ANSWER (this turn's final assistant " +
@@ -1187,7 +1374,8 @@ export class EmptyAnswerError extends Error {
           ? `The provider reported: ${providerError}`
           : "opencode reported no error for the turn, so the cause is not in the history — " +
             "check the model id (a provider can reject a configured id) and, if the activity " +
-            "layer is on, the call's activity errors."),
+            "layer is on, the call's activity errors.") +
+        (diagnostics !== undefined ? ` ${describeTurnDiagnostics(diagnostics)}` : ""),
     );
     this.name = "EmptyAnswerError";
   }
@@ -1327,6 +1515,19 @@ export interface AskResult {
    * run a command, whatever the capture's own representability state turned out to be.
    */
   toolCallCount: number;
+  /**
+   * COMPLETION METADATA OF THE TURN'S LAST ASSISTANT MESSAGE (issue #168), from HISTORY.
+   *
+   * Deliberately NOT a reuse of `metadata` below, which comes off the sync POST envelope: that
+   * body is not a capture source (invariant 1), and on a `sessionId` continuation it describes
+   * the message opencode chose to echo rather than the turn this call is judging. This is read
+   * with the same turn bound as `text`, `providerError` and `toolCallCount`, so all four
+   * describe one turn. Absent when opencode recorded none.
+   */
+  completion?: TurnCompletion;
+  /** The turn's assistant part types, counted (issue #168) — see `TurnDiagnostics.partTypes`.
+   * Absent when the turn carried no assistant parts. */
+  partTypes?: Record<string, number>;
   sessionId: string;
   /** Completion metadata from the sync response (cost/tokens/ids/finish). */
   metadata: SendResult;
@@ -1497,8 +1698,20 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // line never fired — the guard failed open on exactly the drivers that continue sessions
       // (`/guild:collaborate`, `/guild:workshop` round 2). Do not unbound that walk.
       const providerError = finalAssistantError(history);
+      // Issue #168: all three are computed BEFORE the refusal, not after, because the refusal
+      // is the one caller that most needs them. Same turn bound as the text — `toolCallCount`
+      // reuses `turnToolCallCount` rather than introducing a second counter, so the BANANA
+      // bound it carries is inherited, not re-derived.
+      const toolCallCount = turnToolCallCount(history);
+      const completion = finalAssistantCompletion(history);
+      const partTypes = turnAssistantPartTypes(history);
+      const hasPartTypes = Object.keys(partTypes).length > 0;
       if (opts.requireAnswer === true && text.trim() === "") {
-        throw new EmptyAnswerError(sessionId, text, providerError);
+        throw new EmptyAnswerError(sessionId, text, providerError, {
+          toolCallCount,
+          ...(completion !== undefined ? { completion } : {}),
+          ...(hasPartTypes ? { partTypes } : {}),
+        });
       }
 
       const result: AskResult = {
@@ -1506,7 +1719,9 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         sessionId,
         metadata,
         toolParts: toolParts(history),
-        toolCallCount: turnToolCallCount(history),
+        toolCallCount,
+        ...(completion !== undefined ? { completion } : {}),
+        ...(hasPartTypes ? { partTypes } : {}),
         history,
         // OPTIONAL-FIELD DISCIPLINE (C29's rule, applied to a wire-adjacent shape): written only
         // when opencode carried an error, so a normal turn's result is shaped exactly as it was

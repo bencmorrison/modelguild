@@ -56,7 +56,12 @@
 import os from "node:os";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { type ServeProvider, type ServeRouter } from "./client.js";
+import {
+  describeTurnDiagnostics,
+  type ServeProvider,
+  type ServeRouter,
+  type TurnDiagnostics,
+} from "./client.js";
 import { type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
@@ -260,6 +265,11 @@ export interface DelegateError {
   exitAnalogue: number | null;
   model: string;
   tier?: PolicyTier;
+  /**
+   * Present ONLY on `empty-delegation` (issue #168): the turn's tool-call count — zero, by the
+   * refusal's own definition — and the provider's completion metadata for the turn.
+   */
+  diagnostics?: TurnDiagnostics;
 }
 
 export interface DelegateOk {
@@ -697,6 +707,11 @@ export async function delegate(
     // deletion matrix has already torn it down under `created here + success + !keepSession`.
     // C74's continued-session row — a caller's id kept alive because the caller owns it — has no
     // counterpart here and no new row is added to that matrix.
+    const delegateDiagnostics: TurnDiagnostics = {
+      toolCallCount: outcome.toolCallCount,
+      ...(outcome.completion !== undefined ? { completion: outcome.completion } : {}),
+      ...(outcome.partTypes !== undefined ? { partTypes: outcome.partTypes } : {}),
+    };
     const fail: DelegateFail = {
       ok: false,
       rootConflict,
@@ -716,7 +731,13 @@ export async function delegate(
             : `opencode reported no error for the turn, so the cause is not in the history — ` +
               `check the model id (guild_models lists the authed provider CONFIGURATION, and a ` +
               `provider can still reject a listed id at call time) and, if the activity layer is ` +
-              `on, the call's activity errors.`),
+              `on, the call's activity errors.`) +
+          // Issue #168: the same diagnostics line the read paths carry. Here the tool-call half
+          // is a tautology by construction — this refusal requires zero — but the COMPLETION
+          // half is not, and a zero-output-token completion reads differently from one opencode
+          // recorded no metadata for at all.
+          ` ${describeTurnDiagnostics(delegateDiagnostics)}`,
+        diagnostics: delegateDiagnostics,
       },
       capture,
       ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),

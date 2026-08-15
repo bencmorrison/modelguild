@@ -657,6 +657,266 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 6i. EMPTY-ANSWER DIAGNOSTICS (issue #168). The reported failure was a member that made five
+  //     successful `read` calls and then said nothing, and the refusal it produced was
+  //     indistinguishable from one for a model that never reached for a tool at all. Both facts
+  //     the issue asked for are asserted here, structurally AND in the message the reporter
+  //     actually reads: the turn's tool-call count, and opencode's own completion metadata.
+  //
+  //     The token numbers are set BY THE FIXTURE and asserted verbatim, which is what makes this
+  //     a test of an extraction rather than of a constant.
+  // -------------------------------------------------------------------------
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      // The `text` shape is the reported one: a tool-call assistant message, then a
+      // text-bearing one whose text is empty. Tool calls happened; the answer did not.
+      historyText: "",
+      assistantTokens: { input: 4321, output: 0, reasoning: 12, cache: { read: 7, write: 3 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168: still an empty-answer refusal (C74 unchanged)");
+      if (!r.ok) {
+        const d = r.error.diagnostics;
+        c.check(!!d, "#168: the refusal carries structured diagnostics");
+        c.check(!!d && d.toolCallCount === 1, "#168: the turn's tool-call count is reported (1 read, then silence)");
+        c.check(!!d?.completion && d.completion.finish === "stop", "#168: opencode's finish reason is reported");
+        c.check(
+          !!d?.completion?.tokens &&
+            d.completion.tokens.input === 4321 &&
+            d.completion.tokens.output === 0 &&
+            d.completion.tokens.reasoning === 12 &&
+            d.completion.tokens.cacheRead === 7 &&
+            d.completion.tokens.cacheWrite === 3,
+          "#168: the token counts are the payload's, not a constant",
+        );
+        c.check(!!d?.completion && d.completion.cost === 0.0042, "#168: cost is reported");
+        // The MESSAGE is the surface the issue's reporter read, so it carries them too.
+        c.check(
+          /1 tool call before it ended/.test(r.error.message),
+          "#168: the message says the turn DID make tool calls before going quiet",
+        );
+        c.check(
+          /output=0/.test(r.error.message) && /input=4321/.test(r.error.message),
+          "#168: the message quotes the token counts",
+        );
+        c.check(
+          /finish="stop"/.test(r.error.message),
+          "#168: the message quotes the finish reason verbatim",
+        );
+        // …and through the MCP boundary, where a driver would actually read it.
+        const wire = consultToToolResult(r);
+        const err = (wire.structuredContent as { error: { diagnostics?: { toolCallCount: number } } }).error;
+        c.check(
+          err.diagnostics?.toolCallCount === 1,
+          "#168: diagnostics survive the MCP boundary on structuredContent.error",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6j. THE OTHER SIDE OF THE DISTINCTION: a turn that said nothing AND reached for no tool.
+  //     Same refusal kind, different diagnostics — which is the entire point of #168.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (no tools): still empty-answer");
+      if (!r.ok) {
+        c.check(r.error.diagnostics?.toolCallCount === 0, "#168 (no tools): zero tool calls reported");
+        c.check(
+          /made NO tool calls/.test(r.error.message),
+          "#168 (no tools): the message distinguishes 'said nothing at all' from 'did work then went quiet'",
+        );
+        // The probed rejection shape carries `finish: null`; an absent finish must read as
+        // "not recorded" rather than being invented.
+        c.check(
+          r.error.diagnostics?.completion?.finish === undefined &&
+            /finish=\(not recorded\)/.test(r.error.message),
+          "#168 (no tools): a finish opencode did not record is reported as not recorded, never guessed",
+        );
+        // The provider's own words still lead the message — #117's behaviour is not displaced.
+        c.check(
+          /exceeded your monthly quota/.test(r.error.message),
+          "#168 (no tools): the provider error still leads the message (C74 unchanged)",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6k. OPENCODE RECORDED NOTHING. Absent metadata must be reported as absent — a fabricated
+  //     `output=0` here would assert a zero-token completion that was never observed, which is
+  //     exactly the confusion #168 exists to remove.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "", omitCompletionMetadata: true });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (no metadata): still empty-answer");
+      if (!r.ok) {
+        c.check(
+          r.error.diagnostics !== undefined && r.error.diagnostics.completion === undefined,
+          "#168 (no metadata): completion is ABSENT, not a zero-filled object",
+        );
+        c.check(
+          /recorded no completion metadata/.test(r.error.message),
+          "#168 (no metadata): the message says opencode recorded none",
+        );
+        c.check(
+          r.error.diagnostics?.toolCallCount === 1,
+          "#168 (no metadata): the tool-call count is still reported — it comes from the parts, not the metadata",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6l. TURN-SCOPED, like every other extractor (the BANANA bound). On a continuation the
+  //     diagnostics must describe THIS turn: turn 1 made a tool call and finished `stop`, turn 2
+  //     made none and opencode recorded no finish. Inheriting turn 1's would make a silent turn
+  //     look busy — the same fail-OPEN shape `turnToolCallCount`'s comment warns about.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnTexts: ["TURN-ONE-ANSWER", "unused"],
+      turnShapes: ["text", "rejected"],
+      sessionId: "ses_prior",
+    });
+    try {
+      const deps = { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 };
+      const first = await consult(
+        { question: "q1", model: "openai/allow-model", keepSession: true },
+        deps,
+      );
+      c.check(first.ok, "#168 (turn scope): turn 1 answered");
+      const r = await consult(
+        { question: "q2", model: "openai/allow-model", sessionId: "ses_prior", keepSession: true },
+        deps,
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (turn scope): the silent second turn is refused");
+      if (!r.ok) {
+        c.check(
+          r.error.diagnostics?.toolCallCount === 0,
+          "#168 (turn scope): turn 2's count is 0 — turn 1's tool call is NOT inherited",
+        );
+        c.check(
+          r.error.diagnostics?.completion?.finish === undefined,
+          "#168 (turn scope): turn 2's completion is turn 2's — turn 1's finish='stop' is NOT inherited",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m. THE PART-TYPE CENSUS (issue #168), and the case it exists for: a turn whose only
+  //     text-bearing part is `reasoning`. `finalAssistantText` reads `type === "text"` alone,
+  //     so this reconstructs to "" and is refused — while the model demonstrably produced
+  //     output. Before the census, the receipts could not tell this from silence at all.
+  //
+  //     This is the leading root-cause candidate for the reported failure, NOT a confirmed
+  //     diagnosis: what it pins is that the next occurrence SAYS which it was.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "a long and confident answer that lives in a reasoning part",
+      turnShapes: ["reasoning-only"],
+      assistantTokens: { input: 500, output: 320, reasoning: 300, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (reasoning): the turn is still refused — the extractor found no answer");
+      if (!r.ok) {
+        const d = r.error.diagnostics;
+        c.check(
+          d?.partTypes?.reasoning === 1 && d?.partTypes?.text === undefined,
+          "#168 (reasoning): the census names a reasoning part and NO text part — where the output went",
+        );
+        c.check(d?.partTypes?.tool === 1, "#168 (reasoning): the tool part is counted too");
+        c.check(
+          /Parts this turn:/.test(r.error.message) && /reasoning=1/.test(r.error.message),
+          "#168 (reasoning): the census reaches the message a human reads",
+        );
+        // THE DISCRIMINATOR the issue asked for, working: nonzero output tokens beside an
+        // empty answer says the provider DID emit — so the emptiness is ours, not theirs.
+        c.check(
+          d?.completion?.tokens?.output === 320,
+          "#168 (reasoning): nonzero output tokens beside an empty answer — the provider produced something",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6n. The census counts the turn's ASSISTANT parts only, and is turn-scoped like the rest.
+  //     A user message's parts are the caller's own prompt and say nothing about the model.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnTexts: ["TURN-ONE-ANSWER", "unused"],
+      turnShapes: ["text", "rejected"],
+      sessionId: "ses_prior",
+    });
+    try {
+      const deps = { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 };
+      await consult({ question: "q1", model: "openai/allow-model", keepSession: true }, deps);
+      const r = await consult(
+        { question: "q2", model: "openai/allow-model", sessionId: "ses_prior", keepSession: true },
+        deps,
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (census scope): the silent second turn is refused");
+      if (!r.ok) {
+        // Turn 2 (the `rejected` shape) contributes ONE assistant message with zero parts, so
+        // the census is empty. Turn 1's step-start/tool/text parts must not appear.
+        c.check(
+          r.error.diagnostics?.partTypes === undefined,
+          "#168 (census scope): turn 2 carried no assistant parts — turn 1's are NOT inherited",
+        );
+        c.check(
+          !/Parts this turn:/.test(r.error.message),
+          "#168 (census scope): an empty census is omitted rather than rendered as a bare label",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 7. Model-call failure → completed/failed logged + tool error (no fabricated answer).
   //    The expected-call gap stays closed (started+completed present); capture_state
   //    failed makes verify() fail LOUDLY (code 7), as designed (C25/C40).
