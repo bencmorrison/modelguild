@@ -129,11 +129,13 @@
  *
  * TWO RULES, and they point in opposite directions on purpose.
  *   INSTALL refuses EARLY or not at all. `planFor` resolves every payload destination, the
- *   ownership record and the project-mode ancillary paths (`.gitignore`, and `.mcp.json` under
- *   `--write-mcp`) BEFORE the loop, so a refusal costs nothing and leaves nothing. After that
- *   point nothing may throw: a per-file failure is a warning-and-skip, and the guarded
- *   ancillary writes degrade the same way, so the run always reaches `writeRecords` and always
- *   leaves a record accounting for what it placed.
+ *   ownership record and — under `--write-mcp` — `.mcp.json` BEFORE the loop, so a refusal costs
+ *   nothing and leaves nothing. After that point nothing may throw: a per-file failure is a
+ *   warning-and-skip, and the ancillary writes (`.gitignore`, which is deliberately NOT resolved
+ *   in `planFor`, and `.mcp.json`) degrade the same way, so the run always reaches `writeRecords`
+ *   and always leaves a record accounting for what it placed. `.gitignore` did NOT degrade until
+ *   issue #174: `addGitignoreBlock` opened with `safeJoin`, which throws at a live leaf symlink,
+ *   so a complete install exited 1 saying `Nothing was installed.`
  *   UNINSTALL NEVER REFUSES. Its job is removal, and an ancillary file — or one unreadable
  *   payload file — must not hold the payload hostage. Every failure there is a warning and the
  *   removal continues.
@@ -263,6 +265,12 @@ export function payloadFiles(): PayloadEntry[] {
 const COMMAND_DEST_RELS = new Set(
   COMMAND_DOCS.map((c) => `.claude/commands/guild/${c}.md`),
 );
+
+/** The PAYLOAD destinations alone. `InitResult.blocked` also carries the ancillary `.mcp.json`
+ * and `.gitignore`, and uninstall's record-retention rule (issue #176) turns only on a payload
+ * file being left behind — an ancillary write that failed leaves nothing needing proof of
+ * ownership. Derived from `payloadFiles()` so it cannot drift from it. */
+const PAYLOAD_DESTS = new Set(payloadFiles().map((f) => f.dest));
 
 /** Deepest-first, pruned on uninstall only when empty (a user file keeps its dir). */
 const PRUNE_DIRS = [
@@ -443,14 +451,21 @@ function planFor(opts: InitOptions): InstallPlan {
     // Cost, stated: a record planted behind that link decides which of the 13 fixed payload
     // paths a removal will delete — bounded to files whose bytes already hash to a value the
     // planter chose, in a repository they can already write to.
+    //
+    // THE FINAL SENTENCE IS CONDITIONAL SINCE ISSUE #176, and the tense is the whole of it. It
+    // used to promise the link would be removed, which was safe only while that removal was
+    // unconditional; the retention branch in `init` KEEPS the record — and therefore the link —
+    // whenever a payload file is blocked, so the flat promise became a plan-time claim about an
+    // action that may not happen. That is #165's F-3 shape, and it is why this says "if the
+    // removal completes" and `init` states the actual outcome where it is known.
     recordPath = path.join(opts.targetDir, RECORD_REL);
     const link = resolveRecordLink(recordPath);
     if (link) {
       warnings.push(
         `reading the ownership record through a symlink — ${recordPath} links to ${link.target}` +
           `${link.live ? "" : " (dangling, so nothing is owned)"}. Files are still removed only ` +
-          `where their bytes match what that record says init wrote; the link itself is removed ` +
-          `at the end, its target left alone.`,
+          `where their bytes match what that record says init wrote; if the removal completes, ` +
+          `the link itself is removed at the end and its target left alone.`,
       );
     }
   } else {
@@ -491,9 +506,12 @@ function planFor(opts: InitOptions): InstallPlan {
     //
     // `.gitignore` is deliberately NOT refused here, and that is a resolution toward C78 rather
     // than an omission: it is the LAST step of an install whose payload and record are already
-    // down, so `addGitignoreBlock` SKIPS a shape it cannot write and warns, and this run still
-    // reports `blocked`. Refusing the whole install over an ignore-rule convenience would be
-    // the wrong direction for the same reason C78 gives.
+    // down, so `addGitignoreBlock` SKIPS every shape it cannot write and warns. Refusing the
+    // whole install over an ignore-rule convenience would be the wrong direction for the same
+    // reason C78 gives. THAT CLAIM WAS FALSE FOR A LIVE SYMLINK UNTIL ISSUE #174 — the function
+    // opened with `safeJoin`, which throws there, so the install completed and then died with
+    // `Nothing was installed.` If you move `.gitignore` handling, the invariant to preserve is
+    // that this function never throws.
     if (opts.writeMcp) {
       const mcpAbs = safeJoin(opts.targetDir, ".mcp.json");
       const dangling = danglingLinkAt(mcpAbs);
@@ -514,7 +532,9 @@ function planFor(opts: InitOptions): InstallPlan {
     }
   }
   return {
-    destFor: (rel) => safeJoin(opts.targetDir, rel),
+    // The mode rides on the closure so the uninstall loop's embedded message is written for the
+    // run it is actually in (issue #176).
+    destFor: (rel) => safeJoin(opts.targetDir, rel, opts.uninstall ? "uninstall" : "install"),
     recordPath,
     pruneDirs: PRUNE_DIRS.map((d) => path.join(opts.targetDir, d)),
     gitignoreDir: opts.targetDir,
@@ -669,7 +689,7 @@ function validRel(rel: string): boolean {
  * shipped decision. A directory component has no such branch to fall into — it redirects
  * everything below it — so it is refused whether it resolves or not.
  */
-function safeJoin(base: string, rel: string): string {
+function safeJoin(base: string, rel: string, mode: "install" | "uninstall" = "install"): string {
   if (!validRel(rel)) throw new Error(`refusing unsafe path: ${rel}`);
   const parts = rel.split("/");
   let cur = base;
@@ -694,12 +714,22 @@ function safeJoin(base: string, rel: string): string {
     } catch {
       /* unreadable link target — the message just omits it */
     }
+    // THE TAIL IS PER-MODE (issue #176). The uninstall loop embeds this message verbatim into
+    // `keeping <dest> — …`, so the install-only sentences were printed BY `--uninstall`: it said
+    // `Nothing was installed.` in a run that had just removed ten files, and `\`--uninstall\` is
+    // not blocked by this` in a run that then exited 1. The leading phrase, the component and the
+    // remedy are identical in both modes — only the consequence sentence differs — because that
+    // phrase is what a user searching for this error already has (issue #167).
+    const tail =
+      mode === "uninstall"
+        ? `That file is left in place, untouched, and the rest of the removal continues. Remove ` +
+          `the link (\`rm ${cur}\`) and re-run \`--uninstall\` to finish removing it.`
+        : `Nothing was installed. Remove the link (\`rm ${cur}\`) and re-run. \`--uninstall\` is ` +
+          `not blocked by this: it keeps that file, with the same warning, and removes the rest.`;
     throw new Error(
       `refusing destination symlink: ${path.join(base, rel)} — the path component ${cur} is a ` +
         `symlink${target ? ` to '${target}'` : ""}, and a project destination is never resolved ` +
-        `through one (it can redirect a write out of ${base}). Nothing was installed. Remove the ` +
-        `link (\`rm ${cur}\`) and re-run. \`--uninstall\` is not blocked by this: it keeps that ` +
-        `file, with the same warning, and removes the rest.`,
+        `through one (it can redirect a write out of ${base}). ${tail}`,
     );
   }
   return cur;
@@ -1314,7 +1344,17 @@ export interface PayloadLocateOptions {
 }
 
 /** Project first, then global — mirroring how each piece resolves at runtime. Fail-closed:
- * found in neither ⇒ `"none"`. */
+ * found in neither ⇒ `"none"`.
+ *
+ * `isRegularFile`, NOT `existsSync` (issue #175, C78). `existsSync` answers TRUE for a DIRECTORY,
+ * so a directory at a hardened agent def path made `doctor` print `✓ 3/3 hardened agent defs
+ * present` for a repo where `hardenedDefPresentIn` — the predicate C78 fixed for exactly this
+ * shape — says absent and C16 therefore refuses at every model-calling tool. Two surfaces of one
+ * product disagreeing about one file, with no way for a reader to tell which to believe. `stat`
+ * and not `lstat` is load-bearing here in the other direction: a stow- or chezmoi-linked payload
+ * file IS present (issue #163), and this must keep following the link, exactly as opencode's own
+ * `--agent` resolution and every other runtime consumer does. Fail-closed, so nothing that
+ * currently resolves starts reading as absent. */
 export function locatePayload(destRel: string, opts: PayloadLocateOptions): PayloadLocation {
   const at = (global: boolean): boolean => {
     const { base, rel } = payloadDest(destRel, {
@@ -1322,7 +1362,7 @@ export function locatePayload(destRel: string, opts: PayloadLocateOptions): Payl
       targetDir: opts.targetDir,
       global_dirs: opts.global_dirs,
     });
-    return existsSync(path.join(base, rel));
+    return isRegularFile(path.join(base, rel));
   };
   if (opts.globalOnly) return at(true) ? "global" : "none";
   if (at(false)) return "project";
@@ -1581,24 +1621,44 @@ function stripGitignoreBlock(text: string): string {
  * shape we DECLINE to write is policy — the same judgement C78 makes above, and the same
  * judgement never-clobber makes about a payload file — so it stays exit 0. A write that FAILED
  * is an environmental failure the caller could not have chosen, so it is `blocked` and exits 1.
+ *
+ * `path.join`, NOT `safeJoin` (issue #174) — and this is the one line that made C79's "an
+ * install refuses early or not at all" false in the shipped release. `safeJoin` refuses a LIVE
+ * leaf symlink by THROWING, and this function runs after the payload loop AND after
+ * `writeRecords`, so a `.gitignore` symlinked into a dotfiles repo — an ordinary layout — got a
+ * complete, correct install reported as `Nothing was installed.` with exit 1, on every run
+ * forever; `install.sh` propagates that status. A LIVE link now takes the SAME skip-and-warn
+ * branch a dangling one already took, which is what the comment in `planFor` always claimed
+ * happened. Hoisting `.gitignore` into `planFor`'s eager pass was the alternative and was
+ * REJECTED: it would make a shared/symlinked `.gitignore` refuse the whole install, which is a
+ * harder failure than the bug it replaces, over an ignore-rule convenience that is not payload
+ * and whose absence breaks nothing C16 depends on. It also matches the uninstall side, where
+ * `stripGitignoreOnly` already declines the write at a link rather than failing the run. COST,
+ * stated: the block is not added, so `modelguild/logs/` — which holds raw prompts and responses
+ * — is not git-ignored by us and can be committed. The warning names all three rules.
  */
 function addGitignoreBlock(targetDir: string): { warning?: string; blocked?: boolean } {
-  const p = safeJoin(targetDir, ".gitignore");
+  const p = path.join(targetDir, ".gitignore");
+  // ANY symlink, live or dangling. A dangling one would create its target outside the project
+  // (issue #159's write-through); a live one would write THROUGH into a file that is the user's,
+  // which project mode never does. One branch, one posture, the wording differing only in which
+  // it is. (`resolveRecordLink` is not record-specific — it is the general "is there a link here,
+  // where does it point, and does it resolve?" probe.)
+  const link = resolveRecordLink(p);
+  if (link) {
+    return {
+      warning:
+        `skipping the .gitignore block — ${p} is a symlink to ${link.target}` +
+        `${link.live ? ", and a project install never writes through one" : " whose target does not exist, so writing it would create that file outside this project"}. ` +
+        `Everything else was installed. Add \`modelguild/logs/\`, ` +
+        `\`modelguild/models.policy.local\` and \`modelguild/modelguild.conf.local\` to your ` +
+        `ignore rules by hand (that first one holds the raw prompts and responses of every model ` +
+        `call), or remove the link and re-run init.`,
+    };
+  }
   if (isNonRegularFile(p)) {
     return {
       warning: `skipping the .gitignore block — ${p} is not a regular file; add it by hand if you want it.`,
-    };
-  }
-  // A DANGLING link is the shape C78 leaves to whoever owns dangling links, and here that is
-  // this function: the write would follow it and create the target outside the project (issue
-  // #159's write-through). Same skip, same posture — the link is the user's.
-  const dangling = danglingLinkAt(p);
-  if (dangling !== undefined) {
-    return {
-      warning:
-        `skipping the .gitignore block — ${p} is a symlink${dangling ? ` to '${dangling}'` : ""} ` +
-        `whose target does not exist, so writing it would create that file outside this project. ` +
-        `Remove the link and re-run init, or add the ignore rules by hand.`,
     };
   }
   let text = isRegularFile(p) ? readFileSync(p, "utf8") : "";
@@ -1778,10 +1838,71 @@ export function init(opts: InitOptions): InitResult {
       if (warning) result.warnings.push(warning);
       if (blocked) result.blocked.push(".mcp.json");
     }
-    // Remove the record file, then (project only) the gitignore block, then empty dirs.
-    // `lstat`, so a DANGLING record link is removed rather than followed-and-called-absent;
-    // `unlink(2)` never follows a final component, so a live link's target survives (C77).
-    if (entryExists(plan.recordPath)) {
+    // KEEP THE RECORD WHEN A PAYLOAD FILE COULD NOT BE REMOVED (issue #176). This unlink used to
+    // be unconditional, and that closed the only door left: `.opencode` becoming a symlink after
+    // an install made `--uninstall` keep the three agent defs, drop the record anyway, and then
+    // every `init` was refused by `planFor`'s eager `safeJoin` loop while a second `--uninstall`
+    // could no longer prove the leftovers were ours. Files present, record gone, install refused,
+    // removal impossible — the unrepairable-by-any-invocation class #167/#159/#160/#161 exist to
+    // eliminate, reached by a different route. The proof of ownership is the only thing that can
+    // finish the job later, so it outlives the run that could not.
+    //
+    // SCOPED TO PAYLOAD DESTINATIONS, which AMENDS a shipped decision rather than reversing it
+    // (C79): the case C79 argued — an uninstall whose `.mcp.json` write failed removes the record
+    // that proved the key was ours, so a second run keeps the key fail-safe — is untouched,
+    // because `.mcp.json` and `.gitignore` are not payload and their being blocked does not leave
+    // a payload file needing proof. `blocked` is the right test rather than "anything kept": a
+    // file kept for POLICY (no record, changed bytes, not a regular file) can never be removed by
+    // a re-run either, so retaining the record buys nothing there.
+    //
+    // COST, stated. The record kept is the WHOLE record, so it still claims the files this run
+    // did remove. That is benign in all three consumers and was checked rather than assumed: a
+    // later install overwrites each entry as it places the file, a later uninstall skips an absent
+    // path silently (`isRegularFile` is false), and `payloadScanEntries` only scans files it
+    // located. Rewriting the record down to the blocked entries was the alternative and was
+    // REJECTED: it puts a WRITE on a path whose whole contract is that it never refuses and never
+    // throws (C79), to buy tidiness in a record every consumer already tolerates. The other cost
+    // is that a user who wanted the record gone now has it; the warning names the path.
+    const blockedPayload = result.blocked.filter((d) => PAYLOAD_DESTS.has(d));
+    if (blockedPayload.length > 0 && entryExists(plan.recordPath)) {
+      // THE RETAINED CASE HAS TO SAY WHAT HAPPENED TO A SYMLINKED RECORD PATH TOO, and this is
+      // not an optional courtesy — without it this branch makes an EXISTING message false.
+      // `planFor`'s plan-time disclosure promises "the link itself is removed at the end, its
+      // target left alone", written when removal was unconditional; keeping the record keeps the
+      // LINK, so that promise is broken by this branch and nothing else would correct it. That is
+      // #165's F-3 shape (a message asserting an action that did not happen) pointed the other
+      // way, so the plan-time sentence is now conditional and the outcome is stated HERE, where
+      // it is known. Deliberately NOT a copy of #165's removal warning below: nothing was
+      // removed, so no leftover is claimed and no ownership of the target is asserted.
+      //
+      // THE DANGLING CASE IS THE ONE THAT MATTERS, and it is a caveat on this branch's whole
+      // remedy: `entryExists` is `lstat`-based, so a dangling link satisfies it while there is no
+      // readable record behind it — so "re-run `--uninstall` to finish" would not work, and
+      // saying so is the difference between a remedy and a false reassurance.
+      const recordLink = resolveRecordLink(plan.recordPath);
+      result.warnings.push(
+        `KEEPING the ownership record at ${plan.recordPath} — ${blockedPayload.length} payload ` +
+          `file(s) could not be removed (${blockedPayload.join(", ")}), and that record is the ` +
+          `only proof they are ours. Fix the cause named above and re-run \`--uninstall\` to ` +
+          `finish; deleting the record first would strand those files permanently.` +
+          (recordLink
+            ? ` That path is a symlink to ${recordLink.target}, and this run removed neither the ` +
+              `link nor its target.` +
+              (recordLink.live
+                ? ` The next run reads the record through the link, so leave both in place.`
+                : ` The link is DANGLING, so there is no record behind it to keep and re-running ` +
+                  `\`--uninstall\` will prove nothing is ours: restore the target, or remove ` +
+                  `those files by hand.`)
+            : ""),
+      );
+    } else if (entryExists(plan.recordPath)) {
+      // Remove the record file, then (project only) the gitignore block, then empty dirs.
+      // `lstat`, so a DANGLING record link is removed rather than followed-and-called-absent;
+      // `unlink(2)` never follows a final component, so a live link's target survives (C77).
+      //
+      // ISSUE #165'S LEFTOVER DISCLOSURE BELONGS TO THIS ARM ALONE (merge of #165 and #176):
+      // hoisting it above the retention branch would announce a removal that did not happen —
+      // #165's own F-3 defect, re-created by a merge rather than by an edit.
       const recordLink = symlinkTargetOf(plan.recordPath);
       try {
         unlinkSync(plan.recordPath);

@@ -30,6 +30,7 @@ import {
   init,
   isDrifted,
   isSkewed,
+  locatePayload,
   packageVersion,
   payloadFiles,
   resolveGlobalDirs,
@@ -37,6 +38,7 @@ import {
   type PayloadFileState,
   type ServerLaunch,
 } from "../src/init.js";
+import { hardenedDefPresentIn } from "../src/config.js";
 import { emitPayloadSkewNotice, noticeStatePath, payloadFingerprint, readNoticeState } from "../src/notice.js";
 
 // The shipped default launch line: portable, non-interactive npx form.
@@ -2376,6 +2378,281 @@ export async function run(): Promise<number> {
       c.check(
         countFiles(path.join(H, ".claude")) === 0,
         `regression guard: <home>/.claude is emptied (got ${countFiles(path.join(H, ".claude"))} file(s) left)`,
+      );
+    }
+
+    // --- #174: a LIVE symlink at `.gitignore` must not fail a complete install ----
+    // The defect that falsified C79's "an install refuses early or not at all":
+    // `addGitignoreBlock` opened with `safeJoin`, which THROWS at a live leaf link, and it runs
+    // after the payload loop AND after `writeRecords` — so an install that had fully succeeded
+    // exited 1 saying `Nothing was installed.`, on every run, forever. `initScored` is what makes
+    // this a red line rather than an aborted suite: it catches the throw, scores it, and returns
+    // an empty result, so the assertions below read `[]` instead of killing the run.
+    {
+      const P = tempProject();
+      const store = tempProject();
+      const shared = path.join(store, "shared-gitignore");
+      writeFileSync(shared, "node_modules/\n");
+      symlinkSync(shared, path.join(P, ".gitignore"));
+      const r = initScored(c, "#174: install with a LIVE symlink at .gitignore", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH,
+      });
+      c.check(
+        r.installed.length === N_PAYLOAD,
+        `#174: the whole payload is installed (got ${r.installed.length} of ${N_PAYLOAD}) — pre-fix this THREW`,
+      );
+      c.check(
+        recordedFileCount(path.join(P, "modelguild/.modelguild-install.json")) === N_PAYLOAD,
+        "#174: and the ownership record is written",
+      );
+      c.check(
+        (r.blocked ?? []).length === 0,
+        `#174: a shape init DECLINES to write is policy, so the run stays exit 0 (got blocked=[${(r.blocked ?? []).join(", ")}])`,
+      );
+      c.check(
+        r.warnings.some((w) => w.includes("skipping the .gitignore block") && w.includes("never writes through one")),
+        `#174: it SAYS the block was skipped and why (got: ${r.warnings.join(" | ").slice(-300)})`,
+      );
+      c.check(
+        readFileSync(shared, "utf8") === "node_modules/\n",
+        "#174: the file behind the link is untouched — a project install never writes through one",
+      );
+
+      // Through the CLI, because the exit code and the sentence are the user-visible defect.
+      const P2 = tempProject();
+      symlinkSync(shared, path.join(P2, ".gitignore"));
+      const rc = runBounded([path.join(repoRoot, "src/cli.ts"), "init", "--dir", P2], { timeoutMs: 60_000 });
+      c.check(!rc.timedOut, "#174: the CLI install RETURNS");
+      c.check(rc.status === 0, `#174: and exits 0 (got ${rc.status}) — pre-fix: 1`);
+      c.check(
+        !(rc.stdout + rc.stderr).includes("Nothing was installed"),
+        `#174: it does not claim 'Nothing was installed' over a complete install (got: ${(rc.stdout + rc.stderr).slice(0, 200)})`,
+      );
+
+      // The DANGLING case already worked; it must keep working, and must still not write
+      // through the link (issue #159's write-through, at `.gitignore`).
+      const P3 = tempProject();
+      const nowhere = path.join(store, "no-such-dir", "x");
+      symlinkSync(nowhere, path.join(P3, ".gitignore"));
+      const r3 = initScored(c, "#174: install with a DANGLING symlink at .gitignore", {
+        targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH,
+      });
+      c.check(
+        r3.installed.length === N_PAYLOAD && (r3.blocked ?? []).length === 0,
+        `#174: a dangling link is still a clean skip (got ${r3.installed.length}, blocked=[${(r3.blocked ?? []).join(", ")}])`,
+      );
+      c.check(
+        !existsSync(path.join(store, "no-such-dir")),
+        "#174: and nothing is written THROUGH it",
+      );
+    }
+
+    // --- #175: `doctor`'s presence check and C16's refusal must agree ------
+    // `locatePayload` used a bare `existsSync`, which is TRUE for a DIRECTORY — so `doctor`
+    // printed `✓ 3/3 hardened agent defs present` for a repo where `hardenedDefPresentIn` says
+    // absent and C16 therefore refuses at every model-calling tool. The value asserted here is
+    // the AGREEMENT: one product must not have two answers about one file.
+    {
+      const P = tempProject();
+      const G = tempProject();
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const gd = resolveGlobalDirs({ homeDir: G, xdgConfigHome: path.join(G, ".config") });
+      const defRel = ".opencode/agent/guild-read.md";
+      const defAbs = path.join(P, defRel);
+      const agentDir = path.join(P, ".opencode/agent");
+      const locate = (): string => locatePayload(defRel, { targetDir: P, global_dirs: gd });
+      const predicate = (): boolean => hardenedDefPresentIn("guild-read", [agentDir]).present;
+
+      c.check(
+        locate() === "project" && predicate(),
+        `#175: baseline — a real def reads present on BOTH surfaces (locate=${locate()}, predicate=${predicate()})`,
+      );
+
+      // A DIRECTORY at the def path. Neither can block, so this is safe in-process (C78).
+      rmSync(defAbs);
+      mkdirSync(defAbs, { recursive: true });
+      c.check(
+        locate() === "none" && !predicate(),
+        `#175: a DIRECTORY at a def path reads ABSENT on both (locate=${locate()}, predicate=${predicate()}) — pre-fix locate said "project"`,
+      );
+      rmSync(defAbs, { recursive: true });
+
+      // #163's direction, unchanged and load-bearing: `stat` not `lstat`, so a stow-style link
+      // to a real def is still PRESENT on both surfaces. Fixing #175 must not break this.
+      const store = tempProject();
+      const stored = path.join(store, "guild-read.md");
+      copyFileSync(path.join(repoRoot, defRel), stored);
+      symlinkSync(stored, defAbs);
+      c.check(
+        locate() === "project" && predicate(),
+        `#175/#163: a SYMLINKED def is still present on both (locate=${locate()}, predicate=${predicate()})`,
+      );
+    }
+
+    // --- #176: an uninstall that could not remove a payload file keeps the record ----
+    // Sequence: install cleanly, a symlink appears at `.opencode`, `--uninstall` keeps the 3
+    // defs and (pre-fix) unlinked the record anyway — after which every `init` was refused by
+    // `planFor`'s eager loop and a second `--uninstall` could no longer prove the leftovers
+    // were ours. Files present, record gone, install refused, removal impossible.
+    {
+      const P = tempProject();
+      const store = tempProject();
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const oc = path.join(store, "oc");
+      execFileSync("mv", [path.join(P, ".opencode"), oc]);
+      symlinkSync(oc, path.join(P, ".opencode"));
+      const record = path.join(P, "modelguild/.modelguild-install.json");
+
+      const r = initScored(c, "#176: uninstall through a symlinked directory component", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        r.removed.length === N_PAYLOAD - AGENT_DEF_COUNT &&
+          (r.blocked ?? []).length === AGENT_DEF_COUNT,
+        `#176: the resolvable files are removed and the ${AGENT_DEF_COUNT} defs are blocked (got removed=${r.removed.length}, blocked=[${(r.blocked ?? []).join(", ")}])`,
+      );
+      c.check(
+        existsSync(record),
+        "#176: THE OWNERSHIP RECORD SURVIVES — it is the only proof the leftovers are ours (pre-fix: unlinked)",
+      );
+      c.check(
+        r.warnings.some((w) => w.includes("KEEPING the ownership record")),
+        `#176: and the run says so rather than leaving it silently (got: ${r.warnings.join(" | ").slice(-300)})`,
+      );
+
+      // THE MESSAGE DEFECT, same path: `safeJoin`'s install-only sentences were embedded
+      // verbatim into an uninstall warning.
+      const kept = r.warnings.find((w) => w.startsWith(`keeping ${".opencode/agent/guild-read.md"}`)) ?? "";
+      c.check(
+        kept.includes("the rest of the removal continues"),
+        `#176: the uninstall warning is written for an uninstall (got: ${kept.slice(-220) || "<no warning>"})`,
+      );
+      c.check(
+        !kept.includes("Nothing was installed") && !kept.includes("`--uninstall` is not blocked by this"),
+        `#176: and carries neither install-only sentence (got: ${kept.slice(-220) || "<no warning>"})`,
+      );
+
+      // THE REPAIR the retained record buys: undo the link, re-run `--uninstall`, done.
+      unlinkSync(path.join(P, ".opencode"));
+      execFileSync("mv", [oc, path.join(P, ".opencode")]);
+      const r2 = initScored(c, "#176: the second uninstall finishes the job", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        r2.removed.length === AGENT_DEF_COUNT && (r2.blocked ?? []).length === 0,
+        `#176: the leftovers ARE removable afterwards (got removed=${r2.removed.length}, blocked=[${(r2.blocked ?? []).join(", ")}]) — pre-fix: kept forever, "no ownership record to prove it's ours"`,
+      );
+      c.check(!existsSync(record), "#176: and the record goes with them once nothing is blocked");
+
+      // THE SCOPE, so the amendment to C79 stays narrow: an ANCILLARY blocked write does NOT
+      // retain the record. C79 argued that case deliberately (a kept record claiming files
+      // already gone was judged worse), and #176 does not reopen it.
+      const P2 = tempProject();
+      init({ targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true });
+      execFileSync("chmod", ["444", path.join(P2, ".mcp.json")]);
+      const r3 = initScored(c, "#176: an ancillary block does not retain the record", {
+        targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      execFileSync("chmod", ["644", path.join(P2, ".mcp.json")]);
+      c.check(
+        (r3.blocked ?? []).includes(".mcp.json") &&
+          !existsSync(path.join(P2, "modelguild/.modelguild-install.json")),
+        `#176: a blocked .mcp.json still removes the record (C79 unchanged; blocked=[${(r3.blocked ?? []).join(", ")}])`,
+      );
+    }
+
+    // --- #176 × #165: a SYMLINKED record path on the retained branch -------
+    // Neither branch covered this on its own, and the merge is where it bites twice.
+    //   (1) MERGE HAZARD: #165's leftover disclosure ("removed the symlink at …") belongs to the
+    //       REMOVAL arm only. Hoisted above the retention branch it announces a destruction that
+    //       did not happen — #165's own F-3 defect, re-created by a merge rather than an edit.
+    //   (2) `planFor`'s plan-time line promised the link "is removed at the end", which the
+    //       retention branch falsifies — so it is conditional now, and the outcome is stated
+    //       where it is known.
+    {
+      const P = tempProject();
+      const store = tempProject();
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      // Move the record behind a symlink, the way a dotfiles manager would.
+      const record = path.join(P, "modelguild/.modelguild-install.json");
+      const stored = path.join(store, "install.json");
+      copyFileSync(record, stored);
+      unlinkSync(record);
+      symlinkSync(stored, record);
+      // …and block the payload the same way the section above does.
+      const oc = path.join(store, "oc");
+      execFileSync("mv", [path.join(P, ".opencode"), oc]);
+      symlinkSync(oc, path.join(P, ".opencode"));
+
+      const r = initScored(c, "#176×#165: uninstall, record behind a LIVE symlink, payload blocked", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        (r.blocked ?? []).length === AGENT_DEF_COUNT &&
+          lstatSync(record).isSymbolicLink() &&
+          existsSync(stored),
+        `#176×#165: the record link AND its target both survive (blocked=[${(r.blocked ?? []).join(", ")}])`,
+      );
+      const keeping = r.warnings.find((w) => w.startsWith("KEEPING the ownership record")) ?? "";
+      c.check(
+        keeping.includes(stored) && keeping.includes("removed neither the link nor its target"),
+        `#176×#165: the retained branch names the link's target and says nothing was removed (got: ${keeping.slice(-260) || "<no warning>"})`,
+      );
+      c.check(
+        !r.warnings.some((w) => w.includes("removed the symlink at")),
+        `#176×#165: THE MERGE HAZARD — #165's removal disclosure must NOT fire when nothing was removed (got: ${r.warnings.join(" | ").slice(-260)})`,
+      );
+      // The plan-time line: CONDITIONAL now, not a promise. Asserted in both directions — the
+      // pre-fix text is the flat `wrote; the link itself is removed at the end`, which this run
+      // would have made false.
+      const planLine = r.warnings.find((w) => w.startsWith("reading the ownership record")) ?? "";
+      c.check(
+        planLine.includes("if the removal completes") &&
+          !planLine.includes("wrote; the link itself is removed"),
+        `#176×#165: the plan-time line no longer PROMISES a removal this run did not do (got: ${planLine.slice(-200) || "<no warning>"})`,
+      );
+
+      // A DANGLING record link on the same branch: `entryExists` is `lstat`-based, so the record
+      // is "kept" while there is nothing behind it — the remedy would not work, and saying so is
+      // the difference between a remedy and a false reassurance.
+      const P2 = tempProject();
+      const store2 = tempProject();
+      init({ targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const record2 = path.join(P2, "modelguild/.modelguild-install.json");
+      unlinkSync(record2);
+      symlinkSync(path.join(store2, "gone.json"), record2);
+      const oc2 = path.join(store2, "oc");
+      execFileSync("mv", [path.join(P2, ".opencode"), oc2]);
+      symlinkSync(oc2, path.join(P2, ".opencode"));
+      const rd = initScored(c, "#176×#165: uninstall, record behind a DANGLING symlink", {
+        targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      const keeping2 = rd.warnings.find((w) => w.startsWith("KEEPING the ownership record")) ?? "";
+      c.check(
+        keeping2.includes("DANGLING") && keeping2.includes("prove nothing is ours"),
+        `#176×#165: a dangling record link says the remedy will NOT work (got: ${keeping2.slice(-260) || "<no warning>"})`,
+      );
+
+      // AND THE REMOVAL ARM IS UNTOUCHED: with nothing blocked, #165's disclosure still fires.
+      const P3 = tempProject();
+      const store3 = tempProject();
+      init({ targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const record3 = path.join(P3, "modelguild/.modelguild-install.json");
+      const stored3 = path.join(store3, "install.json");
+      copyFileSync(record3, stored3);
+      unlinkSync(record3);
+      symlinkSync(stored3, record3);
+      const rr = initScored(c, "#176×#165: a clean uninstall still discloses the removed link", {
+        targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        (rr.blocked ?? []).length === 0 &&
+          rr.warnings.some((w) => w.includes("removed the symlink at") && w.includes(stored3)),
+        `#176×#165: #165's removal disclosure is NOT suppressed by the retention branch (blocked=[${(rr.blocked ?? []).join(", ")}], got: ${rr.warnings.join(" | ").slice(-260)})`,
+      );
+      c.check(
+        !existsSync(record3) && existsSync(stored3),
+        "#176×#165: …and it removed the link while leaving the target, as C77 says",
       );
     }
   }
