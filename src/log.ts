@@ -56,6 +56,7 @@ import {
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { isRegularFile } from "./fsguard.js";
 import {
   buildEntryLine,
   canonicalStringify,
@@ -389,7 +390,11 @@ export class EvidenceLog {
       // so `confGet`'s last-assignment-wins makes the project key override the global one.
       for (const root of roots) {
         const local = path.join(root, "modelguild.conf.local");
-        if (existsSync(local) && !found.includes(local)) found.push(local);
+        // `isRegularFile`, not `existsSync` (issue #162): a FIFO here satisfied `existsSync`
+        // and `#confRead`'s `readFileSync` then blocked forever, which no `catch` reaches.
+        // `EvidenceLog` resolves the conf chain itself rather than through `src/config.ts`,
+        // so the gate has to be stated in both places — keep them the same predicate.
+        if (isRegularFile(local) && !found.includes(local)) found.push(local);
       }
       this.#confFiles = found.reverse();
     }
@@ -399,6 +404,8 @@ export class EvidenceLog {
     if (this.#confContents === undefined) {
       const parts: string[] = [];
       for (const file of this.#confFiles) {
+        // The gate again for the `$GUILD_CONF` override, which is taken unchecked above.
+        if (!isRegularFile(file)) continue; // issue #162 — non-regular ⇒ no value
         try { parts.push(readFileSync(file, "utf8")); } catch { /* unreadable ⇒ no value */ }
       }
       // `\n` join so a layer without a trailing newline cannot fuse into the next one.

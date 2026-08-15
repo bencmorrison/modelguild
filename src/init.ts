@@ -91,6 +91,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isNonRegularFile, isRegularFile } from "./fsguard.js";
 
 // ---------------------------------------------------------------------------
 // "Shipped" — the payload the RUNNING code would install (issue #94).
@@ -300,7 +301,10 @@ function planFor(opts: InitOptions): InstallPlan {
         const p = globalJoin(base, rel);
         // Only an INSTALL writes the record; `--uninstall` reads it and unlinks the link, so
         // a link the write could not have followed must not stop a removal.
-        if (!opts.uninstall) assertRecordLinkWritable(p);
+        if (!opts.uninstall) {
+          assertRecordPathWritable(p);
+          assertRecordLinkWritable(p);
+        }
         return p;
       })(),
       pruneDirs: [
@@ -313,7 +317,13 @@ function planFor(opts: InitOptions): InstallPlan {
   }
   return {
     destFor: (rel) => safeJoin(opts.targetDir, rel),
-    recordPath: safeJoin(opts.targetDir, RECORD_REL),
+    recordPath: (() => {
+      const p = safeJoin(opts.targetDir, RECORD_REL);
+      // `safeJoin` refuses a symlinked component; it says nothing about a FIFO, which the
+      // record write blocks on forever (issue #162). Install-only, as in global mode.
+      if (!opts.uninstall) assertRecordPathWritable(p);
+      return p;
+    })(),
     pruneDirs: PRUNE_DIRS.map((d) => path.join(opts.targetDir, d)),
     gitignoreDir: opts.targetDir,
   };
@@ -474,7 +484,10 @@ function entryExists(p: string): boolean {
 
 function readRecords(recordPath: string): Records {
   const p = recordPath;
-  if (!existsSync(p)) return {};
+  // `isRegularFile`, not `existsSync`: a FIFO here answered TRUE and hung every init run on
+  // the read below, which no `catch` can reach (issue #162). A non-regular path is treated
+  // exactly like an unreadable one — no records, so nothing is "owned".
+  if (!isRegularFile(p)) return {};
   try {
     const parsed = JSON.parse(readFileSync(p, "utf8")) as { files?: unknown };
     const files = parsed.files;
@@ -495,7 +508,7 @@ function readRecords(recordPath: string): Records {
  * record (no `mcp` field) or an unreadable one returns `undefined` — treated as NOT owned, so
  * uninstall never deletes a `.mcp.json` key it cannot prove init wrote. */
 function readMcpRecord(recordPath: string): McpRecord | undefined {
-  if (!existsSync(recordPath)) return undefined;
+  if (!isRegularFile(recordPath)) return undefined; // issue #162 — see `readRecords`
   try {
     const parsed = JSON.parse(readFileSync(recordPath, "utf8")) as { mcp?: unknown };
     const m = parsed.mcp;
@@ -557,6 +570,29 @@ function resolveRecordLink(recordPath: string): { target: string; live: boolean 
  * working cases are untouched — a LIVE link, and a dangling link whose target directory EXISTS,
  * are both still written through with `recordSymlinkWarning`'s warning.
  */
+/**
+ * REFUSE — at PLAN time, before a single payload byte is written — an ownership-record path
+ * that is not a regular file: a FIFO, a directory, a socket (issue #162).
+ *
+ * `writeRecords` writes this path unconditionally, and `writeFileSync` to a FIFO BLOCKS
+ * forever with no writer on the other end. That is not an exception, so the install did not
+ * fail — it HUNG, after the whole payload was already on disk, on the default project path
+ * with no flag. Same placement and same reasoning as `assertRecordLinkWritable` above: the
+ * record path is the one destination `planFor` resolves eagerly, so refusing here leaves
+ * nothing written. Install-only for the same reason — `--uninstall` writes no record.
+ *
+ * Both modes, unlike `assertRecordLinkWritable`: project mode's `safeJoin` refuses a symlink,
+ * not a FIFO, so it had the identical hang.
+ */
+function assertRecordPathWritable(recordPath: string): void {
+  if (!isNonRegularFile(recordPath)) return;
+  throw new Error(
+    `refusing to install: the ownership record path ${recordPath} exists and is not a regular ` +
+      `file. Writing it would block forever (a FIFO) or fail (a directory). Remove or move ` +
+      `whatever is there, then re-run init.`,
+  );
+}
+
 function assertRecordLinkWritable(recordPath: string): void {
   const link = resolveRecordLink(recordPath);
   if (!link || link.live) return; // no link, or one that resolves to an existing file
@@ -760,8 +796,12 @@ export function scanPayload(packageRoot: string, entries: PayloadScanEntry[]): P
     let current: string;
     let shipped: string;
     try {
-      if (!existsSync(shippedPath) || !existsSync(e.installedPath)) continue;
-      if (!lstatSync(e.installedPath).isFile()) continue;
+      // `stat`, NOT `lstat` (issue #163). The gate must answer the question the READ below
+      // asks, and `readFileSync` follows symlinks. `lstat` answered about the LINK, so a
+      // stow-/chezmoi-style install — real files in a store, symlinks at the destinations —
+      // scored 0 of 8 command docs and vanished from every C72 surface with no signal. `stat`
+      // scores 8 while still rejecting a directory, FIFO, socket or device at a payload path.
+      if (!isRegularFile(shippedPath) || !isRegularFile(e.installedPath)) continue;
       current = sha256(readFileSync(e.installedPath));
       shipped = sha256(readFileSync(shippedPath));
     } catch {
@@ -898,7 +938,17 @@ function writeMcpJson(opts: InitOptions): { action: InitResult["mcpAction"]; ent
   let root: Record<string, unknown> = {};
   let existed = false;
   let hadKey = false;
-  if (existsSync(p)) {
+  // BOTH directions block on a FIFO (issue #162) — `readFileSync` below and, once the read is
+  // gated, the `writeFileSync` at the end. So this refuses on the SHAPE of the path, before
+  // either. Same verdict and same remedy as the unparseable-JSON branch below: init will not
+  // guess what to do with a `.mcp.json` that is not a file.
+  if (isNonRegularFile(p)) {
+    throw new Error(
+      `.mcp.json exists but is not a regular file (${p}); ` +
+        `fix or remove it, then re-run init.`,
+    );
+  }
+  if (isRegularFile(p)) {
     existed = true;
     const raw = readFileSync(p, "utf8");
     try {
@@ -992,14 +1042,29 @@ function stripGitignoreBlock(text: string): string {
   return [...before, ...after].join("\n");
 }
 
-function addGitignoreBlock(targetDir: string): void {
+/**
+ * Returns a warning when the block could not be added, else `undefined`.
+ *
+ * A non-regular `.gitignore` — a FIFO, a directory — is SKIPPED with a warning rather than
+ * written or refused (issue #162). Both the read and the write below block forever on a FIFO,
+ * and neither is reachable by a `catch`. Skipping is the right direction here specifically:
+ * this is the LAST step of an install whose payload and ownership record are already on disk,
+ * the block is a convenience rather than part of the payload, and the never-clobber posture
+ * says a thing the user put there is not ours to replace. (`.mcp.json` refuses instead — see
+ * `writeMcpJson`; it is written mid-install and init already refuses an unusable one.)
+ */
+function addGitignoreBlock(targetDir: string): string | undefined {
   const p = safeJoin(targetDir, ".gitignore");
-  let text = existsSync(p) ? readFileSync(p, "utf8") : "";
+  if (isNonRegularFile(p)) {
+    return `skipping the .gitignore block — ${p} is not a regular file; add it by hand if you want it.`;
+  }
+  let text = isRegularFile(p) ? readFileSync(p, "utf8") : "";
   text = stripGitignoreBlock(text); // idempotent — never double-add
   if (text.length > 0 && !text.endsWith("\n")) text += "\n";
   if (text.length > 0) text += "\n";
   text += GITIGNORE_BODY;
   writeFileSync(p, text);
+  return undefined;
 }
 
 function stripGitignoreOnly(targetDir: string): void {
@@ -1040,7 +1105,10 @@ export function init(opts: InitOptions): InitResult {
   if (opts.uninstall) {
     for (const { dest } of payloadFiles()) {
       const abs = plan.destFor(dest);
-      if (!existsSync(abs)) continue;
+      // `isRegularFile`, not `existsSync`: a FIFO at a payload path answered TRUE and hung the
+      // hash read below (issue #162). A non-regular entry is skipped exactly as an absent one
+      // — it cannot hash to what init recorded, so it was never going to be removed anyway.
+      if (!isRegularFile(abs)) continue;
       const recorded = records[dest];
       if (!recorded) {
         result.warnings.push(`keeping ${dest} — no ownership record to prove it's ours.`);
@@ -1155,6 +1223,9 @@ export function init(opts: InitOptions): InitResult {
   if (recordWarning) result.warnings.push(recordWarning);
   writeRecords(plan.recordPath, newRecords, mcpRecord);
   // A project `.gitignore` block only makes sense for a project install.
-  if (plan.gitignoreDir) addGitignoreBlock(plan.gitignoreDir);
+  if (plan.gitignoreDir) {
+    const gitignoreWarning = addGitignoreBlock(plan.gitignoreDir);
+    if (gitignoreWarning) result.warnings.push(gitignoreWarning);
+  }
   return result;
 }

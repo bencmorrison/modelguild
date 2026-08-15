@@ -16,6 +16,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isRegularFile } from "./fsguard.js";
 import { confGet } from "./log.js";
 import { bashGlobMatch } from "./policy.js";
 import { MESSAGE_HTTP_MS } from "./client.js";
@@ -184,12 +185,18 @@ export function resolveAgentDefDir(opts: {
   return path.join(projectDir, ".opencode", "agent");
 }
 
-/** True iff the hardened agent's def file (`<agent>.md`) exists in the resolved dir. */
+/** True iff the hardened agent's def file (`<agent>.md`) is a regular file in the resolved dir.
+ *
+ * `isRegularFile`, not `existsSync` (issue #163): a DIRECTORY at a def path satisfied
+ * `existsSync`, so the pre-check passed and the real failure surfaced seconds later, mid-turn,
+ * out of opencode — instead of as the clean `agent-def-missing` refusal this check exists to
+ * give. It follows symlinks, exactly as opencode's own resolution does, so a linked def still
+ * counts; the change is fail-CLOSED, so no working setup starts refusing. */
 export function hardenedDefPresent(
   agent: string,
   agentDefDir: string,
 ): boolean {
-  return existsSync(path.join(agentDefDir, `${agent}.md`));
+  return isRegularFile(path.join(agentDefDir, `${agent}.md`));
 }
 
 /**
@@ -238,7 +245,7 @@ export function hardenedDefPresentIn(
   agentDefDirs: string[],
 ): { present: boolean; dir?: string } {
   for (const d of agentDefDirs) {
-    if (existsSync(path.join(d, `${agent}.md`))) return { present: true, dir: d };
+    if (isRegularFile(path.join(d, `${agent}.md`))) return { present: true, dir: d }; // issue #163
   }
   return { present: false };
 }
@@ -254,7 +261,10 @@ export function resolveConfFile(
   const override = env.GUILD_CONF;
   if (override && override.length > 0) return override;
   const local = path.join(guildDir, "modelguild.conf.local");
-  return existsSync(local) ? local : undefined;
+  // `isRegularFile`, not `existsSync` (issue #162): a FIFO here satisfied `existsSync` and the
+  // reads below then BLOCKED forever, which no `catch` reaches. Non-regular ⇒ no config file,
+  // the same answer as absent.
+  return isRegularFile(local) ? local : undefined;
 }
 
 /** Contents of the resolved config file, or "" when there is none / it is unreadable.
@@ -265,7 +275,9 @@ export function readConfContents(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const file = resolveConfFile(guildDir, env);
-  if (!file) return "";
+  // The `$GUILD_CONF` override bypasses the resolver's gate, so re-check the shape here too
+  // (issue #162) — an override pointed at a FIFO hung `doctor` on the read below.
+  if (!file || !isRegularFile(file)) return "";
   try { return readFileSync(file, "utf8"); } catch { return ""; }
 }
 
@@ -284,7 +296,7 @@ export function resolveConfFiles(
   const out: string[] = [];
   for (const dir of guildDirs) {
     const local = path.join(dir, "modelguild.conf.local");
-    if (existsSync(local) && !out.includes(local)) out.push(local);
+    if (isRegularFile(local) && !out.includes(local)) out.push(local); // issue #162
   }
   return out;
 }
@@ -310,6 +322,9 @@ export function readLayeredConfContents(
   const parts: string[] = [];
   // Least-specific first: reverse the most-specific-first file list.
   for (const file of [...files].reverse()) {
+    // The shape gate again for the `$GUILD_CONF` override, which `resolveConfFiles` returns
+    // unchecked (issue #162).
+    if (!isRegularFile(file)) continue; // non-regular ⇒ contributes nothing
     try { parts.push(readFileSync(file, "utf8")); } catch { /* unreadable ⇒ contributes nothing */ }
   }
   return parts.join("\n");

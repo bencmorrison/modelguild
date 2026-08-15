@@ -24,7 +24,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Checker, repoRoot, tsxBin } from "./harness.js";
+import { Checker, repoRoot, runBounded, tsxBin } from "./harness.js";
 import {
   init,
   isDrifted,
@@ -1405,6 +1405,169 @@ export async function run(): Promise<number> {
       badUninstallMsg === "",
       `record symlink: --uninstall --global is NOT blocked by the refused link (got: ${badUninstallMsg})`,
     );
+  }
+
+  // --- issues #162 / #163: THE STAT PREDICATE AT A PRESENCE CHECK -----------------------
+  //
+  // One defect class, two directions. `existsSync` says TRUE for a FIFO and the read that
+  // follows BLOCKS (#162); `lstatSync().isFile()` says FALSE for a symlink and the read that
+  // follows never happens (#163). Both were gates on a path that is about to be opened, and
+  // the gate has to answer the question the OPEN asks — which is `stat`'s question.
+  //
+  // EVERY FIFO CASE RUNS IN A CHILD PROCESS UNDER A WALL-CLOCK BOUND (`runBounded`). A
+  // blocking synchronous fs call cannot be interrupted from inside this process, so an
+  // in-process assertion would HANG the suite on a regression instead of failing it — see the
+  // note on `runBounded` in `test/harness.ts`.
+  {
+    const CLI = path.join(repoRoot, "src", "cli.ts");
+    const mkfifo = (p: string): void => { execFileSync("mkfifo", [p]); };
+
+    // (1) #163 — THE STOW LAYOUT. Real files in a store, symlinks at the destinations: the
+    // layout GNU stow produces whenever the parent directory cannot be tree-folded, and what
+    // chezmoi's `symlink_` targets do by design. Under `lstat` all 8 command docs scored 0 and
+    // the whole install vanished from skew/drift detection with no signal (C72's three
+    // surfaces all went quiet). Under `stat` they are scanned and classified.
+    {
+      const SP = tempProject();
+      init({ targetDir: SP, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      const store = tempProject();
+      const real = path.join(store, "consult.md");
+      writeFileSync(real, readFileSync(path.join(SP, CONSULT), "utf8"));
+      unlinkSync(path.join(SP, CONSULT));
+      symlinkSync(real, path.join(SP, CONSULT));
+
+      c.check(
+        lstatSync(path.join(SP, CONSULT)).isSymbolicLink(),
+        "stat predicate: the stow fixture really is a symlink at the payload destination",
+      );
+      const stow = scanAgainst(PKG_V2, SP);
+      c.check(
+        stow.skewed.length === 1 && stow.skewed[0]?.dest === CONSULT,
+        `stat predicate (#163): a SYMLINKED payload file behind the release is reported as skew (got skewed=${stow.skewed.length}, unknown=${stow.unknown.length})`,
+      );
+      c.check(
+        scanAgainst(PKG_V1, SP).skewed.length === 0,
+        "stat predicate (#163): a symlinked payload file matching the release it came from is still clean",
+      );
+    }
+
+    // (2) #163 / review finding F8 — THE OTHER SYMLINK. A payload path pointed at a file of
+    // the user's own that init never wrote, with no ownership record covering it. This must
+    // NOT come out as silence: presence is not identity, and C72's honest answer for "differs
+    // from shipped, no record to judge it by" is UNJUDGEABLE. Under `lstat` it was skipped
+    // entirely, so `doctor`/`guild_status`/the notice all said nothing at all about it.
+    {
+      const FP = tempProject();
+      init({ targetDir: FP, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      setRecord(FP, CONSULT, null); // the link predates any install of ours
+      const mine = path.join(tempProject(), "my-own-notes.md");
+      writeFileSync(mine, "my own file, nothing to do with modelguild\n");
+      unlinkSync(path.join(FP, CONSULT));
+      symlinkSync(mine, path.join(FP, CONSULT));
+
+      const shadowed = scanAgainst(PKG_V1, FP);
+      c.check(
+        shadowed.unknown.length === 1 && shadowed.unknown[0]?.dest === CONSULT,
+        `stat predicate (#163/F8): a payload path linked to an UNRELATED file with no record is reported as unjudgeable, not skipped (got unknown=${shadowed.unknown.length})`,
+      );
+      c.check(
+        shadowed.skewed.length === 0 && shadowed.drifted.length === 0,
+        "stat predicate (#163/F8): an unrecorded shadowing file is NOT guessed as skew or drift",
+      );
+    }
+
+    // (3) #163 — the guard the `isFile()` half was there for, kept. `stat` follows the link;
+    // it still refuses a DIRECTORY standing where a payload file should be.
+    {
+      const DP = tempProject();
+      init({ targetDir: DP, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      rmSync(path.join(DP, CONSULT));
+      mkdirSync(path.join(DP, CONSULT), { recursive: true });
+      const dirCase = scanAgainst(PKG_V2, DP);
+      c.check(
+        dirCase.skewed.length === 0 && dirCase.drifted.length === 0 && dirCase.unknown.length === 0,
+        `stat predicate (#163): a DIRECTORY at a payload path is still skipped by the scan (got skewed=${dirCase.skewed.length}, unknown=${dirCase.unknown.length})`,
+      );
+    }
+
+    // (4) #162 — a FIFO at `.gitignore`. THE DEFAULT PROJECT INSTALL PATH, no flag required:
+    // the read hung, and gating only the read would have moved the hang to the write. The
+    // block is the last step of the install, so it is SKIPPED with a warning rather than
+    // refused — the payload and the ownership record are already on disk and correct.
+    {
+      const GP = tempProject();
+      mkfifo(path.join(GP, ".gitignore"));
+      const r = runBounded([CLI, "init", "--dir", GP], { timeoutMs: 60_000 });
+      c.check(!r.timedOut, "FIFO (#162): `init` with a FIFO at .gitignore RETURNS (it used to block forever)");
+      c.check(r.status === 0, `FIFO (#162): that install still succeeds (exit ${r.status})`);
+      c.check(
+        countFiles(path.join(GP, ".claude")) + countFiles(path.join(GP, ".opencode")) > 0,
+        "FIFO (#162): the payload is installed despite the unusable .gitignore",
+      );
+      c.check(
+        existsSync(path.join(GP, "modelguild", ".modelguild-install.json")),
+        "FIFO (#162): the ownership record is still written",
+      );
+      c.check(
+        (r.stdout + r.stderr).includes("skipping the .gitignore block"),
+        `FIFO (#162): and it SAYS the block was skipped rather than doing it silently (got: ${(r.stdout + r.stderr).slice(-300)})`,
+      );
+    }
+
+    // (5) #162 — a FIFO at `.mcp.json` under `--write-mcp`. Refused, not skipped: this file is
+    // written mid-install and init already refuses an unparseable one, so the shape check
+    // lands on the same branch with the same remedy.
+    {
+      const MP = tempProject();
+      mkfifo(path.join(MP, ".mcp.json"));
+      const r = runBounded([CLI, "init", "--dir", MP, "--write-mcp"], { timeoutMs: 60_000 });
+      c.check(!r.timedOut, "FIFO (#162): `init --write-mcp` with a FIFO at .mcp.json RETURNS (it used to block forever)");
+      // `!== null` as well as `!== 0`: a KILLED child reports a null status, which `!== 0`
+      // alone accepts — so the weaker form passed against the very hang it is here to catch.
+      c.check(
+        r.status !== null && r.status !== 0,
+        `FIFO (#162): and it refuses rather than reporting success (exit ${r.status})`,
+      );
+      c.check(
+        (r.stdout + r.stderr).includes("not a regular file"),
+        `FIFO (#162): the .mcp.json refusal says what is wrong with the path (got: ${(r.stdout + r.stderr).slice(-300)})`,
+      );
+    }
+
+    // (6) #162 — a FIFO at the OWNERSHIP RECORD. `writeRecords` writes that path
+    // unconditionally, so this is the WRITE direction with no read to gate. Refused at plan
+    // time, which is the only placement that leaves nothing behind: the pre-fix behaviour
+    // installed the entire payload and THEN hung on the record.
+    {
+      const RP = tempProject();
+      mkdirSync(path.join(RP, "modelguild"), { recursive: true });
+      mkfifo(path.join(RP, "modelguild", ".modelguild-install.json"));
+      const r = runBounded([CLI, "init", "--dir", RP], { timeoutMs: 60_000 });
+      c.check(!r.timedOut, "FIFO (#162): `init` with a FIFO at the ownership record RETURNS (it used to block forever)");
+      c.check(r.status !== null && r.status !== 0, `FIFO (#162): and it refuses (exit ${r.status})`);
+      const written = countFiles(path.join(RP, ".claude")) + countFiles(path.join(RP, ".opencode"));
+      c.check(
+        written === 0,
+        `FIFO (#162): the record refusal is at PLAN time — ZERO payload files written (got ${written})`,
+      );
+    }
+
+    // (7) #162 — a FIFO at a payload path during `--uninstall`. The hash read that decides
+    // whether a file is ours blocked on it; a non-regular entry cannot hash to what init
+    // recorded, so skipping it is the same answer arrived at without the block.
+    {
+      const UP = tempProject();
+      init({ targetDir: UP, packageRoot: PKG_V1, serverLaunch: LAUNCH });
+      rmSync(path.join(UP, CONSULT));
+      mkfifo(path.join(UP, CONSULT));
+      const r = runBounded([CLI, "init", "--dir", UP, "--uninstall"], { timeoutMs: 60_000 });
+      c.check(!r.timedOut, "FIFO (#162): `init --uninstall` with a FIFO at a payload path RETURNS (it used to block forever)");
+      c.check(r.status === 0, `FIFO (#162): the uninstall completes (exit ${r.status})`);
+      c.check(
+        lstatSync(path.join(UP, CONSULT)).isFIFO(),
+        "FIFO (#162): the user's FIFO is left alone, not removed",
+      );
+    }
   }
 
   console.log(`init.test: ${c.passes} passed, ${c.failures} failed`);

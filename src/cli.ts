@@ -34,6 +34,7 @@ import {
   type PayloadFileState,
   type ServerLaunch,
 } from "./init.js";
+import { isRegularFile } from "./fsguard.js";
 import { formatSkewNote, noticeStatePath } from "./notice.js";
 import { layeredRoots, readLayeredConfContents } from "./config.js";
 import { resolvePolicyLayers } from "./policy.js";
@@ -388,7 +389,11 @@ export async function runDoctor(
   // setup. Prefer an any-scope check via the Claude CLI; fall back to the project file.
   const mcpPath = path.join(targetDir, ".mcp.json");
   let projectHasKey = false;
-  if (existsSync(mcpPath)) {
+  // `isRegularFile`, not `existsSync` (issue #162): a FIFO at `.mcp.json` satisfied `existsSync`
+  // and `readFileSync` then blocked forever — `doctor` never returned, and the `catch` below
+  // could not help, because a block is not an exception. Non-regular ⇒ no key, the same verdict
+  // the invalid-JSON branch already gives.
+  if (isRegularFile(mcpPath)) {
     try {
       const root = JSON.parse(readFileSync(mcpPath, "utf8")) as {
         mcpServers?: Record<string, unknown>;
