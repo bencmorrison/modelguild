@@ -90,7 +90,7 @@ function initScored(c: Checker, label: string, opts: Parameters<typeof init>[0])
     return init(opts);
   } catch (e) {
     c.check(false, `${label} — init threw: ${(e as Error).message}`);
-    return { installed: [], skipped: [], removed: [], shadowed: [], drifted: [], warnings: [], mcpAction: "skipped" };
+    return { installed: [], skipped: [], removed: [], shadowed: [], drifted: [], blocked: [], warnings: [], mcpAction: "skipped" };
   }
 }
 
@@ -1047,6 +1047,7 @@ export async function run(): Promise<number> {
   // `~/.claude` and `<xdg>/opencode` are symlinks under GNU stow / chezmoi / a hand-rolled
   // `ln -s`. Global mode follows those DIRECTORY links; project mode still refuses (below).
   const N_PAYLOAD = payloadFiles().length;
+  const AGENT_DEF_COUNT = payloadFiles().filter((p) => p.dest.startsWith(".opencode/agent/")).length;
   {
     const linkHome = tempProject();
     const linkXdg = tempProject();
@@ -1158,11 +1159,17 @@ export async function run(): Promise<number> {
       `symlink leaf: both linked destinations are reported skipped (got ${resLeaf.skipped.join(", ")})`,
     );
     c.check(
-      resLeaf.warnings.includes("skipping .claude/commands/guild/consult.md — a non-file exists there; left untouched."),
+      resLeaf.warnings.includes(
+        `skipping .claude/commands/guild/consult.md — a non-file exists at ` +
+          `${path.join(leafHome, ".claude/commands/guild/consult.md")}; left untouched.`,
+      ),
       `symlink leaf: the live link warns by name (got ${resLeaf.warnings.join(" | ")})`,
     );
     c.check(
-      resLeaf.warnings.includes("skipping .opencode/agent/guild-read.md — a non-file exists there; left untouched."),
+      resLeaf.warnings.includes(
+        `skipping .opencode/agent/guild-read.md — a non-file exists at ` +
+          `${path.join(leafXdg, "opencode/agent/guild-read.md")}; left untouched.`,
+      ),
       `symlink leaf: the DANGLING link warns by name rather than being written through (got ${resLeaf.warnings.join(" | ")})`,
     );
     c.check(readFileSync(kept, "utf8") === "MY OWN FILE\n", "symlink leaf: the live link's target is not overwritten");
@@ -1188,8 +1195,17 @@ export async function run(): Promise<number> {
       msg = (e as Error).message;
     }
     c.check(
-      msg === "refusing destination symlink: .opencode/agent/guild-read.md",
-      `project mode still refuses a leaf symlink, naming the path (got: ${msg || "<no throw>"})`,
+      // The refusal now names the ABSOLUTE path, the offending component, the link's target and
+      // a remedy (issue #167) — the old text was a bare project-relative path with no base.
+      msg.startsWith(`refusing destination symlink: ${path.join(P, ".opencode/agent/guild-read.md")} —`) &&
+        msg.includes(`the path component ${path.join(P, ".opencode/agent/guild-read.md")} is a symlink to '${target}'`) &&
+        msg.includes(`\`rm ${path.join(P, ".opencode/agent/guild-read.md")}\``) &&
+        msg.includes("`--uninstall` is not blocked by this"),
+      `project mode still refuses a leaf symlink, naming the absolute path, the component and the remedy (got: ${msg || "<no throw>"})`,
+    );
+    c.check(
+      countFiles(path.join(P, ".claude")) + countFiles(path.join(P, "modelguild")) === 0,
+      "project mode: the leaf-symlink refusal lands at PLAN time — ZERO files written",
     );
     c.check(readFileSync(target, "utf8") === "OUTSIDE\n", "project mode: the refused link's target is untouched");
 
@@ -1203,8 +1219,9 @@ export async function run(): Promise<number> {
       msg2 = (e as Error).message;
     }
     c.check(
-      msg2.startsWith("refusing destination symlink: .opencode/agent/"),
-      `project mode still refuses a symlinked directory component (got: ${msg2 || "<no throw>"})`,
+      msg2.startsWith(`refusing destination symlink: ${path.join(P2, ".opencode/agent/")}`) &&
+        msg2.includes(`the path component ${path.join(P2, ".opencode")} is a symlink`),
+      `project mode still refuses a symlinked directory component, naming THAT component (got: ${msg2 || "<no throw>"})`,
     );
 
     // A DANGLING leaf link in project mode used to be written THROUGH — `existsSync` follows,
@@ -1566,6 +1583,440 @@ export async function run(): Promise<number> {
       c.check(
         lstatSync(path.join(UP, CONSULT)).isFIFO(),
         "FIFO (#162): the user's FIFO is left alone, not removed",
+      );
+    }
+  }
+
+  // =========================================================================
+  // Issues #167 / #159 / #160 / #161 / #164 — WHEN a refusal lands.
+  //
+  // One defect: every path-level check ran lazily, so a refusal of any kind landed after the
+  // filesystem had been mutated, and — because the ownership record is what `--uninstall` and
+  // never-clobber both key on — a run that died before `writeRecords` left an install that was
+  // neither present nor absent and that NO invocation could repair.
+  //
+  // The two rules under test: an INSTALL refuses EARLY (nothing written) or not at all; an
+  // UNINSTALL never refuses at all.
+  // =========================================================================
+  {
+    const LINKED_DEST = "modelguild/models.policy"; // payload entry 12 of 13 — 11 land before it
+
+    // --- #167 (a): a symlinked payload destination refuses at PLAN time -----
+    {
+      const P = tempProject();
+      const outside = tempProject();
+      const mine = path.join(outside, "mine");
+      writeFileSync(mine, "MY OWN POLICY\n");
+      mkdirSync(path.join(P, "modelguild"), { recursive: true });
+      symlinkSync(mine, path.join(P, LINKED_DEST));
+      let msg = "";
+      try {
+        init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      c.check(msg.startsWith("refusing destination symlink:"), `#167: a linked payload dest is refused (got: ${msg || "<no throw>"})`);
+      // The whole point: on the pre-fix code this threw from INSIDE the loop, leaving 11 files.
+      c.check(
+        countFiles(path.join(P, ".claude")) === 0 && countFiles(path.join(P, ".opencode")) === 0,
+        `#167: the refusal writes ZERO files (got ${countFiles(path.join(P, ".claude")) + countFiles(path.join(P, ".opencode"))})`,
+      );
+      c.check(!existsSync(path.join(P, "modelguild/.modelguild-install.json")), "#167: and no ownership record");
+      c.check(readFileSync(mine, "utf8") === "MY OWN POLICY\n", "#167: the link's target is untouched");
+    }
+
+    // --- #167 (b): the WORST shape — a link at an AGENT DEF ----------------
+    // Per C16 a missing hardened def makes guild_research/guild_delegate REFUSE, so the
+    // pre-fix outcome (8 command docs, no agent defs, no record) was non-functional, not
+    // merely incomplete.
+    {
+      const P = tempProject();
+      const outside = tempProject();
+      const t = path.join(outside, "def.md");
+      writeFileSync(t, "MINE\n");
+      mkdirSync(path.join(P, ".opencode/agent"), { recursive: true });
+      symlinkSync(t, path.join(P, ".opencode/agent/guild-build.md"));
+      let threw = false;
+      try {
+        init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      } catch {
+        threw = true;
+      }
+      c.check(
+        threw && countFiles(path.join(P, ".claude")) === 0,
+        "#167: a link at an agent def refuses BEFORE the command docs land (never 'docs but no defs')",
+      );
+    }
+
+    // --- #167 (c): UNINSTALL is no longer blocked by the same link ---------
+    {
+      const P = tempProject();
+      const outside = tempProject();
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      // Plant a LIVE link AFTER a good install, over a file init owns — the shape `safeJoin`
+      // refuses, and therefore the shape that used to make `--uninstall` impossible.
+      const elsewhere = path.join(outside, "elsewhere");
+      writeFileSync(elsewhere, "SOMEBODY ELSE'S FILE\n");
+      unlinkSync(path.join(P, LINKED_DEST));
+      symlinkSync(elsewhere, path.join(P, LINKED_DEST));
+      const ru = initScored(c, "#167: uninstall over a linked payload dest", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        ru.removed.length === N_PAYLOAD - 1,
+        `#167: uninstall removes every OTHER file rather than refusing the run (got ${ru.removed.length})`,
+      );
+      c.check((ru.blocked ?? []).includes(LINKED_DEST), `#167: the one it could not resolve is reported blocked (got [${(ru.blocked ?? []).join(", ")}])`);
+      c.check(
+        ru.warnings.some((w) => w.startsWith(`keeping ${LINKED_DEST} — refusing destination symlink:`)),
+        `#167: with a warning naming it (got ${ru.warnings.join(" | ")})`,
+      );
+      c.check(lstatSync(path.join(P, LINKED_DEST)).isSymbolicLink(), "#167: the user's link itself is left alone");
+      c.check(readFileSync(elsewhere, "utf8") === "SOMEBODY ELSE'S FILE\n", "#167: and its target is not deleted through it");
+    }
+
+    // --- #159: a DANGLING symlink at a DIRECTORY component -----------------
+    // `safeJoin` gated on `existsSync`, which FOLLOWS, so a dangling link was skipped by the
+    // guard entirely. Pre-fix on this base that surfaced as a raw `ENOENT … mkdir` from inside
+    // the loop with 8 files on disk and no record.
+    {
+      const P = tempProject();
+      const outside = tempProject();
+      symlinkSync(path.join(outside, "nodir"), path.join(P, ".opencode"));
+      let msg = "";
+      try {
+        init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      c.check(
+        msg.startsWith("refusing destination symlink:") && msg.includes(`the path component ${path.join(P, ".opencode")} is a symlink`),
+        `#159: a DANGLING directory component is refused by name (got: ${msg || "<no throw>"})`,
+      );
+      c.check(
+        countFiles(path.join(P, ".claude")) === 0 && countFiles(path.join(P, "modelguild")) === 0,
+        "#159: and nothing is written (pre-fix: 8 command docs, then ENOENT)",
+      );
+      c.check(!existsSync(path.join(outside, "nodir")), "#159: nothing is created at the link's target either");
+    }
+
+    // A DANGLING LEAF link stays a SKIP, not a refusal — that is C77's shipped decision and
+    // this change must not revert it. (A LIVE leaf link is still refused, asserted above.)
+    {
+      const P = tempProject();
+      const outside = tempProject();
+      mkdirSync(path.join(P, ".opencode/agent"), { recursive: true });
+      symlinkSync(path.join(outside, "escaped.md"), path.join(P, ".opencode/agent/guild-read.md"));
+      const r = initScored(c, "#159: dangling LEAF link", { targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      c.check(
+        r.installed.length === N_PAYLOAD - 1 && r.skipped.includes(".opencode/agent/guild-read.md"),
+        `#159: a dangling LEAF link is still skipped, not refused (got ${r.installed.length} installed)`,
+      );
+      c.check(!existsSync(path.join(outside, "escaped.md")), "#159: and never written through");
+    }
+
+    // --- #160: `.mcp.json` sits between the payload loop and the record ----
+    // DESIGN CALL: what is KNOWABLE before writing is refused up front (nothing written); what
+    // can only be learnt BY writing degrades to a warning with the record still written.
+    {
+      // (a) UNPARSEABLE — knowable ⇒ refused, nothing written.
+      const P = tempProject();
+      writeFileSync(path.join(P, ".mcp.json"), "not json at all\n");
+      let msg = "";
+      try {
+        init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      c.check(
+        msg.includes("not valid JSON") && msg.includes("Nothing was installed"),
+        `#160: an unparseable .mcp.json is refused up front (got: ${msg || "<no throw>"})`,
+      );
+      c.check(
+        countFiles(path.join(P, ".claude")) === 0 && countFiles(path.join(P, ".opencode")) === 0,
+        "#160: the unparseable refusal writes ZERO payload files (pre-fix: 13, and no record)",
+      );
+
+      // (b) SYMLINKED — knowable ⇒ refused, nothing written.
+      const P2 = tempProject();
+      const outside = tempProject();
+      const real = path.join(outside, "real.json");
+      writeFileSync(real, '{"mcpServers":{}}\n');
+      symlinkSync(real, path.join(P2, ".mcp.json"));
+      let msg2 = "";
+      try {
+        init({ targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true });
+      } catch (e) {
+        msg2 = (e as Error).message;
+      }
+      c.check(
+        msg2.startsWith("refusing destination symlink:") && msg2.includes(".mcp.json"),
+        `#160: a symlinked .mcp.json is refused up front (got: ${msg2 || "<no throw>"})`,
+      );
+      c.check(countFiles(path.join(P2, ".opencode")) === 0, "#160: and writes nothing");
+
+      // (c) UNWRITABLE — only learnable by writing ⇒ the payload AND THE RECORD still land.
+      const P3 = tempProject();
+      writeFileSync(path.join(P3, ".mcp.json"), '{"mcpServers":{}}\n');
+      execFileSync("chmod", ["444", path.join(P3, ".mcp.json")]);
+      const r3 = initScored(c, "#160: unwritable .mcp.json", {
+        targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true,
+      });
+      c.check(r3.installed.length === N_PAYLOAD, `#160: an unwritable .mcp.json does not stop the payload (got ${r3.installed.length})`);
+      c.check(
+        recordedFileCount(path.join(P3, "modelguild/.modelguild-install.json")) === N_PAYLOAD,
+        "#160: THE OWNERSHIP RECORD IS STILL WRITTEN (pre-fix: absent, and unrepairable)",
+      );
+      c.check(r3.mcpAction === "skipped" && (r3.blocked ?? []).includes(".mcp.json"), `#160: .mcp.json is reported unwritten and blocked (got ${r3.mcpAction}, [${(r3.blocked ?? []).join(", ")}])`);
+      // …and the install is now repairable: fix the cause, re-run, done.
+      execFileSync("chmod", ["644", path.join(P3, ".mcp.json")]);
+      const r3b = initScored(c, "#160: retry after fixing the cause", {
+        targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true,
+      });
+      c.check(
+        r3b.mcpAction === "merged" && (r3b.blocked ?? []).length === 0,
+        `#160: a retry completes the install rather than throwing at the same point (got ${r3b.mcpAction}, [${(r3b.blocked ?? []).join(", ")}])`,
+      );
+    }
+
+    // --- #161: uninstall must never be held hostage by an ancillary file ---
+    {
+      // (a) read-only `.gitignore`: pre-fix ⇒ exit 1, payload gone, record gone, block still
+      //     present, `pruneEmptyDirs` NEVER REACHED.
+      const P = tempProject();
+      init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      execFileSync("chmod", ["444", path.join(P, ".gitignore")]);
+      const r = initScored(c, "#161: uninstall over a read-only .gitignore", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(r.removed.length === N_PAYLOAD, `#161: every payload file is still removed (got ${r.removed.length})`);
+      c.check((r.blocked ?? []).includes(".gitignore"), `#161: the .gitignore is reported blocked (got [${(r.blocked ?? []).join(", ")}])`);
+      c.check(
+        !existsSync(path.join(P, ".claude/commands/guild")),
+        "#161: pruneEmptyDirs IS reached (pre-fix the throw landed before it)",
+      );
+      execFileSync("chmod", ["644", path.join(P, ".gitignore")]);
+
+      // (b) read-only `.mcp.json` holding our key: pre-fix ⇒ the record survived, CLAIMING 13
+      //     files that were already gone, and every re-run exited 1.
+      const P2 = tempProject();
+      init({ targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, writeMcp: true });
+      execFileSync("chmod", ["444", path.join(P2, ".mcp.json")]);
+      const r2 = initScored(c, "#161: uninstall over a read-only .mcp.json", {
+        targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(r2.removed.length === N_PAYLOAD, `#161: the payload is removed (got ${r2.removed.length})`);
+      c.check(
+        !existsSync(path.join(P2, "modelguild/.modelguild-install.json")),
+        "#161: and the record does not survive claiming files that are gone",
+      );
+      c.check(r2.mcpAction === "kept" && (r2.blocked ?? []).includes(".mcp.json"), `#161: the key is kept and reported (got ${r2.mcpAction})`);
+      execFileSync("chmod", ["644", path.join(P2, ".mcp.json")]);
+
+      // (c) a NON-REGULAR `.mcp.json` was reported `unchanged` with NO warning — and on this
+      //     base `readFileSync` on a FIFO does not merely mislead, it HANGS.
+      //
+      //     IN A BOUNDED CHILD PROCESS, for the reason `runBounded` exists (C78): reverting the
+      //     fix makes this BLOCK, and a blocking synchronous fs call cannot be interrupted from
+      //     inside this process — an in-process assertion would wedge the suite instead of going
+      //     red, which is a bite-check that silently proves nothing. `timedOut` is asserted
+      //     FIRST and the exit code is compared to `0` rather than `!== 0`, because a killed
+      //     child reports `status === null` and `!== 0` would ACCEPT the hang.
+      const P3 = tempProject();
+      init({ targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      execFileSync("mkfifo", [path.join(P3, ".mcp.json")]);
+      const r3 = runBounded([path.join(repoRoot, "src", "cli.ts"), "init", "--dir", P3, "--uninstall"], {
+        timeoutMs: 60_000,
+      });
+      c.check(!r3.timedOut, "#161: uninstall with a FIFO at .mcp.json RETURNS (the read used to block forever)");
+      c.check(r3.status === 0, `#161: and completes (exit ${r3.status})`);
+      c.check(
+        r3.stdout.includes(`removed ${N_PAYLOAD} file(s)`),
+        `#161: the whole payload is removed rather than the read hanging (got: ${r3.stdout.split("\n")[1]})`,
+      );
+      c.check(
+        (r3.stdout + r3.stderr).includes("is not a regular file, so it was neither read nor rewritten"),
+        `#161: a non-regular .mcp.json is NAMED rather than silently 'unchanged' (got: ${(r3.stdout + r3.stderr).slice(-300)})`,
+      );
+      unlinkSync(path.join(P3, ".mcp.json"));
+
+      // (d) an UNREADABLE payload file inside the removal loop. DESIGN CALL: warn-and-continue.
+      const P4 = tempProject();
+      init({ targetDir: P4, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const locked = path.join(P4, ".opencode/agent/guild-read.md");
+      execFileSync("chmod", ["000", locked]);
+      const r4 = initScored(c, "#161: uninstall over an unreadable payload file", {
+        targetDir: P4, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        r4.removed.length === N_PAYLOAD - 1 && (r4.blocked ?? []).includes(".opencode/agent/guild-read.md"),
+        `#161: the other ${N_PAYLOAD - 1} are removed and the one that failed is reported (got ${r4.removed.length}, [${(r4.blocked ?? []).join(", ")}])`,
+      );
+      execFileSync("chmod", ["644", locked]);
+    }
+
+    // --- #164: a partial install must not exit 0 ---------------------------
+    // Asserted through the CLI, because the exit code is the defect.
+    {
+      // `runBounded`, not `execFileSync`: the exit code IS the assertion here, and a bare
+      // `execFileSync` has no timeout — so a regression that blocks would wedge the suite rather
+      // than fail it. Every case below asserts `!timedOut` before it reads `status`, because a
+      // killed child reports `status === null` (C78).
+      const cli = (args: string[]): { status: number | null; out: string; timedOut: boolean } => {
+        const r = runBounded([path.join(repoRoot, "src/cli.ts"), ...args], { timeoutMs: 60_000 });
+        return { status: r.status, out: r.stdout + r.stderr, timedOut: r.timedOut };
+      };
+
+      // BLOCKED: a file stands where `.claude/commands/guild` must be a directory, so none of
+      // the 8 slash commands can be placed.
+      const P = tempProject();
+      mkdirSync(path.join(P, ".claude/commands"), { recursive: true });
+      writeFileSync(path.join(P, ".claude/commands/guild"), "not a dir\n");
+      const r = cli(["init", "--dir", P]);
+      c.check(!r.timedOut, "#164: the blocked install RETURNS");
+      c.check(r.status === 1, `#164: an install that placed none of the 8 commands exits 1 (got ${r.status})`);
+      c.check(r.out.includes("INCOMPLETE"), `#164: and does not read as 'Installed' (got: ${r.out.split("\n")[0]})`);
+      c.check(
+        recordedFileCount(path.join(P, "modelguild/.modelguild-install.json")) === N_PAYLOAD - 8,
+        `#164: while STILL writing a record for the 5 that landed (got ${recordedFileCount(path.join(P, "modelguild/.modelguild-install.json"))})`,
+      );
+
+      // POLICY: a re-install that declines to clobber a user's edit is the ownership model
+      // working, so it must stay exit 0. This is the line the exit code is drawn on.
+      const P2 = tempProject();
+      cli(["init", "--dir", P2]);
+      writeFileSync(path.join(P2, ".claude/commands/guild/consult.md"), "MY EDIT\n");
+      const r2 = cli(["init", "--dir", P2]);
+      c.check(!r2.timedOut, "#164: the re-install RETURNS");
+      c.check(r2.status === 0, `#164: a never-clobber skip stays exit 0 (got ${r2.status})`);
+      c.check(!r2.out.includes("INCOMPLETE"), "#164: and does not claim to be incomplete");
+
+      // A clean install is untouched.
+      const P3 = tempProject();
+      const r3 = cli(["init", "--dir", P3]);
+      c.check(!r3.timedOut, "#164: the clean install RETURNS");
+      c.check(r3.status === 0 && !r3.out.includes("INCOMPLETE"), `#164: a clean install is exit 0 (got ${r3.status})`);
+    }
+
+    // --- The four routes an adversarial review of #156 reproduced ----------
+    // Same defect, same fix: the record write throwing AFTER the payload loop.
+    {
+      // F1a — a DANGLING DIRECTORY link above the record path. `assertRecordLinkWritable`
+      // cannot see this: it `lstat`s the record, which throws ENOENT when a parent does not
+      // resolve. Pre-fix: 11 of 13 files, no record, `--uninstall` removes nothing.
+      const H = tempProject();
+      const X = tempProject();
+      const G = tempProject();
+      mkdirSync(path.join(H, ".claude"), { recursive: true });
+      symlinkSync(path.join(G, "nowhere"), path.join(H, ".claude/modelguild"));
+      let msg = "";
+      try {
+        init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      c.check(
+        msg.includes(`the directory component ${path.join(H, ".claude/modelguild")} is a symlink`) &&
+          msg.includes("whose target does not exist"),
+        `F1a: a dangling directory link above the record is refused by name (got: ${msg || "<no throw>"})`,
+      );
+      c.check(
+        countFiles(path.join(H, ".claude")) + countFiles(path.join(X, "opencode")) === 0,
+        "F1a: with ZERO files written (pre-fix: 11 of 13, no record)",
+      );
+
+      // F1b — `<xdg>/opencode` is a symlink to a REGULAR FILE. Pre-fix: 8 files, ENOTDIR.
+      const H2 = tempProject();
+      const X2 = tempProject();
+      const G2 = tempProject();
+      const afile = path.join(G2, "afile");
+      writeFileSync(afile, "i am a file\n");
+      symlinkSync(afile, path.join(X2, "opencode"));
+      let msg2 = "";
+      try {
+        init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: H2, xdgConfigHome: X2 });
+      } catch (e) {
+        msg2 = (e as Error).message;
+      }
+      c.check(
+        msg2.includes(`${path.join(X2, "opencode")} exists but is not a directory`),
+        `F1b: a directory component that is a regular file is refused by name (got: ${msg2 || "<no throw>"})`,
+      );
+      c.check(countFiles(path.join(H2, ".claude")) === 0, "F1b: with ZERO files written (pre-fix: 8, no record)");
+      c.check(readFileSync(afile, "utf8") === "i am a file\n", "F1b: and the user's file is untouched");
+
+      // F1c — a symlink LOOP at the record path. `existsSync` reports false for ELOOP exactly
+      // as for a dangling link, so the two enumerated conditions passed it. Pre-fix: 13 files
+      // on disk, no record.
+      const H3 = tempProject();
+      const X3 = tempProject();
+      const rec3 = path.join(H3, ".claude/modelguild/.modelguild-install.json");
+      mkdirSync(path.dirname(rec3), { recursive: true });
+      symlinkSync(rec3, rec3);
+      let msg3 = "";
+      try {
+        init({ targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: H3, xdgConfigHome: X3 });
+      } catch (e) {
+        msg3 = (e as Error).message;
+      }
+      c.check(
+        msg3.includes("cannot be resolved (ELOOP, a symlink loop)"),
+        `F1c: a symlink loop at the record path is refused by name (got: ${msg3 || "<no throw>"})`,
+      );
+      c.check(
+        countFiles(path.join(H3, ".claude")) + countFiles(path.join(X3, "opencode")) === 0,
+        "F1c: with ZERO files written (pre-fix: 13, no record)",
+      );
+
+      // F4 — PROJECT mode reaches the identical state. C77 scoped the two refusals to
+      // `--global`; the same layout crashed one branch over.
+      const P = tempProject();
+      const G4 = tempProject();
+      mkdirSync(path.join(P, "modelguild"), { recursive: true });
+      symlinkSync(path.join(G4, "nodir/rec.json"), path.join(P, "modelguild/.modelguild-install.json"));
+      let msg4 = "";
+      try {
+        init({ targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      } catch (e) {
+        msg4 = (e as Error).message;
+      }
+      c.check(
+        msg4.includes(`whose directory ${path.join(G4, "nodir")} does not exist`),
+        `F4: project mode refuses the dangling record link too (got: ${msg4 || "<no throw>"})`,
+      );
+      c.check(
+        countFiles(path.join(P, ".claude")) + countFiles(path.join(P, ".opencode")) === 0,
+        "F4: with ZERO files written (pre-fix: 13, no record)",
+      );
+    }
+
+    // --- THE REGRESSION `wip/issue-156-full-review-work` CARRIED -----------
+    // That branch ran the eager global directory-chain check on the UNINSTALL path too, so a
+    // broken component in ONE destination tree aborted removal from the OTHER. It must not.
+    {
+      const H = tempProject();
+      const X = tempProject();
+      const G = tempProject();
+      const seeded = initScored(c, "regression guard: seed a global install", {
+        targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
+      });
+      c.check(seeded.installed.length === N_PAYLOAD, `regression guard: seeded ${N_PAYLOAD} files (got ${seeded.installed.length})`);
+      // Break the <xdg>/opencode tree the way F1b does — the exact shape the eager check
+      // refuses on INSTALL — leaving <home>/.claude intact and full of our files.
+      rmSync(path.join(X, "opencode"), { recursive: true, force: true });
+      const notADir = path.join(G, "in-the-way");
+      writeFileSync(notADir, "NOT A DIRECTORY\n");
+      symlinkSync(notADir, path.join(X, "opencode"));
+      const ru = initScored(c, "regression guard: uninstall with one tree broken", {
+        targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X, uninstall: true,
+      });
+      c.check(
+        ru.removed.length === N_PAYLOAD - AGENT_DEF_COUNT,
+        `regression guard: removal from the INTACT tree still happens (got ${ru.removed.length} of ${N_PAYLOAD - AGENT_DEF_COUNT})`,
+      );
+      c.check(
+        countFiles(path.join(H, ".claude")) === 0,
+        `regression guard: <home>/.claude is emptied (got ${countFiles(path.join(H, ".claude"))} file(s) left)`,
       );
     }
   }

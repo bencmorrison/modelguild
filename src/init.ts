@@ -73,6 +73,39 @@
  * including outside `$HOME`, and uninstall's `pruneEmptyDirs` may `rmdir` now-empty dirs in the
  * backing store. Provenance: the ask and the global-only scope are the maintainer's
  * (issue #156); the shape is Claude's.
+ *
+ * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
+ * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
+ * uninstall loops, `.mcp.json` between the payload loop and `writeRecords`, `.gitignore` after
+ * both — so a refusal of any kind landed AFTER the filesystem had been mutated. Because the
+ * ownership record is what `--uninstall` and the never-clobber upgrade path both key on, a run
+ * that died before `writeRecords` left an install that was neither present nor absent and that
+ * NO subsequent invocation could repair: the retry threw at the same component, and
+ * `--uninstall` removed nothing because there was no record to prove anything was ours.
+ *
+ * TWO RULES, and they point in opposite directions on purpose.
+ *   INSTALL refuses EARLY or not at all. `planFor` resolves every payload destination, the
+ *   ownership record and the project-mode ancillary paths (`.gitignore`, and `.mcp.json` under
+ *   `--write-mcp`) BEFORE the loop, so a refusal costs nothing and leaves nothing. After that
+ *   point nothing may throw: a per-file failure is a warning-and-skip, and the guarded
+ *   ancillary writes degrade the same way, so the run always reaches `writeRecords` and always
+ *   leaves a record accounting for what it placed.
+ *   UNINSTALL NEVER REFUSES. Its job is removal, and an ancillary file — or one unreadable
+ *   payload file — must not hold the payload hostage. Every failure there is a warning and the
+ *   removal continues.
+ * The dividing principle for install: REFUSE what can be determined before writing (a symlinked
+ * or non-regular destination, unparseable `.mcp.json`); DEGRADE what can only be learnt by
+ * writing (EACCES, ENOSPC, a race). An `accessSync`-style "can this write succeed?" predicate is
+ * deliberately NOT used — it is advisory, it lies for root, and it is the general predicate the
+ * maintainer declined for the record path (C77).
+ *
+ * A SKIP IS NOT ALWAYS A POLICY DECISION, and the exit code now says which (issue #164).
+ * `InitResult.blocked` holds the destinations that do NOT resolve to a regular file once the run
+ * is over — the mechanical form of "the payload piece is not there". Never-clobber skips (a file
+ * of the user's, or a live symlink to one) resolve, so they stay exit 0; a dangling link, a
+ * directory in the way, an EACCES or a failed ancillary write do not, and `cli.ts` exits 1. That
+ * distinction matters because C16 makes an absent agent def a REFUSAL at every model-calling
+ * tool, so an install that silently omitted one is not incomplete, it is non-functional.
  */
 
 import { createHash } from "node:crypto";
@@ -270,6 +303,9 @@ interface InstallPlan {
   recordPath: string;
   pruneDirs: string[]; // absolute, deepest-first
   gitignoreDir?: string; // project mode only
+  /** Warnings produced while RESOLVING the plan, replayed into the result. Only the uninstall
+   * path produces any (a symlinked record path it reads through rather than refuses). */
+  warnings: string[];
 }
 
 /**
@@ -287,10 +323,33 @@ export function recordPathFor(opts: {
   return path.join(base, rel);
 }
 
+/**
+ * Resolve the plan, and — on an INSTALL — perform every path-level check the run can make
+ * before it writes anything (issues #167/#160; see the module header for why "when" is the
+ * whole point). `--global` needs no payload pass: `globalJoin` follows directory links by
+ * decision (C77) and its only refusal is `validRel`, which cannot fail for the module's own
+ * constants. What it does need is the record check, which it already had.
+ *
+ * NOTHING HERE RUNS ON `--uninstall`, and that is the fix for the regression this shape
+ * carried on `wip/issue-156-full-review-work`: an eager destination check applied to the
+ * removal path let a broken component in ONE destination tree abort removal from the OTHER.
+ * Uninstall's job is removal; a destination it cannot resolve is one file kept with a warning
+ * (see `init`), never a run that refuses.
+ */
 function planFor(opts: InitOptions): InstallPlan {
+  const warnings: string[] = [];
   if (opts.global) {
     const g = resolveGlobalDirs(opts);
     const destOpts = { global: true as const, targetDir: opts.targetDir, global_dirs: g };
+    // The eager pass for `--global`: the DIRECTORY chain of every destination and of the
+    // ownership record. Install only — see `checkGlobalDirChain` for why running it on
+    // `--uninstall` is the regression this shape must not carry.
+    if (!opts.uninstall) {
+      for (const { dest } of [...payloadFiles(), { dest: RECORD_REL }]) {
+        const { base, rel } = payloadDest(dest, destOpts);
+        checkGlobalDirChain(base, rel, dest === RECORD_REL ? "the ownership record" : dest);
+      }
+    }
     return {
       destFor: (rel) => {
         const { base, rel: r } = payloadDest(rel, destOpts);
@@ -313,19 +372,79 @@ function planFor(opts: InitOptions): InstallPlan {
         path.join(g.xdgConfigHome, "opencode", "agent"),
         path.join(g.homeDir, ".claude", "modelguild"),
       ],
+      warnings,
     };
+  }
+  let recordPath: string;
+  if (opts.uninstall) {
+    // `path.join`, NOT `safeJoin`: a symlinked record path used to throw from HERE, before the
+    // removal loop, so `--uninstall` was impossible and the only way out was deleting the link
+    // by hand — which the message did not mention (issue #167). Reading through the link is
+    // safe enough to prefer over that dead end: removal is still hash-gated per file, and the
+    // final `unlinkSync` removes the LINK and never its target (C77). Named, not silent.
+    // Cost, stated: a record planted behind that link decides which of the 13 fixed payload
+    // paths a removal will delete — bounded to files whose bytes already hash to a value the
+    // planter chose, in a repository they can already write to.
+    recordPath = path.join(opts.targetDir, RECORD_REL);
+    const link = resolveRecordLink(recordPath);
+    if (link) {
+      warnings.push(
+        `reading the ownership record through a symlink — ${recordPath} links to ${link.target}` +
+          `${link.live ? "" : " (dangling, so nothing is owned)"}. Files are still removed only ` +
+          `where their bytes match what that record says init wrote; the link itself is removed ` +
+          `at the end, its target left alone.`,
+      );
+    }
+  } else {
+    // Payload destinations FIRST — the eager pass. `safeJoin` is unchanged in what it refuses
+    // (project mode keeps refuse-any-directory-component); running it here is what makes the
+    // refusal cost nothing (issue #167).
+    for (const { dest } of payloadFiles()) safeJoin(opts.targetDir, dest);
+    recordPath = safeJoin(opts.targetDir, RECORD_REL);
+    // `safeJoin` refuses a symlinked component; it says nothing about a FIFO, which the record
+    // write blocks on forever (issue #162, C78). Install-only, as in global mode.
+    assertRecordPathWritable(recordPath);
+    // C77 scoped this to `--global`, where the move off `safeJoin` had introduced it. The same
+    // layout reaches the same unrepairable state in PROJECT mode — a dangling record link whose
+    // target directory is missing passes `safeJoin`, the payload installs, and `writeRecords`
+    // then raises a raw ENOENT with no record written — so the two enumerated refusals now
+    // cover both modes. Install only, as before: `--uninstall` writes no record.
+    assertRecordLinkWritable(recordPath);
+    // …AND `.mcp.json` UNDER `--write-mcp` (issue #160). It was resolved LATE — after the
+    // payload loop and before `writeRecords` — so a symlink, a non-regular file or unparseable
+    // JSON there left a full payload on disk with NO ownership record, which no retry could
+    // repair. Everything knowable is decided here instead, with nothing written.
+    //
+    // `.gitignore` is deliberately NOT refused here, and that is a resolution toward C78 rather
+    // than an omission: it is the LAST step of an install whose payload and record are already
+    // down, so `addGitignoreBlock` SKIPS a shape it cannot write and warns, and this run still
+    // reports `blocked`. Refusing the whole install over an ignore-rule convenience would be
+    // the wrong direction for the same reason C78 gives.
+    if (opts.writeMcp) {
+      const mcpAbs = safeJoin(opts.targetDir, ".mcp.json");
+      const dangling = danglingLinkAt(mcpAbs);
+      if (dangling !== undefined) {
+        throw new Error(
+          `refusing destination symlink: ${mcpAbs} (the project .mcp.json) is a symlink` +
+            `${dangling ? ` to '${dangling}'` : ""} whose target does not exist, and writing it ` +
+            `would create that file OUTSIDE this project. Nothing was installed — this is refused ` +
+            `before any file is written, because an install that dies here leaves a payload with ` +
+            `no ownership record that neither a re-run nor \`--uninstall\` can repair. Remove the ` +
+            `link (\`rm ${mcpAbs}\`), then re-run.`,
+        );
+      }
+      // The non-regular refusal (C78) and the unparseable-JSON refusal both live in
+      // `readMcpRootForMerge`; `writeMcpJson` calls the same function again for real, so the
+      // eager check and the write cannot disagree about what is acceptable.
+      readMcpRootForMerge(mcpAbs);
+    }
   }
   return {
     destFor: (rel) => safeJoin(opts.targetDir, rel),
-    recordPath: (() => {
-      const p = safeJoin(opts.targetDir, RECORD_REL);
-      // `safeJoin` refuses a symlinked component; it says nothing about a FIFO, which the
-      // record write blocks on forever (issue #162). Install-only, as in global mode.
-      if (!opts.uninstall) assertRecordPathWritable(p);
-      return p;
-    })(),
+    recordPath,
     pruneDirs: PRUNE_DIRS.map((d) => path.join(opts.targetDir, d)),
     gitignoreDir: opts.targetDir,
+    warnings,
   };
 }
 
@@ -406,6 +525,21 @@ export interface InitResult {
    * state only an observer that is not installing can be in — `doctor`, `guild_status`, and the
    * server's start-up notice. Reporting it from `init` would be reporting what init just fixed. */
   drifted: PayloadFileState[];
+  /**
+   * THE SKIPS THAT ARE NOT POLICY (issue #164) — the destinations this run was expected to
+   * produce and that, once it was over, do NOT resolve to a regular file. `cli.ts` exits 1 on a
+   * non-empty list, so `install.sh` or a CI wrapper can tell a broken install from a good one.
+   *
+   * The test is mechanical rather than a taxonomy of causes, and that is what keeps it honest:
+   * a never-clobber skip leaves the user's own file (or a live symlink to one) at the path, so
+   * it resolves and stays exit 0 — a re-install that declines to clobber an edit is the
+   * ownership model working, not a failure. A dangling link, a directory or FIFO in the way, an
+   * EACCES, a failed ancillary write: nothing resolves, and the piece is missing. On
+   * `--uninstall` it is the mirror image — what could not be REMOVED for an environmental
+   * reason. A file kept because no record proves it is ours, or because its bytes changed, is
+   * policy and is not listed.
+   */
+  blocked: string[];
   warnings: string[];
   /** `.mcp.json` outcome. `kept` (uninstall only): a `modelguild` key was present but left in
    * place because the ownership record does not prove init wrote it, or the current entry no
@@ -438,22 +572,96 @@ function validRel(rel: string): boolean {
 }
 
 /**
- * Resolve `<base>/<rel>` refusing a symlink at ANY existing component — the
- * safe_dest_rel guard: a planted symlink (payload file or intermediate dir) must not
- * redirect a write outside `base`. PROJECT MODE ONLY since issue #156; `--global` uses
- * `globalJoin` below (maintainer decision 2026-08-05 — the project target is somebody's
- * source repo, the global target is the user's own config).
+ * Resolve `<base>/<rel>` refusing a symlinked DIRECTORY component, and a LIVE symlinked leaf —
+ * the safe_dest_rel guard: a planted symlink must not redirect a write outside `base`. PROJECT
+ * MODE ONLY since issue #156; `--global` uses `globalJoin` below (maintainer decision
+ * 2026-08-05 — the project target is somebody's source repo, the global target is the user's
+ * own config).
+ *
+ * THE GATE IS `lstat`, NOT `existsSync` (issue #159). `existsSync` FOLLOWS, so it answered
+ * **false** for a DANGLING link and the guard skipped that component entirely. At a directory
+ * component that produced a raw `ENOENT` from `ensureDir` PARTWAY THROUGH the install — the
+ * unrepairable state of issue #167 by another route (reproduced on this base: `.opencode` as a
+ * dangling link installs the 8 command docs, then dies with `ENOENT … mkdir`, no record). The
+ * out-of-tree WRITE the issue reports is no longer reachable here — `mkdir -p` will not create
+ * through a dangling link, and C77's `lstat`-based `entryExists` already stopped the leaf case —
+ * but that is `mkdir(2)`'s behaviour holding the line, not this guard, and the guard's own
+ * contract says a symlinked component is refused.
+ *
+ * THE LEAF IS DELIBERATELY ASYMMETRIC, and it is C77's rule, not a new one: a LIVE leaf link is
+ * refused by name (unchanged), while a DANGLING one falls through to the install loop's
+ * never-clobber branch, which skips it with a warning. Refusing it here would revert #156's
+ * shipped decision. A directory component has no such branch to fall into — it redirects
+ * everything below it — so it is refused whether it resolves or not.
  */
 function safeJoin(base: string, rel: string): string {
   if (!validRel(rel)) throw new Error(`refusing unsafe path: ${rel}`);
+  const parts = rel.split("/");
   let cur = base;
-  for (const part of rel.split("/")) {
-    cur = path.join(cur, part);
-    if (existsSync(cur) && lstatSync(cur).isSymbolicLink()) {
-      throw new Error(`refusing destination symlink: ${rel}`);
+  for (let i = 0; i < parts.length; i++) {
+    cur = path.join(cur, parts[i]);
+    let isLink: boolean;
+    try {
+      isLink = lstatSync(cur).isSymbolicLink();
+    } catch {
+      continue; // nothing there — `mkdir -p` will create it, and the write decides the rest
     }
+    if (!isLink) continue;
+    if (i === parts.length - 1 && !existsSync(cur)) continue; // dangling leaf ⇒ the skip branch
+    // NAME THE ABSOLUTE PATH, THE OFFENDING COMPONENT AND A REMEDY (issue #167): the old text
+    // was `refusing destination symlink: <dest-rel>`, a relative path with no base, so under
+    // some layouts the user could not tell which file to remove — and it said nothing about
+    // `--uninstall`, which the same refusal used to block outright. The leading phrase is kept
+    // verbatim because it is what a user searching for this error already has.
+    let target = "";
+    try {
+      target = readlinkSync(cur);
+    } catch {
+      /* unreadable link target — the message just omits it */
+    }
+    throw new Error(
+      `refusing destination symlink: ${path.join(base, rel)} — the path component ${cur} is a ` +
+        `symlink${target ? ` to '${target}'` : ""}, and a project destination is never resolved ` +
+        `through one (it can redirect a write out of ${base}). Nothing was installed. Remove the ` +
+        `link (\`rm ${cur}\`) and re-run. \`--uninstall\` is not blocked by this: it keeps that ` +
+        `file, with the same warning, and removes the rest.`,
+    );
   }
   return cur;
+}
+
+/** The errno of a caught fs error, so a warning says something rather than nothing. */
+function errCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code ?? (err instanceof Error ? err.message : "unknown error");
+}
+
+/**
+ * The link target when `p` is a symlink that does NOT resolve, else `undefined`.
+ *
+ * The one shape `fsguard` deliberately leaves alone (C78: "a write through a dangling link
+ * creates its target and does not block, so refusing there would change behaviour this issue is
+ * not about"), and the one shape the ANCILLARY files still need decided — because they have no
+ * never-clobber branch to fall into. `safeJoin` refuses a LIVE leaf link, `isNonRegularFile`
+ * catches a FIFO or a directory, and a dangling link slips between the two: the write follows it
+ * and creates the target OUTSIDE the project (issue #159's write-through, at `.gitignore` /
+ * `.mcp.json` rather than at a payload path).
+ *
+ * `lstat` is correct here precisely because the question IS about the link rather than its
+ * target — the exception C78 names.
+ */
+function danglingLinkAt(p: string): string | undefined {
+  try {
+    if (!lstatSync(p).isSymbolicLink()) return undefined;
+  } catch {
+    return undefined; // absent
+  }
+  if (existsSync(p)) return undefined; // a LIVE link — somebody else's rule decides it
+  try {
+    return readlinkSync(p);
+  } catch {
+    return ""; // a dangling link whose target cannot be read — still dangling
+  }
 }
 
 /**
@@ -466,6 +674,101 @@ function safeJoin(base: string, rel: string): string {
 function globalJoin(base: string, rel: string): string {
   if (!validRel(rel)) throw new Error(`refusing unsafe path: ${rel}`);
   return path.join(base, rel);
+}
+
+/** What one DIRECTORY component of a global destination is, after following links. */
+type DirComponent =
+  | { kind: "absent" }
+  | { kind: "dir" }
+  | { kind: "dangling"; target: string }
+  | { kind: "not-a-dir" }
+  | { kind: "error"; code: string };
+
+/**
+ * Classify a single directory component. Two syscalls, deliberately: `lstat` answers "is this a
+ * link?" — needed to tell a DANGLING link from a plain absence, which report the same errno —
+ * and `stat` answers "does it resolve to a directory?".
+ */
+function probeDirComponent(abs: string): DirComponent {
+  let link = false;
+  try {
+    link = lstatSync(abs).isSymbolicLink();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "absent" };
+    return { kind: "error", code: code ?? "unknown" };
+  }
+  try {
+    return statSync(abs).isDirectory() ? { kind: "dir" } : { kind: "not-a-dir" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      if (!link) return { kind: "absent" }; // raced away between the two calls
+      let target = "";
+      try {
+        target = readlinkSync(abs);
+      } catch {
+        /* unreadable link target — the message just omits it */
+      }
+      return { kind: "dangling", target };
+    }
+    return { kind: "error", code: code ?? "unknown" };
+  }
+}
+
+/**
+ * Validate the DIRECTORY components of a `--global` destination before anything is written.
+ *
+ * `globalJoin` follows directory links by decision (C77) and dropped `safeJoin`'s per-component
+ * inspection WITHOUT substituting any diagnosis, so a half-applied stow layout produced a raw
+ * `mkdir` errno from inside the payload loop rather than a sentence about the broken link. Three
+ * routes were reproduced on this base and all three leave the unrepairable state — payload
+ * partly on disk, NO ownership record, a re-run failing identically and `--uninstall` able to
+ * prove nothing: a DANGLING `<home>/.claude/modelguild` (11 of 13 files, `ENOENT … mkdir`), an
+ * `<xdg>/opencode` linking to a REGULAR FILE (8 files, `ENOTDIR … mkdir`), and the same shape at
+ * any other component. `assertRecordLinkWritable` cannot see the first of those: it `lstat`s the
+ * record path, which throws ENOENT when a parent does not resolve, so it returns "no link here"
+ * and refuses nothing.
+ *
+ * Absent is fine — `mkdir -p` creates it, and nothing below an absent directory can exist, so
+ * the walk stops. A link to a real directory is fine: that is the layout the whole `--global`
+ * change exists to support. Everything else is refused, NAMING the absolute destination, the
+ * offending component and a remedy.
+ *
+ * INSTALL ONLY. Running this on `--uninstall` is precisely the regression
+ * `wip/issue-156-full-review-work` carried: a broken component in one destination tree aborted
+ * removal from the other, and uninstall's job is removal.
+ */
+function checkGlobalDirChain(base: string, rel: string, what: string): void {
+  const parts = rel.split("/");
+  let cur = base;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cur = path.join(cur, parts[i]);
+    const probe = probeDirComponent(cur);
+    if (probe.kind === "dir") continue;
+    if (probe.kind === "absent") return; // nothing below an absent directory can exist either
+    const head =
+      `modelguild init --global: refusing to place ${what} at ${path.join(base, rel)}`;
+    const cost =
+      ` Nothing was installed — refusing here costs nothing, whereas failing from the write ` +
+      `leaves a payload with no ownership record that no re-run or \`--uninstall\` can repair.`;
+    if (probe.kind === "dangling") {
+      throw new Error(
+        `${head} — the directory component ${cur} is a symlink` +
+          `${probe.target ? ` to '${probe.target}'` : ""} whose target does not exist.${cost} ` +
+          `Restore that directory or remove the link (\`rm ${cur}\`), then re-run.`,
+      );
+    }
+    if (probe.kind === "not-a-dir") {
+      throw new Error(
+        `${head} — ${cur} exists but is not a directory.${cost} Move it aside, then re-run.`,
+      );
+    }
+    throw new Error(
+      `${head} — could not resolve the directory component ${cur} (${probe.code}` +
+        `${probe.code === "ELOOP" ? ", a symlink loop" : ""}).${cost} Fix that path, then re-run.`,
+    );
+  }
 }
 
 /**
@@ -557,18 +860,24 @@ function resolveRecordLink(recordPath: string): { target: string; live: boolean 
  * because the record path is the one destination `planFor` already resolves eagerly, so the
  * refusal lands where the mode's other record-path decisions do.
  *
- * TWO NAMED CONDITIONS, ENUMERATED — NOT a general "can this write succeed?" predicate
- * (maintainer decision 2026-08-05): the target's directory is ABSENT (`ENOENT`), or it is
- * present but NOT A DIRECTORY (`ENOTDIR`). Both were regressions against `origin/main` by the
- * same route, so both are refused, with distinct wording naming which it is. Anything else —
- * an unreadable target directory, a symlink loop, a read-only one — is left to fail from the
- * write as it does today; try-and-report is a separate design question this does not settle.
- * The stat is therefore POSITIVE evidence only: a stat that cannot be taken refuses nothing.
+ * THREE NAMED CONDITIONS, ENUMERATED — still NOT a general "can this write succeed?" predicate
+ * (maintainer decision 2026-08-05): the target's directory is ABSENT (`ENOENT`), it is present
+ * but NOT A DIRECTORY (`ENOTDIR`), or — added for the symlink LOOP that reproduced the identical
+ * state, 13 files on disk and no record — the record path cannot be RESOLVED at all although its
+ * target's directory is fine. Each is refused with wording naming which it is. Anything else is
+ * left to fail from the write; try-and-report is a separate design question this does not
+ * settle. The stats are POSITIVE evidence only: a stat that cannot be taken refuses nothing.
  *
  * Creating (or replacing) the target's directory was considered and REJECTED: init making
  * directories wherever a user's link happens to point is a bigger step than declining. The
  * working cases are untouched — a LIVE link, and a dangling link whose target directory EXISTS,
  * are both still written through with `recordSymlinkWarning`'s warning.
+ *
+ * BOTH MODES since issues #167/#160 (C77 scoped it to `--global`, where the move off `safeJoin`
+ * had introduced it). Project mode reaches the identical unrepairable state by the identical
+ * route — `safeJoin` lets a DANGLING record link through, the payload installs, and the write
+ * raises the same raw errno with no record — and there is no reason for the same layout to be
+ * refused in one mode and crash in the other. Still install-only.
  */
 /**
  * REFUSE — at PLAN time, before a single payload byte is written — an ownership-record path
@@ -615,11 +924,33 @@ function assertRecordLinkWritable(recordPath: string): void {
   } catch {
     return;
   }
-  if (isDir) return; // dangling, but the write will create the target
-  throw new Error(
-    `the ownership record ${recordPath} is a symlink to ${link.target}, but ${targetDir} is not ` +
-      `a directory${why}Replace ${targetDir} with a directory, or remove the link, then re-run init.`,
-  );
+  if (!isDir) {
+    throw new Error(
+      `the ownership record ${recordPath} is a symlink to ${link.target}, but ${targetDir} is not ` +
+        `a directory${why}Replace ${targetDir} with a directory, or remove the link, then re-run init.`,
+    );
+  }
+  // A THIRD ENUMERATED CONDITION, and it sits LAST because the two above are the more specific
+  // diagnoses of the same errnos. `link.live` comes from `existsSync`, which reports false for a
+  // symlink LOOP exactly as it does for a dangling link — so a loop was read as "dangling", the
+  // target's directory was a real directory, this returned clean, and `writeFileSync` then
+  // raised ELOOP with all 13 files on disk and no record (reproduced). Where the target's
+  // directory is fine, a path that still cannot be resolved is a state this cannot describe and
+  // must not write into. Still enumerated by observation rather than a general "can this write
+  // succeed?" predicate: an absent target (ENOENT) is the normal dangling case and passes.
+  try {
+    statSync(recordPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      const shown = code ?? "unknown error";
+      throw new Error(
+        `the ownership record ${recordPath} is a symlink to ${link.target} that cannot be ` +
+          `resolved (${shown}${shown === "ELOOP" ? ", a symlink loop" : ""})${why}Fix or remove ` +
+          `the link (\`rm ${recordPath}\`), then re-run init.`,
+      );
+    }
+  }
 }
 
 /**
@@ -931,40 +1262,55 @@ export function mcpServerEntry(opts: InitOptions): Record<string, unknown> {
   };
 }
 
+/**
+ * The existing `.mcp.json` as a mergeable object, or `null` when there is nothing to merge into.
+ *
+ * FACTORED OUT SO IT CAN RUN EAGERLY (issue #160). This refusal is not path-level, so the
+ * eager `safeJoin` pass does not cover it — but it has the identical failure shape: it fired
+ * from inside `writeMcpJson`, which runs AFTER the payload loop and BEFORE `writeRecords`, so an
+ * unparseable `.mcp.json` under `--write-mcp` left a full payload with NO ownership record, a
+ * retry threw at the same point, and `--uninstall` (which treats unparseable JSON as
+ * `unchanged`) could prove nothing and so removed nothing. `planFor` calls this before any byte
+ * is written; `writeMcpJson` calls it again for real. ONE definition, so the two cannot disagree.
+ *
+ * The PATH-SHAPE gate is `fsguard` (issues #162/#163, C78), and it lives here rather than
+ * beside the write so the eager call refuses the same shapes: BOTH directions block on a FIFO —
+ * the `readFileSync` below and the `writeFileSync` at the end of `writeMcpJson` — and a block is
+ * not an exception, so the shape has to be looked at before either. `isNonRegularFile` is the
+ * refusal (something is there and it is not a file) and `isRegularFile` the read gate; an absent
+ * path is neither, and is simply nothing to merge.
+ */
+function readMcpRootForMerge(p: string): Record<string, unknown> | null {
+  if (isNonRegularFile(p)) {
+    throw new Error(
+      `.mcp.json exists but is not a regular file (${p}); ` +
+        `fix or remove it, then re-run init. Nothing was installed.`,
+    );
+  }
+  if (!isRegularFile(p)) return null;
+  const raw = readFileSync(p, "utf8");
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    throw new Error(".mcp.json is not a JSON object — refusing to overwrite it");
+  } catch (err) {
+    throw new Error(
+      `.mcp.json exists but is not valid JSON (${(err as Error).message}); ` +
+        `fix or remove it, then re-run init. Nothing was installed.`,
+    );
+  }
+}
+
 function writeMcpJson(opts: InitOptions): { action: InitResult["mcpAction"]; entryHash: string } {
   const p = safeJoin(opts.targetDir, ".mcp.json");
   const entry = mcpServerEntry(opts);
   const entryHash = mcpEntryHash(entry);
-  let root: Record<string, unknown> = {};
-  let existed = false;
+  const parsedRoot = readMcpRootForMerge(p);
+  const existed = parsedRoot !== null;
   let hadKey = false;
-  // BOTH directions block on a FIFO (issue #162) — `readFileSync` below and, once the read is
-  // gated, the `writeFileSync` at the end. So this refuses on the SHAPE of the path, before
-  // either. Same verdict and same remedy as the unparseable-JSON branch below: init will not
-  // guess what to do with a `.mcp.json` that is not a file.
-  if (isNonRegularFile(p)) {
-    throw new Error(
-      `.mcp.json exists but is not a regular file (${p}); ` +
-        `fix or remove it, then re-run init.`,
-    );
-  }
-  if (isRegularFile(p)) {
-    existed = true;
-    const raw = readFileSync(p, "utf8");
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        root = parsed as Record<string, unknown>;
-      } else {
-        throw new Error(".mcp.json is not a JSON object — refusing to overwrite it");
-      }
-    } catch (err) {
-      throw new Error(
-        `.mcp.json exists but is not valid JSON (${(err as Error).message}); ` +
-          `fix or remove it, then re-run init.`,
-      );
-    }
-  }
+  const root: Record<string, unknown> = parsedRoot ?? {};
   const servers =
     root.mcpServers && typeof root.mcpServers === "object" && !Array.isArray(root.mcpServers)
       ? (root.mcpServers as Record<string, unknown>)
@@ -985,13 +1331,39 @@ function writeMcpJson(opts: InitOptions): { action: InitResult["mcpAction"]; ent
  * A user-created key (default install: init never touched `.mcp.json`), a legacy record with
  * no `mcp` field, or a user-edited entry are all KEPT with a warning, never deleted.
  * A read/parse failure or a missing key is `unchanged`.
+ *
+ * NEVER THROWS, AND NEVER REFUSES (issue #161). It runs AFTER every payload file has been
+ * removed, so a throw here left a record claiming files that were gone, the `.gitignore` block
+ * still in place, `pruneEmptyDirs` unreached and every re-run exiting 1 — the ancillary file
+ * holding the payload hostage. Three changes carry that: `path.join` rather than `safeJoin` (a
+ * symlinked `.mcp.json` is KEPT with a warning, which honours project mode's never-write-through
+ * -a-link rule by not writing rather than by failing the run); `isRegularFile` (C78) rather than
+ * `existsSync`, which both stops a FIFO hanging the read and lets a non-regular file be NAMED
+ * instead of silently reported `unchanged`; and a guarded write.
  */
 function removeMcpKey(
   targetDir: string,
   owned: McpRecord | undefined,
-): { action: InitResult["mcpAction"]; warning?: string } {
-  const p = safeJoin(targetDir, ".mcp.json");
-  if (!existsSync(p)) return { action: "unchanged" };
+): { action: InitResult["mcpAction"]; warning?: string; blocked?: boolean } {
+  const p = path.join(targetDir, ".mcp.json");
+  if (!isRegularFile(p)) {
+    let st;
+    try {
+      st = lstatSync(p);
+    } catch {
+      return { action: "unchanged" }; // absent — the common case, and silent
+    }
+    // Present but not something we can read or rewrite. Say so: the old code called this
+    // `unchanged` with no warning, so a user was never told anything had been left behind.
+    return {
+      action: "kept",
+      warning: st.isSymbolicLink()
+        ? `left ${p} alone — it is a symlink, and a project install never writes through one. ` +
+          `If it holds a '${MCP_KEY}' key, remove it yourself: \`claude mcp remove ${MCP_KEY}\`.`
+        : `left ${p} alone — it is not a regular file, so it was neither read nor rewritten. ` +
+          `If it holds a '${MCP_KEY}' key, remove it yourself: \`claude mcp remove ${MCP_KEY}\`.`,
+    };
+  }
   let root: Record<string, unknown>;
   try {
     const parsed = JSON.parse(readFileSync(p, "utf8")) as unknown;
@@ -1020,7 +1392,20 @@ function removeMcpKey(
     };
   }
   delete servers[MCP_KEY];
-  writeFileSync(p, JSON.stringify(root, null, 2) + "\n");
+  try {
+    writeFileSync(p, JSON.stringify(root, null, 2) + "\n");
+  } catch (err) {
+    // The payload is already gone; a read-only `.mcp.json` must not abort what is left of the
+    // removal (issue #161). Blocked: the caller asked for the key to go and it did not.
+    return {
+      action: "kept",
+      blocked: true,
+      warning:
+        `could not remove the '${MCP_KEY}' key from ${p} (${errCode(err)}) — everything else was ` +
+        `uninstalled. Fix that file's permissions and re-run, or remove the key yourself: ` +
+        `\`claude mcp remove ${MCP_KEY}\`.`,
+    };
+  }
   return { action: "removed" };
 }
 
@@ -1051,27 +1436,94 @@ function stripGitignoreBlock(text: string): string {
  * this is the LAST step of an install whose payload and ownership record are already on disk,
  * the block is a convenience rather than part of the payload, and the never-clobber posture
  * says a thing the user put there is not ours to replace. (`.mcp.json` refuses instead — see
- * `writeMcpJson`; it is written mid-install and init already refuses an unusable one.)
+ * `readMcpRootForMerge`; it is written mid-install and init already refuses an unusable one.)
+ *
+ * THE WRITE IS GUARDED FOR THE SAME REASON THE SHAPE IS (issue #160): an EACCES here — a
+ * read-only `.gitignore` — is not knowable before the write and must not turn a complete
+ * install into a total failure. It is a warning, never a throw.
+ *
+ * THE TWO OUTCOMES ARE NOT THE SAME KIND, and only one of them is `blocked` (issue #164). A
+ * shape we DECLINE to write is policy — the same judgement C78 makes above, and the same
+ * judgement never-clobber makes about a payload file — so it stays exit 0. A write that FAILED
+ * is an environmental failure the caller could not have chosen, so it is `blocked` and exits 1.
  */
-function addGitignoreBlock(targetDir: string): string | undefined {
+function addGitignoreBlock(targetDir: string): { warning?: string; blocked?: boolean } {
   const p = safeJoin(targetDir, ".gitignore");
   if (isNonRegularFile(p)) {
-    return `skipping the .gitignore block — ${p} is not a regular file; add it by hand if you want it.`;
+    return {
+      warning: `skipping the .gitignore block — ${p} is not a regular file; add it by hand if you want it.`,
+    };
+  }
+  // A DANGLING link is the shape C78 leaves to whoever owns dangling links, and here that is
+  // this function: the write would follow it and create the target outside the project (issue
+  // #159's write-through). Same skip, same posture — the link is the user's.
+  const dangling = danglingLinkAt(p);
+  if (dangling !== undefined) {
+    return {
+      warning:
+        `skipping the .gitignore block — ${p} is a symlink${dangling ? ` to '${dangling}'` : ""} ` +
+        `whose target does not exist, so writing it would create that file outside this project. ` +
+        `Remove the link and re-run init, or add the ignore rules by hand.`,
+    };
   }
   let text = isRegularFile(p) ? readFileSync(p, "utf8") : "";
   text = stripGitignoreBlock(text); // idempotent — never double-add
   if (text.length > 0 && !text.endsWith("\n")) text += "\n";
   if (text.length > 0) text += "\n";
   text += GITIGNORE_BODY;
-  writeFileSync(p, text);
-  return undefined;
+  try {
+    writeFileSync(p, text);
+  } catch (err) {
+    return {
+      blocked: true,
+      warning:
+        `could not write the ModelGuild block into ${p} (${errCode(err)}) — everything else was ` +
+        `installed. Add \`modelguild/logs/\`, \`modelguild/models.policy.local\` and ` +
+        `\`modelguild/modelguild.conf.local\` to your ignore rules by hand, or fix that file and ` +
+        `re-run init.`,
+    };
+  }
+  return {};
 }
 
-function stripGitignoreOnly(targetDir: string): void {
+/**
+ * Strip our fenced block on uninstall. Returns a warning where it declined to, and NEVER throws
+ * (issue #161): like `removeMcpKey` this runs after the payload has been removed, so a refusal
+ * here would wedge the very uninstall it is a footnote to — reproduced as a read-only
+ * `.gitignore` giving exit 1, zero payload files, the record removed, the block still present
+ * and `pruneEmptyDirs` never reached.
+ *
+ * `path.join` + an explicit link check rather than `safeJoin`: project mode's rule is that it
+ * does not write THROUGH a link, and declining the write honours that without failing the run.
+ */
+function stripGitignoreOnly(targetDir: string): { warning?: string; blocked?: boolean } {
   const p = path.join(targetDir, ".gitignore");
-  if (!existsSync(p)) return;
-  const stripped = stripGitignoreBlock(readFileSync(p, "utf8"));
-  writeFileSync(p, stripped);
+  let st;
+  try {
+    st = lstatSync(p);
+  } catch {
+    return {}; // absent — the common case, and silent
+  }
+  if (st.isSymbolicLink() || !isRegularFile(p)) {
+    // POLICY, not `blocked` — the same split `addGitignoreBlock` makes: a shape we DECLINE to
+    // write is not a failure, so it does not change the exit code (issue #164).
+    return {
+      warning:
+        `left the ModelGuild block in ${p} — it is ${st.isSymbolicLink() ? "a symlink, and a project install never writes through one" : "not a regular file"}. ` +
+        `Delete the fenced \`${GITIGNORE_BEGIN}\` … \`${GITIGNORE_END}\` block by hand if you want it gone.`,
+    };
+  }
+  try {
+    writeFileSync(p, stripGitignoreBlock(readFileSync(p, "utf8")));
+  } catch (err) {
+    return {
+      blocked: true,
+      warning:
+        `could not strip the ModelGuild block from ${p} (${errCode(err)}) — everything else was ` +
+        `uninstalled. Delete the fenced \`${GITIGNORE_BEGIN}\` … \`${GITIGNORE_END}\` block by hand.`,
+    };
+  }
+  return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,112 +1547,193 @@ export function init(opts: InitOptions): InitResult {
     removed: [],
     shadowed: [],
     drifted: [],
+    blocked: [],
     warnings: [],
     mcpAction: "unchanged",
   };
   const plan = planFor(opts);
+  result.warnings.push(...plan.warnings);
   const records = readRecords(plan.recordPath);
   const ownedMcp = readMcpRecord(plan.recordPath);
 
   if (opts.uninstall) {
+    // NOTHING IN THIS BLOCK MAY THROW (issue #161, and the uninstall half of #167). Every step
+    // below used to be able to abort a removal that had already deleted files, which is the
+    // worst of the three possible outcomes: the payload half-gone, the record gone or claiming
+    // files that are not there, and every re-run failing the same way. Uninstall's job is
+    // removal, so the failing step is what gives way.
     for (const { dest } of payloadFiles()) {
-      const abs = plan.destFor(dest);
+      let abs = "";
+      try {
+        abs = plan.destFor(dest);
+      } catch (err) {
+        // A symlinked destination. `safeJoin` threw here from inside this loop and made
+        // `--uninstall` impossible for the WHOLE payload (issue #167). One file, one warning.
+        // BLOCKED, unlike the non-regular case below: a refused component can HIDE our file
+        // rather than replace it, so the run cannot claim it removed everything.
+        result.warnings.push(`keeping ${dest} — ${(err as Error).message}`);
+        result.blocked.push(dest);
+        continue;
+      }
       // `isRegularFile`, not `existsSync`: a FIFO at a payload path answered TRUE and hung the
-      // hash read below (issue #162). A non-regular entry is skipped exactly as an absent one
-      // — it cannot hash to what init recorded, so it was never going to be removed anyway.
-      if (!isRegularFile(abs)) continue;
+      // hash read below (issue #162, C78) — and `stat`, not `lstat`, so a stow-style symlink to
+      // a real file is FOLLOWED and hash-checked like any other (issue #163).
+      if (!isRegularFile(abs)) {
+        // Absent is the common case and silent. Something that IS there but is not a regular
+        // file gets NAMED, because #161 is about a user never being told what was left behind
+        // — but it is POLICY rather than a failure (it cannot hash to what init recorded, so it
+        // was never ours to remove), so it does not go in `blocked`.
+        if (entryExists(abs)) {
+          result.warnings.push(`keeping ${dest} — ${abs} is not a regular file; left untouched.`);
+        }
+        continue;
+      }
       const recorded = records[dest];
       if (!recorded) {
         result.warnings.push(`keeping ${dest} — no ownership record to prove it's ours.`);
-        continue;
+        continue; // POLICY, not blocked: init cannot prove this file is ours.
       }
-      const current = sha256(readFileSync(abs));
-      if (current === recorded) {
-        unlinkSync(abs);
-        result.removed.push(dest);
-      } else {
-        result.warnings.push(`keeping changed file ${dest} — it no longer matches what init wrote.`);
+      try {
+        const current = sha256(readFileSync(abs));
+        if (current === recorded) {
+          unlinkSync(abs);
+          result.removed.push(dest);
+        } else {
+          result.warnings.push(`keeping changed file ${dest} — it no longer matches what init wrote.`);
+        }
+      } catch (err) {
+        // An unreadable file or a read-only parent directory. This threw MID-LOOP, so some
+        // files were removed and the rest were not (issue #161).
+        result.warnings.push(`keeping ${dest} — could not remove ${abs} (${errCode(err)}).`);
+        result.blocked.push(dest);
       }
     }
     // No project .mcp.json in global mode; the global payload never wrote one.
     if (opts.global) {
       result.mcpAction = "unchanged";
     } else {
-      const { action, warning } = removeMcpKey(opts.targetDir, ownedMcp);
+      const { action, warning, blocked } = removeMcpKey(opts.targetDir, ownedMcp);
       result.mcpAction = action;
       if (warning) result.warnings.push(warning);
+      if (blocked) result.blocked.push(".mcp.json");
     }
     // Remove the record file, then (project only) the gitignore block, then empty dirs.
-    if (existsSync(plan.recordPath)) unlinkSync(plan.recordPath);
-    if (plan.gitignoreDir) stripGitignoreOnly(plan.gitignoreDir);
+    // `lstat`, so a DANGLING record link is removed rather than followed-and-called-absent;
+    // `unlink(2)` never follows a final component, so a live link's target survives (C77).
+    if (entryExists(plan.recordPath)) {
+      try {
+        unlinkSync(plan.recordPath);
+      } catch (err) {
+        result.warnings.push(
+          `could not remove the ownership record at ${plan.recordPath} (${errCode(err)}) — ` +
+            `delete it by hand, or a re-install will judge files against a record for an install ` +
+            `that no longer exists.`,
+        );
+        result.blocked.push(RECORD_REL);
+      }
+    }
+    if (plan.gitignoreDir) {
+      const gi = stripGitignoreOnly(plan.gitignoreDir);
+      if (gi.warning) result.warnings.push(gi.warning);
+      if (gi.blocked) result.blocked.push(".gitignore");
+    }
     pruneEmptyDirs(plan.pruneDirs);
     return result;
   }
 
-  // Install / upgrade.
+  // Install / upgrade. PAST THIS POINT NOTHING MAY THROW UNTIL `writeRecords` (issue #167):
+  // every path-level refusal has already happened in `planFor`, so what is left is the
+  // filesystem saying no — EACCES, ENOSPC, a race — and a throw here would leave a partial
+  // payload with no ownership record and no in-tool way back. The loop always finishes, and the
+  // record always accounts for what it managed to place.
   const newRecords: Records = {};
   for (const { src, dest } of payloadFiles()) {
     const srcAbs = path.join(opts.packageRoot, src);
     if (!existsSync(srcAbs)) {
       result.warnings.push(`payload source missing in package: ${src} (skipped).`);
+      result.skipped.push(dest);
       continue;
     }
-    const payloadBytes = readFileSync(srcAbs);
-    const payloadHash = sha256(payloadBytes);
-    const destAbs = plan.destFor(dest);
+    let destAbs = "";
+    try {
+      const payloadBytes = readFileSync(srcAbs);
+      const payloadHash = sha256(payloadBytes);
+      destAbs = plan.destFor(dest);
 
-    // `entryExists`, not `existsSync`: a DANGLING symlink at the destination is an entry the
-    // user put there, and `existsSync` follows the link and calls it absent — which sent the
-    // write straight through it (issue #156). The branch below is unchanged.
-    if (entryExists(destAbs)) {
-      if (!lstatSync(destAbs).isFile()) {
-        result.warnings.push(`skipping ${dest} — a non-file exists there; left untouched.`);
-        result.skipped.push(dest);
-        if (records[dest]) newRecords[dest] = records[dest];
-        continue;
-      }
-      const current = sha256(readFileSync(destAbs));
-      const owned = records[dest] === current || current === payloadHash;
-      if (!owned) {
-        // A file the user already had (or edited). Never clobber it — but SAY when the skip
-        // leaves them behind the release (issue #22), which the old bare warning did not.
-        result.skipped.push(dest);
-        const recorded = records[dest];
-        if (isDrifted(recorded, current, payloadHash)) {
-          result.drifted.push({
-            dest,
-            installedPath: destAbs,
-            shippedPath: srcAbs,
-            installedHash: current,
-            shippedHash: payloadHash,
-            recordPath: plan.recordPath,
-          });
-          result.warnings.push(
-            `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +
-              `NEWER version: your copy is stale (see the drift note).`,
-          );
-        } else {
-          result.warnings.push(
-            recorded
-              ? `skipping ${dest} — you edited it since init wrote it; left untouched ` +
-                `(your edit is against the version this release still ships — not stale).`
-              : `skipping ${dest} — a file you already have is there; left untouched.`,
-          );
+      // `entryExists`, not `existsSync`: a DANGLING symlink at the destination is an entry the
+      // user put there, and `existsSync` follows the link and calls it absent — which sent the
+      // write straight through it (issue #156). The branch below is unchanged.
+      if (entryExists(destAbs)) {
+        if (!lstatSync(destAbs).isFile()) {
+          result.warnings.push(`skipping ${dest} — a non-file exists at ${destAbs}; left untouched.`);
+          result.skipped.push(dest);
+          if (records[dest]) newRecords[dest] = records[dest];
+          continue;
         }
-        if (COMMAND_DEST_RELS.has(dest)) result.shadowed.push(dest);
-        if (records[dest]) newRecords[dest] = records[dest];
-        continue;
+        const current = sha256(readFileSync(destAbs));
+        const owned = records[dest] === current || current === payloadHash;
+        if (!owned) {
+          // A file the user already had (or edited). Never clobber it — but SAY when the skip
+          // leaves them behind the release (issue #22), which the old bare warning did not.
+          result.skipped.push(dest);
+          const recorded = records[dest];
+          if (isDrifted(recorded, current, payloadHash)) {
+            result.drifted.push({
+              dest,
+              installedPath: destAbs,
+              shippedPath: srcAbs,
+              installedHash: current,
+              shippedHash: payloadHash,
+              recordPath: plan.recordPath,
+            });
+            result.warnings.push(
+              `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +
+                `NEWER version: your copy is stale (see the drift note).`,
+            );
+          } else {
+            result.warnings.push(
+              recorded
+                ? `skipping ${dest} — you edited it since init wrote it; left untouched ` +
+                  `(your edit is against the version this release still ships — not stale).`
+                : `skipping ${dest} — a file you already have is there; left untouched.`,
+            );
+          }
+          if (COMMAND_DEST_RELS.has(dest)) result.shadowed.push(dest);
+          if (records[dest]) newRecords[dest] = records[dest];
+          continue;
+        }
+        if (current === payloadHash) {
+          // Already up to date — record and move on (idempotent no-write).
+          newRecords[dest] = payloadHash;
+          continue;
+        }
       }
-      if (current === payloadHash) {
-        // Already up to date — record and move on (idempotent no-write).
-        newRecords[dest] = payloadHash;
-        continue;
-      }
+      ensureDir(path.dirname(destAbs));
+      writeFileSync(destAbs, payloadBytes);
+      newRecords[dest] = payloadHash;
+      result.installed.push(dest);
+    } catch (err) {
+      result.warnings.push(
+        `skipping ${dest} — could not write ${destAbs || path.join(opts.targetDir, dest)} ` +
+          `(${errCode(err)}); left untouched.`,
+      );
+      result.skipped.push(dest);
+      if (records[dest]) newRecords[dest] = records[dest];
     }
-    ensureDir(path.dirname(destAbs));
-    writeFileSync(destAbs, payloadBytes);
-    newRecords[dest] = payloadHash;
-    result.installed.push(dest);
+  }
+
+  // WHICH SKIPS ARE FAILURES (issue #164) — asked of the filesystem, not of the reason we
+  // skipped. A never-clobber skip leaves the user's file (or a live link to one) resolving at
+  // the path; a dangling link, a directory in the way or an EACCES leaves nothing there, and
+  // that payload piece is simply missing. `cli.ts` turns a non-empty list into exit 1.
+  for (const dest of result.skipped) {
+    let abs = "";
+    try {
+      abs = plan.destFor(dest);
+    } catch {
+      /* the path itself is refused ⇒ nothing of ours resolves there */
+    }
+    if (!abs || !isRegularFile(abs)) result.blocked.push(dest);
   }
 
   // MCP registration is user-driven by default (`claude mcp add`, their choice of scope);
@@ -1208,9 +1741,26 @@ export function init(opts: InitOptions): InitResult {
   // has no project `.mcp.json`, so writeMcp is ignored there (forced skipped).
   let mcpRecord: McpRecord | undefined;
   if (!opts.global && opts.writeMcp) {
-    const { action, entryHash } = writeMcpJson(opts);
-    result.mcpAction = action;
-    mcpRecord = { key: MCP_KEY, entryHash }; // proof for a future uninstall
+    // GUARDED (issue #160). `planFor` has refused the shapes that are knowable before writing —
+    // a symlink, a non-regular file, unparseable JSON — so what reaches here is an EACCES, a
+    // full disk or a race, none of which may cost the ownership record. Degrade instead: the
+    // payload and the record still land, `.mcp.json` is reported unwritten, and `blocked` makes
+    // the run exit 1 so the missing registration is not mistaken for the default install's
+    // deliberate `skipped`.
+    try {
+      const { action, entryHash } = writeMcpJson(opts);
+      result.mcpAction = action;
+      mcpRecord = { key: MCP_KEY, entryHash }; // proof for a future uninstall
+    } catch (err) {
+      result.mcpAction = "skipped";
+      mcpRecord = ownedMcp;
+      result.blocked.push(".mcp.json");
+      result.warnings.push(
+        `could not write the project .mcp.json (${errCode(err)}) — the payload and the ownership ` +
+          `record were still installed. Fix that file and re-run with --write-mcp, or register ` +
+          `the server yourself: \`claude mcp add ${MCP_KEY} -s project -- …\`.`,
+      );
+    }
   } else {
     result.mcpAction = "skipped";
     // Carry forward a prior --write-mcp ownership proof so a DEFAULT re-run does not forget
@@ -1221,11 +1771,28 @@ export function init(opts: InitOptions): InitResult {
   // live one, and the write settles that either way (issue #156).
   const recordWarning = recordSymlinkWarning(plan.recordPath);
   if (recordWarning) result.warnings.push(recordWarning);
-  writeRecords(plan.recordPath, newRecords, mcpRecord);
-  // A project `.gitignore` block only makes sense for a project install.
+  try {
+    writeRecords(plan.recordPath, newRecords, mcpRecord);
+  } catch (err) {
+    // THE ONE REMAINING THROW AFTER BYTES HAVE MOVED, and it stays a throw: an install with no
+    // ownership record IS a failed install, and dressing it as a warning would hide the state
+    // that matters. `assertRecordLinkWritable` has already refused the two link shapes that
+    // reach here predictably; what is left (permissions, a full disk) a re-run repairs once the
+    // cause is fixed, because the placed files now match the shipped bytes and pass the
+    // ownership check on their own.
+    throw new Error(
+      `modelguild init: the payload was placed, but the ownership record could NOT be written at ` +
+        `${plan.recordPath} (${errCode(err)}). Until it is, a re-install will treat those files as ` +
+        `yours and skip them, and \`--uninstall\` will remove nothing. Fix that path — ` +
+        `permissions, or free space — and re-run init to complete the install.`,
+    );
+  }
+  // A project `.gitignore` block only makes sense for a project install. It runs AFTER the
+  // record, so a failure here costs an ignore rule and nothing else — a warning, never a throw.
   if (plan.gitignoreDir) {
-    const gitignoreWarning = addGitignoreBlock(plan.gitignoreDir);
-    if (gitignoreWarning) result.warnings.push(gitignoreWarning);
+    const gi = addGitignoreBlock(plan.gitignoreDir);
+    if (gi.warning) result.warnings.push(gi.warning);
+    if (gi.blocked) result.blocked.push(".gitignore");
   }
   return result;
 }
