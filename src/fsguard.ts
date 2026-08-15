@@ -18,9 +18,14 @@
  * `open(2)` included, follows it and reads the bytes fine. `stat` answers the question the
  * consumers actually ask, and still rejects a directory, FIFO, socket or device.
  *
- * Do NOT substitute `lstat` at a call site that then reads or writes the path. Where a rule
- * is genuinely about the LINK rather than its target — the install loop's never-clobber leaf
- * branch (C77), the notice state file — `lstat` is correct and stays where it is.
+ * Do NOT substitute `lstat` at a call site that then reads or writes the path. Where a rule is
+ * genuinely about the LINK rather than its target — `safeJoin`'s per-component refusal and
+ * `danglingLinkAt` in `src/init.ts`, the notice state file — `lstat` is correct and stays.
+ *
+ * The install loop's never-clobber leaf branch USED to be on that list and no longer is (issue
+ * #165, C80): a `--global` leaf symlink is now settled from the bytes read THROUGH it, so it is
+ * a call site that reads the path and takes `stat` like every other. It is named here because
+ * the old wording pointed at exactly the line that changed, and pointed the wrong way.
  */
 
 import { statSync } from "node:fs";

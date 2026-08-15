@@ -57,9 +57,8 @@
  * FOLLOWS directory links, landing the payload in the backing store. Before this, such a
  * layout threw at the FIRST linked destination: nothing installed when `~/.claude` was the
  * link (`planFor` resolves the record path under it EAGERLY, before the loop), a PARTIAL
- * install with no ownership record when only `<xdg>/opencode` was. In GLOBAL mode a LEAF payload file that is a symlink is not
- * written through and not refused: it takes the existing never-clobber path — skipped
- * with a warning, `init` completes, the ownership record is still written. (Project mode
+ * install with no ownership record when only `<xdg>/opencode` was. In GLOBAL mode a LEAF payload
+ * file that is a symlink is not refused — C80 below says what it does. (Project mode
  * still REFUSES a live leaf link; only the dangling case changed there.) The RECORD's own
  * path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
  * there is written THROUGH — deliberately, since only init writes the record and there is
@@ -73,6 +72,51 @@
  * including outside `$HOME`, and uninstall's `pruneEmptyDirs` may `rmdir` now-empty dirs in the
  * backing store. Provenance: the ask and the global-only scope are the maintainer's
  * (issue #156); the shape is Claude's.
+ *
+ * A LEAF PAYLOAD SYMLINK IS SETTLED BY THE OWNERSHIP RULE, NOT BY PATH TYPE (issue #165,
+ * maintainer decision 2026-08-05, C80). #156 covers the layout where a whole config DIRECTORY is
+ * linked. The per-FILE layout is the common one: GNU stow links leaves whenever the parent
+ * directory already has content and cannot be tree-folded — and `~/.claude` typically cannot, it
+ * holds `settings.json`, `projects/` and credentials stow did not create — and chezmoi's
+ * `symlink_` targets produce the same shape on purpose. C77 skipped those with a warning, so the
+ * user's copy stayed on an old release FOREVER while `doctor` kept reporting it as skew and
+ * naming `npx modelguild init` as the fix (reproduced 2026-08-15: v1 installed, stowed, re-run
+ * against v2 ⇒ `installed=0`, `blocked=[]`, exit 0, store copy still v1).
+ *
+ * NOTHING NEW IS INVENTED: never-clobber already keys on BYTES, not on path type. The bytes are
+ * read THROUGH the link and hashed; ours ⇒ the write goes through it too, updating the dotfiles
+ * copy; not ours ⇒ skipped with a warning like any file init did not write. A DANGLING link has
+ * no bytes, so it cannot match and stays a skip — by the rule, not by an exception to it. Scope
+ * is `--global` only, inheriting C77's asymmetry unchanged.
+ *
+ * THE HASH IS A FRESHNESS CHECK, NOT AN AUTHORIZATION CHECK, and that has to be written down
+ * rather than left implied by the word "ownership". Recorded hashes are of SHIPPED payload files,
+ * which are public in the npm tarball, so anyone who can plant the link can also plant matching
+ * bytes. Demonstrated end to end: install v1, copy v1's `consult.md` to a victim path, point the
+ * payload path at it, install v2 ⇒ the victim file is overwritten (with a warning naming both).
+ * Within the trusted-repo posture — planting a link in your own config tree already implies code
+ * execution — but it buys freshness, never authority, and the warning says so in those words.
+ *
+ * UNINSTALL REMOVES THE LINK AND LEAVES THE TARGET, and now says so. `unlink(2)` never follows a
+ * final component, so that is what it already did; the change is that it is named. Asymmetric with
+ * install on purpose: updating a file the user asked to be there is not the same act as deleting
+ * one out of a store they manage. Stated consequence: install → uninstall → reinstall does NOT
+ * restore the stow layout — the reinstall writes a regular file at the destination and the
+ * orphaned copy stays in the store.
+ *
+ * THE RECORD LEAF KEEPS DIVERGING, and the divergence is forced — see `recordSymlinkWarning`:
+ * there is no record OF the record, so the hash gate is circular. Its write-through (C77) stands.
+ * What changed is the disclosure, and it is SPLIT: WHICH link is there and where it points is
+ * resolved at plan time (nothing in the run rewrites the link, and a future refusal would want
+ * it there), while whether the target EXISTS is read beside the write. Moving that second half
+ * to plan time was tried and was WRONG — a record link aimed at a not-yet-installed payload file
+ * is dangling at plan time and live by the write, so the message announced a creation while
+ * silently destroying an agent def the same run had just installed (issue #165 review, F-1). The
+ * uninstall leftover is named too, and names only what the run can stand up: the record parsed
+ * from that path is the evidence that the bytes behind the link were ever ours (F-3).
+ *
+ * Provenance: the ask, the rule and the uninstall shape are the maintainer's (issue #165,
+ * 2026-08-05); the plan-time hoist and the wording are Claude's.
  *
  * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
  * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
@@ -303,6 +347,13 @@ interface InstallPlan {
   recordPath: string;
   pruneDirs: string[]; // absolute, deepest-first
   gitignoreDir?: string; // project mode only
+  /**
+   * The ownership record path's own symlink, RESOLVED at plan time (install only) — the link and
+   * where it points, which nothing in the run changes. Deliberately NOT its live/dangling state:
+   * that is a fact about the link's TARGET, and the target can be a payload destination this run
+   * is about to create (issue #165 review, F-1), so it is only knowable at write time.
+   */
+  recordLink?: { target: string };
   /** Warnings produced while RESOLVING the plan, replayed into the result. Only the uninstall
    * path produces any (a symlinked record path it reads through rather than refuses). */
   warnings: string[];
@@ -338,6 +389,8 @@ export function recordPathFor(opts: {
  */
 function planFor(opts: InitOptions): InstallPlan {
   const warnings: string[] = [];
+  // Filled by the record-path resolution below (install only); see `InstallPlan.recordLink`.
+  let recordLink: { target: string } | undefined;
   if (opts.global) {
     const g = resolveGlobalDirs(opts);
     const destOpts = { global: true as const, targetDir: opts.targetDir, global_dirs: g };
@@ -363,6 +416,8 @@ function planFor(opts: InitOptions): InstallPlan {
         if (!opts.uninstall) {
           assertRecordPathWritable(p);
           assertRecordLinkWritable(p);
+          // RESOLVED here, REPORTED at write time (issue #165). See the project branch below.
+          recordLink = resolveRecordLink(p);
         }
         return p;
       })(),
@@ -373,6 +428,9 @@ function planFor(opts: InitOptions): InstallPlan {
         path.join(g.homeDir, ".claude", "modelguild"),
       ],
       warnings,
+      // AFTER `recordPath` in this literal on purpose: the IIFE above is what assigns it, and
+      // object properties are evaluated in source order.
+      recordLink,
     };
   }
   let recordPath: string;
@@ -410,6 +468,22 @@ function planFor(opts: InitOptions): InstallPlan {
     // then raises a raw ENOENT with no record written — so the two enumerated refusals now
     // cover both modes. Install only, as before: `--uninstall` writes no record.
     assertRecordLinkWritable(recordPath);
+    // THE RECORD LINK IS RESOLVED HERE AND REPORTED AT WRITE TIME, and the split is the whole
+    // correction (issue #165, review finding F-1).
+    //
+    // An earlier cut of #165 moved the entire disclosure here, on the reasoning that "the link
+    // state cannot change between plan time and the write, because the record path is not a
+    // payload destination". The record PATH is not — but the record link's TARGET can be, and
+    // `init` creates payload files in between. A record link pointing at a not-yet-installed
+    // payload file (say `<xdg>/opencode/agent/guild-read.md`, directory present, file absent) is
+    // DANGLING at plan time and LIVE at write time: the def is installed, reported in
+    // `installed`, then overwritten by the record JSON — while a plan-time message says "will
+    // CREATE that file (the link is dangling)". `origin/main`'s late call site said "replaced
+    // that file's contents", which was RIGHT. The hoist made the message worse, so only the half
+    // that is genuinely stable moves: WHICH link is here and WHERE it points (nothing in the run
+    // rewrites the link itself), which is what a future refusal would need. Whether the target
+    // EXISTS is a fact about the target, so it is read where it is true — beside the write.
+    recordLink = resolveRecordLink(recordPath);
     // …AND `.mcp.json` UNDER `--write-mcp` (issue #160). It was resolved LATE — after the
     // payload loop and before `writeRecords` — so a symlink, a non-regular file or unparseable
     // JSON there left a full payload on disk with NO ownership record, which no retry could
@@ -445,6 +519,7 @@ function planFor(opts: InitOptions): InstallPlan {
     pruneDirs: PRUNE_DIRS.map((d) => path.join(opts.targetDir, d)),
     gitignoreDir: opts.targetDir,
     warnings,
+    recordLink,
   };
 }
 
@@ -772,6 +847,25 @@ function checkGlobalDirChain(base: string, rel: string, what: string): void {
 }
 
 /**
+ * The ABSOLUTE target of a symlink at `p`, or `undefined` when `p` holds no entry or is not a
+ * link. Resolved against the LINK's own directory, because `readlink(2)` returns the stored text
+ * and a relative one means nothing to a reader who does not know where the link lives. Never
+ * throws — an unreadable link answers `undefined`, the same as no link at all.
+ *
+ * Deliberately narrower than `resolveRecordLink`, which also reports whether the link RESOLVES.
+ * The payload loops ask only "is there a link here, and where does it point?"; `isRegularFile`
+ * (C78: `stat`, so it follows) answers the other half from the bytes themselves.
+ */
+function symlinkTargetOf(p: string): string | undefined {
+  try {
+    if (!lstatSync(p).isSymbolicLink()) return undefined;
+    return path.resolve(path.dirname(p), readlinkSync(p));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * True when a path has an entry of its own — a DANGLING symlink included, which `existsSync`
  * (it follows) reports as absent. The install loop gates its never-clobber check on this so a
  * dangling leaf link reaches the not-a-regular-file branch instead of being written THROUGH.
@@ -962,18 +1056,59 @@ function assertRecordLinkWritable(recordPath: string): void {
  * parent directory already exists) legitimately puts a link here. But a user CAN point that
  * path at a file of their own, and then the bytes land somewhere they did not expect — so
  * name the link and the file the bytes actually go to, the same way the install loop names a
- * skipped payload file. Must be called BEFORE the write: afterwards a dangling link and a
- * live one are indistinguishable. Returns `undefined` for the normal case (no entry, or a
- * regular file). Never throws — a warning that cannot be computed must not fail the install.
+ * skipped payload file. Must be called IMMEDIATELY BEFORE the write: afterwards a dangling link
+ * and a live one are indistinguishable, and BEFOREHAND they can be the wrong way round.
+ *
+ * WHICH LINK is resolved at plan time (`InstallPlan.recordLink`) because nothing in the run
+ * rewrites the link itself; whether its TARGET EXISTS is read HERE, because the payload loop can
+ * have created it in between — issue #165's F-1, where a record link aimed at a
+ * not-yet-installed agent def was dangling at plan time, live by the write, and described as a
+ * creation while it was silently destroying a def that had just been installed. The tense stays
+ * FUTURE: the write is the next statement, and it has not happened yet.
+ *
+ * `payloadAt` maps an absolute payload destination to its dest-rel, so the case that is not just
+ * a lost user file — the record landing on top of a payload file this very run placed, which
+ * makes an agent def unparseable and is caught only by C73 seconds into the first tool call —
+ * is NAMED rather than left to read as an ordinary overwrite. Best-effort by string comparison:
+ * a link reaching the same file by another route (through a directory symlink, say) is not
+ * matched, and the warning then reads as the generic one, which is still accurate.
+ *
+ * Never throws — a warning that cannot be computed must not fail the install.
+ *
+ * THE RECORD LEAF DELIBERATELY DIVERGES FROM THE PAYLOAD LEAF (issue #165, C80), and the
+ * divergence is FORCED rather than preferred. A payload leaf is followed only when the bytes
+ * behind it hash to what the ownership record says init wrote there — and there is no record OF
+ * the record: the hash it would be checked against is the one this very file is about to contain.
+ * The check is circular, so the only two rules available here are write-through (C77's shipped
+ * decision, and what a stow-managed record path needs) or skip-always (which breaks that layout
+ * outright). Write-through stands; this warning is what carries its cost, so it says which of the
+ * two it is doing and that nothing gated it.
  */
-function recordSymlinkWarning(recordPath: string): string | undefined {
-  const link = resolveRecordLink(recordPath);
-  if (!link) return undefined;
-  const { target, live } = link;
+function recordSymlinkWarning(
+  recordPath: string,
+  link: { target: string },
+  payloadAt: Map<string, string>,
+): string {
+  const { target } = link;
+  // READ NOW, not at plan time: `existsSync` follows, so this is a question about the TARGET.
+  let live: boolean;
+  try {
+    live = existsSync(recordPath);
+  } catch {
+    live = false; // unanswerable ⇒ the milder claim, never a destruction we cannot stand up
+  }
+  const collides = payloadAt.get(target);
   return (
     `writing the ownership record through a symlink — ${recordPath} links to ${target}, so the record ` +
-    (live ? `replaced that file's contents` : `created that file (the link was dangling)`) +
-    `. Remove the link and re-run init to keep the record at ${recordPath} itself.`
+    (live ? `will REPLACE that file's contents` : `will CREATE that file (the link is dangling)`) +
+    (collides
+      ? `. THAT FILE IS A PAYLOAD DESTINATION (${collides}): this install placed it and is about ` +
+        `to overwrite it with the record JSON, which leaves it unusable — an agent def in this ` +
+        `state is caught only when a tool call refuses`
+      : ``) +
+    `. Unlike a payload file, this is NOT hash-gated — there is no record of the record to ` +
+    `recognise, so nothing here declines to clobber. Remove the link and re-run init to keep the ` +
+    `record at ${recordPath} itself.`
   );
 }
 
@@ -1555,6 +1690,18 @@ export function init(opts: InitOptions): InitResult {
   result.warnings.push(...plan.warnings);
   const records = readRecords(plan.recordPath);
   const ownedMcp = readMcpRecord(plan.recordPath);
+  /**
+   * THE LEAF RULE IS GLOBAL-ONLY (issue #165, C80), and that is C77's asymmetry rather than a new
+   * one: `--global` writes into the user's OWN config, where a dotfiles manager legitimately puts
+   * a link at each payload path, while a project destination is somebody's source repo.
+   *
+   * In PROJECT mode no destination this reaches can BE a live link — `safeJoin` refuses one
+   * eagerly in `planFor` and again from `destFor` — so the probe is SKIPPED rather than asked and
+   * always answered `undefined`: same result, one fewer `lstat` per file, and a third destination
+   * mode cannot be added without deciding what it answers here.
+   */
+  const leafLinkTarget = (p: string): string | undefined =>
+    opts.global ? symlinkTargetOf(p) : undefined;
 
   if (opts.uninstall) {
     // NOTHING IN THIS BLOCK MAY THROW (issue #161, and the uninstall half of #167). Every step
@@ -1596,8 +1743,22 @@ export function init(opts: InitOptions): InitResult {
       try {
         const current = sha256(readFileSync(abs));
         if (current === recorded) {
+          // REMOVE THE LINK, LEAVE THE TARGET, AND SAY SO (issue #165, C80). `unlink(2)` never
+          // follows a final component, so this is what it already did — silently. Asymmetric with
+          // install ON PURPOSE: writing through the link updates a file the user asked to be
+          // there, while deleting through it would remove a file out of a store they manage
+          // (typically a git dotfiles repo), which nobody asked for. Init wrote the BYTES; the
+          // user chose the link and where it points. Named so the leftover can be dealt with.
+          const linkTarget = leafLinkTarget(abs);
           unlinkSync(abs);
           result.removed.push(dest);
+          if (linkTarget) {
+            result.warnings.push(
+              `removed the symlink at ${abs}, but LEFT its target ${linkTarget} in place — it ` +
+                `lives in a directory you manage (dotfiles?), so deleting from there is yours to ` +
+                `do. A re-install will write a regular file at ${abs}, not restore the link.`,
+            );
+          }
         } else {
           result.warnings.push(`keeping changed file ${dest} — it no longer matches what init wrote.`);
         }
@@ -1621,8 +1782,40 @@ export function init(opts: InitOptions): InitResult {
     // `lstat`, so a DANGLING record link is removed rather than followed-and-called-absent;
     // `unlink(2)` never follows a final component, so a live link's target survives (C77).
     if (entryExists(plan.recordPath)) {
+      const recordLink = symlinkTargetOf(plan.recordPath);
       try {
         unlinkSync(plan.recordPath);
+        if (recordLink) {
+          // THE SAME CALL AS A PAYLOAD LEAF'S, AND NOW THE SAME REPORTING (issue #165). This
+          // already removed the LINK and left the target — silently, while the payload leaf's
+          // whole justification is that the leftover must be named. It matters more here, not
+          // less: the write-through was not hash-gated, so the file left behind may be the
+          // user's own with ModelGuild's JSON in it (C77's stated cost), and nothing else in the
+          // run mentions it. `symlinkTargetOf`, not `leafLinkTarget` — the record write-through
+          // is BOTH modes (C77), so the disclosure of its leftover has to be too.
+          //
+          // DO NOT ASSERT A DESTRUCTION THAT MAY NOT HAVE HAPPENED (issue #165, review finding
+          // F-3). An earlier cut said flatly that the target "still holds ModelGuild's
+          // ownership-record JSON, which the install wrote over it" — but the only condition
+          // guarding that sentence was "there is a link here", which says nothing about whether
+          // any install ever wrote through it. Reproduced: plant a record symlink at a file
+          // holding `MINE\n`, never install, run `--uninstall` ⇒ the claim fired and the file was
+          // untouched. The evidence is already in hand and costs no syscall: `records` /
+          // `ownedMcp` were parsed FROM that path at the top of this function, so a non-empty
+          // read means the bytes behind the link really are ours. Empty is genuinely ambiguous —
+          // not ours, unreadable, or an empty record — so it gets the conditional wording.
+          const wasOurs = Object.keys(records).length > 0 || ownedMcp !== undefined;
+          result.warnings.push(
+            `removed the symlink at ${plan.recordPath}, but LEFT its target ${recordLink} in ` +
+              `place${existsSync(recordLink) ? "" : " (already gone)"} — uninstall deletes the ` +
+              `link, never through it. ` +
+              (wasOurs
+                ? `That file holds ModelGuild's ownership-record JSON, which an install wrote ` +
+                  `through this link; if the file was originally yours, nothing here restores it.`
+                : `Its contents did not read as a ModelGuild ownership record, so nothing was ` +
+                  `removed from it and this run made no claim on it.`),
+          );
+        }
       } catch (err) {
         result.warnings.push(
           `could not remove the ownership record at ${plan.recordPath} (${errCode(err)}) — ` +
@@ -1659,13 +1852,27 @@ export function init(opts: InitOptions): InitResult {
       const payloadBytes = readFileSync(srcAbs);
       const payloadHash = sha256(payloadBytes);
       destAbs = plan.destFor(dest);
+      const linkTarget = leafLinkTarget(destAbs);
 
       // `entryExists`, not `existsSync`: a DANGLING symlink at the destination is an entry the
       // user put there, and `existsSync` follows the link and calls it absent — which sent the
-      // write straight through it (issue #156). The branch below is unchanged.
+      // write straight through it (issue #156).
       if (entryExists(destAbs)) {
-        if (!lstatSync(destAbs).isFile()) {
-          result.warnings.push(`skipping ${dest} — a non-file exists at ${destAbs}; left untouched.`);
+        // A LEAF LINK IS SETTLED BY THE OWNERSHIP RULE, NOT BY PATH TYPE (issue #165, C80).
+        // `isRegularFile` is `stat` (C78), so it FOLLOWS the link and answers about the bytes the
+        // hash two lines down will read; `lstatSync().isFile()` answers about the LINK, which is
+        // what turned every stow/chezmoi per-file destination into a permanent skip. A DANGLING
+        // link still skips — by this same rule rather than by an exception to it, because it has
+        // no bytes and so cannot match anything init recorded.
+        const usable = linkTarget ? isRegularFile(destAbs) : lstatSync(destAbs).isFile();
+        if (!usable) {
+          result.warnings.push(
+            linkTarget
+              ? `skipping ${dest} — ${destAbs} is a symlink to ${linkTarget}, which is not a ` +
+                `regular file (missing, a directory, or a FIFO); left untouched. A leaf link is ` +
+                `followed only when the bytes behind it are ones init recorded, and there are none.`
+              : `skipping ${dest} — a non-file exists at ${destAbs}; left untouched.`,
+          );
           result.skipped.push(dest);
           if (records[dest]) newRecords[dest] = records[dest];
           continue;
@@ -1677,6 +1884,9 @@ export function init(opts: InitOptions): InitResult {
           // leaves them behind the release (issue #22), which the old bare warning did not.
           result.skipped.push(dest);
           const recorded = records[dest];
+          // Where the destination is a link, SAY SO: "I left your file alone" reads differently
+          // when the file is not at the path being named (issue #165).
+          const via = linkTarget ? ` (${destAbs} is a symlink to ${linkTarget})` : "";
           if (isDrifted(recorded, current, payloadHash)) {
             result.drifted.push({
               dest,
@@ -1688,14 +1898,14 @@ export function init(opts: InitOptions): InitResult {
             });
             result.warnings.push(
               `skipping ${dest} — you edited it since init wrote it, and this release ships a ` +
-                `NEWER version: your copy is stale (see the drift note).`,
+                `NEWER version: your copy is stale (see the drift note)${via}.`,
             );
           } else {
             result.warnings.push(
               recorded
                 ? `skipping ${dest} — you edited it since init wrote it; left untouched ` +
-                  `(your edit is against the version this release still ships — not stale).`
-                : `skipping ${dest} — a file you already have is there; left untouched.`,
+                  `(your edit is against the version this release still ships — not stale)${via}.`
+                : `skipping ${dest} — a file you already have is there; left untouched${via}.`,
             );
           }
           if (COMMAND_DEST_RELS.has(dest)) result.shadowed.push(dest);
@@ -1709,9 +1919,21 @@ export function init(opts: InitOptions): InitResult {
         }
       }
       ensureDir(path.dirname(destAbs));
-      writeFileSync(destAbs, payloadBytes);
+      writeFileSync(destAbs, payloadBytes); // FOLLOWS a leaf link — deliberately (C80)
       newRecords[dest] = payloadHash;
       result.installed.push(dest);
+      if (linkTarget) {
+        // A write THROUGH a link lands in a directory the user manages, so it is surfaced rather
+        // than done silently. An idempotent re-run never reaches here (equal bytes ⇒ no write),
+        // so this fires on a real upgrade, not on every run. It states the bound of the check
+        // that authorized it, because "ownership" makes it easy to read as more than it is.
+        result.warnings.push(
+          `wrote ${dest} THROUGH the symlink at ${destAbs} — the bytes landed in ${linkTarget}. ` +
+            `init followed the link because what was behind it hashed to what init last wrote ` +
+            `there; that is a FRESHNESS check, not an authorization check (the recorded hashes ` +
+            `are of files published in the npm tarball).`,
+        );
+      }
     } catch (err) {
       result.warnings.push(
         `skipping ${dest} — could not write ${destAbs || path.join(opts.targetDir, dest)} ` +
@@ -1767,10 +1989,20 @@ export function init(opts: InitOptions): InitResult {
     // that init wrote the key (mirrors carrying an unchanged file's record forward).
     mcpRecord = ownedMcp;
   }
-  // Warn BEFORE the write: it is the only moment a dangling link is distinguishable from a
-  // live one, and the write settles that either way (issue #156).
-  const recordWarning = recordSymlinkWarning(plan.recordPath);
-  if (recordWarning) result.warnings.push(recordWarning);
+  // THE RECORD-LINK DISCLOSURE, reported HERE and resolved at plan time (issue #165, F-1). The
+  // live/dangling half is a fact about the link's TARGET, and the payload loop above can have
+  // just created it, so it is read where it is true rather than where it would read tidily.
+  if (plan.recordLink) {
+    const payloadAt = new Map<string, string>();
+    for (const { dest } of payloadFiles()) {
+      try {
+        payloadAt.set(plan.destFor(dest), dest);
+      } catch {
+        /* an unresolvable destination cannot be what the record link points at */
+      }
+    }
+    result.warnings.push(recordSymlinkWarning(plan.recordPath, plan.recordLink, payloadAt));
+  }
   try {
     writeRecords(plan.recordPath, newRecords, mcpRecord);
   } catch (err) {
