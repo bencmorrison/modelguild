@@ -279,6 +279,25 @@ async function runCases(): Promise<number> {
   c.check(f.out.includes("missing: consult"), "(f) names the missing doc (consult)");
   c.check(f.out.includes("✗"), "(f) prints a ✗ line for the missing doc");
 
+  // ---- (f2) A DIRECTORY at a def path must FAIL, agreeing with C16 (issue #175) ----
+  // `locatePayload` used a bare `existsSync`, which is TRUE for a directory — so this exact
+  // fixture printed `✓ 3/3 hardened agent defs present` and `doctor: OK` for a repo where
+  // `hardenedDefPresentIn` (C78's predicate) says absent and C16 therefore refuses at every
+  // model-calling tool. The user-visible half of that contradiction is asserted here; the
+  // predicate-level agreement is in `test/init.test.ts`. Neither shape can block, so no
+  // bounded child is needed (C78's test discipline applies to FIFOs, not to directories).
+  const projDirDef = tempDir();
+  init({ targetDir: projDirDef, packageRoot: repoRoot, serverLaunch: LAUNCH });
+  const dirDef = path.join(projDirDef, ".opencode/agent/guild-read.md");
+  rmSync(dirDef);
+  mkdirSync(dirDef, { recursive: true });
+  const f2 = await captureDoctor(["--dir", projDirDef], { homeDir: tempDir(), xdgConfigHome: tempDir() });
+  c.check(f2.code === 1, `(f2) a DIRECTORY at a def path FAILS (exit ${f2.code}) — pre-fix: 0, "doctor: OK"`);
+  c.check(
+    f2.out.includes("2/3 hardened agent defs") && f2.out.includes("missing: guild-read"),
+    `(f2) and it is counted absent and named, as C16's refusal already treats it (got: ${f2.out.split("\n").find((l) => l.includes("hardened agent defs")) ?? "<no line>"})`,
+  );
+
   // ---- (g) LAYERED config/policy chain is REPORTED (issue #19) -------------
   // A project install under a home that ALSO carries a global install: doctor must print
   // BOTH layers (project over global baseline) plus every policy file in the chain, so the
