@@ -41,6 +41,8 @@ import {
   type PreTurnAgentCheck,
   type ServeProvider,
   type ServeRouter,
+  type TurnCompletion,
+  type TurnDiagnostics,
 } from "./client.js";
 import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
@@ -340,6 +342,13 @@ export interface ConsultError {
   model: string;
   /** Present on policy errors: the tier that produced the refusal. */
   tier?: PolicyTier;
+  /**
+   * Present ONLY on `empty-answer` (issue #168): the turn's tool-call count and the provider's
+   * completion metadata (`finish`, token counts, cost) as opencode recorded them. It rides
+   * inside `error` deliberately — `consultToToolResult` copies that object wholesale into
+   * `structuredContent.error`, so no second plumbing point exists to drift.
+   */
+  diagnostics?: TurnDiagnostics;
 }
 
 export interface ConsultOk {
@@ -977,6 +986,15 @@ export type LifecycleOutcome =
        * independent of whatever the capture was able to measure afterwards.
        */
       toolCallCount: number;
+      /**
+       * The turn's completion metadata (issue #168), turn-scoped like `toolCallCount`.
+       * `guild_delegate` reads it for the `empty-delegation` refusal; the read paths get theirs
+       * off `EmptyAnswerError` instead, because they refuse inside `askViaAgent`.
+       */
+      completion?: TurnCompletion;
+      /** The turn's assistant part types, counted (issue #168) — threaded for the same reason
+       * as `completion`: only `guild_delegate` builds its own diagnostics. */
+      partTypes?: Record<string, number>;
       /** Bounded activity summary for this call; absent when the layer is off. */
       activity?: ActivitySummary;
       /** Approval record for this call; absent unless the bridge was armed. */
@@ -996,6 +1014,13 @@ export type LifecycleOutcome =
         | "agent-unhardened"
         /** Only produced when the caller set `requireAnswer` (issue #117, C74). */
         | "empty-answer";
+      /**
+       * Set ONLY on `empty-answer` (issue #168): what the turn did before it went quiet, and
+       * what the provider said about the completion that ended it. Every other failure kind
+       * either never reached the model or has its own message; attaching a turn's diagnostics
+       * to a turn that did not happen would be a fabrication.
+       */
+      diagnostics?: TurnDiagnostics;
       /** Present on failure too — a black-box call that DIED is exactly the one whose
        * action trace matters most. */
       activity?: ActivitySummary;
@@ -1179,6 +1204,8 @@ export async function runAgentLifecycle(
     if (recorder !== undefined) ok.activity = recorder.summary();
     if (approver !== undefined) ok.approval = approver.summary();
     if (result.providerError !== undefined) ok.providerError = result.providerError;
+    if (result.completion !== undefined) ok.completion = result.completion;
+    if (result.partTypes !== undefined) ok.partTypes = result.partTypes;
     return ok;
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
@@ -1231,6 +1258,10 @@ export async function runAgentLifecycle(
               ? "empty-answer"
               : "call-failed",
     };
+    // Issue #168: the diagnostics ride out on the refusal, structurally as well as in the
+    // message text, so a caller can tell "read five files then said nothing" from "said
+    // nothing at all" without parsing prose.
+    if (empty && err.diagnostics !== undefined) failed.diagnostics = err.diagnostics;
     if (recorder !== undefined) failed.activity = recorder.summary();
     if (approver !== undefined) failed.approval = approver.summary();
     return failed;
@@ -1517,6 +1548,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       // signal is kind + isError; the reason rides in `message`.
       exitAnalogue: null,
       message,
+      ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
     },
   };
   if (runId.length > 0) fail.runId = runId;

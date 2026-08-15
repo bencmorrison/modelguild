@@ -79,6 +79,12 @@ export interface FakeOpencodeOpts {
    * needs `distinctSessions` to tell members apart.
    */
   emptyAnswerForModel?: string;
+  /**
+   * ISSUE #168, the reported panel: serve the `tools-then-silent` shape only for the member
+   * whose body model id equals this. Its sibling answers normally against the same fake, which
+   * is what makes the per-member diagnostics assertion meaningful rather than trivial.
+   */
+  toolsThenSilentForModel?: string;
   /** Delay (ms) before the POST message response — used to trigger a timeout abort. */
   messageDelayMs?: number;
   /** Return 500 on the GET history (drive an error path with the session created). */
@@ -111,6 +117,18 @@ export interface FakeOpencodeOpts {
    * session and prove the per-member summaries do not cross-contaminate.
    */
   eventScript?: unknown[] | ((sessionId: string) => unknown[]);
+  /**
+   * COMPLETION METADATA on every assistant `info` (issue #168). The default is the shape
+   * opencode's own OpenAPI document declares for `AssistantMessage` — `cost` plus
+   * `tokens: {input, output, reasoning, cache:{read,write}}` — and a test that sets this
+   * proves the reported numbers are READ from the payload rather than constants baked into
+   * the product. Set `assistantTokens: null` together with `omitCompletionMetadata` for the
+   * "opencode recorded nothing" branch.
+   */
+  assistantTokens?: unknown;
+  /** Serve assistant messages with NO `finish`, `tokens` or `cost` at all — an opencode that
+   * recorded no completion metadata. The product must say so rather than invent zeroes. */
+  omitCompletionMetadata?: boolean;
   /** Delay (ms) between scripted frames. Default 0 (emit them back to back). */
   eventDelayMs?: number;
   /** Refuse `GET /event` with a 500 — drives the `activity.degraded` path. */
@@ -395,7 +413,23 @@ export type TurnShape =
   | "rejected"
   | "silent"
   | "non-string-text"
-  | "preamble-then-textless";
+  | "preamble-then-textless"
+  /**
+   * ISSUE #168's REPORTED SHAPE: tool calls that all SUCCEEDED, then a final assistant message
+   * whose text is empty and which carries NO `info.error`. Distinct from `silent` (which makes
+   * no tool call) and from `rejected` (which also carries a provider error) — and the whole
+   * point of #168 is that the product used to render all three identically.
+   */
+  | "tools-then-silent"
+  /**
+   * ISSUE #168's LEADING ROOT-CAUSE CANDIDATE, fixtured so it is testable rather than merely
+   * argued. The turn's tool calls succeed and the final assistant message carries a
+   * `reasoning` part with real text and NO `text` part. `finalAssistantText` reads
+   * `type === "text"` only, so this reconstructs to `""` and is refused — while opencode's own
+   * TUI, rendering reasoning, would show the user a full answer. `ReasoningPart` is a real
+   * member of opencode 1.18.18's `Part` union carrying its own `text` (probed at `GET /doc`).
+   */
+  | "reasoning-only";
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -414,6 +448,12 @@ function firstTextPart(body: Record<string, unknown>): string | undefined {
 /** Which shape this turn serves. Decided at POST time: the model id and the turn number are
  * both only knowable there, and the history GET carries neither. */
 function turnShapeFor(opts: FakeOpencodeOpts, modelId: string, turnNo: number): TurnShape {
+  if (
+    opts.toolsThenSilentForModel !== undefined &&
+    modelId === opts.toolsThenSilentForModel
+  ) {
+    return "tools-then-silent";
+  }
   if (opts.emptyAnswerForModel !== undefined && modelId === opts.emptyAnswerForModel) return "rejected";
   const shapes = opts.turnShapes;
   if (shapes === undefined || shapes.length === 0) return "text";
@@ -449,16 +489,31 @@ function rejectionError(opts: FakeOpencodeOpts): Record<string, unknown> {
 function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknown[] {
   // Optionally stamp info.agent on the assistant messages (agent-mismatch probe).
   const agentField = opts.servedAgent !== undefined ? { agent: opts.servedAgent } : {};
-  const asst = (id: string, extra: Record<string, unknown>): Record<string, unknown> => ({
-    id,
-    role: "assistant",
-    ...agentField,
-    providerID: "openai",
-    modelID: "gpt-fake",
-    cost: 0.0042,
-    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-    ...extra,
-  });
+  // Issue #168: `omitCompletionMetadata` drops `cost`/`tokens` from the base AND `finish` from
+  // whatever `extra` the shape supplies, so the "opencode recorded nothing" branch is reachable
+  // without every shape growing a variant.
+  const asst = (id: string, extra: Record<string, unknown>): Record<string, unknown> => {
+    const base: Record<string, unknown> = {
+      id,
+      role: "assistant",
+      ...agentField,
+      providerID: "openai",
+      modelID: "gpt-fake",
+    };
+    if (opts.omitCompletionMetadata === true) {
+      const { finish: _dropped, ...rest } = extra;
+      return { ...base, ...rest };
+    }
+    return {
+      ...base,
+      cost: 0.0042,
+      tokens:
+        "assistantTokens" in opts
+          ? opts.assistantTokens
+          : { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      ...extra,
+    };
+  };
   const user = {
     info: { id: `msg_user_${n}`, role: "user", time: { created: n } },
     parts: [{ id: `t${n}p0`, type: "text", text: turn.question }],
@@ -499,6 +554,40 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
       { id: `t${n}p3`, type: "step-finish" },
     ],
   };
+  // ISSUE #168's LEADING CANDIDATE: output arrived, as `reasoning`, and the extractor reads
+  // only `text` — so the receipts say "empty" while the model demonstrably produced tokens.
+  if (turn.shape === "reasoning-only") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        parts: [
+          { id: `t${n}p4`, type: "step-start" },
+          { id: `t${n}p5`, type: "reasoning", text: turn.text },
+          { id: `t${n}p6`, type: "step-finish" },
+        ],
+      },
+    ];
+  }
+  // ISSUE #168's REPORTED SHAPE: the tool calls landed and succeeded, and the message that
+  // ended the turn carries an empty text part with NO `info.error`. `finish` is a normal
+  // completion — which is exactly why the refusal could not tell this from a model that never
+  // reached for anything.
+  if (turn.shape === "tools-then-silent") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        parts: [
+          { id: `t${n}p4`, type: "step-start" },
+          { id: `t${n}p5`, type: "text", text: "" },
+          { id: `t${n}p6`, type: "step-finish" },
+        ],
+      },
+    ];
+  }
   if (turn.shape === "preamble-then-textless") {
     return [
       user,

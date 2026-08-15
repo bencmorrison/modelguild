@@ -214,8 +214,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "guild_research) that surfaces as an empty-answer error rather than a blank answer; on " +
         "guild_delegate it surfaces as an empty-delegation error (issue #121) — no report AND " +
         "no tool calls. An empty report on its own is NOT an error there: the answer is the " +
-        "patch, so a terse model that edited files has still delivered. If an id fails either " +
-        "way, pick another and say so.",
+        "patch, so a terse model that edited files has still delivered. Either refusal carries " +
+        "structuredContent.error.diagnostics (issue #168): how many tool calls the turn made " +
+        "before it went quiet, and opencode's own completion metadata (finish reason, token " +
+        "counts, cost) where it recorded any. RELAY THOSE — 'read five files then said nothing' " +
+        "and 'said nothing at all' are different failures. If an id fails either way, pick " +
+        "another and say so.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
     {

@@ -665,6 +665,64 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 12c. THE ISSUE-#168 CASE, WHICH IS 12b's CASE WITH THE DIAGNOSTICS THE REPORT ASKED FOR.
+  //      The reported panel had one member answer normally and one read five files and then
+  //      return nothing, and the refusal could not say which of those two things had happened.
+  //      Per member, like `activity`: merging would destroy exactly the finding.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "ok voice",
+      distinctSessions: true,
+      // THE REPORTED SHAPE: beta's reads all succeed, then it says nothing and opencode reports
+      // no error — the case a `rejected` fixture cannot express.
+      toolsThenSilentForModel: "beta/silent",
+      assistantTokens: { input: 999, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/silent"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#168 panel: the panel itself is still ok");
+      if (r.ok) {
+        const alpha = r.results.find((m) => m.model === "alpha/ok");
+        const beta = r.results.find((m) => m.model === "beta/silent");
+        c.check(alpha?.text === "ok voice", "#168 panel: the answering sibling is untouched");
+        c.check(
+          alpha?.error === undefined,
+          "#168 panel: diagnostics are attached to the FAILING member only, never to a success",
+        );
+        const d = beta?.error?.diagnostics;
+        c.check(!!d, "#168 panel: the silent member carries diagnostics");
+        c.check(d?.toolCallCount === 1, "#168 panel: the silent member's own tool-call count");
+        c.check(
+          d?.completion?.tokens?.input === 999 && d?.completion?.tokens?.output === 0,
+          "#168 panel: the silent member's own token counts",
+        );
+        // The digest is what a text-only reader sees; it must carry the distinction too.
+        const text = panelToToolResult(r).content[0].text;
+        c.check(
+          /1 tool call before it ended/.test(text),
+          "#168 panel: the rendered digest states what the silent member did before going quiet",
+        );
+        const wire = panelToToolResult(r).structuredContent as {
+          results: Array<{ model: string; error?: { diagnostics?: { toolCallCount: number } } }>;
+        };
+        c.check(
+          wire.results.find((m) => m.model === "beta/silent")?.error?.diagnostics?.toolCallCount === 1,
+          "#168 panel: diagnostics survive the MCP boundary, per member",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Per-call timeoutMs applies to EVERY panel member (issue #37). A small per-call
   // value wins over a large env value and aborts each delayed member. No deps seam.
   // -------------------------------------------------------------------------

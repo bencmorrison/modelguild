@@ -27,7 +27,7 @@
  */
 
 import os from "node:os";
-import { type ServeProvider, type ServeRouter } from "./client.js";
+import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
 import { type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
@@ -154,6 +154,8 @@ export interface ResearchError {
   exitAnalogue: number | null;
   model: string;
   tier?: PolicyTier;
+  /** Present ONLY on `empty-answer` (issue #168) — see `ConsultError.diagnostics`. */
+  diagnostics?: TurnDiagnostics;
 }
 
 export interface ResearchOk {
@@ -416,6 +418,7 @@ export async function research(
       model: requestedModel,
       exitAnalogue: null,
       message,
+      ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
     },
   };
   if (runId.length > 0) fail.runId = runId;
