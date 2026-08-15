@@ -7,7 +7,8 @@
  * oracle it was ported against retired at M12). No model is called.
  */
 
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -29,7 +30,7 @@ import {
   hardenedDefPresentIn,
 } from "../src/config.js";
 import { MESSAGE_HTTP_MS } from "../src/client.js";
-import { Checker } from "./harness.js";
+import { Checker, runBoundedProbe, srcSpecifier } from "./harness.js";
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m4cfg-"): string {
@@ -355,6 +356,107 @@ export async function run(): Promise<number> {
       t.check(
         dirsEnv.includes(globalAgentDir),
         "resolveAgentDefDirs: honors $XDG_CONFIG_HOME for the global dir",
+      );
+    }
+
+    // ---- issues #162 / #163: the stat predicate at a presence check --------------
+    //
+    // Two shapes of the same mistake. `existsSync` is TRUE for a FIFO, and the read that
+    // follows BLOCKS — which no `catch` reaches, so the process hangs rather than fails.
+    // `existsSync` is also TRUE for a DIRECTORY at an agent-def path, so the def pre-check
+    // passed and the real failure surfaced seconds later, mid-turn, out of opencode instead
+    // of as the clean `agent-def-missing` refusal this check exists to give.
+    //
+    // The predicate is `statSync().isFile()`: it FOLLOWS symlinks (so a def or conf file
+    // placed by a dotfiles manager still counts, exactly as opencode's own resolution and
+    // `open(2)` see it) and still rejects a directory, FIFO, socket or device.
+    //
+    // EVERY FIFO CASE BELOW RUNS IN A BOUNDED CHILD PROCESS (`runBoundedProbe`), and the
+    // reasoning is the one thing to get right here, because the obvious reading is wrong.
+    // It is TRUE that post-fix these predicates never open the FIFO, so an in-process call
+    // returns at once — and that is exactly what makes an in-process test useless. **The
+    // bite-check is a PRE-fix question.** Pre-fix the code DOES open the FIFO and DOES block,
+    // and a block is neither an exception nor a pending promise, so nothing in this process
+    // can interrupt it: the assertion would not go red, it would WEDGE THE SUITE and hand CI
+    // a timeout with no signal. A test only earns its place in the state where the bug exists.
+    // (The directory and symlink cases stay in-process: neither can block, whatever the code.)
+    {
+      const defDir = tmp("m4cfg-defshape-");
+      mkdirSync(defDir, { recursive: true });
+
+      // (a) #163 — a DIRECTORY standing where a def file should be is NOT "present".
+      mkdirSync(path.join(defDir, "guild-read.md"), { recursive: true });
+      t.check(
+        hardenedDefPresentIn("guild-read", [defDir]).present === false,
+        "def shape (#163): a DIRECTORY at an agent-def path is not present (was accepted, then failed mid-turn from opencode)",
+      );
+
+      // (b) #163 — the fail-open direction that must NOT regress: a symlink to a real def
+      // file IS present, because `stat` follows it and so does opencode.
+      const store = tmp("m4cfg-defstore-");
+      writeFileSync(path.join(store, "guild-build.md"), "---\nmode: all\n---\n");
+      symlinkSync(path.join(store, "guild-build.md"), path.join(defDir, "guild-build.md"));
+      const linked = hardenedDefPresentIn("guild-build", [defDir]);
+      t.check(
+        linked.present === true && linked.dir === defDir,
+        "def shape (#163): a SYMLINKED def file is present — the change is fail-closed, not a new refusal for dotfiles layouts",
+      );
+
+      // (c)+(d) #162 — a FIFO at `modelguild.conf.local`, and at the `$GUILD_CONF` single-FILE
+      // override, which bypasses the resolver's gate so the readers re-check the shape.
+      // (e) the fail-open direction: a SYMLINK to a real conf file still binds.
+      const confRoot = tmp("m4cfg-conffifo-");
+      execFileSync("mkfifo", [path.join(confRoot, "modelguild.conf.local")]);
+      const overrideFifo = path.join(tmp("m4cfg-confovr-"), "conf.fifo");
+      execFileSync("mkfifo", [overrideFifo]);
+      const confStore = tmp("m4cfg-confstore-");
+      writeFileSync(path.join(confStore, "real.conf"), "GUILD_MODEL=openai/from-a-link\n");
+      const linkedRoot = tmp("m4cfg-conflink-");
+      symlinkSync(path.join(confStore, "real.conf"), path.join(linkedRoot, "modelguild.conf.local"));
+
+      const confProbe = runBoundedProbe<{
+        resolved: string | null;
+        layeredCount: number;
+        contents: string;
+        layered: string;
+        ovrContents: string;
+        ovrLayered: string;
+        viaLink: string;
+      }>(
+        `import { confGet, resolveConfFile, resolveConfFiles, readConfContents, readLayeredConfContents } from ${srcSpecifier("config.ts")};\n` +
+          `const root = ${JSON.stringify(confRoot)};\n` +
+          `const linkRoot = ${JSON.stringify(linkedRoot)};\n` +
+          `const ovr = { GUILD_CONF: ${JSON.stringify(overrideFifo)} };\n` +
+          `console.log(JSON.stringify({\n` +
+          `  resolved: resolveConfFile(root, {}) ?? null,\n` +
+          `  layeredCount: resolveConfFiles([root], {}).length,\n` +
+          `  contents: readConfContents(root, {}),\n` +
+          `  layered: readLayeredConfContents([root], {}),\n` +
+          `  ovrContents: readConfContents(root, ovr),\n` +
+          `  ovrLayered: readLayeredConfContents([root], ovr),\n` +
+          `  viaLink: confGet(readConfContents(linkRoot, {}), "GUILD_MODEL"),\n` +
+          `}));\n`,
+      );
+
+      t.check(
+        !confProbe.timedOut,
+        "conf shape (#162): resolving and reading a FIFO-bearing root RETURNS (pre-fix this blocked forever, which is why it runs bounded)",
+      );
+      t.check(
+        confProbe.value?.resolved === null && confProbe.value?.layeredCount === 0,
+        `conf shape (#162): a FIFO at modelguild.conf.local resolves to NO config file, in either resolver (got ${JSON.stringify(confProbe.value?.resolved)}, ${confProbe.value?.layeredCount})`,
+      );
+      t.check(
+        confProbe.value?.contents === "" && confProbe.value?.layered === "",
+        "conf shape (#162): both readers answer 'no value' rather than opening it",
+      );
+      t.check(
+        confProbe.value?.ovrContents === "" && confProbe.value?.ovrLayered === "",
+        "conf shape (#162): a $GUILD_CONF override pointed at a FIFO reads as empty, not as a block",
+      );
+      t.check(
+        confProbe.value?.viaLink === "openai/from-a-link",
+        `conf shape (#162): a SYMLINKED modelguild.conf.local still binds (stat follows; lstat would have dropped it) (got ${JSON.stringify(confProbe.value?.viaLink)})`,
       );
     }
 

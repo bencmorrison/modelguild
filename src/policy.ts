@@ -19,6 +19,7 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
+import { isRegularFile } from "./fsguard.js";
 import path from "node:path";
 
 export type PolicyTier = "allow" | "ask" | "deny";
@@ -303,7 +304,13 @@ export function resolvePolicyLayers(
   for (const guildDir of guildDirs) {
     const local = path.join(guildDir, "models.policy.local");
     let localContents: string | undefined;
-    try { localContents = readFileSync(local, "utf8"); } catch { localContents = undefined; }
+    // The shape gate the committed file below (and `policyTierAcross`) already had, applied to
+    // the `.local` too (issue #162). It was the ONE unguarded read in this chain, so a FIFO at
+    // `models.policy.local` hung `doctor` forever while the same FIFO at `models.policy` merely
+    // contributed nothing — inconsistent within a single command, and a block no `catch` reaches.
+    if (isRegularFile(local)) {
+      try { localContents = readFileSync(local, "utf8"); } catch { localContents = undefined; }
+    }
     if (localContents !== undefined && hasRules(localContents)) {
       out.push({ file: local, source: "local", root: guildDir, exists: true });
     }

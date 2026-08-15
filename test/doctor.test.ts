@@ -22,10 +22,11 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Checker, repoRoot } from "./harness.js";
+import { Checker, repoRoot, runBounded } from "./harness.js";
 import { init, type ServerLaunch } from "../src/init.js";
 import { runDoctor } from "../src/cli.js";
 
@@ -666,6 +667,50 @@ async function runCases(): Promise<number> {
     sOk.out.includes("✓ model policy present (") && sOk.out.includes("✓ 3/3 hardened agent defs present in"),
     "(z) the passing forms are unchanged",
   );
+
+  // ---- (aa) issue #162: `doctor` RETURNS on a FIFO at any path it reads --------------------
+  //
+  // Four paths `doctor` opened behind an `existsSync`/no gate at all: `.mcp.json`,
+  // `modelguild.conf.local`, `models.policy.local`, and (the inconsistency that made the bug
+  // obvious) `models.policy`, which already stat-gated and so merely contributed nothing.
+  // The first three hung the process forever.
+  //
+  // THESE RUN IN A CHILD PROCESS UNDER A WALL-CLOCK BOUND, and that is the only way to write
+  // them: the defect is a BLOCKING synchronous read, which is neither an exception nor a
+  // pending promise, so nothing in this process could interrupt it. An in-process assertion
+  // would hang the suite on a regression — a CI timeout with no signal — rather than fail.
+  // `runBounded` hands the job to the OS: a regression is a killed child and a red line.
+  //
+  // PATH is shadowed the same way the rest of this suite shadows it, for the same reason and
+  // one more: `doctor` shells out to `claude mcp get`, and the Claude CLI in this dev
+  // container ALSO blocks when `$GUILD_CONF` points at a FIFO. Keeping it off PATH makes
+  // these cases a statement about ModelGuild rather than about the host's other tools.
+  {
+    const cliEntry = path.join(repoRoot, "src", "cli.ts");
+    // An ABSOLUTE `mkfifo`: this suite's PATH shadow is total, so a bare name would not
+    // resolve. Same candidate-list shape as `SHELL_TOOLS`, and loud if it is nowhere.
+    const mkfifoBin = ["/usr/bin/mkfifo", "/bin/mkfifo"].find((p) => existsSync(p));
+    if (mkfifoBin === undefined) throw new Error("doctor.test: no mkfifo found for the issue-#162 cases");
+    const stubPath = `${opencodeStub({ authList: AUTH_LIST.authed })}:${shellOnlyDir()}`;
+    const fifoCase = (label: string, rel: string): void => {
+      const dir = tempDir();
+      mkdirSync(path.join(dir, "modelguild"), { recursive: true });
+      execFileSync(mkfifoBin, [path.join(dir, rel)]);
+      const r = runBounded([cliEntry, "doctor", "--dir", dir], {
+        env: { ...process.env, PATH: stubPath, HOME: tempDir(), XDG_CONFIG_HOME: tempDir() },
+        timeoutMs: 60_000,
+      });
+      c.check(!r.timedOut, `(aa) doctor RETURNS with a FIFO at ${label} (it used to block forever)`);
+      c.check(
+        !r.timedOut && r.status !== null,
+        `(aa) ...with a real exit status rather than a signal (status ${r.status}, signal-killed=${r.timedOut})`,
+      );
+    };
+    fifoCase(".mcp.json", ".mcp.json");
+    fifoCase("modelguild/modelguild.conf.local", "modelguild/modelguild.conf.local");
+    fifoCase("modelguild/models.policy.local", "modelguild/models.policy.local");
+    fifoCase("modelguild/models.policy", "modelguild/models.policy"); // the one that never hung
+  }
 
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;

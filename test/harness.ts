@@ -5,6 +5,9 @@
  * offline: spawning `opencode serve` is free and allowed, but NO model is called.
  */
 
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ServeHandle } from "../src/lifecycle.js";
@@ -28,6 +31,104 @@ export const serverEntry = path.join(repoRoot, "src", "server.ts");
 let nextFakeInstanceId = 1;
 export function fakeServeHandle(baseUrl: string, pid = 0): ServeHandle {
   return { baseUrl, port: 0, pid, instanceId: nextFakeInstanceId++ };
+}
+
+/** The result of `runBounded`: `timedOut` is the assertion that matters most. */
+export interface BoundedRun {
+  /** True when the child had to be killed — i.e. it BLOCKED. */
+  timedOut: boolean;
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run a `.ts` entry point in a CHILD PROCESS under a hard wall-clock bound (issues #162/#163).
+ *
+ * WHY A CHILD PROCESS, and it is the whole point of this helper: the defect under test is a
+ * BLOCKING synchronous fs call — `readFileSync`/`writeFileSync` on a FIFO with no peer. A
+ * block is not an exception and not a pending promise, so nothing inside the test process can
+ * interrupt it: no `try/catch`, no `Promise.race`, no timer (the event loop never gets a turn).
+ * An in-process assertion would therefore not FAIL on a regression, it would HANG — and a suite
+ * that hangs gives CI a timeout with no signal, which is worse than having no test at all.
+ * Handing the work to a separate process makes the OS the arbiter: a regression is a killed
+ * child and a red line, in bounded time.
+ *
+ * `SIGKILL`, not the default `SIGTERM`: a process parked in a blocking `open(2)` should not be
+ * relied on to run a JS signal handler before it dies.
+ *
+ * Spawned as `node <tsx> <entry>` rather than through the `tsx` bin shim, so the child does not
+ * need `node` on its PATH — which lets a caller shadow PATH completely (as `doctor.test.ts`
+ * does) without breaking the spawn itself.
+ */
+export function runBounded(
+  args: string[],
+  opts: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number } = {},
+): BoundedRun {
+  const r = spawnSync(process.execPath, [tsxBin, ...args], {
+    encoding: "utf8",
+    timeout: opts.timeoutMs ?? 30_000,
+    killSignal: "SIGKILL",
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+  });
+  const err = r.error as NodeJS.ErrnoException | undefined;
+  return {
+    timedOut: err?.code === "ETIMEDOUT" || r.signal === "SIGKILL",
+    status: r.status,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+  };
+}
+
+/** `runBoundedProbe`'s result: `value` is `undefined` whenever the probe did not report. */
+export interface BoundedProbe<T> extends BoundedRun {
+  value: T | undefined;
+}
+
+/**
+ * Evaluate a snippet of TypeScript against `src/` in a bounded CHILD PROCESS and bring its
+ * answer back as JSON (issues #162/#163).
+ *
+ * `runBounded` bounds a whole CLI invocation; this bounds a LIBRARY-LEVEL assertion, which is
+ * what the config- and policy-layer cases need — they are about `resolveConfFile`,
+ * `readLayeredConfContents`, `resolvePolicyLayers` and friends, not about `doctor`'s output.
+ *
+ * WHY THEY CANNOT SIMPLY RUN IN-PROCESS, stated because I got this wrong once and the wrong
+ * reasoning was written into the file: **the bite-check is a PRE-fix question.** Post-fix these
+ * predicates never open the FIFO, so an in-process call returns instantly — which is exactly
+ * what makes an in-process test worthless. Pre-fix the code DOES open it and DOES block, so on
+ * a regression the assertion cannot go red: it wedges the suite, and CI reports a timeout with
+ * no signal. A test is only a test in the state where the bug is present. Every FIFO assertion
+ * therefore runs where the OS can kill it.
+ *
+ * The snippet is written to a temp file and imports `src/` by ABSOLUTE specifier, so it does
+ * not depend on where the temp file landed. It must `console.log` exactly one JSON value; the
+ * last non-empty stdout line is parsed. A probe that blocked, crashed, or printed nothing
+ * yields `value: undefined`, so a caller that forgets to check `timedOut` still fails rather
+ * than silently passing on absent data.
+ */
+export function runBoundedProbe<T = unknown>(
+  source: string,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): BoundedProbe<T> {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "mg-probe-"));
+  const file = path.join(dir, "probe.ts");
+  writeFileSync(file, source);
+  const run = runBounded([file], opts);
+  const lines = run.stdout.split("\n").filter((l) => l.trim().length > 0);
+  let value: T | undefined;
+  try {
+    value = lines.length > 0 ? (JSON.parse(lines[lines.length - 1]) as T) : undefined;
+  } catch {
+    value = undefined;
+  }
+  return { ...run, value };
+}
+
+/** Absolute import specifier for a `src/` module, for use inside a `runBoundedProbe` snippet. */
+export function srcSpecifier(rel: string): string {
+  return JSON.stringify(path.join(repoRoot, "src", rel));
 }
 
 /** A single test file's pass/fail accounting. */

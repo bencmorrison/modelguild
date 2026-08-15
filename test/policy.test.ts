@@ -11,8 +11,8 @@
  * edges match bash's own matcher, not minimatch.
  */
 
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -25,7 +25,7 @@ import {
   policyTierAcross,
   type PolicyTier,
 } from "../src/policy.js";
-import { Checker } from "./harness.js";
+import { Checker, runBoundedProbe, srcSpecifier } from "./harness.js";
 
 const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
@@ -425,6 +425,57 @@ export async function run(): Promise<number> {
       `policy corpus: ${crossAgree}/${crossChecks} cases match the expected tier, 0 mismatches`);
     console.log(`    [policy corpus] ${scenarios.length} scenarios, ${crossChecks} model×policy checks`);
     console.log(`    [glob corpus] ${globChecks} pattern×subject cross-checks against bash \`case\``);
+
+    // ---- issue #162: the ONE unguarded read in the policy chain ------------------
+    //
+    // `policyTierAcross` has always stat-gated each layer before reading it, and
+    // `resolvePolicyLayers` stat-gated the COMMITTED file — but it read the `.local` outright
+    // to run the `_has_rules` gate. So a FIFO at `models.policy` merely contributed nothing
+    // while the same FIFO at `models.policy.local` blocked forever: inconsistent within a
+    // single `doctor` run, and a block no `catch` can reach. Same predicate now.
+    //
+    // IT RUNS IN A BOUNDED CHILD PROCESS, and the reason is a pre-fix fact, not a post-fix
+    // one: post-fix nothing here opens the FIFO, but the check is only meaningful in the state
+    // where the bug exists — and there `resolvePolicyLayers` DOES open it and blocks. A block
+    // is not catchable and not interruptible, so an in-process assertion could never go red;
+    // it would wedge the suite and leave CI with a bare timeout. The OS is the only arbiter.
+    {
+      const fifoRoot = tmp("m4pol-fifo-");
+      execFileSync("mkfifo", [path.join(fifoRoot, "models.policy.local")]);
+      const store = tmp("m4pol-store-");
+      writeFileSync(path.join(store, "real.policy"), "deny openai/*\n");
+      const linkRoot = tmp("m4pol-link-");
+      symlinkSync(path.join(store, "real.policy"), path.join(linkRoot, "models.policy.local"));
+
+      const probe = runBoundedProbe<{ sources: string[]; fifoTier: string; linkTier: string }>(
+        `import { resolvePolicyLayers, policyTierAcross } from ${srcSpecifier("policy.ts")};\n` +
+          `const fifoRoot = ${JSON.stringify(fifoRoot)};\n` +
+          `const linkRoot = ${JSON.stringify(linkRoot)};\n` +
+          `console.log(JSON.stringify({\n` +
+          `  sources: resolvePolicyLayers([fifoRoot], {}).map((l) => l.source),\n` +
+          `  fifoTier: policyTierAcross("openai/gpt-5", { guildDirs: [fifoRoot], env: {} }).tier,\n` +
+          `  linkTier: policyTierAcross("openai/gpt-5", { guildDirs: [linkRoot], env: {} }).tier,\n` +
+          `}));\n`,
+      );
+
+      t.check(
+        !probe.timedOut,
+        "policy shape (#162): resolving a root with a FIFO at models.policy.local RETURNS (pre-fix this blocked forever, which is why it runs bounded)",
+      );
+      t.check(
+        probe.value !== undefined && !probe.value.sources.includes("local"),
+        `policy shape (#162): a FIFO at models.policy.local contributes NO layer (got ${JSON.stringify(probe.value?.sources)})`,
+      );
+      t.check(
+        probe.value?.fifoTier === "allow",
+        `policy shape (#162): and the chain resolves normally around it — the same answer a FIFO at models.policy already gave (got ${probe.value?.fifoTier})`,
+      );
+      // Fail-open direction: a SYMLINKED `.local` still binds, because `stat` follows it.
+      t.check(
+        probe.value?.linkTier === "deny",
+        `policy shape (#162): a SYMLINKED models.policy.local still binds (stat follows; lstat would have dropped it) (got ${probe.value?.linkTier})`,
+      );
+    }
   } finally {
     cleanup();
   }
