@@ -138,23 +138,33 @@ function runInit(argv: string[]): number {
   const res = init({ targetDir, packageRoot: PACKAGE_ROOT, serverLaunch: launch, uninstall, writeMcp, global });
   const g = resolveGlobalDirs({});
 
+  // A BLOCKED ITEM MAKES THIS RUN FAIL (issue #164). `runInit` used to return 0 unconditionally,
+  // so an install that placed none of the 8 slash commands was indistinguishable — to
+  // `install.sh`, which execs into this and propagates its status, or to any CI wrapper — from a
+  // complete one. `res.blocked` is the mechanical "does this destination resolve to a regular
+  // file?" answer, so a never-clobber skip (the ownership model working as designed) stays exit
+  // 0 while a piece that simply is not there does not. The headline says so too: "Installed"
+  // over a payload missing an agent def is the framing that misled, and C16 makes that install
+  // non-functional rather than merely incomplete.
+  const incomplete = res.blocked.length > 0;
+  const mark = incomplete ? " — INCOMPLETE" : "";
   if (uninstall) {
     if (global) {
-      console.log("Uninstalled ModelGuild (MCP) GLOBAL payload");
+      console.log(`Uninstalled ModelGuild (MCP) GLOBAL payload${mark}`);
       console.log(`  removed ${res.removed.length} file(s) from your global config`);
     } else {
-      console.log(`Uninstalled ModelGuild (MCP) from ${targetDir}`);
+      console.log(`Uninstalled ModelGuild (MCP) from ${targetDir}${mark}`);
       console.log(`  removed ${res.removed.length} file(s); .mcp.json ${res.mcpAction}`);
     }
   } else if (global) {
-    console.log("Installed ModelGuild (MCP) GLOBAL payload — available in EVERY project");
+    console.log(`Installed ModelGuild (MCP) GLOBAL payload — available in EVERY project${mark}`);
     console.log(`  ${res.installed.length} file(s) written, ${res.skipped.length} skipped`);
     console.log(`  commands: ${path.join(g.homeDir, ".claude", "commands", "guild")}/`);
     console.log(`  agents:   ${path.join(g.xdgConfigHome, "opencode", "agent")}/`);
     console.log(`  policy:   ${path.join(g.homeDir, ".claude", "modelguild")}/`);
     console.log(`  .mcp.json: NOT written — register the server globally yourself (see below).`);
   } else {
-    console.log(`Installed ModelGuild (MCP) into ${targetDir}`);
+    console.log(`Installed ModelGuild (MCP) into ${targetDir}${mark}`);
     console.log(`  ${res.installed.length} file(s) written, ${res.skipped.length} skipped`);
     if (writeMcp) {
       console.log(`  .mcp.json: ${res.mcpAction} — server key 'modelguild'`);
@@ -191,7 +201,14 @@ function runInit(argv: string[]): number {
     console.log("  3. Restart Claude Code so it picks up the MCP server.");
     console.log(`  4. Check the setup:        npx modelguild doctor${global ? " --global" : ""}`);
   }
-  return 0;
+  if (incomplete) {
+    console.warn(
+      `  ! ${res.blocked.length} item(s) could not be ${uninstall ? "removed" : "installed"} — ` +
+        `${res.blocked.join(", ")}. See the warnings above for each; exit status is 1 so a script ` +
+        `can tell this run from a complete one.`,
+    );
+  }
+  return incomplete ? 1 : 0;
 }
 
 /**
