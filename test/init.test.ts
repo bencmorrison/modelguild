@@ -2447,6 +2447,102 @@ export async function run(): Promise<number> {
       );
     }
 
+    // --- #179: an UNREADABLE regular `.gitignore` must degrade, not throw --------
+    // The second escape from "an install refuses early or not at all", and the reason C79 could
+    // not restate that invariant in its strong form after #174. `isRegularFile` answers SHAPE,
+    // not PERMISSION, so a mode-000 `.gitignore` passed the gate and `readFileSync` threw an
+    // EACCES from the same position #174's throw came from — payload AND ownership record
+    // already on disk, exit 1, a bare errno with no path context and no remedy. `mode 444` (the
+    // common shape) already degraded, from the WRITE; these are one class and take one branch.
+    // `initScored` again: pre-fix `init()` THROWS here, and it must score red rather than abort
+    // the suite.
+    // NOTE: the fixture only bites as a non-root uid — root reads a mode-000 file regardless.
+    {
+      const P = tempProject();
+      const gip = path.join(P, ".gitignore");
+      writeFileSync(gip, "node_modules/\n");
+      execFileSync("chmod", ["000", gip]);
+      const r = initScored(c, "#179: install over an unreadable .gitignore", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH,
+      });
+      c.check(
+        r.installed.length === N_PAYLOAD,
+        `#179: the whole payload is installed (got ${r.installed.length} of ${N_PAYLOAD}) — pre-fix this THREW`,
+      );
+      c.check(
+        recordedFileCount(path.join(P, "modelguild/.modelguild-install.json")) === N_PAYLOAD,
+        "#179: and the ownership record accounts for it",
+      );
+      c.check(
+        (r.blocked ?? []).includes(".gitignore"),
+        `#179: a write it ATTEMPTED and failed is blocked, not policy (got blocked=[${(r.blocked ?? []).join(", ")}])`,
+      );
+      c.check(
+        r.warnings.some(
+          (w) => w.includes("could not read") && w.includes(gip) && w.includes("EACCES") && w.includes("modelguild/logs/"),
+        ),
+        `#179: the warning names the path, the errno and the rules to add by hand (got: ${r.warnings.join(" | ").slice(-300)})`,
+      );
+
+      // Through the CLI, because the bare errno and the missing remedy are the user-visible half.
+      const P2 = tempProject();
+      const gip2 = path.join(P2, ".gitignore");
+      writeFileSync(gip2, "node_modules/\n");
+      execFileSync("chmod", ["000", gip2]);
+      const rc = runBounded([path.join(repoRoot, "src/cli.ts"), "init", "--dir", P2], { timeoutMs: 60_000 });
+      const out = rc.stdout + rc.stderr;
+      c.check(!rc.timedOut, "#179: the CLI install RETURNS");
+      c.check(rc.status === 1, `#179: and exits 1 — the write failed, so this is blocked (got ${rc.status})`);
+      c.check(
+        out.includes("could not read") && out.includes("could not be installed"),
+        `#179: it explains what could not be done rather than printing a bare errno (got: ${out.slice(-300)})`,
+      );
+      c.check(
+        !/^modelguild: EACCES/m.test(out),
+        `#179: no uncaught errno line (got: ${out.slice(-200)})`,
+      );
+      c.check(
+        recordedFileCount(path.join(P2, "modelguild/.modelguild-install.json")) === N_PAYLOAD,
+        "#179: the CLI run still leaves a complete ownership record",
+      );
+
+      // The WRITE side of the same class — a read-only (444) `.gitignore`, which is the COMMON
+      // shape and already degraded correctly. It must land in the same bucket AND carry the same
+      // sensitivity disclosure: `modelguild/logs/` holds the raw prompts and responses of every
+      // model call, and C79 names not ignoring it as the stated cost of this whole branch. The
+      // read warning carried that line and the older write warning did not, which made the more
+      // common of the two the one missing it.
+      const P3 = tempProject();
+      const gip3 = path.join(P3, ".gitignore");
+      writeFileSync(gip3, "node_modules/\n");
+      execFileSync("chmod", ["444", gip3]);
+      const r3 = initScored(c, "#179: install over a read-only .gitignore", {
+        targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH,
+      });
+      c.check(
+        r3.installed.length === N_PAYLOAD && (r3.blocked ?? []).includes(".gitignore"),
+        `#179: 444 and 000 are one class in one bucket (got ${r3.installed.length}, blocked=[${(r3.blocked ?? []).join(", ")}])`,
+      );
+      c.check(
+        r3.warnings.some(
+          (w) => w.includes("could not write") && w.includes("raw prompts and responses of every model call"),
+        ),
+        `#179: and the WRITE warning carries the same sensitivity disclosure the read one does (got: ${r3.warnings.join(" | ").slice(-300)})`,
+      );
+      execFileSync("chmod", ["644", gip3]);
+
+      // Repairable: fix the cause, re-run, clean.
+      execFileSync("chmod", ["644", gip]);
+      const rb = initScored(c, "#179: retry after fixing the cause", {
+        targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH,
+      });
+      c.check(
+        (rb.blocked ?? []).length === 0 && readFileSync(gip, "utf8").includes("ModelGuild >>>"),
+        `#179: a retry adds the block and clears the blocked entry (got blocked=[${(rb.blocked ?? []).join(", ")}])`,
+      );
+      execFileSync("chmod", ["644", gip2]);
+    }
+
     // --- #175: `doctor`'s presence check and C16's refusal must agree ------
     // `locatePayload` used a bare `existsSync`, which is TRUE for a DIRECTORY — so `doctor`
     // printed `✓ 3/3 hardened agent defs present` for a repo where `hardenedDefPresentIn` says
