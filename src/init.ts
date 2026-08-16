@@ -130,12 +130,24 @@
  * TWO RULES, and they point in opposite directions on purpose.
  *   INSTALL refuses EARLY or not at all. `planFor` resolves every payload destination, the
  *   ownership record and — under `--write-mcp` — `.mcp.json` BEFORE the loop, so a refusal costs
- *   nothing and leaves nothing. After that point nothing may throw: a per-file failure is a
- *   warning-and-skip, and the ancillary writes (`.gitignore`, which is deliberately NOT resolved
- *   in `planFor`, and `.mcp.json`) degrade the same way, so the run always reaches `writeRecords`
- *   and always leaves a record accounting for what it placed. `.gitignore` did NOT degrade until
- *   issue #174: `addGitignoreBlock` opened with `safeJoin`, which throws at a live leaf symlink,
- *   so a complete install exited 1 saying `Nothing was installed.`
+ *   nothing and leaves nothing. After that point nothing may throw UNTIL `writeRecords` (the form
+ *   the call site at the install loop states): a per-file failure is a warning-and-skip, and the
+ *   ancillary writes (`.gitignore`, which is deliberately NOT resolved in `planFor`, and
+ *   `.mcp.json`) degrade the same way, so the run always reaches `writeRecords`. `writeRecords`
+ *   ITSELF IS THE ONE DELIBERATE THROW AND IT STAYS ONE — an install with no ownership record IS
+ *   a failed install, and dressing that as a warning would hide the state that matters — so the
+ *   run leaves a record accounting for what it placed WHENEVER THE RECORD CAN BE WRITTEN AT ALL.
+ *   `planFor` refuses the predictable link and non-regular shapes; an EACCES on the record path or
+ *   its directory, ENOSPC, EROFS or a race still throws with the payload already on disk
+ *   (reproduced: an existing record at mode 444, which passes both eager gates because it IS a
+ *   regular file and IS not a link; and a `modelguild/` at mode 555, where the recursive
+ *   `mkdirSync` no-ops and the EACCES lands on the write).
+ *   `.gitignore` is the ancillary write that escaped the pre-`writeRecords` half of that rule
+ *   TWICE, and both are now closed: issue #174 — `addGitignoreBlock` opened with `safeJoin`, which
+ *   throws at a live leaf symlink, so a complete install exited 1 saying `Nothing was installed.`
+ *   — and issue #179, where the surviving unguarded `readFileSync` threw an EACCES from the same
+ *   position on a regular `.gitignore` the process could not read, because a shape gate answers
+ *   shape and not permission.
  *   UNINSTALL NEVER REFUSES. Its job is removal, and an ancillary file — or one unreadable
  *   payload file — must not hold the payload hostage. Every failure there is a warning and the
  *   removal continues.
@@ -1617,6 +1629,16 @@ function stripGitignoreBlock(text: string): string {
  * read-only `.gitignore` — is not knowable before the write and must not turn a complete
  * install into a total failure. It is a warning, never a throw.
  *
+ * THE READ IS GUARDED FOR THAT SAME REASON, AND IT WAS NOT UNTIL ISSUE #179 — the second escape
+ * that kept C79's strong invariant unstated. `isRegularFile` answers SHAPE, not PERMISSION, so a
+ * regular `.gitignore` this process cannot READ passes the gate above and the read threw from the
+ * same position the #174 throw came from: payload and ownership record already on disk, exit 1,
+ * a bare errno with no path context and no remedy, identically on every re-run. `mode 000`
+ * reaches it; `mode 444` — the common shape — already degraded correctly, from the WRITE. Those
+ * two are one class (an EACCES on a read-modify-write of a regular file, learnable only by
+ * trying), so they take one branch: `blocked`, not policy. `stripGitignoreOnly` has had the
+ * identical read inside a `try` since #161; this is the install side catching up to it.
+ *
  * THE TWO OUTCOMES ARE NOT THE SAME KIND, and only one of them is `blocked` (issue #164). A
  * shape we DECLINE to write is policy — the same judgement C78 makes above, and the same
  * judgement never-clobber makes about a payload file — so it stays exit 0. A write that FAILED
@@ -1661,12 +1683,28 @@ function addGitignoreBlock(targetDir: string): { warning?: string; blocked?: boo
       warning: `skipping the .gitignore block — ${p} is not a regular file; add it by hand if you want it.`,
     };
   }
-  let text = isRegularFile(p) ? readFileSync(p, "utf8") : "";
-  text = stripGitignoreBlock(text); // idempotent — never double-add
-  if (text.length > 0 && !text.endsWith("\n")) text += "\n";
-  if (text.length > 0) text += "\n";
-  text += GITIGNORE_BODY;
+  let text: string;
   try {
+    // The shape gate above says this is a regular file; it does NOT say it is readable (#179).
+    text = isRegularFile(p) ? readFileSync(p, "utf8") : "";
+  } catch (err) {
+    return {
+      blocked: true,
+      warning:
+        `could not read ${p} to add the ModelGuild block (${errCode(err)}) — everything else was ` +
+        `installed. Add \`modelguild/logs/\`, \`modelguild/models.policy.local\` and ` +
+        `\`modelguild/modelguild.conf.local\` to your ignore rules by hand (that first one holds ` +
+        `the raw prompts and responses of every model call), or fix that file and re-run init.`,
+    };
+  }
+  try {
+    // Inside the try with the write, not between the two: appending to a string the read only
+    // just proved fits raises a `RangeError` at V8's max string length, which is not an errno
+    // but is still a throw, and this function may not have one anywhere.
+    text = stripGitignoreBlock(text); // idempotent — never double-add
+    if (text.length > 0 && !text.endsWith("\n")) text += "\n";
+    if (text.length > 0) text += "\n";
+    text += GITIGNORE_BODY;
     writeFileSync(p, text);
   } catch (err) {
     return {
@@ -1674,8 +1712,8 @@ function addGitignoreBlock(targetDir: string): { warning?: string; blocked?: boo
       warning:
         `could not write the ModelGuild block into ${p} (${errCode(err)}) — everything else was ` +
         `installed. Add \`modelguild/logs/\`, \`modelguild/models.policy.local\` and ` +
-        `\`modelguild/modelguild.conf.local\` to your ignore rules by hand, or fix that file and ` +
-        `re-run init.`,
+        `\`modelguild/modelguild.conf.local\` to your ignore rules by hand (that first one holds ` +
+        `the raw prompts and responses of every model call), or fix that file and re-run init.`,
     };
   }
   return {};
