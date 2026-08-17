@@ -299,6 +299,10 @@ export function formatSkewNote(opts: {
   for (const s of shown) {
     out.push(`${indent}    ${s.dest}`);
     out.push(`${indent}      diff "${s.shippedPath}" "${s.installedPath}"`);
+    // A SYMLINKED DESTINATION IS ANNOTATED HERE, not left to the remedy below, because the
+    // remedy is per-list and this fact is per-file: one stowed file among twelve ordinary ones
+    // must not silently disqualify the whole `init` advice, and must not silently inherit it.
+    if (s.linkTarget) out.push(`${indent}      ↳ symlink to ${s.linkTarget}`);
   }
   if (shown.length < n) out.push(`${indent}    … and ${n - shown.length} more`);
   // DIRECTION IS NOT CLAIMED, because two hashes cannot carry it. The ownership record holds
@@ -329,6 +333,51 @@ export function formatSkewNote(opts: {
           `version could not be read, so the command cannot be pinned to it: that installs the ` +
           `LATEST payload, which converges only if this server is the latest release.`,
   );
+  // …EXCEPT FOR THE ONES `init` CANNOT REWRITE, WHICH IS THE WHOLE REASON THIS BRANCH EXISTS.
+  // The sentence above ends "init rewrites them in place" — true because skew is by definition
+  // bytes that pass the ownership check. It is NOT true for a destination that is a symlink:
+  // `init` does not write through one, so it skips the file, reports `installed=0`, `blocked=[]`
+  // and exits 0, and the next `doctor` prints this same note again. Detection was right, the
+  // remedy was false, and the two surfaces gave no way to tell which to believe.
+  //
+  // The stow/chezmoi per-file layout produces exactly this (probed on GNU stow 2.4.1: `stow
+  // --adopt` over an existing install leaves a link at every payload path), so it is a real
+  // layout rather than a hypothetical one.
+  //
+  // NOTHING HERE FIXES IT — the two routes named are the user's, and both are theirs to choose:
+  // the store copy is in a repository they manage, and removing the link changes a layout they
+  // set up. This says which files, where the bytes really live, and what would work.
+  //
+  // THE COUNT IS OVER ALL SKEWED FILES; THE ↳ MARKERS ARE ONLY OVER THE SHOWN ONES — and the two
+  // sets are NOT the same, which is the whole reason this reads as three cases. `maxFiles` caps
+  // the list above (the start-up notice passes 8 against a 13-file payload; `doctor` passes
+  // Infinity and never truncates), so a linked file can be counted here and be sitting inside the
+  // "… and N more" with no ↳ anywhere. An earlier cut said flatly "each one listed above carries
+  // a ↳", which was FALSE exactly then — reachable in the layout that motivated this, since
+  // `~/.claude` and `<xdg>/opencode` are separate stow packages and stowing only the opencode
+  // half puts every linked file past the cap.
+  //
+  // COUNT OVER ALL, NEVER OVER `shown`: undercounting would silently drop the caveat and leave
+  // "init rewrites them in place" standing unqualified, which is the direction that misleads.
+  // The remedy for the truncated case is named rather than implied — `doctor` lists them all.
+  const linkedShown = shown.filter((s) => s.linkTarget).length;
+  const linkedTotal = opts.skewed.filter((s) => s.linkTarget).length;
+  if (linkedTotal > 0) {
+    out.push(
+      `${indent}  …EXCEPT ${linkedTotal} of them, whose destination is a SYMLINK: init does not ` +
+        `write through a symlink, so it will skip those and this note will not clear. ` +
+        (linkedShown === linkedTotal
+          ? `Each is marked ↳ above with the file its bytes really live in. `
+          : linkedShown > 0
+            ? `${linkedShown} of them are marked ↳ above; the other ${linkedTotal - linkedShown} ` +
+              `are inside the "… and more" and are not named here — \`npx modelguild doctor\` ` +
+              `lists every file without truncating. `
+            : `None are in the list above — they are all inside the "… and more". \`npx ` +
+              `modelguild doctor\` lists every file without truncating. `) +
+        `Update the file each link points at, or remove the link and re-run init — which then ` +
+        `writes a regular file there, so a dotfiles layout would need re-adopting.`,
+    );
+  }
   if (opts.unsolicited) {
     out.push(
       `${indent}  This appears once per server version, and again when the list above or the ` +
