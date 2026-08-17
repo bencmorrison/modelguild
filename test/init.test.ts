@@ -39,7 +39,13 @@ import {
   type ServerLaunch,
 } from "../src/init.js";
 import { hardenedDefPresentIn } from "../src/config.js";
-import { emitPayloadSkewNotice, noticeStatePath, payloadFingerprint, readNoticeState } from "../src/notice.js";
+import {
+  emitPayloadSkewNotice,
+  formatSkewNote,
+  noticeStatePath,
+  payloadFingerprint,
+  readNoticeState,
+} from "../src/notice.js";
 
 // The shipped default launch line: portable, non-interactive npx form.
 const LAUNCH: ServerLaunch = { command: "npx", args: ["-y", "modelguild", "serve"] };
@@ -1124,10 +1130,9 @@ export async function run(): Promise<number> {
     );
   }
 
-  // A LEAF payload-file symlink is settled by the OWNERSHIP RULE (issue #165, C80), so a link
-  // whose bytes are NOT ours is skipped with a warning — never written through, never a throw:
-  // the install completes and still writes the ownership record. A DANGLING link has no bytes at
-  // all, so it cannot match and is skipped by the same rule.
+  // A LEAF payload-file symlink is SKIPPED with a warning — never written through, never a
+  // throw: the install completes and still writes the ownership record. Both the live and the
+  // DANGLING link (which `existsSync` calls absent) take that same path.
   {
     const leafHome = tempProject();
     const leafXdg = tempProject();
@@ -1162,22 +1167,24 @@ export async function run(): Promise<number> {
       resLeaf.skipped.includes(".claude/commands/guild/consult.md") && resLeaf.skipped.includes(".opencode/agent/guild-read.md"),
       `symlink leaf: both linked destinations are reported skipped (got ${resLeaf.skipped.join(", ")})`,
     );
+    // THE SKIP NAMES THE LINK, ITS TARGET AND THE REMEDY. The old text was `a non-file exists
+    // at <path>`, which is false to a reader here: the thing behind the link IS a regular file,
+    // every runtime consumer reads it, and `doctor`'s C72 scan reads it too — which is how the
+    // product came to say "run `npx modelguild init`" on one surface while this one declined to
+    // act. The rule is unchanged; only what it tells you is.
+    const liveSkip = resLeaf.warnings.find((w) => w.startsWith("skipping .claude/commands/guild/consult.md")) ?? "";
     c.check(
-      resLeaf.warnings.includes(
-        `skipping .claude/commands/guild/consult.md — a file you already have is there; left untouched ` +
-          `(${path.join(leafHome, ".claude/commands/guild/consult.md")} is a symlink to ${kept}).`,
-      ),
-      `symlink leaf: the live NOT-OURS link is never-clobbered and the warning names the link AND its ` +
-        `target — "I left your file alone" has to point at the file (got ${resLeaf.warnings.join(" | ")})`,
+      liveSkip.includes(`${path.join(leafHome, ".claude/commands/guild/consult.md")} is a symlink to ${kept}`) &&
+        liveSkip.includes("init does not write through a symlink") &&
+        liveSkip.includes(`Neither the link nor ${kept} was touched`),
+      `symlink leaf: the live link names link, target and remedy (got ${liveSkip || "<none>"})`,
     );
+    const danglingSkip = resLeaf.warnings.find((w) => w.startsWith("skipping .opencode/agent/guild-read.md")) ?? "";
     c.check(
-      resLeaf.warnings.includes(
-        `skipping .opencode/agent/guild-read.md — ${path.join(leafXdg, "opencode/agent/guild-read.md")} ` +
-          `is a symlink to ${missing}, which is not a regular file (missing, a directory, or a FIFO); ` +
-          `left untouched. A leaf link is followed only when the bytes behind it are ones init recorded, ` +
-          `and there are none.`,
-      ),
-      `symlink leaf: the DANGLING link warns by name rather than being written through (got ${resLeaf.warnings.join(" | ")})`,
+      danglingSkip.includes(`${path.join(leafXdg, "opencode/agent/guild-read.md")} is a symlink to ${missing}`) &&
+        danglingSkip.includes("DANGLING") &&
+        danglingSkip.includes(`nothing was created there`),
+      `symlink leaf: the DANGLING link says so rather than claiming a target was left alone (got ${danglingSkip || "<none>"})`,
     );
     c.check(readFileSync(kept, "utf8") === "MY OWN FILE\n", "symlink leaf: the live link's target is not overwritten");
     c.check(!existsSync(missing), "symlink leaf: the dangling link's target is NOT created by the write");
@@ -1185,354 +1192,201 @@ export async function run(): Promise<number> {
       existsSync(path.join(storeClaude, "modelguild/.modelguild-install.json")),
       "symlink leaf: a skipped leaf does not stop the ownership record being written",
     );
-    // C79 is untouched by C80, in BOTH directions and for opposite reasons: a live link to a
-    // regular file RESOLVES, so a never-clobber skip is still exit 0; a dangling one resolves to
-    // nothing, so that payload piece really is missing and the run is exit 1.
-    c.check(
-      !(resLeaf.blocked ?? []).includes(".claude/commands/guild/consult.md") &&
-        (resLeaf.blocked ?? []).includes(".opencode/agent/guild-read.md"),
-      `symlink leaf: C79 blocked = the DANGLING leaf only (got ${JSON.stringify(resLeaf.blocked ?? [])})`,
-    );
   }
 
-  // ISSUE #165 / C80 — THE PER-FILE (stow/chezmoi) LAYOUT UPGRADES.
+  // DETECTION AND REMEDY MUST AGREE ABOUT A STOWED PAYLOAD FILE.
   //
-  // The defect this replaces: a payload file the user has since stowed — the real bytes moved
-  // into a dotfiles store, a symlink left at the destination — was skipped as "a non-file", so
-  // the store copy stayed on whatever release wrote it, FOREVER, while `doctor` kept reporting it
-  // as skew and naming `npx modelguild init` as the fix. Reproduced on the pre-fix code:
-  // installed=0, blocked=[], exit 0, store copy unchanged.
+  // The defect, end to end and reproduced before this was written: install, then adopt one
+  // payload file into a dotfiles store (GNU stow 2.4.1's `stow --adopt` over an existing
+  // install produces exactly this — the bytes move to the store, a leaf symlink is left at the
+  // destination; probed, not assumed). The release then moves on. `scanPayload` reads THROUGH
+  // the link (C78's `stat`, issue #163) and correctly classifies the file as C72 SKEW, whose
+  // remedy sentence is "these files are unedited, so init rewrites them in place" — and `init`
+  // does not write through a symlink, so it skips: `installed=0`, `blocked=[]`, exit 0, the
+  // store copy unchanged, and the next `doctor` printing the same note. Forever.
   //
-  // These cases are BEHAVIOURAL — they assert the bytes in the store, not just the result shape —
-  // because "followed the link" and "wrote beside the link" produce identical `installed` lists.
+  // BEHAVIOURAL, and it asserts BOTH SURFACES in one fixture, because that is the property: the
+  // classification is right and stays, and the advice each surface prints has to match what the
+  // other one will actually do.
   {
-    const V1 = fakePackage("1.0.0");
-    const V2 = fakePackage("2.0.0", bumpConsult);
-    const CONSULT_REL = ".claude/commands/guild/consult.md";
-    const v2Bytes = readFileSync(path.join(V2, CONSULT_REL), "utf8");
-
-    // (a) OURS ⇒ WRITTEN THROUGH. Install v1 as real files, then stow one of them (rename into a
-    //     store, symlink the destination at it — `stow --adopt`, chezmoi's `symlink_`), then
-    //     install v2. The bytes behind the link still hash to what the record says init wrote.
     const H = tempProject();
     const X = tempProject();
-    const STORE = tempProject();
-    initScored(c, "C80: seed v1", {
-      targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-    });
-    const dest = path.join(H, CONSULT_REL);
-    const stowed = path.join(STORE, "consult.md");
-    renameSync(dest, stowed);
-    symlinkSync(stowed, dest);
+    const store = tempProject();
+    const dirs = resolveGlobalDirs({ homeDir: H, xdgConfigHome: X, env: {} });
 
-    const up = initScored(c, "C80: upgrade over a stowed leaf link", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-    });
-    c.check(
-      up.installed.includes(CONSULT_REL) && !up.skipped.includes(CONSULT_REL),
-      `C80: a stowed leaf whose bytes are OURS is installed, not skipped (installed=${JSON.stringify(up.installed)} skipped=${JSON.stringify(up.skipped)})`,
-    );
-    c.check(
-      readFileSync(stowed, "utf8") === v2Bytes,
-      "C80: the write goes THROUGH the link — the dotfiles store copy is upgraded to v2",
-    );
-    c.check(
-      lstatSync(dest).isSymbolicLink(),
-      "C80: the link itself survives — init writes through it, it does not replace it with a regular file",
-    );
-    c.check(
-      (up.blocked ?? []).length === 0,
-      `C80: an upgraded stow layout is a clean run (blocked=${JSON.stringify(up.blocked ?? [])})`,
-    );
-    c.check(
-      up.warnings.some((w) => w.startsWith(`wrote ${CONSULT_REL} THROUGH the symlink at ${dest} —`) && w.includes(stowed)),
-      `C80: the write-through is SURFACED, naming the link and where the bytes landed (got ${up.warnings.join(" | ")})`,
-    );
-    // THE BOUND, ASSERTED IN THE PRODUCT'S OWN WORDS: the check that authorized this is freshness,
-    // not authority, and the message has to keep saying so — "ownership" reads as more than it is.
-    c.check(
-      up.warnings.some((w) => w.includes("FRESHNESS check, not an authorization check")),
-      "C80: the write-through warning states that the hash is a freshness check, not an authorization check",
-    );
-    // Idempotence: a second run against the SAME release writes nothing and so says nothing.
-    const again = initScored(c, "C80: idempotent re-run over the link", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-    });
-    c.check(
-      !again.installed.includes(CONSULT_REL) && !again.warnings.some((w) => w.includes("THROUGH the symlink")),
-      `C80: equal bytes ⇒ no write and no repeated warning (installed=${JSON.stringify(again.installed)})`,
-    );
-
-    // (b) UNINSTALL removes the LINK, leaves the TARGET, and names it.
-    const un = initScored(c, "C80: uninstall through a stowed leaf link", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X, uninstall: true,
-    });
-    c.check(un.removed.includes(CONSULT_REL), `C80: the stowed leaf is removed (got ${JSON.stringify(un.removed)})`);
-    c.check(
-      !existsSync(dest) && lstatSync(dest, { throwIfNoEntry: false }) === undefined,
-      "C80: uninstall removes the LINK",
-    );
-    c.check(existsSync(stowed), "C80: uninstall LEAVES the link's target in the dotfiles store");
-    c.check(
-      un.warnings.some((w) => w.startsWith(`removed the symlink at ${dest}, but LEFT its target ${stowed} in place`)),
-      `C80: the orphaned target is NAMED (got ${un.warnings.join(" | ")})`,
-    );
-    // The stated consequence: a reinstall does NOT restore the stow layout.
-    const re = initScored(c, "C80: reinstall after uninstall", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-    });
-    c.check(re.installed.includes(CONSULT_REL), "C80: the reinstall places the file again");
-    c.check(
-      !lstatSync(dest).isSymbolicLink() && lstatSync(dest).isFile(),
-      "C80 (stated cost): the reinstall writes a REGULAR FILE — the stow layout is not restored",
-    );
-    c.check(existsSync(stowed), "C80 (stated cost): the orphaned store copy is left behind");
-
-    // (c) FRESHNESS, NOT AUTHORIZATION — the demonstration, kept executable so the cost cannot be
-    //     quietly reworded out of the docs. The recorded hashes are of SHIPPED files, public in
-    //     the npm tarball, so planting matching bytes needs no access to the ownership record.
-    const H2 = tempProject();
-    const X2 = tempProject();
-    const VICTIMDIR = tempProject();
-    initScored(c, "C80: seed v1 for the freshness demo", {
-      targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H2, xdgConfigHome: X2,
-    });
-    const victim = path.join(VICTIMDIR, "victim.md");
-    copyFileSync(path.join(V1, CONSULT_REL), victim); // a copy of the PUBLISHED v1 payload file
-    const dest2 = path.join(H2, CONSULT_REL);
-    unlinkSync(dest2);
-    symlinkSync(victim, dest2);
-    const pwn = initScored(c, "C80: install v2 over a planted link with matching bytes", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H2, xdgConfigHome: X2,
-    });
-    c.check(
-      pwn.installed.includes(CONSULT_REL) && readFileSync(victim, "utf8") === v2Bytes,
-      "C80 (stated cost): matching bytes at a planted link ARE written through — freshness, not authorization",
-    );
-    c.check(
-      pwn.warnings.some((w) => w.includes(victim)),
-      `C80: the write-through names the file it actually landed in (got ${pwn.warnings.join(" | ")})`,
-    );
-
-    // (d) NOT ours ⇒ still never-clobbered, which is the half that makes (c) a bounded cost
-    //     rather than an unbounded one: only bytes that already match are followed.
-    const H3 = tempProject();
-    const X3 = tempProject();
-    const OTHER = tempProject();
-    initScored(c, "C80: seed v1 for the not-ours case", {
-      targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H3, xdgConfigHome: X3,
-    });
-    const mine = path.join(OTHER, "mine.md");
-    writeFileSync(mine, "MY OWN CONSULT\n");
-    const dest3 = path.join(H3, CONSULT_REL);
-    unlinkSync(dest3);
-    symlinkSync(mine, dest3);
-    const nc = initScored(c, "C80: install v2 over a link to a file that is not ours", {
-      targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H3, xdgConfigHome: X3,
-    });
-    c.check(
-      nc.skipped.includes(CONSULT_REL) && readFileSync(mine, "utf8") === "MY OWN CONSULT\n",
-      `C80: bytes that are not ours are never clobbered through the link (skipped=${JSON.stringify(nc.skipped)})`,
-    );
-    c.check(
-      !(nc.blocked ?? []).includes(CONSULT_REL),
-      `C80: a never-clobber skip through a LIVE link still resolves, so C79 keeps it exit 0 (blocked=${JSON.stringify(nc.blocked ?? [])})`,
-    );
-
-    // (e) PROJECT MODE IS UNCHANGED — the leaf rule is global-only, inheriting C77's asymmetry.
-    //     A live leaf link in a project is still REFUSED by name, at plan time, with nothing
-    //     written; it is NOT followed just because its bytes happen to be ours.
-    const P = tempProject();
-    initScored(c, "C80: seed a project install", { targetDir: P, packageRoot: V1, serverLaunch: LAUNCH });
-    const pStore = tempProject();
-    const pDest = path.join(P, CONSULT_REL);
-    const pStowed = path.join(pStore, "consult.md");
-    renameSync(pDest, pStowed);
-    symlinkSync(pStowed, pDest);
-    let pMsg = "";
-    try {
-      init({ targetDir: P, packageRoot: V2, serverLaunch: LAUNCH });
-    } catch (e) {
-      pMsg = (e as Error).message;
+    // v1 → real files; v2 → one payload file's bytes moved on.
+    const v1 = tempProject();
+    const v2 = tempProject();
+    for (const { src } of payloadFiles()) {
+      for (const root of [v1, v2]) {
+        mkdirSync(path.join(root, path.dirname(src)), { recursive: true });
+        copyFileSync(path.join(repoRoot, src), path.join(root, src));
+      }
     }
+    const moved = ".claude/commands/guild/consult.md";
+    writeFileSync(path.join(v2, moved), readFileSync(path.join(v1, moved), "utf8") + "\n<!-- v2 -->\n");
+
+    initScored(c, "skew×symlink: install v1 --global", {
+      targetDir: tempProject(), packageRoot: v1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
+    });
+
+    // `stow --adopt`: the bytes move to the store, a leaf link is left behind.
+    const dest = path.join(H, ".claude/commands/guild/consult.md");
+    const stored = path.join(store, "consult.md");
+    renameSync(dest, stored);
+    symlinkSync(stored, dest);
+    const storedBefore = readFileSync(stored, "utf8");
+
+    const r = initScored(c, "skew×symlink: install v2 over the stowed file", {
+      targetDir: tempProject(), packageRoot: v2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
+    });
     c.check(
-      pMsg.startsWith(`refusing destination symlink: ${pDest} —`),
-      `C80: PROJECT mode still refuses a live leaf link even when the bytes ARE ours (got "${pMsg}")`,
+      r.skipped.includes(moved) && !r.installed.includes(moved) && readFileSync(stored, "utf8") === storedBefore,
+      `skew×symlink: init still declines to write through the link (skipped=${r.skipped.join(",")})`,
+    );
+    const skipMsg = r.warnings.find((w) => w.startsWith(`skipping ${moved}`)) ?? "";
+    c.check(
+      skipMsg.includes(`is a symlink to ${stored}`) && skipMsg.includes("does not write through a symlink"),
+      `skew×symlink: …and says WHY, naming the file the bytes really live in (got ${skipMsg || "<none>"})`,
+    );
+
+    // The other surface, on the same tree.
+    const scan = scanInstalledPayload({ packageRoot: v2, targetDir: tempProject(), global_dirs: dirs, globalOnly: true });
+    const entry = scan.skewed.find((s) => s.dest === moved);
+    c.check(
+      entry !== undefined,
+      `skew×symlink: the scan still classifies it as SKEW — reading through the link is correct and stays (skewed=${scan.skewed.map((s) => s.dest).join(",")})`,
     );
     c.check(
-      readFileSync(pStowed, "utf8") !== v2Bytes,
-      "C80: the project refusal writes nothing through the link",
+      entry?.linkTarget === stored,
+      `skew×symlink: …and now carries the one fact that decides the remedy (linkTarget=${entry?.linkTarget ?? "<absent>"})`,
+    );
+    const note = formatSkewNote({ skewed: scan.skewed, version: "9.9.9" }).join("\n");
+    c.check(
+      note.includes(`↳ symlink to ${stored}`) &&
+        note.includes("init does not write through a symlink") &&
+        note.includes("this note will not clear"),
+      `skew×symlink: THE CONTRADICTION IS CLOSED — the skew note no longer promises a fix init will not perform (got: ${note.slice(-320)})`,
+    );
+
+    // The negative direction: an ordinary skewed file is unannotated and keeps the plain advice,
+    // so one stowed file among many does not disqualify the whole `init` remedy.
+    const plain = scan.skewed.find((s) => s.dest !== moved);
+    c.check(
+      scan.skewed.length === 1 && plain === undefined && !note.includes("↳ symlink to /dev/null"),
+      `skew×symlink: only the linked file is annotated (skewed=${scan.skewed.length})`,
     );
   }
 
-  // ISSUE #165 REVIEW FINDINGS — the four the reviewer found, pinned so they cannot come back.
+  // THE COUNT AND THE ↳ MARKERS COVER DIFFERENT SETS WHEN THE LIST IS TRUNCATED.
+  //
+  // `formatSkewNote` counts linked files over ALL of `skewed` while emitting ↳ only over the
+  // `maxFiles` it shows — and the start-up notice passes 8 against a 13-file payload. An earlier
+  // cut asserted flatly "each one listed above carries a ↳", which is false the moment a linked
+  // file falls past the cap. That is REACHABLE in the layout this whole change is about:
+  // `~/.claude` and `<xdg>/opencode` are separate stow packages, so stowing only the opencode
+  // half puts the agent defs and templates — the tail of payload order — outside the window.
+  //
+  // A claim true of one set quietly assumed of another is the exact defect the deleted C80
+  // recorded, so it must not ship on the branch that deletes it. Asserted as a UNIT on
+  // `formatSkewNote`, because the defect is entirely in that function's arithmetic and a
+  // 13-file fixture would prove the same thing while hiding which number was wrong.
   {
-    const V1 = fakePackage("1.0.0");
-    const V2 = fakePackage("2.0.0", bumpConsult);
-    const CONSULT_REL = ".claude/commands/guild/consult.md";
-    const DEF_REL = ".opencode/agent/guild-read.md";
+    const mk = (n: string, link?: string) => ({
+      dest: n,
+      installedPath: `/home/u/${n}`,
+      shippedPath: `/pkg/${n}`,
+      installedHash: "a",
+      shippedHash: "b",
+      recordPath: "/home/u/.claude/modelguild/.modelguild-install.json",
+      ...(link ? { linkTarget: link } : {}),
+    });
+    const arrow = (s: string) => (s.match(/↳ symlink to /g) ?? []).length;
 
-    // (F-1) THE RECORD LINK'S TARGET CAN BE A PAYLOAD DESTINATION, so its live/dangling state is
-    // NOT stable across the run: dangling when the plan is made, LIVE by the time the record is
-    // written, because the payload loop created it in between. An earlier cut computed the whole
-    // warning at plan time on the reasoning that nothing could change it, and therefore announced
-    // "will CREATE that file (the link is dangling)" while silently overwriting an agent def it
-    // had just installed. The liveness is read beside the write; the collision is NAMED.
-    {
-      const H = tempProject();
-      const X = tempProject();
-      const defAbs = path.join(X, "opencode/agent/guild-read.md");
-      mkdirSync(path.dirname(defAbs), { recursive: true }); // directory yes, FILE no
-      const recLink = path.join(H, ".claude/modelguild/.modelguild-install.json");
-      mkdirSync(path.dirname(recLink), { recursive: true });
-      symlinkSync(defAbs, recLink);
-      c.check(!existsSync(defAbs), "F-1: the record link is DANGLING when the plan is made");
+    // (i) EVERY linked file is inside the window ⇒ the strong claim is allowed.
+    const all = formatSkewNote({
+      skewed: [mk("a.md", "/store/a.md"), mk("b.md")] as any,
+      version: "1.0.0",
+      maxFiles: 8,
+    }).join("\n");
+    c.check(
+      all.includes("…EXCEPT 1 of them") && all.includes("Each is marked ↳ above") && arrow(all) === 1,
+      `truncation: untruncated ⇒ the marker claim is made and is true (arrows=${arrow(all)})`,
+    );
 
-      const r = initScored(c, "F-1: record link aimed at a not-yet-installed payload file", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-      });
-      c.check(r.installed.includes(DEF_REL), `F-1: the def is installed by the loop (got ${r.installed.length} files)`);
-      const w = r.warnings.find((x) => x.startsWith("writing the ownership record through a symlink"));
-      c.check(w !== undefined, `F-1: the record-link warning is emitted (got ${r.warnings.join(" | ")})`);
-      c.check(
-        (w ?? "").includes("will REPLACE that file's contents"),
-        `F-1: it reports a REPLACEMENT, because the payload loop made the link live — the plan-time ` +
-          `answer ("will CREATE … dangling") was the defect (got "${w ?? ""}")`,
-      );
-      c.check(
-        (w ?? "").includes(`THAT FILE IS A PAYLOAD DESTINATION (${DEF_REL})`),
-        `F-1: the collision with a payload file is NAMED, not left reading as an ordinary overwrite ` +
-          `(got "${w ?? ""}")`,
-      );
-      // The honest state afterwards: the def really does hold the record JSON. Asserted so the
-      // severity in the docs is measured rather than asserted.
-      c.check(
-        readFileSync(defAbs, "utf8").includes(`"version": 1`),
-        "F-1: the agent def now holds the ownership-record JSON — the outcome the warning must describe",
-      );
-    }
+    // (ii) NONE of the linked files are shown — the notice's real shape. The count must still
+    // fire (dropping the caveat would leave "init rewrites them in place" unqualified), the
+    // false claim must not, and the untruncated surface must be named.
+    const tail = [
+      ...["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"].map((n) => mk(`${n}.md`)),
+      mk("guild-read.md", "/store/guild-read.md"),
+      mk("guild-build.md", "/store/guild-build.md"),
+    ];
+    const none = formatSkewNote({ skewed: tail as any, version: "1.0.0", maxFiles: 8 }).join("\n");
+    c.check(
+      none.includes("…EXCEPT 2 of them") && arrow(none) === 0,
+      `truncation: linked files past the cap are STILL counted (arrows=${arrow(none)})`,
+    );
+    c.check(
+      !none.includes("Each is marked ↳ above") && none.includes("None are in the list above"),
+      `truncation: THE DEFECT — no claim that files nobody listed carry a marker (got: ${none.slice(-300)})`,
+    );
+    c.check(
+      none.includes("modelguild doctor` lists every file without truncating"),
+      "truncation: …and the surface that does show them all is named",
+    );
 
-    // (F-3) THE UNINSTALL RECORD WARNING MUST NOT ASSERT A DESTRUCTION THAT DID NOT HAPPEN. Its
-    // only guard was "there is a link here", which says nothing about whether an install ever
-    // wrote through it.
-    {
-      // Never installed: the target still holds the user's bytes, and the warning must say so.
-      const H = tempProject();
-      const X = tempProject();
-      const OUT = tempProject();
-      const mine = path.join(OUT, "mine.json");
-      writeFileSync(mine, "MINE\n");
-      const recLink = path.join(H, ".claude/modelguild/.modelguild-install.json");
-      mkdirSync(path.dirname(recLink), { recursive: true });
-      symlinkSync(mine, recLink);
-      const u = initScored(c, "F-3: uninstall over a record link that was never written through", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X, uninstall: true,
-      });
-      const w = u.warnings.find((x) => x.startsWith(`removed the symlink at ${recLink}`)) ?? "";
-      c.check(w !== "", `F-3: the leftover is still named (got ${u.warnings.join(" | ")})`);
-      c.check(
-        w.includes("did not read as a ModelGuild ownership record") && !w.includes("which an install wrote"),
-        `F-3: it makes NO claim that the file was overwritten — nothing was (got "${w}")`,
-      );
-      c.check(readFileSync(mine, "utf8") === "MINE\n", "F-3: and indeed the user's bytes are untouched");
+    // (iii) SPLIT — some shown, some not. The two numbers must both appear and must be right.
+    const split = [
+      mk("s1.md", "/store/s1.md"),
+      ...["c1", "c2", "c3", "c4", "c5", "c6", "c7"].map((n) => mk(`${n}.md`)),
+      mk("s2.md", "/store/s2.md"),
+    ];
+    const mixed = formatSkewNote({ skewed: split as any, version: "1.0.0", maxFiles: 8 }).join("\n");
+    c.check(
+      mixed.includes("…EXCEPT 2 of them") &&
+        mixed.includes("1 of them are marked ↳ above; the other 1") &&
+        arrow(mixed) === 1,
+      `truncation: a split list states both halves (arrows=${arrow(mixed)}, got: ${mixed.slice(-300)})`,
+    );
 
-      // The positive control: a real install DID write through, so the claim is made.
-      const H2 = tempProject();
-      const X2 = tempProject();
-      const OUT2 = tempProject();
-      const theirs = path.join(OUT2, "theirs.json");
-      writeFileSync(theirs, "THEIRS\n");
-      const recLink2 = path.join(H2, ".claude/modelguild/.modelguild-install.json");
-      mkdirSync(path.dirname(recLink2), { recursive: true });
-      symlinkSync(theirs, recLink2);
-      initScored(c, "F-3: seed an install through the record link", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H2, xdgConfigHome: X2,
-      });
-      const u2 = initScored(c, "F-3: uninstall after a real write-through", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H2, xdgConfigHome: X2, uninstall: true,
-      });
-      const w2 = u2.warnings.find((x) => x.startsWith(`removed the symlink at ${recLink2}`)) ?? "";
-      c.check(
-        w2.includes("which an install wrote through this link"),
-        `F-3 (control): where the bytes really are ours, the claim IS made (got "${w2}")`,
-      );
-    }
+    // (iv) `doctor` passes no cap, so it never reaches any of this.
+    const doctorNote = formatSkewNote({ skewed: tail as any, version: "1.0.0" }).join("\n");
+    c.check(
+      doctorNote.includes("Each is marked ↳ above") && arrow(doctorNote) === 2,
+      `truncation: doctor's untruncated note marks every linked file (arrows=${arrow(doctorNote)})`,
+    );
+  }
 
-    // (F-4) A LIVE NOT-OURS LEAF LINK NOW REACHES THE DRIFT/SHADOW MACHINERY it never reached
-    // before, because it is hashed rather than dismissed as a non-file. That is new OUTPUT —
-    // `drifted`, `shadowed` and a paste-able diff hint — on a path that previously produced only
-    // a skip. Pinned rather than redesigned, including the wording's known imprecision: the file
-    // was not "edited", the LINK was repointed, and the message cannot tell the difference.
-    {
-      const H = tempProject();
-      const X = tempProject();
-      const OUT = tempProject();
-      initScored(c, "F-4: seed v1", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-      });
-      // A file of the user's whose bytes are v1's consult.md PLUS an edit — so all three hashes
-      // differ and `isDrifted` fires, the state that used to be unreachable through a link.
-      const theirs = path.join(OUT, "theirs.md");
-      writeFileSync(theirs, readFileSync(path.join(V1, CONSULT_REL), "utf8") + "\n<!-- mine -->\n");
-      const dest = path.join(H, CONSULT_REL);
-      unlinkSync(dest);
-      symlinkSync(theirs, dest);
+  // A LEAF LINK TO A DIRECTORY IS NOT A LIVE FILE AND MUST NOT BE ADVISED AS ONE. The skip
+  // wording asked only whether the target RESOLVED, so a link pointing at a directory produced
+  // "update <dir> yourself" — advice that cannot be followed. `blocked` was and stays correct.
+  {
+    const H = tempProject();
+    const X = tempProject();
+    const store = tempProject();
+    const asDir = path.join(store, "a-directory");
+    mkdirSync(asDir, { recursive: true });
+    mkdirSync(path.join(H, ".claude/commands/guild"), { recursive: true });
+    symlinkSync(asDir, path.join(H, ".claude/commands/guild/consult.md"));
 
-      const r = initScored(c, "F-4: install v2 over a live link to an edited copy", {
-        targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-      });
-      c.check(r.skipped.includes(CONSULT_REL), "F-4: still never-clobbered");
-      c.check(
-        (r.drifted ?? []).some((d) => d.dest === CONSULT_REL && d.installedPath === dest),
-        `F-4: it now reports DRIFT, naming the destination (the link), not the store file — new ` +
-          `output on this path (got ${JSON.stringify((r.drifted ?? []).map((d) => d.dest))})`,
-      );
-      c.check(
-        (r.shadowed ?? []).includes(CONSULT_REL),
-        `F-4: and SHADOWED, since a command doc at our path is not ours (got ${JSON.stringify(r.shadowed ?? [])})`,
-      );
-      c.check(
-        r.warnings.some((x) => x.includes("you edited it since init wrote it") && x.includes(`is a symlink to ${theirs}`)),
-        `F-4: the wording says "you edited it" when the user repointed a LINK — imprecise, and ` +
-          `pinned so it is a known state rather than a surprise (got ${r.warnings.join(" | ")})`,
-      );
-      c.check(readFileSync(theirs, "utf8").endsWith("<!-- mine -->\n"), "F-4: their file is untouched");
-    }
-
-    // (ITEM 2) TWO PAYLOAD DESTINATIONS LINKED AT ONE STORE FILE. Not a plausible stow layout,
-    // but it is the shape the leaf rule makes reachable, so it is pinned rather than predicted:
-    // the second file loses, silently, and the run still exits 0.
-    {
-      const H = tempProject();
-      const X = tempProject();
-      const STORE = tempProject();
-      initScored(c, "item2: seed v1", {
-        targetDir: tempProject(), packageRoot: V1, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-      });
-      const PANEL_REL = ".claude/commands/guild/panel.md";
-      const one = path.join(STORE, "shared.md");
-      copyFileSync(path.join(V1, CONSULT_REL), one); // ours by hash, for consult.md
-      for (const rel of [CONSULT_REL, PANEL_REL]) {
-        unlinkSync(path.join(H, rel));
-        symlinkSync(one, path.join(H, rel));
-      }
-      const r = initScored(c, "item2: install v2 with two dests on one store file", {
-        targetDir: tempProject(), packageRoot: V2, serverLaunch: LAUNCH, global: true, homeDir: H, xdgConfigHome: X,
-      });
-      c.check(
-        r.installed.includes(CONSULT_REL) && !r.installed.includes(PANEL_REL),
-        `item2: the first write wins and the second is skipped (installed=${JSON.stringify(r.installed)})`,
-      );
-      c.check(
-        readFileSync(one, "utf8") === readFileSync(path.join(V2, CONSULT_REL), "utf8"),
-        "item2: the shared file holds the CONSULT doc — so panel.md now serves consult's content",
-      );
-      c.check(
-        (r.blocked ?? []).length === 0,
-        `item2: and the run still exits 0, because both destinations resolve to a regular file — ` +
-          `C79's test is shape, not content (blocked=${JSON.stringify(r.blocked ?? [])})`,
-      );
-    }
+    const r = initScored(c, "leaf link → DIRECTORY", {
+      targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH,
+      global: true, homeDir: H, xdgConfigHome: X,
+    });
+    const w = r.warnings.find((m) => m.startsWith("skipping .claude/commands/guild/consult.md")) ?? "";
+    c.check(
+      w.includes(`is a symlink to ${asDir}`) && w.includes("is not a regular file (a directory, FIFO or socket)"),
+      `leaf link → directory: named as a non-file, not as something to edit (got: ${w || "<none>"})`,
+    );
+    c.check(
+      !w.includes(`update ${asDir} yourself`) && !w.includes("DANGLING"),
+      `leaf link → directory: neither the edit-it nor the dangling wording (got: ${w})`,
+    );
+    c.check(
+      (r.blocked ?? []).includes(".claude/commands/guild/consult.md"),
+      `leaf link → directory: still blocked — the piece is genuinely missing (blocked=${(r.blocked ?? []).join(",")})`,
+    );
   }
 
   // PROJECT mode is UNCHANGED: a symlink at any existing component is refused by name.
@@ -1625,12 +1479,8 @@ export async function run(): Promise<number> {
     );
     c.check(
       resR.warnings.includes(
-        // FUTURE tense since issue #165: the disclosure is produced at PLAN time, before a byte
-        // moves, rather than one line above the write.
         `writing the ownership record through a symlink — ${recLink} links to ${userFile}, so the record ` +
-          `will REPLACE that file's contents. Unlike a payload file, this is NOT hash-gated — there is no ` +
-          `record of the record to recognise, so nothing here declines to clobber. Remove the link and ` +
-          `re-run init to keep the record at ${recLink} itself.`,
+          `replaced that file's contents. Remove the link and re-run init to keep the record at ${recLink} itself.`,
       ),
       `record symlink: the live link warns, naming BOTH the link and the file written (got ${resR.warnings.join(" | ")})`,
     );
@@ -1669,9 +1519,7 @@ export async function run(): Promise<number> {
     c.check(
       resD.warnings.includes(
         `writing the ownership record through a symlink — ${dngLink} links to ${missing}, so the record ` +
-          `will CREATE that file (the link is dangling). Unlike a payload file, this is NOT hash-gated — ` +
-          `there is no record of the record to recognise, so nothing here declines to clobber. Remove the ` +
-          `link and re-run init to keep the record at ${dngLink} itself.`,
+          `created that file (the link was dangling). Remove the link and re-run init to keep the record at ${dngLink} itself.`,
       ),
       `record symlink: the DANGLING link warns, naming BOTH paths and saying the file was created (got ${resD.warnings.join(" | ")})`,
     );
@@ -2657,14 +2505,14 @@ export async function run(): Promise<number> {
       );
     }
 
-    // --- #176 × #165: a SYMLINKED record path on the retained branch -------
-    // Neither branch covered this on its own, and the merge is where it bites twice.
-    //   (1) MERGE HAZARD: #165's leftover disclosure ("removed the symlink at …") belongs to the
-    //       REMOVAL arm only. Hoisted above the retention branch it announces a destruction that
-    //       did not happen — #165's own F-3 defect, re-created by a merge rather than an edit.
-    //   (2) `planFor`'s plan-time line promised the link "is removed at the end", which the
-    //       retention branch falsifies — so it is conditional now, and the outcome is stated
-    //       where it is known.
+    // --- #176: a SYMLINKED record path on the retained branch --------------
+    // `planFor`'s plan-time line promised the link "is removed at the end", which the retention
+    // branch falsifies — so it is conditional now, and the outcome is stated where it is known.
+    //
+    // This block was written as `#176 × #165` and outlived the #165 revert. What it asserted
+    // about #165 — that the leftover disclosure fires on the removal arm and not on the
+    // retention arm — is gone with the disclosure; what remains is the C77 behaviour underneath
+    // it, which never depended on #165: `unlink(2)` removes the LINK and leaves the TARGET.
     {
       const P = tempProject();
       const store = tempProject();
@@ -2680,23 +2528,19 @@ export async function run(): Promise<number> {
       execFileSync("mv", [path.join(P, ".opencode"), oc]);
       symlinkSync(oc, path.join(P, ".opencode"));
 
-      const r = initScored(c, "#176×#165: uninstall, record behind a LIVE symlink, payload blocked", {
+      const r = initScored(c, "#176: uninstall, record behind a LIVE symlink, payload blocked", {
         targetDir: P, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
       });
       c.check(
         (r.blocked ?? []).length === AGENT_DEF_COUNT &&
           lstatSync(record).isSymbolicLink() &&
           existsSync(stored),
-        `#176×#165: the record link AND its target both survive (blocked=[${(r.blocked ?? []).join(", ")}])`,
+        `#176: the record link AND its target both survive (blocked=[${(r.blocked ?? []).join(", ")}])`,
       );
       const keeping = r.warnings.find((w) => w.startsWith("KEEPING the ownership record")) ?? "";
       c.check(
         keeping.includes(stored) && keeping.includes("removed neither the link nor its target"),
-        `#176×#165: the retained branch names the link's target and says nothing was removed (got: ${keeping.slice(-260) || "<no warning>"})`,
-      );
-      c.check(
-        !r.warnings.some((w) => w.includes("removed the symlink at")),
-        `#176×#165: THE MERGE HAZARD — #165's removal disclosure must NOT fire when nothing was removed (got: ${r.warnings.join(" | ").slice(-260)})`,
+        `#176: the retained branch names the link's target and says nothing was removed (got: ${keeping.slice(-260) || "<no warning>"})`,
       );
       // The plan-time line: CONDITIONAL now, not a promise. Asserted in both directions — the
       // pre-fix text is the flat `wrote; the link itself is removed at the end`, which this run
@@ -2705,7 +2549,7 @@ export async function run(): Promise<number> {
       c.check(
         planLine.includes("if the removal completes") &&
           !planLine.includes("wrote; the link itself is removed"),
-        `#176×#165: the plan-time line no longer PROMISES a removal this run did not do (got: ${planLine.slice(-200) || "<no warning>"})`,
+        `#176: the plan-time line no longer PROMISES a removal this run did not do (got: ${planLine.slice(-200) || "<no warning>"})`,
       );
 
       // A DANGLING record link on the same branch: `entryExists` is `lstat`-based, so the record
@@ -2720,16 +2564,17 @@ export async function run(): Promise<number> {
       const oc2 = path.join(store2, "oc");
       execFileSync("mv", [path.join(P2, ".opencode"), oc2]);
       symlinkSync(oc2, path.join(P2, ".opencode"));
-      const rd = initScored(c, "#176×#165: uninstall, record behind a DANGLING symlink", {
+      const rd = initScored(c, "#176: uninstall, record behind a DANGLING symlink", {
         targetDir: P2, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
       });
       const keeping2 = rd.warnings.find((w) => w.startsWith("KEEPING the ownership record")) ?? "";
       c.check(
         keeping2.includes("DANGLING") && keeping2.includes("prove nothing is ours"),
-        `#176×#165: a dangling record link says the remedy will NOT work (got: ${keeping2.slice(-260) || "<no warning>"})`,
+        `#176: a dangling record link says the remedy will NOT work (got: ${keeping2.slice(-260) || "<no warning>"})`,
       );
 
-      // AND THE REMOVAL ARM IS UNTOUCHED: with nothing blocked, #165's disclosure still fires.
+      // AND THE REMOVAL ARM IS UNTOUCHED: with nothing blocked the record link really is removed,
+      // and C77's rule that `unlink(2)` never follows a final component still leaves the target.
       const P3 = tempProject();
       const store3 = tempProject();
       init({ targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH });
@@ -2738,17 +2583,17 @@ export async function run(): Promise<number> {
       copyFileSync(record3, stored3);
       unlinkSync(record3);
       symlinkSync(stored3, record3);
-      const rr = initScored(c, "#176×#165: a clean uninstall still discloses the removed link", {
+      const rr = initScored(c, "#176: a clean uninstall reaches the removal arm", {
         targetDir: P3, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
       });
       c.check(
         (rr.blocked ?? []).length === 0 &&
-          rr.warnings.some((w) => w.includes("removed the symlink at") && w.includes(stored3)),
-        `#176×#165: #165's removal disclosure is NOT suppressed by the retention branch (blocked=[${(rr.blocked ?? []).join(", ")}], got: ${rr.warnings.join(" | ").slice(-260)})`,
+          !rr.warnings.some((w) => w.startsWith("KEEPING the ownership record")),
+        `#176: nothing blocked ⇒ the retention branch does not fire (blocked=[${(rr.blocked ?? []).join(", ")}])`,
       );
       c.check(
         !existsSync(record3) && existsSync(stored3),
-        "#176×#165: …and it removed the link while leaving the target, as C77 says",
+        "#176: …and it removed the link while leaving the target, as C77 says",
       );
     }
   }
