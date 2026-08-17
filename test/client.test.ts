@@ -14,6 +14,7 @@ import {
   sendMessage,
   fetchHistory,
   finalAssistantText,
+  finalAssistantChannel,
   finalAssistantError,
   servingAgent,
   turnStartIndex,
@@ -526,6 +527,144 @@ export async function run(): Promise<number> {
       messages: [user("q1"), answered("OLD"), user("q2"), answered("I'll start by"), rejected()],
     };
     c.check(finalAssistantText(preamble) === "I'll start by", "turn scope: C74's bound — a preamble inside the turn is returned");
+
+    // --- ISSUE #168: THE REASONING FALLBACK -------------------------------------------------
+    // opencode's `Part` union carries `ReasoningPart` with its own `text`, and opencode's own
+    // TUI renders it. A turn whose visible output arrived that way reconstructed to "" here and
+    // was refused as `empty-answer` while the model demonstrably answered — the reported
+    // failure. `answerSource` falls back to it, and ONLY when `text` found nothing.
+    const reasoningOnly = (text: string, agent?: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop", ...(agent ? { agent } : {}) } as Record<string, unknown>,
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", text },
+        { type: "step-finish" },
+      ] as Array<Record<string, unknown>>,
+    });
+
+    const reasoned: SessionHistory = {
+      messages: [user("q"), toolOnly("guild-read"), reasoningOnly("THE REASONED ANSWER", "guild-read")],
+    };
+    c.check(
+      finalAssistantText(reasoned) === "THE REASONED ANSWER",
+      "#168: a reasoning-only turn reconstructs to the reasoning text, not ''",
+    );
+    // THE COUPLING (issue #168): the masquerade check must see the same message the answer came
+    // from, or it goes blind on precisely the turns the fallback newly admits.
+    c.check(
+      servingAgent(reasoned) === "guild-read",
+      "#168: servingAgent reads the reasoning message — the mismatch check is not blinded by the fallback",
+    );
+
+    // FALLBACK, NEVER A MERGE. `answered()` already carries a reasoning part beside its text, so
+    // this asserts the priority directly: text alone, no chain-of-thought prefix.
+    c.check(
+      finalAssistantText({ messages: [user("q"), answered("THE ANSWER")] }) === "THE ANSWER",
+      "#168: text wins outright over a reasoning part in the same message — no merge",
+    );
+    // And across MESSAGES within one turn: a reasoning-bearing message must not beat a later
+    // text-bearing one, nor an earlier one. Both directions, because the two passes walk
+    // independently and a single-pass implementation would get exactly one of them right.
+    c.check(
+      finalAssistantText({
+        messages: [user("q"), reasoningOnly("EARLIER-REASONING"), answered("LATER-TEXT")],
+      }) === "LATER-TEXT",
+      "#168: a text-bearing message later in the turn wins over an earlier reasoning-only one",
+    );
+    c.check(
+      finalAssistantText({
+        messages: [user("q"), answered("EARLIER-TEXT"), reasoningOnly("LATER-REASONING")],
+      }) === "EARLIER-TEXT",
+      "#168: an earlier text-bearing message still wins over a later reasoning-only one",
+    );
+
+    // TURN-SCOPED, both passes. The fallback must not reach back across a user message and
+    // answer this turn with the previous turn's reasoning — the BANANA defect by a second door.
+    c.check(
+      finalAssistantText({
+        messages: [user("q1"), reasoningOnly("PREVIOUS-TURN-REASONING"), user("q2"), rejected()],
+      }) === "",
+      "#168: the reasoning fallback is turn-scoped — a silent turn borrows nothing from the last one",
+    );
+    // A reasoning part present but NOT a string is no answer, same rule as `text`.
+    c.check(
+      finalAssistantText({
+        messages: [
+          user("q"),
+          {
+            role: "assistant",
+            info: { role: "assistant", finish: "stop" } as Record<string, unknown>,
+            parts: [{ type: "reasoning", text: 42 }] as Array<Record<string, unknown>>,
+          },
+        ],
+      }) === "",
+      "#168: a non-string reasoning part is no answer",
+    );
+
+    // --- AN EMPTY TEXT PART MUST NOT BLOCK THE FALLBACK ------------------------------------
+    // The gate is the JOINED STRING, not part presence. `{type:"text", text:""}` is exactly how
+    // `tools-then-silent` — this repo's own model of #168's reported turn — ends, so a
+    // presence-gated fallback would never have fired on the very shape it was written for.
+    // All three arrangements, because a fallback can be wrong about any one of them alone.
+    const emptyText = (agent?: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop", ...(agent ? { agent } : {}) } as Record<string, unknown>,
+      parts: [{ type: "step-start" }, { type: "text", text: "" }] as Array<Record<string, unknown>>,
+    });
+    const bothInOne = {
+      role: "assistant",
+      info: { role: "assistant", finish: "stop", agent: "guild-read" } as Record<string, unknown>,
+      parts: [
+        { type: "reasoning", text: "COT" },
+        { type: "text", text: "" },
+      ] as Array<Record<string, unknown>>,
+    };
+    c.check(
+      finalAssistantText({ messages: [user("q"), bothInOne] }) === "COT",
+      "#168: an EMPTY text part in the same message does not block the reasoning fallback",
+    );
+    c.check(
+      servingAgent({ messages: [user("q"), bothInOne] }) === "guild-read",
+      "#168: ...and servingAgent still reads that message",
+    );
+    c.check(
+      finalAssistantText({ messages: [user("q"), reasoningOnly("COT"), emptyText()] }) === "COT",
+      "#168: an empty-text message AFTER a reasoning one does not block the fallback",
+    );
+    c.check(
+      finalAssistantText({ messages: [user("q"), emptyText(), reasoningOnly("COT")] }) === "COT",
+      "#168: an empty-text message BEFORE a reasoning one does not block the fallback",
+    );
+    // And the same rule fixes a defect that has nothing to do with reasoning: a trailing
+    // empty-text message used to blank a real answer earlier in the same turn.
+    c.check(
+      finalAssistantText({ messages: [user("q"), answered("REAL ANSWER"), emptyText()] }) === "REAL ANSWER",
+      "#168: a trailing EMPTY text message no longer blanks a real answer earlier in the turn",
+    );
+    // BYTE-EXACTNESS BEATS THE FALLBACK, deliberately: the gate is `length > 0`, not `trim()`,
+    // so a whitespace-only answer is still captured verbatim (and refused by requireAnswer's
+    // own trim) rather than being dropped from `raw_response`. Stated residual: whitespace
+    // text beside reasoning keeps the whitespace.
+    c.check(
+      finalAssistantText({ messages: [user("q"), answered("  \n ")] }) === "  \n ",
+      "#168: whitespace-only text is kept BYTE-EXACT, not trimmed away into the fallback",
+    );
+
+    // --- THE CHANNEL IS RECORDED (issue #168) ----------------------------------------------
+    c.check(
+      finalAssistantChannel(reasoned) === "reasoning",
+      "#168: a promoted answer reports its channel",
+    );
+    c.check(
+      finalAssistantChannel({ messages: [user("q"), answered("THE ANSWER")] }) === undefined,
+      "#168: an ordinary answer reports NO channel — absent, not 'text' (C29 optional-field)",
+    );
+    c.check(
+      finalAssistantChannel({ messages: [user("q1"), reasoningOnly("OLD"), user("q2"), rejected()] }) ===
+        undefined,
+      "#168: a turn that answered nothing reports no channel",
+    );
 
     // The provider's own diagnosis, whitelisted.
     const diag = finalAssistantError(crossTurn);

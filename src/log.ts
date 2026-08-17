@@ -891,6 +891,17 @@ export class EvidenceLog {
      * (see `#policyFields`). Both optional; absent on legacy/allow entries. */
     tier?: PolicyTier;
     confirmed?: boolean;
+    /**
+     * WHICH CHANNEL `raw_response` CAME OFF, when it was not the ordinary one (issue #168).
+     *
+     * `"reasoning"` says the model produced no text and the extractor promoted its reasoning to
+     * be the answer, so a reader of these receipts can tell "the model's answer" from "the
+     * model's chain-of-thought, promoted because there was no answer" — which `raw_response`
+     * alone renders identically. Optional and absent on every ordinary call, so an entry
+     * written for a normal turn is byte-identical to one written before this field existed
+     * (C29's optional-field rule).
+     */
+    answerChannel?: string;
     run?: string;
   }): Promise<WriteResult> {
     if (args.captureState !== "complete" && args.captureState !== "failed") {
@@ -926,6 +937,9 @@ export class EvidenceLog {
         raw_response: rawResponse,
         response_hash: nullIfEmpty(responseHash),
         ...policyFields(args.tier, args.confirmed),
+        ...(args.answerChannel !== undefined && args.answerChannel.length > 0
+          ? { answer_channel: args.answerChannel }
+          : {}),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, false);
       return { ok: r.ok };

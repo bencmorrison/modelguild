@@ -723,6 +723,60 @@ export async function run(): Promise<number> {
   }
 
   // -------------------------------------------------------------------------
+  // 12d. THE ISSUE-#168 FIX, AT THE SURFACE IT WAS REPORTED ON. The reported member did real
+  //      work (five successful reads) and then landed in `error` as `empty-answer`, while the
+  //      same model answered fully through opencode directly. A turn whose visible output
+  //      arrived as `reasoning` reproduces that exactly, because `finalAssistantText` read
+  //      `type === "text"` alone. The member must now ANSWER — no `error`, a real `text`, and a
+  //      `sessionId` under `keepSessions` so a round-2 continuation does not skip it.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const REASONED = "the answer that arrived as reasoning";
+    const fake = await startFakeOpencode({
+      historyText: REASONED,
+      distinctSessions: true,
+      turnShapes: ["reasoning-only"],
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/reasoner"], keepSessions: true },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#168 panel fix: the panel is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/reasoner");
+        c.check(beta?.error === undefined, "#168 panel fix: the reasoning member does NOT land in error");
+        c.check(beta?.text === REASONED, "#168 panel fix: the reasoning member's answer is its reasoning text");
+        c.check(
+          beta?.sessionId !== undefined,
+          "#168 panel fix: the member keeps its sessionId — round 2 no longer skips it",
+        );
+        const text = panelToToolResult(r).content[0].text;
+        c.check(
+          !/ERROR \(empty-answer\)/.test(text),
+          "#168 panel fix: the digest shows an answer, not an empty-answer failure",
+        );
+        // The receipt is the claim that has to hold: the member's own words, byte-exact.
+        const completed = readEntries(logDir, r.runId).find(
+          (e) => e.call_id === beta?.callId && e.status === "completed",
+        );
+        c.check(completed?.raw_response === REASONED, "#168 panel fix: the receipt records the reasoning text byte-exact");
+        c.check(completed?.exit_code === 0, "#168 panel fix: the member's call is recorded as a success");
+        c.check(
+          completed?.answer_channel === "reasoning",
+          "#168 panel fix: the receipt names the promotion, per member",
+        );
+        c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#168 panel fix: the run verifies clean");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Per-call timeoutMs applies to EVERY panel member (issue #37). A small per-call
   // value wins over a large env value and aborts each delayed member. No deps seam.
   // -------------------------------------------------------------------------
