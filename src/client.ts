@@ -835,31 +835,104 @@ export function turnStartIndex(history: SessionHistory): number {
   return 0;
 }
 
+/** The `type` parts of `m` carrying a string `text`, concatenated verbatim in order with NO
+ * separator, trim or normalization — the byte-exact reconstruction (invariant 2), kept in one
+ * place so "which parts carry an answer, and how they join" has a single definition. */
+function joinPartText(m: HistoryMessage, type: string): string {
+  return m.parts
+    .filter((p) => p.type === type && typeof p.text === "string")
+    .map((p) => p.text as string)
+    .join("");
+}
+
+/**
+ * THE MESSAGE OF THIS TURN THAT PRODUCED THE ANSWER, and the answer it produced.
+ *
+ * Two passes over the turn, in strict priority order, and the priority is the whole design.
+ *
+ * **Pass 1 — `text` parts.** The last assistant message OF THIS TURN whose text parts join to
+ * a NON-EMPTY string, walked backwards so a trailing assistant message that carries no answer
+ * can't blank a real one. This is the only pass that fires on a turn that produced text at all,
+ * so nothing about a normal answer — its bytes, its `raw_response`, its serving agent — is
+ * touched by pass 2's existence.
+ *
+ * **Pass 2 — `reasoning` parts, only when pass 1 found NOTHING (issue #168).** opencode's
+ * `Part` union carries `ReasoningPart` with its own `text` of identical type, and opencode's
+ * own TUI renders it. A turn whose visible output arrived that way reconstructed to `""` here
+ * and was refused as `empty-answer` — the guild path returning nothing where opencode directly
+ * returned a full answer, which is exactly the contrast issue #168 reports. Reading it as the
+ * answer is a FALLBACK and never a merge: a message carrying BOTH kinds returns its `text`
+ * alone, so chain-of-thought never lands beside an answer the model also wrote.
+ *
+ * **PASS 1's TEST IS ON THE JOINED STRING, NOT ON PART PRESENCE, AND THAT IS LOAD-BEARING.**
+ * Requiring merely that a text PART exist made an `{type:"text", text:""}` part satisfy pass 1
+ * and block pass 2 — and an empty text part is precisely how this repo's own fixture models
+ * the reported turn (`tools-then-silent`). So the shape the fallback exists for — a turn that
+ * emitted reasoning AND an empty text part — went on being refused, in all three arrangements
+ * (same message, either message order). Nothing observable is given up by falling through: a
+ * turn whose text joins to `""` is refused as `empty-answer` today, so pass 2 can only turn a
+ * refusal into an answer, never change one answer into another.
+ *
+ * **The test is `length > 0`, NOT `trim() !== ""`, and the difference is byte-exactness.** A
+ * whitespace-only answer is captured verbatim and refused by `requireAnswer`'s own `trim()`;
+ * trimming here instead would drop those bytes from `raw_response` and break invariant 2.
+ * *Residual, stated:* a turn carrying whitespace-only text BESIDE reasoning keeps the
+ * whitespace and is refused, rather than falling through. Nobody has reported that shape, and
+ * preserving the recorded bytes is worth more than covering it.
+ *
+ * **The remaining cost is stated, not engineered around.** Where the fallback fires,
+ * `raw_response` — the byte-exact evidence record — holds reasoning text. That is what the
+ * model emitted, and the receipt gains content only where it previously recorded `""`, never in
+ * place of an answer. The turn this cannot tell apart is one TRUNCATED mid-reasoning: that used
+ * to be refused and is now returned as an answer. Which channel the answer came from is
+ * recorded rather than left implicit — see `AskResult.answerChannel`.
+ *
+ * TURN-SCOPED since issue #117's review — BOTH passes stop at `turnStartIndex`, so a turn that
+ * said nothing on either channel yields nothing rather than the previous turn's answer.
+ */
+function answerSource(
+  history: SessionHistory,
+): { message: HistoryMessage; text: string; channel: AnswerChannel } | undefined {
+  const start = turnStartIndex(history);
+  for (const channel of ["text", "reasoning"] as const) {
+    for (let i = history.messages.length - 1; i >= start; i--) {
+      const m = history.messages[i];
+      if (m.role !== "assistant") continue;
+      const text = joinPartText(m, channel);
+      if (text.length > 0) return { message: m, text, channel };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * WHICH CHANNEL THIS TURN'S ANSWER CAME OFF (issue #168).
+ *
+ * `"text"` is the ordinary case and is never recorded — C29's optional-field discipline, so a
+ * normal turn's result and receipt are byte-identical to what they were before the fallback
+ * existed. `"reasoning"` means the model produced no text at all and this promoted its
+ * reasoning; see `answerSource`.
+ */
+export type AnswerChannel = "text" | "reasoning";
+
 /**
  * The final assistant text, reconstructed BYTE-EXACT from history (invariant 2).
  *
- * The "final answer" is the last assistant message OF THIS TURN that carries text parts —
- * the one the sync response also returns — so a trailing pure-tool-call assistant
- * message can't blank the answer. Text parts are concatenated verbatim in order
- * with NO separator, trim, or normalization, so newlines (including a trailing
- * one), quotes, and unicode survive intact.
- *
- * TURN-SCOPED since issue #117's review: the walk stops at `turnStartIndex`, so a turn that
- * said nothing yields `""` rather than the previous turn's answer. `""` is then the caller's
- * to interpret — `requireAnswer` turns it into an `EmptyAnswerError`.
+ * A turn that produced nothing on either channel yields `""`, which is then the caller's to
+ * interpret — `requireAnswer` turns it into an `EmptyAnswerError`.
  */
 export function finalAssistantText(history: SessionHistory): string {
-  const start = turnStartIndex(history);
-  for (let i = history.messages.length - 1; i >= start; i--) {
-    const m = history.messages[i];
-    if (m.role !== "assistant") continue;
-    const textParts = m.parts.filter(
-      (p) => p.type === "text" && typeof p.text === "string",
-    );
-    if (textParts.length === 0) continue;
-    return textParts.map((p) => p.text as string).join("");
-  }
-  return "";
+  return answerSource(history)?.text ?? "";
+}
+
+/**
+ * The channel `finalAssistantText`'s answer came off, `undefined` when it was the ordinary
+ * `text` one or when the turn answered nothing (issue #168). Absent rather than `"text"` so
+ * every consumer can write it out under C29's optional-field rule without a second condition.
+ */
+export function finalAssistantChannel(history: SessionHistory): AnswerChannel | undefined {
+  const src = answerSource(history);
+  return src !== undefined && src.channel !== "text" ? src.channel : undefined;
 }
 
 /**
@@ -874,23 +947,19 @@ export function finalAssistantText(history: SessionHistory): string {
  * TURN-SCOPED for the same reason as `finalAssistantText`, and it matters just as much here:
  * unbounded, a round-2 continuation validated the agent against ROUND ONE's message, so a
  * silent fallback to a full-access agent on the new turn would have been checked against the
- * hardened agent that served the old one. A turn with no text-bearing assistant message now
+ * hardened agent that served the old one. A turn with no answer-bearing assistant message now
  * answers `undefined` — "opencode didn't say", the documented fail-open (issue #78) — rather
  * than an answer borrowed from a turn this check is not about.
+ *
+ * IT READS `answerSource`, THE SAME MESSAGE `finalAssistantText` RETURNED, and that coupling is
+ * required rather than tidy (issue #168). The two used to duplicate one `type === "text"`
+ * filter; when the reasoning fallback was added to the text extractor alone, a reasoning-only
+ * turn's output was returned while this answered `undefined`, so the masquerade check went
+ * blind on precisely the turns the fallback newly admits. One source, one message, one agent.
  */
 export function servingAgent(history: SessionHistory): string | undefined {
-  const start = turnStartIndex(history);
-  for (let i = history.messages.length - 1; i >= start; i--) {
-    const m = history.messages[i];
-    if (m.role !== "assistant") continue;
-    const textParts = m.parts.filter(
-      (p) => p.type === "text" && typeof p.text === "string",
-    );
-    if (textParts.length === 0) continue;
-    const agent = m.info.agent;
-    return typeof agent === "string" && agent.length > 0 ? agent : undefined;
-  }
-  return undefined;
+  const agent = answerSource(history)?.message.info.agent;
+  return typeof agent === "string" && agent.length > 0 ? agent : undefined;
 }
 
 /** Longest provider-error string quoted into a refusal. Untrusted third-party text on its way
@@ -994,12 +1063,16 @@ export interface TurnDiagnostics {
    *
    * Beyond the two the issue asked for, and here because it is the one column that separates
    * "the provider emitted nothing" from "the provider emitted something this extractor does
-   * not read as an answer". `finalAssistantText` reconstructs from `type === "text"` parts
-   * ONLY, and opencode 1.18.18's `Part` union (probed at `GET /doc`) also contains `reasoning`,
-   * which carries its own `text` — so a turn whose visible output was reasoning alone
-   * reconstructs to `""` here while opencode's own TUI renders it as a full answer. That is a
-   * live candidate for #168's reported failure and it was previously invisible from the
-   * receipts. Absent when the turn carried no assistant parts at all.
+   * not read as an answer". opencode 1.18.18's `Part` union (probed at `GET /doc`) has twelve
+   * members and the census names whichever ones showed up.
+   *
+   * **The specific gap it was written for is now CLOSED, and this survives the fix.**
+   * `reasoning` — a `Part` carrying its own `text` of identical type — used to reconstruct to
+   * `""` while opencode's own TUI rendered it as a full answer; `answerSource` now falls back
+   * to it, so a reasoning-only turn is answered rather than refused. The census stays because
+   * the class of failure is not specific to `reasoning`: a turn refused here while some OTHER
+   * unread part type carried the output is the same defect wearing a different name, and this
+   * is the column that would say so. Absent when the turn carried no assistant parts at all.
    */
   partTypes?: Record<string, number>;
 }
@@ -1528,6 +1601,19 @@ export interface AskResult {
   /** The turn's assistant part types, counted (issue #168) — see `TurnDiagnostics.partTypes`.
    * Absent when the turn carried no assistant parts. */
   partTypes?: Record<string, number>;
+  /**
+   * WHICH CHANNEL `text` CAME OFF (issue #168), present ONLY when it was not the ordinary one.
+   *
+   * `"reasoning"` says the model produced no text at all and `answerSource` promoted its
+   * reasoning to be the answer. Recorded rather than left implicit because the promotion is
+   * otherwise invisible: `raw_response` would render "the model's answer" and "the model's
+   * chain-of-thought, promoted because there was no answer" identically, and the evidence log
+   * exists so a claim can be checked. It also makes the fallback's one real cost — a turn
+   * truncated mid-reasoning is now answered rather than refused — observable instead of
+   * theoretical. Absent on every ordinary turn, so a normal result and receipt are
+   * byte-identical to pre-#168 (C29's optional-field rule).
+   */
+  answerChannel?: AnswerChannel;
   sessionId: string;
   /** Completion metadata from the sync response (cost/tokens/ids/finish). */
   metadata: SendResult;
@@ -1706,6 +1792,9 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       const completion = finalAssistantCompletion(history);
       const partTypes = turnAssistantPartTypes(history);
       const hasPartTypes = Object.keys(partTypes).length > 0;
+      // Issue #168: absent unless the answer was PROMOTED off a non-text channel, so an
+      // ordinary result carries no new field at all (C29's optional-field rule).
+      const answerChannel = finalAssistantChannel(history);
       if (opts.requireAnswer === true && text.trim() === "") {
         throw new EmptyAnswerError(sessionId, text, providerError, {
           toolCallCount,
@@ -1722,6 +1811,7 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         toolCallCount,
         ...(completion !== undefined ? { completion } : {}),
         ...(hasPartTypes ? { partTypes } : {}),
+        ...(answerChannel !== undefined ? { answerChannel } : {}),
         history,
         // OPTIONAL-FIELD DISCIPLINE (C29's rule, applied to a wire-adjacent shape): written only
         // when opencode carried an error, so a normal turn's result is shaped exactly as it was

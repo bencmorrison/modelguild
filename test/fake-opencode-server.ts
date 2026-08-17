@@ -429,7 +429,25 @@ export type TurnShape =
    * TUI, rendering reasoning, would show the user a full answer. `ReasoningPart` is a real
    * member of opencode 1.18.18's `Part` union carrying its own `text` (probed at `GET /doc`).
    */
-  | "reasoning-only";
+  | "reasoning-only"
+  /**
+   * THE NO-MERGE CONTROL for the issue-#168 fallback: the final assistant message carries a
+   * `reasoning` part AND a `text` part, in that order. The reasoning fallback must never fire
+   * here — the text wins outright — so a turn that already worked keeps returning exactly what
+   * it returned before, `raw_response` included. Without this shape "the fallback is a fallback"
+   * would be an argument rather than an assertion.
+   */
+  | "reasoning-then-text"
+  /**
+   * THE SHAPE THE FIRST CUT OF THE #168 FIX DID NOT COVER, and it is `tools-then-silent` — this
+   * repo's own model of the REPORTED turn — with a reasoning part beside it. The ending message
+   * carries `{type:"text", text:""}` AND a `reasoning` part. A fallback gated on "does a text
+   * PART exist" is satisfied by the empty one and never reaches the reasoning, so the turn goes
+   * on being refused; the gate has to be on the joined STRING. The reporter's evidence
+   * (`raw_response: ""`) is equally consistent with no text part and an empty one, so this
+   * arrangement is no less likely to be what was hit than `reasoning-only` is.
+   */
+  | "reasoning-and-empty-text";
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -566,6 +584,41 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
           { id: `t${n}p4`, type: "step-start" },
           { id: `t${n}p5`, type: "reasoning", text: turn.text },
           { id: `t${n}p6`, type: "step-finish" },
+        ],
+      },
+    ];
+  }
+  // REASONING BESIDE AN EMPTY TEXT PART (issue #168): the reported shape plus reasoning. The
+  // empty text part is deliberately LAST, so a fallback that stops at the first text part it
+  // sees is not accidentally rescued by ordering.
+  if (turn.shape === "reasoning-and-empty-text") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        parts: [
+          { id: `t${n}p4`, type: "step-start" },
+          { id: `t${n}p5`, type: "reasoning", text: turn.text },
+          { id: `t${n}p6`, type: "text", text: "" },
+          { id: `t${n}p7`, type: "step-finish" },
+        ],
+      },
+    ];
+  }
+  // THE NO-MERGE CONTROL (issue #168): reasoning AND text in the one ending message. The
+  // reasoning part is FIRST, which is the order that would expose a merge as a prefix.
+  if (turn.shape === "reasoning-then-text") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        parts: [
+          { id: `t${n}p4`, type: "step-start" },
+          { id: `t${n}p5`, type: "reasoning", text: "CHAIN-OF-THOUGHT-THAT-MUST-NOT-APPEAR" },
+          { id: `t${n}p6`, type: "text", text: turn.text },
+          { id: `t${n}p7`, type: "step-finish" },
         ],
       },
     ];

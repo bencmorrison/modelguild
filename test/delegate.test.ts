@@ -2667,6 +2667,48 @@ export async function run(): Promise<number> {
       }
     }
 
+    // --- K(#168-reasoning): THE WRITE PATH INHERITS THE FALLBACK, and that is a behaviour
+    //     change here too, not only on the read paths. `guild_delegate`'s report is
+    //     `finalAssistantText`, so a turn whose report arrived as `reasoning` used to reach the
+    //     tool as `report: ""` — and with zero tool calls that is `empty-delegation`. It is now
+    //     a report. Asserted end to end because nothing else in this file would notice.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const REASONED = "I inspected the files and changed nothing, because …";
+      const fake = await startFakeOpencode({
+        historyText: REASONED,
+        turnShapes: ["reasoning-only"],
+      });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#168(K-reasoning): a reasoning-only delegation is NOT refused as empty-delegation");
+        c.check(r.ok && r.report === REASONED, "#168(K-reasoning): the reasoning text is the report");
+        if (r.ok) {
+          const runDir = path.join(logDir, r.attribution.runId);
+          const entries = readFileSync(path.join(runDir, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            completed.length === 1 && completed[0].raw_response === REASONED,
+            "#168(K-reasoning): the receipt records the promoted text byte-exact",
+          );
+          c.check(
+            completed.length === 1 && completed[0].answer_channel === "reasoning",
+            "#168(K-reasoning): the write path's receipt names the promotion too",
+          );
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
     // --- K(#168-none): opencode recorded no completion metadata. Reported as absent, never as
     //     a fabricated zero — a zero output-token count is evidence and must stay one.
     {

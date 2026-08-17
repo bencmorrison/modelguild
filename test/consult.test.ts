@@ -834,19 +834,20 @@ export async function run(): Promise<number> {
     }
   }
 
-  // 6m. THE PART-TYPE CENSUS (issue #168), and the case it exists for: a turn whose only
-  //     text-bearing part is `reasoning`. `finalAssistantText` reads `type === "text"` alone,
-  //     so this reconstructs to "" and is refused — while the model demonstrably produced
-  //     output. Before the census, the receipts could not tell this from silence at all.
-  //
-  //     This is the leading root-cause candidate for the reported failure, NOT a confirmed
-  //     diagnosis: what it pins is that the next occurrence SAYS which it was.
+  // 6m. THE REPORTED FAILURE (issue #168): a turn whose only text-bearing part is `reasoning`.
+  //     `finalAssistantText` read `type === "text"` alone, so this reconstructed to "" and was
+  //     refused as `empty-answer` — while opencode's own TUI renders that reasoning as a full
+  //     answer, which is the contrast the issue reports (same model, same prompt, same repo,
+  //     answered fully through opencode directly). The fallback returns it instead, and the
+  //     RECEIPT is the assertion that matters: `raw_response` must be the reasoning text
+  //     byte-exact, not "" and not a paraphrase.
   {
     const root = makeGuildRoot();
     const logDir = tmp("m5-logs-");
     const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const REASONED = "a long and confident answer that lives in a reasoning part\n";
     const fake = await startFakeOpencode({
-      historyText: "a long and confident answer that lives in a reasoning part",
+      historyText: REASONED,
       turnShapes: ["reasoning-only"],
       assistantTokens: { input: 500, output: 320, reasoning: 300, cache: { read: 0, write: 0 } },
     });
@@ -855,25 +856,212 @@ export async function run(): Promise<number> {
         { question: "q", model: "openai/allow-model" },
         { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
       );
-      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (reasoning): the turn is still refused — the extractor found no answer");
+      c.check(r.ok, "#168 (reasoning): a reasoning-only turn is ANSWERED, not refused as empty-answer");
+      c.check(r.ok && r.answer === REASONED, "#168 (reasoning): the answer is the reasoning text, byte-exact");
+      if (r.ok) {
+        const entries = readEntries(logDir, r.attribution.runId);
+        const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+        c.check(
+          completed.length === 1 && completed[0].raw_response === REASONED,
+          "#168 (reasoning): the receipt records the reasoning text byte-exact, not the empty string",
+        );
+        c.check(
+          completed.length === 1 && completed[0].exit_code === 0,
+          "#168 (reasoning): the call is recorded as a success, not exit_code 1",
+        );
+        // THE PROMOTION IS ON THE RECORD. Without this the receipt renders "the model's
+        // answer" and "the model's chain-of-thought, promoted because there was no answer"
+        // identically, and the evidence log exists so a claim can be checked.
+        c.check(
+          completed.length === 1 && completed[0].answer_channel === "reasoning",
+          "#168 (reasoning): the receipt names the channel the answer was promoted off",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-a. THE ARRANGEMENT THE FIRST CUT MISSED: reasoning BESIDE an empty text part. That is
+  //     `tools-then-silent` — this repo's own model of the reported turn — with reasoning
+  //     added, and a fallback gated on "a text PART exists" is satisfied by the empty one and
+  //     never fires. End-to-end, because the unit assertions cannot show the refusal it caused.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const REASONED = "the answer, beside an empty text part";
+    const fake = await startFakeOpencode({
+      historyText: REASONED,
+      turnShapes: ["reasoning-and-empty-text"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#168 (empty text part): an empty text part does not re-block the fallback");
+      c.check(r.ok && r.answer === REASONED, "#168 (empty text part): the reasoning is still the answer");
+      if (r.ok) {
+        const completed = readEntries(logDir, r.attribution.runId).filter(
+          (e) => e.type === "call" && e.status === "completed",
+        );
+        c.check(
+          completed.length === 1 && completed[0].answer_channel === "reasoning",
+          "#168 (empty text part): the receipt still names the promotion",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-bis. THE FALLBACK IS A FALLBACK, NOT A MERGE. A turn whose final message carries BOTH a
+  //     reasoning part and a text part returns the TEXT alone — chain-of-thought must never
+  //     land beside an answer the model also wrote, and `raw_response` for every turn that
+  //     already worked has to stay byte-identical to what it was before the fallback existed.
+  //     This is the assertion that would go red on fix shape (a), "include reasoning always".
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "THE ANSWER",
+      turnShapes: ["reasoning-then-text"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok && r.answer === "THE ANSWER", "#168 (no merge): text wins outright over a reasoning part in the same message");
+      if (r.ok) {
+        const completed = readEntries(logDir, r.attribution.runId).filter(
+          (e) => e.type === "call" && e.status === "completed",
+        );
+        c.check(
+          completed.length === 1 && completed[0].raw_response === "THE ANSWER",
+          "#168 (no merge): the receipt carries the answer alone — no chain-of-thought in raw_response",
+        );
+        // C29's optional-field rule: an ordinary answer adds NO field, even though a reasoning
+        // part was present in the very same message.
+        c.check(
+          completed.length === 1 && !("answer_channel" in completed[0]),
+          "#168 (no merge): an ordinary answer's entry carries no answer_channel at all",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-ter. A turn that said nothing on EITHER channel is still refused, with the issue-#173
+  //     diagnostics intact. The fallback narrows what counts as empty; it does not remove the
+  //     refusal, and the part-type census still reports the shape it found.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["tools-then-silent"],
+      assistantTokens: { input: 500, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#168 (still refused): no text AND no reasoning is still empty-answer");
       if (!r.ok) {
         const d = r.error.diagnostics;
         c.check(
-          d?.partTypes?.reasoning === 1 && d?.partTypes?.text === undefined,
-          "#168 (reasoning): the census names a reasoning part and NO text part — where the output went",
+          d?.partTypes?.reasoning === undefined,
+          "#168 (still refused): the census reports no reasoning part — nothing for the fallback to find",
         );
-        c.check(d?.partTypes?.tool === 1, "#168 (reasoning): the tool part is counted too");
+        // PR #173's CENSUS, ASSERTED POSITIVELY. Every other surviving partTypes assertion is
+        // a negative one, so without these the whole census could return {} and stay green.
+        c.check(d?.partTypes?.text === 1, "#173 census: the empty text part IS counted, positively");
+        c.check(d?.partTypes?.tool === 1, "#173 census: the turn's tool part is counted");
         c.check(
-          /Parts this turn:/.test(r.error.message) && /reasoning=1/.test(r.error.message),
-          "#168 (reasoning): the census reaches the message a human reads",
+          d?.partTypes?.["step-start"] === 2 && d?.partTypes?.["step-finish"] === 2,
+          "#173 census: the structural parts are counted across BOTH assistant messages",
         );
-        // THE DISCRIMINATOR the issue asked for, working: nonzero output tokens beside an
-        // empty answer says the provider DID emit — so the emptiness is ours, not theirs.
         c.check(
-          d?.completion?.tokens?.output === 320,
-          "#168 (reasoning): nonzero output tokens beside an empty answer — the provider produced something",
+          /Parts this turn:/.test(r.error.message) && /text=1/.test(r.error.message) && /tool=1/.test(r.error.message),
+          "#173 census: it reaches the message a human reads",
+        );
+        // #168's own discriminator, asserted positively on both sides of the pair.
+        c.check(
+          d?.completion?.tokens?.input === 500 && d?.completion?.tokens?.output === 0,
+          "#173 tokens: zero output BESIDE a nonzero input — the provider emitted nothing",
+        );
+        c.check(d?.toolCallCount === 1, "#173: the turn's tool-call count rides out");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-ter-bis. THE DISCRIMINATOR THE ISSUE ASKED FOR, in the direction that accuses THIS code:
+  //     nonzero output tokens beside an empty answer means the provider emitted and nothing
+  //     here read it. The reasoning fallback closed the one known route to that state, so the
+  //     case is now a turn whose output went somewhere the extractor still does not read — and
+  //     that is exactly the state the census plus the token counts exist to make legible.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["tools-then-silent"],
+      assistantTokens: { input: 500, output: 320, reasoning: 300, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#173 discriminator: still refused");
+      if (!r.ok) {
+        c.check(
+          r.error.diagnostics?.completion?.tokens?.output === 320,
+          "#173 discriminator: NONZERO output beside an empty answer — the provider produced something",
+        );
+        c.check(
+          r.error.diagnostics?.completion?.tokens?.reasoning === 300,
+          "#173 discriminator: the reasoning token count is reported too",
+        );
+        c.check(
+          r.error.diagnostics?.completion?.finish === "stop",
+          "#173 discriminator: finish is carried opaque and verbatim",
         );
       }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-quater. WHITESPACE-ONLY REASONING IS NOT AN ANSWER. The refusal predicate is untouched
+  //     (`text.trim() === ""`), so the fallback cannot smuggle a blank turn past it by finding
+  //     a reasoning part that says nothing.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "   \n\t ",
+      turnShapes: ["reasoning-only"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(
+        !r.ok && r.error.kind === "empty-answer",
+        "#168 (whitespace): a whitespace-only reasoning part is still refused as empty-answer",
+      );
     } finally {
       await fake.close();
     }

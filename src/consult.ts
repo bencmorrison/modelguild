@@ -1192,6 +1192,9 @@ export async function runAgentLifecycle(
       session: result.sessionId,
       captureState: "complete",
       response: result.text,
+      // Issue #168: absent unless the answer was promoted off a non-text channel, so an
+      // ordinary call's entry is byte-identical to a pre-#168 one.
+      ...(result.answerChannel !== undefined ? { answerChannel: result.answerChannel } : {}),
     });
     const ok: LifecycleOutcome = {
       ok: true,
