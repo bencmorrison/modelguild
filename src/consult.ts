@@ -930,6 +930,17 @@ export interface LifecycleParams {
    * fail exactly the case #120 pinned as a success.
    */
   requireAnswer?: boolean;
+  /**
+   * THIS TURN IS A SECOND ATTEMPT (issue #187): the `call_id` of the attempt it retries,
+   * recorded on this call's `started` entry (`retry_of`) so the receipts distinguish a retried
+   * answer from an independent second call to the same model. Set by `guild_panel` only.
+   *
+   * It changes NOTHING about how the turn runs: a retry is a full, separate lifecycle with its
+   * own call id and — because this spine never reuses a session it was not given one for — its
+   * own FRESH opencode session. Do not add a `sessionId` here to "reuse" the dead session; the
+   * turn that produced nothing is exactly the context a retry must not inherit.
+   */
+  retryOf?: string;
 }
 
 /** Every tool's approval plumbing, resolved once by `armApproval` and threaded through the
@@ -1133,6 +1144,7 @@ export async function runAgentLifecycle(
     prompt: p.question,
     ...(p.readRoot !== undefined ? { readRoot: p.readRoot } : {}),
     ...(p.writeRoot !== undefined ? { writeRoot: p.writeRoot } : {}),
+    ...(p.retryOf !== undefined ? { retryOf: p.retryOf } : {}),
   });
   // One recorder per call. Undefined when the activity layer is absent or `off`, in which
   // case `askViaAgent` opens no subscription at all and nothing below changes.

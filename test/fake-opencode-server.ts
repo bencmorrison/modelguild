@@ -80,6 +80,14 @@ export interface FakeOpencodeOpts {
    */
   emptyAnswerForModel?: string;
   /**
+   * ISSUE #187: how many TURNS `emptyAnswerForModel` stays silent for. Counted PER MODEL and
+   * ACROSS SESSIONS — which is the whole point, since a panel retry runs in a fresh session, so
+   * a per-session turn counter would reset and the member would be silent forever. Unset ⇒ every
+   * turn is silent (the pre-#187 behaviour). `1` is "empty on the first attempt, answers on the
+   * retry", the shape the retry has to recover.
+   */
+  emptyAnswerTimes?: number;
+  /**
    * ISSUE #168, the reported panel: serve the `tools-then-silent` shape only for the member
    * whose body model id equals this. Its sibling answers normally against the same fake, which
    * is what makes the per-member diagnostics assertion meaningful rather than trivial.
@@ -464,15 +472,27 @@ function firstTextPart(body: Record<string, unknown>): string | undefined {
 }
 
 /** Which shape this turn serves. Decided at POST time: the model id and the turn number are
- * both only knowable there, and the history GET carries neither. */
-function turnShapeFor(opts: FakeOpencodeOpts, modelId: string, turnNo: number): TurnShape {
+ * both only knowable there, and the history GET carries neither. `modelTurnNo` is this MODEL's
+ * turn count across every session (issue #187) — `turnNo` is per session and resets on a retry. */
+function turnShapeFor(
+  opts: FakeOpencodeOpts,
+  modelId: string,
+  turnNo: number,
+  modelTurnNo: number,
+): TurnShape {
   if (
     opts.toolsThenSilentForModel !== undefined &&
     modelId === opts.toolsThenSilentForModel
   ) {
     return "tools-then-silent";
   }
-  if (opts.emptyAnswerForModel !== undefined && modelId === opts.emptyAnswerForModel) return "rejected";
+  if (
+    opts.emptyAnswerForModel !== undefined &&
+    modelId === opts.emptyAnswerForModel &&
+    (opts.emptyAnswerTimes === undefined || modelTurnNo <= opts.emptyAnswerTimes)
+  ) {
+    return "rejected";
+  }
   const shapes = opts.turnShapes;
   if (shapes === undefined || shapes.length === 0) return "text";
   return shapes[Math.min(turnNo, shapes.length) - 1];
@@ -697,6 +717,8 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
   const pendingPerms = new Map<string, (reply: string) => void>();
   /** This session's turns, in order — see `TurnRecord`. */
   const turns = new Map<string, TurnRecord[]>();
+  /** Turns posted per MODEL id, across sessions — see `emptyAnswerTimes` (issue #187). */
+  const modelTurns = new Map<string, number>();
   /**
    * The REQUEST RECORD for each open id, so `GET /permission` can serve it (issue #91).
    *
@@ -984,9 +1006,13 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
           const model = (body.model ?? {}) as Record<string, unknown>;
           const modelId = `${model.providerID ?? ""}/${model.modelID ?? ""}`;
           const turnNo = list.length + 1;
+          // PER MODEL, ACROSS SESSIONS (issue #187) — a retry is a fresh session, so `turnNo`
+          // is back to 1 there and cannot express "silent once, then answers".
+          const modelTurnNo = (modelTurns.get(modelId) ?? 0) + 1;
+          modelTurns.set(modelId, modelTurnNo);
           list.push({
             question: firstTextPart(body) ?? "the question",
-            shape: turnShapeFor(opts, modelId, turnNo),
+            shape: turnShapeFor(opts, modelId, turnNo, modelTurnNo),
             text: turnTextFor(opts, turnNo),
           });
           turns.set(msgMatch[1], list);
@@ -1038,7 +1064,7 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
         const list: TurnRecord[] =
           recordedTurns !== undefined && recordedTurns.length > 0
             ? recordedTurns
-            : [{ question: "the question", shape: turnShapeFor(opts, "", 1), text: turnTextFor(opts, 1) }];
+            : [{ question: "the question", shape: turnShapeFor(opts, "", 1, 1), text: turnTextFor(opts, 1) }];
         const messages: unknown[] = [];
         list.forEach((turn, i) => {
           messages.push(...renderTurn(turn, i + 1, opts));

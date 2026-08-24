@@ -15,6 +15,7 @@ import {
   confGet,
   resolveModel,
   resolveMessageTimeoutMs,
+  resolvePanelRetrySettings,
   parsePerCallTimeoutMs,
   TIMER_MAX_MS,
   checkResolvedModelId,
@@ -102,6 +103,25 @@ export async function run(): Promise<number> {
       "resolveMessageTimeoutMs: literal 'max' → the 2^31-1 timer ceiling");
     t.check(resolveMessageTimeoutMs({ env: { GUILD_MESSAGE_TIMEOUT_MS: "  MAX  " } as NodeJS.ProcessEnv, confContents: "", fallback: 900000 }) === 2147483647,
       "resolveMessageTimeoutMs: 'max' is trimmed + case-insensitive");
+
+    // ---- resolvePanelRetrySettings: the issue-#187 panel retry knob ----
+    // Default ON, and LENIENT: only `0`/`off` disable, so a typo costs one extra model turn
+    // rather than silently reinstating the dropped voice this feature exists to recover.
+    const R = resolvePanelRetrySettings;
+    t.check(R({ env: {} as NodeJS.ProcessEnv, confContents: "" }).retryEmpty === true,
+      "resolvePanelRetrySettings: nothing set → ON (a lost panel voice is the failure being fixed)");
+    t.check(R({ env: { GUILD_PANEL_RETRY_EMPTY: "0" } as NodeJS.ProcessEnv, confContents: "" }).retryEmpty === false,
+      "resolvePanelRetrySettings: '0' disables (the value the issue named)");
+    t.check(R({ env: { GUILD_PANEL_RETRY_EMPTY: " OFF " } as NodeJS.ProcessEnv, confContents: "" }).retryEmpty === false,
+      "resolvePanelRetrySettings: 'off' disables too, trimmed + case-insensitive");
+    t.check(R({ env: { GUILD_PANEL_RETRY_EMPTY: "nonsense" } as NodeJS.ProcessEnv, confContents: "" }).retryEmpty === true,
+      "resolvePanelRetrySettings: an unrecognized value stays ON (lenient, like GUILD_ACTIVITY)");
+    t.check(R({ env: noEnv, confContents: "GUILD_PANEL_RETRY_EMPTY=0\n" }).retryEmpty === false,
+      "resolvePanelRetrySettings: the conf file binds when the env says nothing");
+    t.check(R({ env: { GUILD_PANEL_RETRY_EMPTY: "on" } as NodeJS.ProcessEnv, confContents: "GUILD_PANEL_RETRY_EMPTY=0\n" }).retryEmpty === true,
+      "resolvePanelRetrySettings: env wins over conf");
+    t.check(R({ env: { GUILD_PANEL_RETRY_EMPTY: "" } as NodeJS.ProcessEnv, confContents: "GUILD_PANEL_RETRY_EMPTY=0\n" }).retryEmpty === false,
+      "resolvePanelRetrySettings: an empty env string falls through to conf");
 
     // ---- parsePerCallTimeoutMs: STRICT per-call param (invalid → error, not default) ----
     t.check(TIMER_MAX_MS === 2147483647, "TIMER_MAX_MS is 2^31-1");
