@@ -447,7 +447,16 @@ export type TurnShape =
    * (`raw_response: ""`) is equally consistent with no text part and an empty one, so this
    * arrangement is no less likely to be what was hit than `reasoning-only` is.
    */
-  | "reasoning-and-empty-text";
+  | "reasoning-and-empty-text"
+  /**
+   * ISSUE #185: the turn answers, and then a LATER assistant message in the SAME turn carries
+   * nothing but whitespace. #168's `length > 0` gate accepted that trailing message, so the
+   * real answer was discarded and `requireAnswer` refused the turn — the same defect a trailing
+   * EMPTY text message caused, in the shape one space character reaches. It has to be a
+   * separate MESSAGE (not another part of the answering one) because that is what the backward
+   * walk decides between.
+   */
+  | "text-then-whitespace";
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -638,6 +647,25 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
           { id: `t${n}p5`, type: "text", text: "" },
           { id: `t${n}p6`, type: "step-finish" },
         ],
+      },
+    ];
+  }
+  // ISSUE #185: a real answer, then a trailing whitespace-only assistant message.
+  if (turn.shape === "text-then-whitespace") {
+    return [
+      user,
+      toolMsg,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        parts: [
+          { id: `t${n}p4`, type: "step-start" },
+          { id: `t${n}p5`, type: "text", text: turn.text },
+          { id: `t${n}p6`, type: "step-finish" },
+        ],
+      },
+      {
+        info: asst(`msg_asst_trailing_${n}`, { finish: "stop" }),
+        parts: [{ id: `t${n}p7`, type: "text", text: "\n  " }],
       },
     ];
   }
