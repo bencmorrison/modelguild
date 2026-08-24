@@ -71,8 +71,15 @@
  * uninstall could remove nothing. Two named conditions, not a general can-this-write predicate.
  * Capability cost, stated: `--global` now writes wherever those directory links point,
  * including outside `$HOME`, and uninstall's `pruneEmptyDirs` may `rmdir` now-empty dirs in the
- * backing store. Provenance: the ask and the global-only scope are the maintainer's
- * (issue #156); the shape is Claude's.
+ * backing store. UNINSTALL REMOVES THE LINK AND LEAVES THE TARGET, AND SAYS SO (issue #184):
+ * `unlink(2)` never follows a final component, so that is what it always did — the change is
+ * that it is named, because the write-through above is UNGATED and the file left behind may be
+ * the user's own holding our record JSON. Disclosure only, no write-path change. The
+ * ownership half of the message is gated on the record having parsed non-empty FROM that path,
+ * and claims only what that parse carries — our JSON is behind the link NOW, by a route this
+ * run cannot identify; the ungated half reports what this run could not read, never a property
+ * of the user's file. See the removal branch in `init`. Provenance: the ask and the global-only
+ * scope are the maintainer's (issue #156); the shape is Claude's.
  *
  * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
  * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
@@ -1824,12 +1831,65 @@ export function init(opts: InitOptions): InitResult {
     } else if (entryExists(plan.recordPath)) {
       // Remove the record file, then (project only) the gitignore block, then empty dirs.
       // `lstat`, so a DANGLING record link is removed rather than followed-and-called-absent;
-      // `unlink(2)` never follows a final component, so a live link's target survives (C77) —
-      // and that leftover is NOT named here. Naming it was #165's, and went out with #165's
-      // write-through; disclosing a C77 behaviour is a change of its own, not a fragment of a
-      // reverted one.
+      // `unlink(2)` never follows a final component, so a live link's target survives (C77).
+      //
+      // AND THAT LEFTOVER IS NAMED (issue #184). The call is unchanged — this is disclosure
+      // only, no write-path change. It is worth a warning because C77's record write-through is
+      // UNGATED: an install writes the record through a live link, replacing whatever the target
+      // held, so the file left behind here may be the user's own with ModelGuild's JSON in it,
+      // and after the unlink nothing points at it any more. `resolveRecordLink`, not a
+      // global-only helper: the record write-through is BOTH modes (C77), and in `--global`
+      // `planFor` emits no plan-time record-symlink line at all, so this is the only disclosure
+      // that mode gets. Resolved BEFORE the unlink, because afterwards there is no link to read.
+      //
+      // DO NOT ASSERT A DESTRUCTION THAT MAY NOT HAVE HAPPENED (issue #165 review finding F-3,
+      // carried forward because the guard is the reusable part of that change). "There is a link
+      // here" says nothing about whether the bytes behind it were ever ours. Reproduced: plant a
+      // record symlink at a file holding `MINE\n`, never install, run `--uninstall` ⇒ an
+      // unguarded claim fired and the file was untouched. The evidence is already in hand at no
+      // syscall cost — `records` / `ownedMcp` were parsed FROM this path at the top of `init`,
+      // through the link (`isRegularFile` is `stat`-based, C78).
+      //
+      // NEITHER BRANCH MAY CLAIM MORE THAN THE PARSE CARRIES, and both overclaimed on the first
+      // cut (— the #184 review). The variable is named `readAsOurs` and not `wasOurs` because
+      // that is the whole of what it knows.
+      //
+      //   POSITIVE: a non-empty parse establishes that our record JSON is behind the link NOW.
+      //   It does NOT establish that an install wrote it THROUGH the link — a record written
+      //   by an ordinary install and symlinked afterwards by a dotfiles manager reads exactly
+      //   the same, which is the shape `test/init.test.ts` case (c) constructs. So the message
+      //   states the present fact, names both routes as indistinguishable, and keeps the half
+      //   that is actionable either way: if the file was yours, nothing here restores it.
+      //
+      //   NEGATIVE: an empty parse is AMBIGUOUS — not ours, unreadable, dangling, or a VALID
+      //   record whose `files` map is empty. That last one is reachable: a `--global` install
+      //   into a tree where every payload destination is a leaf symlink (the GNU-stow `--adopt`
+      //   layout `docs/setup.md` supports) skips all 13 and writes `{"files":{}}` through the
+      //   record link, destroying the target to do it. So this branch reports the OBSERVATION
+      //   — what this run could not read — and never a property of the user's file. Saying
+      //   "its contents did not read as a ModelGuild ownership record" there was FALSE, and
+      //   false in the mirror direction to F-3: an all-clear over a file we had just destroyed.
+      //   A third state distinguishing the empty-but-valid record is deliberately NOT added
+      //   here; it is filed separately. The leftover is still NAMED in both branches.
+      const recordLink = resolveRecordLink(plan.recordPath);
       try {
         unlinkSync(plan.recordPath);
+        if (recordLink) {
+          const readAsOurs = Object.keys(records).length > 0 || ownedMcp !== undefined;
+          result.warnings.push(
+            `removed the symlink at ${plan.recordPath}, but LEFT its target ${recordLink.target} ` +
+              `in place${recordLink.live ? "" : " (already gone)"} — uninstall deletes the link, ` +
+              `never through it. ` +
+              (readAsOurs
+                ? `That file currently holds ModelGuild's ownership-record JSON — this run ` +
+                  `cannot tell whether an install wrote it through this link or the link was ` +
+                  `pointed at a record already written. Either way, if the file was originally ` +
+                  `yours, nothing here restores it.`
+                : `This run could not read a ModelGuild ownership record behind that link, so ` +
+                  `it makes no claim about what the file holds; nothing was removed from the ` +
+                  `file itself.`),
+          );
+        }
       } catch (err) {
         result.warnings.push(
           `could not remove the ownership record at ${plan.recordPath} (${errCode(err)}) — ` +
