@@ -510,6 +510,47 @@ export function resolvePayloadNoticeSettings(opts: {
 }
 
 /* ---------------------------------------------------------------------------
+ * Panel empty-answer retry (issue #187) — `GUILD_PANEL_RETRY_EMPTY`.
+ *
+ * Same chain as every other knob: env override > `modelguild.conf.local` > default,
+ * across the layered roots (issue #19), so a global `0` binds in a project that never
+ * restates it.
+ *
+ * Defaults to **on**. A panel member that answers nothing is the one failure shape where
+ * the whole call still looks successful — the synthesis proceeds a voice short — so the
+ * default direction is to spend one more turn recovering the voice rather than to report
+ * a quieter panel. `0` (the value the issue named) and `off` both disable it; anything else
+ * retries. LENIENT like `GUILD_ACTIVITY`, not strict like `GUILD_APPROVE`: a typo here costs
+ * at most one extra model turn and leaves no gate un-enforced, so failing toward the
+ * documented default is the safe direction.
+ *
+ * SCOPE, and it is deliberately narrow: it governs `guild_panel`'s `empty-answer` retry and
+ * NOTHING else. It is not a general retry budget — `guild_consult` returning empty is already
+ * visible to the driver, and every other refusal kind is a decision rather than a failure.
+ * --------------------------------------------------------------------------- */
+export interface PanelRetrySettings {
+  /** Whether an `empty-answer` panel member gets ONE more attempt (issue #187). */
+  retryEmpty: boolean;
+}
+
+export function resolvePanelRetrySettings(
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    confContents?: string;
+  } = {},
+): PanelRetrySettings {
+  const env = opts.env ?? process.env;
+  const conf = opts.confContents ?? "";
+  const fromEnv = env.GUILD_PANEL_RETRY_EMPTY;
+  const raw =
+    fromEnv !== undefined && fromEnv !== ""
+      ? fromEnv
+      : confGet(conf, "GUILD_PANEL_RETRY_EMPTY") || "on";
+  const token = raw.trim().toLowerCase();
+  return { retryEmpty: token !== "0" && token !== "off" };
+}
+
+/* ---------------------------------------------------------------------------
  * Default-model precedence (C8): `-m` flag > `$GUILD_MODEL` env > conf `GUILD_MODEL`
  * > opencode's own default (empty). `flag` is the value of an explicit `-m`; `undefined`
  * means none was given (an EMPTY `-m` value is a usage error handled by the caller's

@@ -21,6 +21,10 @@
  *   - A member whose model call THROWS records completed/failed and surfaces a per-model
  *     call-failed error; it NEVER aborts the other members (Promise.all resolves each to
  *     a result object, so no member's rejection can reject the whole panel).
+ *   - A member that answers NOTHING (`empty-answer`, C74) gets ONE more attempt in a FRESH
+ *     session (issue #187, C81, `GUILD_PANEL_RETRY_EMPTY=0` to disable) — a full second
+ *     lifecycle with its own call_id under the same run, linked to the first by `retry_of`.
+ *     ONLY that kind: see the boundary note at the retry itself before widening it.
  *   - The WHOLE panel refuses up front in two cases: the hardened guild-read def is absent
  *     (agent-def-missing, exit-5 analogue — one check for every member, the NO-FALLBACK
  *     deviation guild_research/guild_delegate also make), or the resolved model set is EMPTY
@@ -63,6 +67,7 @@ import {
   readLayeredConfContents,
   resolvePanelModels,
   resolveMessageTimeoutMs,
+  resolvePanelRetrySettings,
   resolveAgentDefDirs,
   hardenedDefPresentIn,
 } from "./config.js";
@@ -183,6 +188,24 @@ export interface PanelMemberError {
   diagnostics?: TurnDiagnostics;
 }
 
+/**
+ * ONE ATTEMPT at a panel member (issue #187). Present only on a member that was RETRIED, and
+ * then for every attempt including the last, in order — so the driver can tell "answered first
+ * time" from "answered second time", and read either attempt's receipt by its own `call_id`.
+ */
+export interface PanelAttempt {
+  /** This attempt's `call_id` — the receipt to read for it, under the panel's one `run_id`. */
+  callId: string;
+  /** `"ok"` when this attempt answered; otherwise the member-error kind it produced. The
+   * FIRST entry is always `empty-answer` (the only kind that is retried); the last may be
+   * anything, because a retry can fail differently from the attempt that provoked it. */
+  outcome: "ok" | PanelMemberErrorKind;
+  /** This attempt's own diagnostics (issue #173's shape), present on an `empty-answer`
+   * attempt. Per attempt rather than merged: two empty turns is the evidence #168 wants, and
+   * merging them would destroy exactly the comparison. */
+  diagnostics?: TurnDiagnostics;
+}
+
 /** One panel member's outcome — exactly one of `text` / `error` is set. `model` is the
  * EXACT id (area-F command surface, panel.md): the resolved/actual id on success, the
  * requested id on a refusal. */
@@ -203,6 +226,14 @@ export interface PanelMemberResult {
   /** PER MEMBER, like `activity`: present only when the approval bridge was armed (issue
    * #20 slice 4) — which on this read path needs `GUILD_APPROVE_EGRESS=ask`. */
   approval?: ApprovalSummary;
+  /**
+   * EVERY ATTEMPT AT THIS MEMBER (issue #187), in order — present ONLY when a retry happened,
+   * so a member that answered first time is byte-identical to one recorded before this field
+   * existed. `callId`, `activity`, `approval`, `text` and `error` above all describe the LAST
+   * attempt: it is the one that produced the result being reported. The earlier attempt is not
+   * lost — its `call_id` here is its receipt, and its `activity.jsonl` lines are keyed on it.
+   */
+  attempts?: PanelAttempt[];
 }
 
 export interface PanelOk {
@@ -424,6 +455,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // ONE activity layer for the panel; each member's recorder is minted per call and routes
   // by its own opencode session id, so concurrent members never see each other's events.
   const activity = activityLayerFor({ env, confContents, log, onActivity: deps.onActivity });
+  // ISSUE #187: resolved ONCE for the whole panel, beside every other loop-invariant knob.
+  const { retryEmpty } = resolvePanelRetrySettings({ env, confContents });
 
   // 5. Members run CONCURRENTLY; each is gated + logged independently. One member's
   //    refusal or failure never touches another's result (order preserved by Promise.all).
@@ -442,31 +475,78 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           },
         };
       }
-      const outcome = await runAgentLifecycle(
-        {
-          question: params.question,
-          requestedModel: model,
-          agent: PANEL_AGENT,
-          command: PANEL_COMMAND,
-          title: "guild_panel",
-          runId,
-          tier: gate.tier,
-          confirmed: gate.confirmed,
-          keepSession: keepSessions,
-          // Issue #117 (C74). This is the member that used to drop out QUIETLY: an empty
-          // `text` rendered as a blank line and the synthesis proceeded a voice short.
-          requireAnswer: true,
-          ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
-        },
-        {
-          serve,
-          log,
-          preTurnCheck,
-          messageTimeoutMs,
-          activity,
-          ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
-        },
-      );
+      /**
+       * ONE attempt at this member. `retryOf` is the previous attempt's call id (issue #187);
+       * everything else is IDENTICAL between attempts — same question, same agent, same gate
+       * decision, same roots. The FRESH SESSION the retry needs comes by construction: this
+       * spine only continues a session it is HANDED, and the panel never hands it one, so every
+       * attempt creates its own. Do not "optimize" that into a continuation — a turn that
+       * produced nothing is the one context a retry must not inherit.
+       */
+      const attempt = (retryOf?: string) =>
+        runAgentLifecycle(
+          {
+            question: params.question,
+            requestedModel: model,
+            agent: PANEL_AGENT,
+            command: PANEL_COMMAND,
+            title: "guild_panel",
+            runId,
+            tier: gate.tier,
+            confirmed: gate.confirmed,
+            keepSession: keepSessions,
+            // Issue #117 (C74). This is the member that used to drop out QUIETLY: an empty
+            // `text` rendered as a blank line and the synthesis proceeded a voice short.
+            requireAnswer: true,
+            ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+            ...(retryOf !== undefined ? { retryOf } : {}),
+          },
+          {
+            serve,
+            log,
+            preTurnCheck,
+            messageTimeoutMs,
+            activity,
+            ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
+          },
+        );
+
+      let outcome = await attempt();
+      /** Set only once a retry has actually happened; see `PanelMemberResult.attempts`. */
+      let attempts: PanelAttempt[] | undefined;
+      /**
+       * ISSUE #187: EXACTLY ONE more attempt, and ONLY for `empty-answer`.
+       *
+       * THE BOUNDARY IS THE POINT, so read the other kinds before widening it. A policy refusal
+       * (`model-id`/`policy-deny`/`policy-ask`) never reaches this line — it returned above,
+       * having logged nothing. Of what does reach here, `agent-mismatch`, `agent-unhardened` and
+       * `approval-not-applied` are DECISIONS about the configuration the turn would run under,
+       * so a second identical attempt re-runs a configuration this server has just refused; and
+       * `call-failed` is a transport/provider failure whose retry policy is a different question
+       * from this one — it is also the kind that turns a bounded retry into a hammer.
+       * `empty-answer` alone says the turn RAN, completed, and produced nothing, which is the
+       * only state where asking again asks the same question of a model that never answered it.
+       *
+       * ONE retry, no loop and no backoff: the second attempt's result is final, whatever it is.
+       */
+      if (retryEmpty && !outcome.ok && outcome.kind === "empty-answer") {
+        const first = outcome;
+        outcome = await attempt(first.callId);
+        attempts = [
+          {
+            callId: first.callId,
+            outcome: "empty-answer",
+            ...(first.diagnostics !== undefined ? { diagnostics: first.diagnostics } : {}),
+          },
+          outcome.ok
+            ? { callId: outcome.callId, outcome: "ok" }
+            : {
+                callId: outcome.callId,
+                outcome: outcome.kind,
+                ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
+              },
+        ];
+      }
       if (outcome.ok) {
         const member: PanelMemberResult = {
           model: outcome.actualModel,
@@ -477,6 +557,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         if (keepSessions) member.sessionId = outcome.sessionId;
         if (outcome.activity !== undefined) member.activity = outcome.activity;
         if (outcome.approval !== undefined) member.approval = outcome.approval;
+        // Issue #187: an answer that needed a second attempt is a different claim from one
+        // that did not, so it says so — on the RESULT as well as in the receipts.
+        if (attempts !== undefined) member.attempts = attempts;
         return member;
       }
       // A FAILED member (call-failed OR agent-mismatch) carries NO sessionId even under
@@ -493,8 +576,13 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
         outcome.kind === "agent-unhardened"
           ? outcome.reason
           : // Issue #117: an empty answer names the model, because that is the whole finding.
+            // Issue #187: and it says whether this was the SECOND such turn, because two empty
+            // turns is a materially stronger claim about the model than one — both for the
+            // driver reading the panel and for #168's investigation.
             outcome.kind === "empty-answer"
-            ? `The panel call to '${model}' returned NO ANSWER: ${outcome.reason}`
+            ? `The panel call to '${model}' returned NO ANSWER${
+                attempts !== undefined ? " TWICE (the retry was also silent)" : ""
+              }: ${outcome.reason}`
             : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
         model,
@@ -503,11 +591,14 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
           kind: outcome.kind,
           exitAnalogue: null,
           message,
+          // The LAST attempt's diagnostics, matching every other field here. Issue #173's shape
+          // is unchanged for a member that was never retried; both attempts' are in `attempts`.
           ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
         },
       };
       if (outcome.activity !== undefined) failed.activity = outcome.activity;
       if (outcome.approval !== undefined) failed.approval = outcome.approval;
+      if (attempts !== undefined) failed.attempts = attempts;
       return failed;
     }),
   );
@@ -542,6 +633,13 @@ function renderPanelText(r: PanelOk): string {
   for (const m of r.results) {
     lines.push("");
     lines.push(`## ${m.model}`);
+    // Issue #187: a text-only reader must see that this voice took two turns to arrive (or
+    // failed twice) — otherwise the retry is invisible on exactly the surface the driver reads.
+    if (m.attempts !== undefined && m.attempts.length > 1) {
+      lines.push(
+        `RETRIED: the first attempt (call ${m.attempts[0].callId}) returned no answer; this is attempt ${m.attempts.length}.`,
+      );
+    }
     if (m.error) lines.push(`ERROR (${m.error.kind}): ${m.error.message}`);
     else lines.push(m.text ?? "");
   }

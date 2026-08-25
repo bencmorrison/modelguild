@@ -310,7 +310,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "denied model returns a per-model error while the others still run; an ask-gated " +
         "model needs the USER's approval. NOTE: a single confirmed:true approves EVERY " +
         "ask-gated model on THIS panel call (panel-wide scope) — obtain it by asking the " +
-        "user about this panel; never grant it yourself.",
+        "user about this panel; never grant it yourself. A member whose turn produces NO " +
+        "ANSWER is asked ONCE more in a fresh session before it is reported as failed " +
+        "(issue #187), so an empty-answer error here means the model was silent TWICE and " +
+        "calling the panel again to retry it is not your move; a member that needed the " +
+        "retry and then answered carries results[].attempts — say that it took two turns. " +
+        "Nothing else is retried, and GUILD_PANEL_RETRY_EMPTY=0 turns it off.",
       inputSchema: {
         type: "object",
         properties: {

@@ -640,7 +640,10 @@ export async function run(): Promise<number> {
         c.check(beta?.error?.exitAnalogue === null, "empty-member: beta's exit analogue is null");
         c.check(!!beta?.error?.message.includes("beta/silent"), "empty-member: beta's message names the model");
         c.check(beta?.sessionId === undefined, "empty-member: beta has NO sessionId under keepSessions (round-2 skips it)");
-        c.check(fake.recorded.deletes.length === 1, "empty-member: exactly one session deleted (beta's; no orphan, no leak)");
+        // TWO since issue #187: this fixture is silent on EVERY turn, so beta is retried once
+        // and both of its sessions must be cleaned up. The property is unchanged — no orphan,
+        // no leak — and the count is the only thing the retry moved.
+        c.check(fake.recorded.deletes.length === 2, "empty-member: both of beta's sessions deleted (no orphan, no leak)");
         c.check(
           alpha?.sessionId !== undefined && !fake.recorded.deletes.includes(alpha.sessionId),
           "empty-member: the kept sibling session was NOT deleted",
@@ -770,6 +773,257 @@ export async function run(): Promise<number> {
           "#168 panel fix: the receipt names the promotion, per member",
         );
         c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#168 panel fix: the run verifies clean");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 12e. ISSUE #187: AN `empty-answer` MEMBER IS RETRIED ONCE, IN A FRESH SESSION, AND THE
+  //      VOICE COMES BACK. 12b is the same fixture with the retry never happening: the
+  //      synthesis proceeded a voice short and naming the loss did not recover it.
+  //
+  //      Every claim here is one the receipts have to carry too — a retried answer is a
+  //      different claim from a first-time one, so the second attempt's `started` entry names
+  //      the first attempt's call_id (`retry_of`) and both lifecycles are complete and verify.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy(""); // default-allow
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_LOG_PROMPTS: "full", GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "the voice the retry recovered",
+      distinctSessions: true,
+      emptyAnswerForModel: "beta/silent",
+      // Silent on the FIRST turn only: the shape a retry exists to recover.
+      emptyAnswerTimes: 1,
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/silent"], keepSessions: true },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#187 retry: the panel is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/silent");
+        c.check(beta?.error === undefined, "#187 retry: the silent member does NOT land in error");
+        c.check(
+          beta?.text === "the voice the retry recovered",
+          "#187 retry: the voice is recovered — the panel is no longer a member short",
+        );
+        c.check(beta?.attempts?.length === 2, "#187 retry: exactly TWO attempts (one retry, no loop)");
+        c.check(
+          beta?.attempts?.[0].outcome === "empty-answer",
+          "#187 retry: attempt 1 is recorded as the empty answer that provoked the retry",
+        );
+        c.check(beta?.attempts?.[1].outcome === "ok", "#187 retry: attempt 2 is recorded as the one that answered");
+        c.check(
+          beta?.callId === beta?.attempts?.[1].callId && beta?.callId !== beta?.attempts?.[0].callId,
+          "#187 retry: the member's callId is the LAST attempt's, and the two are distinct",
+        );
+        c.check(
+          beta?.sessionId !== undefined,
+          "#187 retry: the recovered member keeps its sessionId — round 2 no longer skips it",
+        );
+        // A SIBLING IS UNTOUCHED, and pays nothing: the retry is per member.
+        const alpha = r.results.find((m) => m.model === "alpha/ok");
+        c.check(alpha?.text === "the voice the retry recovered", "#187 retry: the sibling answered normally");
+        c.check(alpha?.attempts === undefined, "#187 retry: a member that answered first time carries NO attempts");
+
+        const entries = readEntries(logDir, r.runId);
+        const first = beta?.attempts?.[0].callId as string;
+        const second = beta?.attempts?.[1].callId as string;
+        // THE RECEIPTS. Both attempts are full three-entry lifecycles under the ONE run.
+        for (const [label, id] of [["first", first], ["second", second]] as const) {
+          const mine = entries.filter((e) => e.call_id === id);
+          c.check(
+            mine.filter((e) => e.type === "expected-call").length === 1 &&
+              mine.filter((e) => e.status === "started").length === 1 &&
+              mine.filter((e) => e.status === "completed").length === 1,
+            `#187 retry: the ${label} attempt is a complete expect/started/completed lifecycle`,
+          );
+        }
+        const firstStarted = entries.find((e) => e.call_id === first && e.status === "started");
+        const secondStarted = entries.find((e) => e.call_id === second && e.status === "started");
+        c.check(
+          firstStarted?.retry_of === undefined,
+          "#187 retry: the FIRST attempt carries no retry_of (an ordinary entry, byte-identical to pre-#187)",
+        );
+        c.check(
+          secondStarted?.retry_of === first,
+          "#187 retry: the second attempt's started entry names the attempt it retried",
+        );
+        // A FRESH SESSION, NEVER THE DEAD ONE. The two attempts' recorded sessions differ, and
+        // the first attempt's session was deleted before the retry ran — continuing it was
+        // never possible, which is the guarantee, not merely the current behaviour.
+        const firstCompleted = entries.find((e) => e.call_id === first && e.status === "completed");
+        const secondCompleted = entries.find((e) => e.call_id === second && e.status === "completed");
+        c.check(
+          typeof firstCompleted?.session_id === "string" &&
+            typeof secondCompleted?.session_id === "string" &&
+            firstCompleted.session_id !== secondCompleted.session_id,
+          "#187 retry: the retry ran in a DIFFERENT opencode session than the empty attempt",
+        );
+        c.check(
+          fake.recorded.deletes.includes(firstCompleted?.session_id as string),
+          "#187 retry: the empty attempt's session was deleted (the retry could not have continued it)",
+        );
+        c.check(
+          fake.recorded.messageBodies.length === 3,
+          "#187 retry: exactly THREE model turns — sibling + two attempts, no third try",
+        );
+        c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#187 retry: the run with a retry in it verifies clean");
+        // The text digest is the surface a text-only client reads; the retry must be visible there.
+        const text = panelToToolResult(r).content[0].text;
+        c.check(/RETRIED:/.test(text), "#187 retry: the rendered digest says the voice needed a second attempt");
+        const wire = panelToToolResult(r).structuredContent as {
+          results: Array<{ model: string; attempts?: Array<{ outcome: string }> }>;
+        };
+        c.check(
+          wire.results.find((m) => m.model === "beta/silent")?.attempts?.length === 2,
+          "#187 retry: attempts survive the MCP boundary",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 12f. ISSUE #187, THE BOUNDARY — AND IT IS THE PART MOST LIKELY TO BE GOT WRONG. Only
+  //      `empty-answer` is retried. A `call-failed` member (here: opencode 500s on that model)
+  //      is a transport/provider failure, and every other reachable kind is a DECISION about
+  //      the configuration the turn would run under; repeating either re-runs something this
+  //      server has just refused or failed at. Asserted on the TURN COUNT, not on the result
+  //      shape, because a second attempt that also failed would look identical otherwise.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "ok voice",
+      distinctSessions: true,
+      failMessageForModel: "beta/broken",
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/broken"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#187 boundary: the panel itself is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/broken");
+        c.check(beta?.error?.kind === "call-failed", "#187 boundary: the broken member is call-failed");
+        c.check(beta?.attempts === undefined, "#187 boundary: a call-failed member records NO attempts");
+        c.check(
+          fake.recorded.messageBodies.length === 2,
+          "#187 boundary: exactly TWO turns — a call-failed member is NOT retried",
+        );
+        const mine = readEntries(logDir, r.runId).filter((e) => e.call_id === beta?.callId);
+        c.check(mine.length === 3, "#187 boundary: the failed member wrote ONE lifecycle, not two");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 12g. ISSUE #187: `GUILD_PANEL_RETRY_EMPTY=0` DISABLES IT — the behaviour goes back to
+  //      exactly 12b's, entry shape included, so someone who does not want the second turn
+  //      spent can turn it off and get the pre-#187 panel.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({
+      GUILD_ROOT: root,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDirWithRead(),
+      GUILD_PANEL_RETRY_EMPTY: "0",
+    });
+    const fake = await startFakeOpencode({
+      historyText: "ok voice",
+      distinctSessions: true,
+      emptyAnswerForModel: "beta/silent",
+      emptyAnswerTimes: 1, // it WOULD have answered on a retry — so a pass here is the knob, not the fixture
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/silent"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#187 knob: the panel is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/silent");
+        c.check(beta?.error?.kind === "empty-answer", "#187 knob: with the knob off the member stays empty-answer");
+        c.check(beta?.attempts === undefined, "#187 knob: no attempts are recorded");
+        c.check(
+          !/TWICE/.test(beta?.error?.message ?? ""),
+          "#187 knob: the message is the pre-#187 single-attempt wording",
+        );
+        c.check(fake.recorded.messageBodies.length === 2, "#187 knob: exactly TWO turns — no retry was spent");
+        const started = readEntries(logDir, r.runId).find(
+          (e) => e.call_id === beta?.callId && e.status === "started",
+        );
+        c.check(started?.retry_of === undefined, "#187 knob: no retry_of appears in the receipts");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 12h. ISSUE #187 POINT 5: A RETRY THAT IS ALSO SILENT FAILS EXACTLY AS BEFORE — with BOTH
+  //      attempts' #173 diagnostics, because two empty turns that each made tool calls is a
+  //      much stronger piece of evidence for #168 than one. `error.diagnostics` stays the LAST
+  //      attempt's, so #173's shape is unchanged for anyone already reading it.
+  // -------------------------------------------------------------------------
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "ok voice",
+      distinctSessions: true,
+      // Permanently silent AFTER real tool work — the reported #168 shape, on both attempts.
+      toolsThenSilentForModel: "beta/silent",
+      assistantTokens: { input: 999, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["alpha/ok", "beta/silent"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#187 double-empty: the panel is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/silent");
+        c.check(beta?.error?.kind === "empty-answer", "#187 double-empty: it still fails as empty-answer");
+        c.check(beta?.text === undefined, "#187 double-empty: still NO text");
+        c.check(
+          /TWICE/.test(beta?.error?.message ?? ""),
+          "#187 double-empty: the message says the retry was silent too",
+        );
+        c.check(beta?.attempts?.length === 2, "#187 double-empty: both attempts are recorded");
+        c.check(
+          beta?.attempts?.every((a) => a.outcome === "empty-answer") === true,
+          "#187 double-empty: both attempts are recorded as empty",
+        );
+        c.check(
+          beta?.attempts?.[0].diagnostics?.toolCallCount === 1 &&
+            beta?.attempts?.[1].diagnostics?.toolCallCount === 1,
+          "#187 double-empty: BOTH attempts carry their own #173 diagnostics",
+        );
+        c.check(
+          beta?.attempts?.[0].diagnostics?.completion?.tokens?.input === 999,
+          "#187 double-empty: the first attempt's diagnostics are its own, not the second's copy",
+        );
+        c.check(
+          beta?.error?.diagnostics?.toolCallCount === 1,
+          "#187 double-empty: error.diagnostics is still present (the LAST attempt's) — #173's shape is unchanged",
+        );
+        c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#187 double-empty: the run verifies clean");
       }
     } finally {
       await fake.close();

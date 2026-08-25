@@ -828,6 +828,24 @@ export class EvidenceLog {
      * entry is paired to it by `call_id`, so the tree and the patch are read together.
      */
     writeRoot?: string;
+    /**
+     * THIS CALL IS A SECOND ATTEMPT AT AN EARLIER ONE (issue #187) — the `call_id` of the
+     * attempt it is retrying, in the same run.
+     *
+     * Without it a retried panel member and two independent calls to the same model are
+     * byte-identical in the receipts, and "this answer needed a second attempt" is a different
+     * claim from "this answer came first time" — the same reason `answer_channel` exists.
+     *
+     * The link is FORWARD-ONLY and cannot be otherwise: the first attempt's three entries are
+     * already written (and hash-chained) before the retry is decided, so the retry names its
+     * predecessor and the predecessor never names its successor.
+     *
+     * Same optional-field rule as `read_root`/`write_root` (C29): written ONLY on a retry, so
+     * an ordinary call's entry is byte-identical to one written before this field existed, and
+     * no `verify()` branch changes — the retry is a full, separate `call_id` with its own
+     * expected/started/completed lifecycle, which is exactly what C24 requires of it.
+     */
+    retryOf?: string;
     run?: string;
   }): Promise<StartedResult> {
     if (this.#disabled()) return { ok: true };
@@ -857,6 +875,10 @@ export class EvidenceLog {
         // Absent unless a non-default WRITE root was actually used — see `writeRoot` above.
         ...(args.writeRoot !== undefined && args.writeRoot.length > 0
           ? { write_root: args.writeRoot }
+          : {}),
+        // Absent unless this call is a retry of an earlier one — see `retryOf` above.
+        ...(args.retryOf !== undefined && args.retryOf.length > 0
+          ? { retry_of: args.retryOf }
           : {}),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, true);
