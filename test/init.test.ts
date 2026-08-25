@@ -2596,6 +2596,180 @@ export async function run(): Promise<number> {
         "#176: …and it removed the link while leaving the target, as C77 says",
       );
     }
+
+    // --- #184: the removed record LINK's leftover target is DISCLOSED ------
+    // C77's record write-through is UNGATED, so a live record link means an install replaced
+    // whatever the target held. `unlink(2)` then takes the link and leaves that file with our
+    // JSON in it and nothing pointing at it. Behaviour unchanged; the warning is the change.
+    //
+    // BOTH DIRECTIONS ARE PINNED, because the guard is the point (issue #165 review F-3): the
+    // "an install wrote through this link" CLAIM fires only where `records`/`ownedMcp` parsed
+    // non-empty from that path. A planted link never installed through must not be told its
+    // data was destroyed. The leftover itself is named either way — a link was removed.
+    {
+      // The two branches' distinguishing substrings. Kept MUTUALLY EXCLUSIVE on purpose — each
+      // case asserts one present AND the other absent, so a regression that collapses the two
+      // branches into one fails rather than half-passing. Reworded by the #184 review: neither
+      // branch may claim more than the parse carries, so the positive marker is the PRESENT
+      // fact ("currently holds") rather than the old route claim ("which an install wrote
+      // through this link"), and the negative marker is what this RUN could not do rather than
+      // the old assertion about the file's contents.
+      const CLAIM = "currently holds ModelGuild's ownership-record JSON";
+      const NOCLAIM = "could not read a ModelGuild ownership record behind that link";
+
+      // (a) GLOBAL, live record link over a file of the user's own — the exact fixture the
+      // issue reproduces. Global mode emits NO plan-time record-symlink line on uninstall, so
+      // this warning is the only disclosure that mode gets.
+      const gHome = tempProject();
+      const gXdg = tempProject();
+      const gStore = tempProject();
+      const gUserFile = path.join(gStore, "my-record.json");
+      writeFileSync(gUserFile, "MY OWN CONTENTS\n");
+      const gLink = path.join(gHome, ".claude/modelguild/.modelguild-install.json");
+      mkdirSync(path.dirname(gLink), { recursive: true });
+      symlinkSync(gUserFile, gLink);
+      const gOpt = { targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true as const, homeDir: gHome, xdgConfigHome: gXdg };
+      initScored(c, "#184: --global install through a live record link", gOpt);
+      c.check(
+        recordedFileCount(gUserFile) === N_PAYLOAD,
+        `#184: the install really did write our record over the user's file (got ${recordedFileCount(gUserFile)})`,
+      );
+      const ug = initScored(c, "#184: --global uninstall over that record link", { ...gOpt, targetDir: tempProject(), uninstall: true });
+      const wg = ug.warnings.find((w) => w.startsWith("removed the symlink at")) ?? "";
+      c.check(
+        wg.includes(gLink) && wg.includes(gUserFile) && wg.includes(CLAIM) && !wg.includes(NOCLAIM),
+        `#184: the leftover is disclosed, naming link and target, and states our JSON is there (got: ${wg || "<no warning>"})`,
+      );
+      // …AND CLAIMS NO MORE THAN THAT (#184 review). A non-empty parse proves our JSON is behind
+      // the link NOW; it cannot distinguish "an install wrote through this link" from "an
+      // ordinary install's record was symlinked afterwards" — case (c) is literally the second.
+      // The old flat claim is asserted ABSENT by its exact wording, so a revert reads as red.
+      c.check(
+        !wg.includes("which an install wrote through this link") &&
+          wg.includes("cannot tell whether an install wrote it through this link or the link was pointed at a record already written") &&
+          wg.includes("if the file was originally yours, nothing here restores it"),
+        `#184: …without claiming a route the evidence cannot establish, keeping the actionable half (got: ${wg || "<no warning>"})`,
+      );
+      c.check(
+        !existsSync(gLink) && recordedFileCount(gUserFile) === N_PAYLOAD,
+        "#184: …and the link is gone while the target still holds ModelGuild's JSON",
+      );
+
+      // (b) THE GUARD. A record symlink PLANTED at a user file and never installed through.
+      // Unguarded, this told the user their data was destroyed when it demonstrably was not.
+      const pHome = tempProject();
+      const pXdg = tempProject();
+      const pStore = tempProject();
+      const pUserFile = path.join(pStore, "not-ours.json");
+      writeFileSync(pUserFile, "MY OWN CONTENTS\n");
+      const pLink = path.join(pHome, ".claude/modelguild/.modelguild-install.json");
+      mkdirSync(path.dirname(pLink), { recursive: true });
+      symlinkSync(pUserFile, pLink);
+      const up = initScored(c, "#184: --global uninstall over a PLANTED record link", {
+        targetDir: tempProject(), packageRoot: repoRoot, serverLaunch: LAUNCH, global: true, homeDir: pHome, xdgConfigHome: pXdg, uninstall: true,
+      });
+      const wp = up.warnings.find((w) => w.startsWith("removed the symlink at")) ?? "";
+      c.check(
+        wp.includes(pLink) && wp.includes(pUserFile) && wp.includes(NOCLAIM) && !wp.includes(CLAIM),
+        `#184: a link never installed through is named but NOT claimed as ours (got: ${wp || "<no warning>"})`,
+      );
+      c.check(
+        !existsSync(pLink) && readFileSync(pUserFile, "utf8") === "MY OWN CONTENTS\n",
+        "#184: …and the user's file is byte-for-byte untouched, as the wording says",
+      );
+
+      // (c) PROJECT mode gets it too — the record write-through is C77, both modes. Here the
+      // link is introduced after the install, the way a dotfiles manager adopts a file.
+      const P4 = tempProject();
+      const store4 = tempProject();
+      init({ targetDir: P4, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const record4 = path.join(P4, "modelguild/.modelguild-install.json");
+      const stored4 = path.join(store4, "install.json");
+      copyFileSync(record4, stored4);
+      unlinkSync(record4);
+      symlinkSync(stored4, record4);
+      const u4 = initScored(c, "#184: project uninstall over a live record link", {
+        targetDir: P4, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      const w4 = u4.warnings.find((w) => w.startsWith("removed the symlink at")) ?? "";
+      c.check(
+        (u4.blocked ?? []).length === 0 && w4.includes(record4) && w4.includes(stored4) &&
+          w4.includes(CLAIM) && !w4.includes(NOCLAIM),
+        `#184: project mode discloses the leftover as well (got: ${w4 || "<no warning>"})`,
+      );
+
+      // (d) A DANGLING record link at uninstall time. `entryExists` is `lstat`-based (#167), so
+      // it IS unlinked — and there are no bytes behind it, so the claim cannot fire and the
+      // target is reported as already gone. Guard and liveness agree here by construction.
+      const P5 = tempProject();
+      const store5 = tempProject();
+      init({ targetDir: P5, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const record5 = path.join(P5, "modelguild/.modelguild-install.json");
+      const gone5 = path.join(store5, "gone.json");
+      unlinkSync(record5);
+      symlinkSync(gone5, record5);
+      const u5 = initScored(c, "#184: project uninstall over a DANGLING record link", {
+        targetDir: P5, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      const w5 = u5.warnings.find((w) => w.startsWith("removed the symlink at")) ?? "";
+      c.check(
+        w5.includes(gone5) && w5.includes("(already gone)") && w5.includes(NOCLAIM) && !w5.includes(CLAIM),
+        `#184: a dangling record link says the target is already gone and claims nothing (got: ${w5 || "<no warning>"})`,
+      );
+      // `lstat`, not `existsSync`: a dangling link is absent to `existsSync` whether or not the
+      // link is still there, so only `lstat` can tell "removed" from "still dangling".
+      let link5Gone = false;
+      try {
+        lstatSync(record5);
+      } catch {
+        link5Gone = true;
+      }
+      c.check(link5Gone, "#184: …and the dangling link itself is removed");
+
+      // (f) A VALID record whose `files` map is EMPTY — the ungated branch's reachable false
+      // negative (#184 review). `records` is `{}` and `ownedMcp` is undefined, so the gate reads
+      // exactly as it does for a planted link, yet the file behind the link IS our record and
+      // the install destroyed whatever was there to write it. Reached in production by a
+      // `--global` install into a tree where every payload destination is a leaf symlink: all 13
+      // are skipped, `{"files":{}}` goes through the record link. A third state distinguishing
+      // this is out of scope and filed separately; what IS pinned here is that the message makes
+      // no claim about the file — the old "its contents did not read as a ModelGuild ownership
+      // record" was an all-clear over a file we had just overwritten.
+      const P7 = tempProject();
+      const store7 = tempProject();
+      init({ targetDir: P7, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const record7 = path.join(P7, "modelguild/.modelguild-install.json");
+      const stored7 = path.join(store7, "install.json");
+      writeFileSync(stored7, JSON.stringify({ version: 1, files: {} }));
+      unlinkSync(record7);
+      symlinkSync(stored7, record7);
+      const u7 = initScored(c, "#184: project uninstall over a link to an EMPTY-files record", {
+        targetDir: P7, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      const w7 = u7.warnings.find((w) => w.startsWith("removed the symlink at")) ?? "";
+      c.check(
+        w7.includes(stored7) && w7.includes(NOCLAIM) && !w7.includes(CLAIM),
+        `#184: an empty-files record reads as ungated, as the predicate says (got: ${w7 || "<no warning>"})`,
+      );
+      c.check(
+        !w7.includes("did not read as a ModelGuild ownership record") &&
+          !w7.includes("made no claim on it") &&
+          w7.includes("makes no claim about what the file holds"),
+        `#184: …and the ungated branch reports the OBSERVATION, never a property of the file (got: ${w7 || "<no warning>"})`,
+      );
+
+      // (e) A PLAIN record file — no link, no warning. The disclosure must not fire on the
+      // ordinary uninstall every user does.
+      const P6 = tempProject();
+      init({ targetDir: P6, packageRoot: repoRoot, serverLaunch: LAUNCH });
+      const u6 = initScored(c, "#184: an ordinary uninstall", {
+        targetDir: P6, packageRoot: repoRoot, serverLaunch: LAUNCH, uninstall: true,
+      });
+      c.check(
+        !u6.warnings.some((w) => w.startsWith("removed the symlink at")),
+        `#184: no link ⇒ no leftover warning (got: ${u6.warnings.join(" | ") || "<none>"})`,
+      );
+    }
   }
 
   console.log(`init.test: ${c.passes} passed, ${c.failures} failed`);
