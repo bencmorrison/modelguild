@@ -848,58 +848,74 @@ function joinPartText(m: HistoryMessage, type: string): string {
 /**
  * THE MESSAGE OF THIS TURN THAT PRODUCED THE ANSWER, and the answer it produced.
  *
- * Two passes over the turn, in strict priority order, and the priority is the whole design.
+ * Four passes over the turn — two GATES × two CHANNELS — in strict priority order, and the
+ * priority is the whole design:
  *
- * **Pass 1 — `text` parts.** The last assistant message OF THIS TURN whose text parts join to
- * a NON-EMPTY string, walked backwards so a trailing assistant message that carries no answer
- * can't blank a real one. This is the only pass that fires on a turn that produced text at all,
- * so nothing about a normal answer — its bytes, its `raw_response`, its serving agent — is
- * touched by pass 2's existence.
+ *   1. a message whose `text` parts join to something NON-BLANK
+ *   2. …else one whose `reasoning` parts join to something NON-BLANK
+ *   3. …else one whose `text` parts join to anything NON-EMPTY, returned verbatim
+ *   4. …else one whose `reasoning` parts join to anything NON-EMPTY, returned verbatim
  *
- * **Pass 2 — `reasoning` parts, only when pass 1 found NOTHING (issue #168).** opencode's
- * `Part` union carries `ReasoningPart` with its own `text` of identical type, and opencode's
- * own TUI renders it. A turn whose visible output arrived that way reconstructed to `""` here
- * and was refused as `empty-answer` — the guild path returning nothing where opencode directly
- * returned a full answer, which is exactly the contrast issue #168 reports. Reading it as the
- * answer is a FALLBACK and never a merge: a message carrying BOTH kinds returns its `text`
- * alone, so chain-of-thought never lands beside an answer the model also wrote.
+ * Each pass walks the turn BACKWARDS, so a trailing assistant message that carries no answer
+ * can't blank a real one. Nothing about a normal answer — its bytes, its `raw_response`, its
+ * serving agent — is touched by the later passes' existence: pass 1 fires on every turn that
+ * produced real text, and it fires on the same message it always did.
  *
- * **PASS 1's TEST IS ON THE JOINED STRING, NOT ON PART PRESENCE, AND THAT IS LOAD-BEARING.**
+ * **THE `reasoning` CHANNEL (issue #168).** opencode's `Part` union carries `ReasoningPart`
+ * with its own `text` of identical type, and opencode's own TUI renders it. A turn whose
+ * visible output arrived that way reconstructed to `""` here and was refused as `empty-answer`
+ * — the guild path returning nothing where opencode directly returned a full answer, which is
+ * exactly the contrast issue #168 reports. Reading it as the answer is a FALLBACK and never a
+ * merge: a message carrying BOTH kinds returns its `text` alone, so chain-of-thought never
+ * lands beside an answer the model also wrote.
+ *
+ * **THE GATE IS ON THE JOINED STRING, NOT ON PART PRESENCE, AND THAT IS LOAD-BEARING.**
  * Requiring merely that a text PART exist made an `{type:"text", text:""}` part satisfy pass 1
- * and block pass 2 — and an empty text part is precisely how this repo's own fixture models
- * the reported turn (`tools-then-silent`). So the shape the fallback exists for — a turn that
- * emitted reasoning AND an empty text part — went on being refused, in all three arrangements
- * (same message, either message order). Nothing observable is given up by falling through: a
- * turn whose text joins to `""` is refused as `empty-answer` today, so pass 2 can only turn a
- * refusal into an answer, never change one answer into another.
+ * and block the fallback — and an empty text part is precisely how this repo's own fixture
+ * models the reported turn (`tools-then-silent`). So the shape the fallback exists for — a turn
+ * that emitted reasoning AND an empty text part — went on being refused, in all three
+ * arrangements (same message, either message order).
  *
- * **The test is `length > 0`, NOT `trim() !== ""`, and the difference is byte-exactness.** A
- * whitespace-only answer is captured verbatim and refused by `requireAnswer`'s own `trim()`;
- * trimming here instead would drop those bytes from `raw_response` and break invariant 2.
- * *Residual, stated:* a turn carrying whitespace-only text BESIDE reasoning keeps the
- * whitespace and is refused, rather than falling through. Nobody has reported that shape, and
- * preserving the recorded bytes is worth more than covering it.
+ * **WHY THE GATE IS SPLIT IN TWO (issue #185), and it is the same defect twice.** One gate of
+ * `length > 0` accepted a trailing message carrying only whitespace — `"\n"`, `"  "` — and so
+ * DISCARDED a real answer emitted earlier in the same turn, which `requireAnswer` then trimmed
+ * to `""` and refused. One gate of `trim() !== ""` would instead drop those bytes from
+ * `raw_response` on a turn whose whole answer was whitespace, breaking invariant 2. That is a
+ * false dichotomy between the GATE and the RETURNED VALUE: passes 1–2 decide **which message
+ * answered** on a blank-insensitive test, passes 3–4 keep **the bytes** of a turn that produced
+ * nothing else. A whitespace-only answer is still captured verbatim and still refused by
+ * `requireAnswer`'s own `trim()`; nothing that used to be recorded is now recorded as `""`.
+ * **Do not collapse the two gates back into one** — either direction reopens one of the two.
  *
- * **The remaining cost is stated, not engineered around.** Where the fallback fires,
+ * Nothing observable is given up by a pass falling through: every string a later pass can
+ * return is one `requireAnswer` refuses, so a later pass can only turn a refusal into an
+ * answer or a blank receipt into a byte-exact one — never change one answer into another.
+ *
+ * **The remaining cost is stated, not engineered around.** Where the reasoning channel fires,
  * `raw_response` — the byte-exact evidence record — holds reasoning text. That is what the
  * model emitted, and the receipt gains content only where it previously recorded `""`, never in
  * place of an answer. The turn this cannot tell apart is one TRUNCATED mid-reasoning: that used
  * to be refused and is now returned as an answer. Which channel the answer came from is
  * recorded rather than left implicit — see `AskResult.answerChannel`.
  *
- * TURN-SCOPED since issue #117's review — BOTH passes stop at `turnStartIndex`, so a turn that
+ * TURN-SCOPED since issue #117's review — EVERY pass stops at `turnStartIndex`, so a turn that
  * said nothing on either channel yields nothing rather than the previous turn's answer.
  */
 function answerSource(
   history: SessionHistory,
 ): { message: HistoryMessage; text: string; channel: AnswerChannel } | undefined {
   const start = turnStartIndex(history);
-  for (const channel of ["text", "reasoning"] as const) {
-    for (let i = history.messages.length - 1; i >= start; i--) {
-      const m = history.messages[i];
-      if (m.role !== "assistant") continue;
-      const text = joinPartText(m, channel);
-      if (text.length > 0) return { message: m, text, channel };
+  // `false` = the answering gate (non-blank); `true` = the byte-preserving one (non-empty).
+  for (const verbatim of [false, true] as const) {
+    for (const channel of ["text", "reasoning"] as const) {
+      for (let i = history.messages.length - 1; i >= start; i--) {
+        const m = history.messages[i];
+        if (m.role !== "assistant") continue;
+        const text = joinPartText(m, channel);
+        if (text.length === 0) continue;
+        if (!verbatim && text.trim() === "") continue;
+        return { message: m, text, channel };
+      }
     }
   }
   return undefined;

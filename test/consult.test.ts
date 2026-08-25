@@ -955,6 +955,45 @@ export async function run(): Promise<number> {
     }
   }
 
+  // 6m-quater. ISSUE #185, END-TO-END: a real answer followed by a trailing WHITESPACE-ONLY
+  //     assistant message in the same turn. #168's `length > 0` gate took the trailing message,
+  //     `requireAnswer` trimmed it to "" and the whole call was REFUSED while the model had
+  //     answered — so the unit assertion on the extractor cannot show what this costs. The
+  //     receipt is the other half: `raw_response` must be the answer, not the whitespace.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const ANSWER = "the real answer, emitted before the model fell silent";
+    const fake = await startFakeOpencode({
+      historyText: ANSWER,
+      turnShapes: ["text-then-whitespace"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#185: a trailing whitespace-only message no longer refuses a turn that answered");
+      c.check(r.ok && r.answer === ANSWER, "#185: the answer is the real text, byte-exact");
+      if (r.ok) {
+        const completed = readEntries(logDir, r.attribution.runId).filter(
+          (e) => e.type === "call" && e.status === "completed",
+        );
+        c.check(
+          completed.length === 1 && completed[0].raw_response === ANSWER,
+          "#185: the receipt records the answer, not the trailing whitespace",
+        );
+        c.check(
+          completed.length === 1 && !("answer_channel" in completed[0]),
+          "#185: it came off `text`, so the entry carries no answer_channel (C29)",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
   // 6m-ter. A turn that said nothing on EITHER channel is still refused, with the issue-#173
   //     diagnostics intact. The fallback narrows what counts as empty; it does not remove the
   //     refusal, and the part-type census still reports the shape it found.
