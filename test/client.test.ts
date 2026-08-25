@@ -642,13 +642,75 @@ export async function run(): Promise<number> {
       finalAssistantText({ messages: [user("q"), answered("REAL ANSWER"), emptyText()] }) === "REAL ANSWER",
       "#168: a trailing EMPTY text message no longer blanks a real answer earlier in the turn",
     );
-    // BYTE-EXACTNESS BEATS THE FALLBACK, deliberately: the gate is `length > 0`, not `trim()`,
-    // so a whitespace-only answer is still captured verbatim (and refused by requireAnswer's
-    // own trim) rather than being dropped from `raw_response`. Stated residual: whitespace
-    // text beside reasoning keeps the whitespace.
+    // --- ISSUE #185: A TRAILING WHITESPACE-ONLY MESSAGE MUST NOT DISCARD A REAL ANSWER -----
+    // #168's gate was `length > 0`, so `"\n"` or `"  "` satisfied it and blanked an answer
+    // emitted earlier in the same turn — the same defect in a narrower shape. The gate is now
+    // split: passes 1-2 decide WHICH MESSAGE ANSWERED on a non-blank test, passes 3-4 keep THE
+    // BYTES of a turn that produced nothing else. Both halves are pinned here, because either
+    // one collapsed back into the other reopens one of the two defects.
+    const wsText = (ws: string, agent?: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop", ...(agent ? { agent } : {}) } as Record<string, unknown>,
+      parts: [{ type: "step-start" }, { type: "text", text: ws }] as Array<Record<string, unknown>>,
+    });
+    const wsReasoning = (ws: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop" } as Record<string, unknown>,
+      parts: [{ type: "reasoning", text: ws }] as Array<Record<string, unknown>>,
+    });
+    // Table 1 of issue #185 — measured on the pre-fix code, every row losing the answer.
     c.check(
-      finalAssistantText({ messages: [user("q"), answered("  \n ")] }) === "  \n ",
-      "#168: whitespace-only text is kept BYTE-EXACT, not trimmed away into the fallback",
+      finalAssistantText({ messages: [user("q"), answered("REAL"), wsText("\n")] }) === "REAL",
+      "#185: a trailing whitespace-only ('\\n') message no longer discards a real answer",
+    );
+    c.check(
+      finalAssistantText({ messages: [user("q"), answered("REAL"), wsText("  ")] }) === "REAL",
+      "#185: a trailing '  ' message no longer discards a real answer",
+    );
+    c.check(
+      finalAssistantText({ messages: [user("q"), reasoningOnly("COT"), wsText("\n")] }) === "COT",
+      "#185: a trailing whitespace-only message no longer discards a promoted reasoning answer",
+    );
+    // THE COUPLING, on the shape #185 introduces: the answering message is an EARLIER one, so
+    // the masquerade check must read that one. Pre-fix it read the trailing message's agent and
+    // would have reported a mismatch against an agent that answered nothing.
+    c.check(
+      servingAgent({ messages: [user("q"), answered("REAL", "guild-read"), wsText("\n", "build")] }) ===
+        "guild-read",
+      "#185: servingAgent reads the message that answered, not the trailing whitespace one",
+    );
+    // Table 2 of issue #185 — the byte-exact half. A whitespace-only answer with nothing else in
+    // the turn is captured VERBATIM (and refused by requireAnswer's own trim), so `raw_response`
+    // keeps what the model emitted. `trim()` as the single gate is what this forbids.
+    c.check(
+      finalAssistantText({ messages: [user("q"), wsText("\n  \t\n")] }) === "\n  \t\n",
+      "#185: whitespace-only text ALONE is kept BYTE-EXACT",
+    );
+    // …and the same for reasoning, which #168 made an answer channel: a turn whose only output
+    // is whitespace reasoning still records those bytes rather than reconstructing to "". The
+    // issue proposed three tiers and this is the fourth; without it this case silently lost the
+    // bytes the third tier exists to preserve.
+    c.check(
+      finalAssistantText({ messages: [user("q"), wsReasoning("  ")] }) === "  ",
+      "#185: whitespace-only REASONING alone is kept BYTE-EXACT too — the gate split is symmetric",
+    );
+    // The residual #168 stated, now closed: whitespace text beside reasoning falls through to
+    // the reasoning instead of keeping the whitespace and being refused.
+    c.check(
+      finalAssistantText({
+        messages: [user("q"), { ...bothInOne, parts: [{ type: "reasoning", text: "COT" }, { type: "text", text: "  " }] }],
+      }) === "COT",
+      "#185: whitespace text BESIDE reasoning promotes the reasoning — #168's stated residual, closed",
+    );
+    c.check(
+      finalAssistantText({ messages: [user("q"), reasoningOnly("COT"), wsText("  ")] }) === "COT",
+      "#185: ...and across messages in the turn as well",
+    );
+    // TURN-SCOPED, on the new passes too: a turn whose only content is whitespace answers with
+    // that whitespace and is refused — it must NOT reach back for the previous turn's answer.
+    c.check(
+      finalAssistantText({ messages: [user("q1"), answered("OLD"), user("q2"), wsText("\n")] }) === "\n",
+      "#185: the byte-preserving passes are turn-scoped — no borrowing across a user message",
     );
 
     // --- THE CHANNEL IS RECORDED (issue #168) ----------------------------------------------
@@ -664,6 +726,16 @@ export async function run(): Promise<number> {
       finalAssistantChannel({ messages: [user("q1"), reasoningOnly("OLD"), user("q2"), rejected()] }) ===
         undefined,
       "#168: a turn that answered nothing reports no channel",
+    );
+    // #185: the byte-preserving passes report their channel on the same rule — a receipt that
+    // records whitespace reasoning is still recording a PROMOTION, refused or not.
+    c.check(
+      finalAssistantChannel({ messages: [user("q"), wsReasoning("  ")] }) === "reasoning",
+      "#185: whitespace reasoning kept for its bytes still reports the reasoning channel",
+    );
+    c.check(
+      finalAssistantChannel({ messages: [user("q"), wsText("\n")] }) === undefined,
+      "#185: whitespace text kept for its bytes reports no channel — it came off `text`",
     );
 
     // The provider's own diagnosis, whitelisted.
