@@ -19,6 +19,9 @@ import {
   finalAssistantError,
   servingAgent,
   turnStartIndex,
+  turnToolCallCount,
+  turnAssistantPartTypes,
+  finalAssistantCompletion,
   toolParts,
   splitModel,
   OpencodeHttpError,
@@ -26,7 +29,7 @@ import {
   type ServeProvider,
   type SessionHistory,
 } from "../src/client.js";
-import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
+import { startFakeOpencode, COMPACTION_TOOL_CALLS, COMPACTION_SUMMARY_TEXT, type FakeOpencode } from "./fake-opencode-server.js";
 import { Checker, fakeServeHandle } from "./harness.js";
 
 /** A `ServeProvider` that points `withServe` at an already-running fake — the M1
@@ -883,6 +886,332 @@ export async function run(): Promise<number> {
     const flat = finalAssistantError(noisy) ?? "";
     c.check(!/[\n\t]/.test(flat), "provider error: control characters are stripped, not passed through");
     c.check(flat.length <= 301, `provider error: bounded (${flat.length} chars)`);
+  }
+
+  // --- ISSUE #189: A MID-TURN AUTO-COMPACTION IS NOT A TURN BOUNDARY ----------------------
+  //
+  // opencode compacts INSIDE one `POST /session/{id}/message`, appending a `user` message
+  // carrying a `compaction` part and then a second one carrying a `synthetic` continue text
+  // part. Taking the last `user` message as the delimiter truncated "this turn" to the
+  // post-compaction remainder, so every extractor under-reported — silently, and always in
+  // that direction. Driven through the FAKE rather than a hand-built history because the same
+  // rendered shape is what `consult`/`delegate` assert against, so the three suites cannot
+  // disagree about what a compacted turn looks like.
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["text", "compaction-then-text"],
+      turnTexts: ["BANANA", "POST-COMPACTION ANSWER"],
+    });
+    try {
+      const post = async (q: string) =>
+        sendMessage({
+          baseUrl: fake.baseUrl,
+          sessionId: "ses_fake",
+          agent: "guild-read",
+          model: "openai/gpt-fake",
+          parts: [{ type: "text", text: q }],
+        });
+      await post("Reply with exactly: BANANA");
+      await post("Now do the big one");
+      const h = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: "ses_fake" });
+
+      // The delimiter is the CALLER's message — turn 2's own user message, not either of the
+      // two opencode appended after it.
+      const callerUserIdx = h.messages.findIndex((m) => m.info.id === "msg_user_2");
+      c.check(callerUserIdx >= 0, "#189: the fake really renders the caller's turn-2 user message");
+      c.check(
+        turnStartIndex(h) === callerUserIdx + 1,
+        `#189: the turn starts just past the CALLER's user message, not past the compaction ones (got ${turnStartIndex(h)}, want ${callerUserIdx + 1})`,
+      );
+      const compactionIdx = h.messages.findIndex((m) => m.info.id === "msg_user_compaction_2");
+      c.check(
+        compactionIdx > turnStartIndex(h),
+        "#189: turnStartIndex lands BEFORE the compaction messages, so they are inside the turn",
+      );
+
+      // The consequences, one per consumer that takes the bound.
+      c.check(
+        turnToolCallCount(h) === COMPACTION_TOOL_CALLS,
+        `#189: turnToolCallCount reports the PRE-compaction calls (got ${turnToolCallCount(h)}, want ${COMPACTION_TOOL_CALLS})`,
+      );
+      const types = turnAssistantPartTypes(h);
+      c.check(
+        (types.tool ?? 0) === COMPACTION_TOOL_CALLS,
+        `#189: the part-type census sees the pre-compaction tool parts (got ${String(types.tool)})`,
+      );
+      c.check(
+        finalAssistantText(h) === "POST-COMPACTION ANSWER",
+        "#189: the answer is still the turn's OWN answer, not anything earlier",
+      );
+
+      // THE BOUND STILL HOLDS — the BANANA property, asserted explicitly. Turn 1's answer sits
+      // in the same payload; widening the walk past the caller's own message would return it.
+      c.check(
+        turnStartIndex(h) > h.messages.findIndex((m) => m.info.id === "msg_asst_final_1"),
+        "#189: the walk still stops before the PREVIOUS turn — the BANANA bound is not unbounded",
+      );
+      c.check(
+        !finalAssistantText(h).includes("BANANA"),
+        "#189: turn 1's BANANA is unreachable from turn 2 (the #117 defect stays fixed)",
+      );
+      c.check(
+        turnToolCallCount(h) !== COMPACTION_TOOL_CALLS * 2,
+        "#189: turn 1's tool calls are NOT counted into turn 2",
+      );
+
+      // THE SUMMARISER'S MESSAGE IS INSIDE THE TURN AND IS NOT THE TURN'S OUTPUT (#189 review).
+      c.check(
+        h.messages.some((m) => m.info.id === "msg_asst_summary_2"),
+        "#189: the fake really renders opencode's compaction-summary assistant message",
+      );
+      c.check(
+        finalAssistantText(h) !== COMPACTION_SUMMARY_TEXT && !finalAssistantText(h).includes(COMPACTION_SUMMARY_TEXT),
+        "#189: opencode's session summary is NEVER returned as the model's answer",
+      );
+      c.check(servingAgent(h) !== "compaction", "#189: servingAgent never reads the compaction agent");
+      // The census counts the model's parts only: two tool messages plus the answering one is
+      // three step-start/step-finish pairs and ONE text part. Four pairs and two text parts is
+      // the summariser's message leaking in.
+      c.check(
+        types.text === 1 && types["step-start"] === 3 && types["step-finish"] === 3,
+        `#189: the census excludes the summariser's parts (text=${String(types.text)} step-start=${String(types["step-start"])})`,
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // The same turn ending SILENTLY: with the summariser's message in the walk this is where the
+  // damage lands — its summary is the only non-blank assistant text in the turn, so it becomes
+  // the "answer" (and its `agent` becomes the serving agent) instead of the correct refusal.
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["compaction-then-silent"],
+    });
+    try {
+      await sendMessage({
+        baseUrl: fake.baseUrl,
+        sessionId: "ses_fake",
+        agent: "guild-read",
+        model: "openai/gpt-fake",
+        parts: [{ type: "text", text: "the big one" }],
+      });
+      const h = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: "ses_fake" });
+      c.check(
+        finalAssistantText(h) === "",
+        `#189: a compacted-then-silent turn answers NOTHING — not opencode's summary (got ${JSON.stringify(finalAssistantText(h))})`,
+      );
+      c.check(
+        servingAgent(h) === undefined,
+        `#189: and servingAgent is not "compaction" — no hard AgentMismatchError on a silent turn (got ${String(servingAgent(h))})`,
+      );
+      c.check(
+        turnToolCallCount(h) === COMPACTION_TOOL_CALLS,
+        "#189: the pre-compaction tool calls are still counted on the silent shape",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // F3: THE REFUSAL SET MOVED, and this is the shape that moved it. The model answered BEFORE
+  // the compaction and said nothing after. Pre-#189 the "turn" was the post-compaction
+  // remainder and this was refused as `empty-answer`; it now returns the pre-compaction answer.
+  // That is C74's same-turn preamble rule — a preamble before a dead final message passes —
+  // extended across a compaction that happens INSIDE the turn.
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["compaction-after-answer"],
+      turnTexts: ["PRE-COMPACTION ANSWER"],
+    });
+    try {
+      await sendMessage({
+        baseUrl: fake.baseUrl,
+        sessionId: "ses_fake",
+        agent: "guild-read",
+        model: "openai/gpt-fake",
+        parts: [{ type: "text", text: "q" }],
+      });
+      const h = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: "ses_fake" });
+      c.check(
+        finalAssistantText(h) === "PRE-COMPACTION ANSWER",
+        `#189(F3): an answer given BEFORE the compaction is this turn's answer (got ${JSON.stringify(finalAssistantText(h))})`,
+      );
+      c.check(
+        finalAssistantText(h) !== COMPACTION_SUMMARY_TEXT,
+        "#189(F3): and it is the model's answer, not the summariser's",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // THE COMPACTION-SUMMARY PREDICATE, at every site that takes the turn bound (#189 review).
+  // Hand-built rather than fixtured, because the marker is a message-level flag and each of the
+  // three forms has to be exercised on its own — and because a summary message LAST in the turn
+  // is the only way to reach the completion/error sites, which no rendered shape produces.
+  {
+    const u = () => ({
+      role: "user",
+      info: { role: "user" } as Record<string, unknown>,
+      parts: [{ type: "text", text: "q" }] as Array<Record<string, unknown>>,
+    });
+    const summary = (marker: Record<string, unknown>) => ({
+      role: "assistant",
+      info: {
+        role: "assistant",
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        error: { name: "SummariserError", data: { message: "SUMMARISER-ERROR-NOT-THE-MODELS" } },
+        ...marker,
+      } as Record<string, unknown>,
+      parts: [
+        { type: "text", text: COMPACTION_SUMMARY_TEXT },
+        { type: "tool", tool: "read", state: { status: "completed" } },
+      ] as Array<Record<string, unknown>>,
+    });
+    for (const [label, marker] of [
+      ["summary: true", { summary: true }],
+      ['agent: "compaction"', { agent: "compaction" }],
+      ['mode: "compaction"', { mode: "compaction" }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const h: SessionHistory = { messages: [u(), summary(marker)] };
+      c.check(finalAssistantText(h) === "", `#189(${label}): the summary is not an answer`);
+      c.check(servingAgent(h) === undefined, `#189(${label}): the summary is not the serving agent`);
+      c.check(turnToolCallCount(h) === 0, `#189(${label}): the summary's parts are not tool calls of this turn`);
+      c.check(
+        Object.keys(turnAssistantPartTypes(h)).length === 0,
+        `#189(${label}): the summary's parts are not in the census`,
+      );
+      c.check(
+        finalAssistantCompletion(h) === undefined,
+        `#189(${label}): the summary's zero cost/tokens are not this turn's completion`,
+      );
+      c.check(
+        finalAssistantError(h) === undefined,
+        `#189(${label}): a summariser error is not quoted as this turn's provider error`,
+      );
+    }
+    // The false-positive direction: an ordinary assistant message is untouched by all of it.
+    const ordinary: SessionHistory = {
+      messages: [
+        u(),
+        {
+          role: "assistant",
+          info: { role: "assistant", finish: "stop", agent: "guild-read", mode: "all", summary: false } as Record<
+            string,
+            unknown
+          >,
+          parts: [{ type: "text", text: "REAL ANSWER" }] as Array<Record<string, unknown>>,
+        },
+      ],
+    };
+    c.check(finalAssistantText(ordinary) === "REAL ANSWER", "#189: `summary: false` on a normal message changes nothing");
+    c.check(servingAgent(ordinary) === "guild-read", "#189: a normal message's agent still reaches servingAgent");
+
+    // THE SUMMARISER LAST, WITH A REAL ANSWER BEHIND IT — the variant every other case here
+    // leaves untested, and the one that fails if any of the five skips is ever written as a
+    // `break` instead of a `continue`. Breaking would end the walk AT the summariser and report
+    // this turn as silent, agentless, zero-cost and error-free while a real answer, a real
+    // provider error and a real tool call sit one message earlier.
+    const behind: SessionHistory = {
+      messages: [
+        u(),
+        {
+          role: "assistant",
+          info: {
+            role: "assistant",
+            finish: "length",
+            agent: "guild-read",
+            cost: 0.5,
+            tokens: { input: 900, output: 77, reasoning: 0, cache: { read: 0, write: 0 } },
+            error: { name: "APIError", data: { message: "REAL-PROVIDER-ERROR", statusCode: 402 } },
+          } as Record<string, unknown>,
+          parts: [
+            { type: "text", text: "REAL ANSWER FROM THE MODEL" },
+            { type: "tool", tool: "read", state: { status: "completed" } },
+          ] as Array<Record<string, unknown>>,
+        },
+        summary({ summary: true }),
+      ],
+    };
+    c.check(
+      finalAssistantText(behind) === "REAL ANSWER FROM THE MODEL",
+      `#189(summary last): the walk continues PAST the summariser to the real answer (got ${JSON.stringify(finalAssistantText(behind))})`,
+    );
+    c.check(servingAgent(behind) === "guild-read", "#189(summary last): and reports the real serving agent, not undefined");
+    c.check(
+      finalAssistantCompletion(behind)?.cost === 0.5 && finalAssistantCompletion(behind)?.tokens?.output === 77,
+      `#189(summary last): the completion is the MODEL'S, not the summariser's zeros (got ${JSON.stringify(finalAssistantCompletion(behind))})`,
+    );
+    c.check(
+      (finalAssistantError(behind) ?? "").includes("REAL-PROVIDER-ERROR"),
+      `#189(summary last): the provider error is the model's, and is still reachable (got ${String(finalAssistantError(behind))})`,
+    );
+    c.check(
+      turnToolCallCount(behind) === 1,
+      `#189(summary last): the model's tool call is counted and the summariser's is not (got ${turnToolCallCount(behind)})`,
+    );
+    const behindTypes = turnAssistantPartTypes(behind);
+    c.check(
+      behindTypes.text === 1 && behindTypes.tool === 1,
+      `#189(summary last): the census is the model's parts alone (got ${JSON.stringify(behindTypes)})`,
+    );
+  }
+
+  // A `user` message the payload does not mark is still a delimiter — the skip fails toward
+  // the pre-#189 bound, so a renamed or dropped marker can never unbound the walk.
+  {
+    const u = (parts: Array<Record<string, unknown>>) => ({
+      role: "user",
+      info: { role: "user" } as Record<string, unknown>,
+      parts,
+    });
+    const a = (text: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop" } as Record<string, unknown>,
+      parts: [{ type: "text", text }] as Array<Record<string, unknown>>,
+    });
+    const cont = { synthetic: true, metadata: { compaction_continue: true } };
+    const cases: Array<[string, Array<Record<string, unknown>>]> = [
+      ["no parts at all", []],
+      ["an unknown part type", [{ type: "future-part-opencode-adds" }]],
+      ["plain caller text", [{ type: "text", text: "q" }]],
+      ["synthetic: false", [{ type: "text", text: "q", synthetic: false }]],
+      ["a non-boolean marker", [{ type: "text", text: "q", synthetic: "true" }]],
+      ["a marked part beside an unmarked one", [{ type: "text", text: "q" }, { type: "text", text: "x", ...cont }]],
+      // F2: `synthetic` ALONE is not a compaction marker. opencode sets it at ~31 sites, and
+      // the background-result injection produces a `user` message whose ONLY part is synthetic
+      // — under a synthetic-only rule that real caller message stopped delimiting the turn.
+      ["synthetic: true with NO compaction_continue", [{ type: "text", text: "background result", synthetic: true }]],
+      [
+        "a synthetic-only injected message (opencode's promptAsync shape)",
+        [{ type: "text", text: "[background task finished]", synthetic: true }],
+      ],
+      // compaction_continue WITHOUT synthetic: opencode's own predicate requires both, and
+      // being narrower than opencode can only fail toward the old bound.
+      ["compaction_continue without synthetic", [{ type: "text", text: "continue", metadata: { compaction_continue: true } }]],
+      ["compaction_continue: not-literal-true", [{ type: "text", text: "c", synthetic: true, metadata: { compaction_continue: "yes" } }]],
+    ];
+    for (const [label, parts] of cases) {
+      const h: SessionHistory = { messages: [a("OLD"), u(parts), a("NEW")] };
+      c.check(turnStartIndex(h) === 2, `#189: ${label} is still a turn delimiter (fails toward the old bound)`);
+    }
+    // A compaction part is enough by itself; the continue part needs BOTH markers on EVERY part.
+    const marked: Array<[string, Array<Record<string, unknown>>]> = [
+      ["a compaction part", [{ type: "compaction", auto: true, overflow: true }]],
+      ["synthetic + compaction_continue", [{ type: "text", text: "continue", ...cont }]],
+      ["a compaction part beside an unknown one", [{ type: "compaction", auto: true }, { type: "future-part" }]],
+      ["two continue parts", [{ type: "text", text: "a", ...cont }, { type: "text", text: "b", ...cont }]],
+    ];
+    for (const [label, parts] of marked) {
+      const h: SessionHistory = { messages: [a("OLD"), u(parts), a("NEW")] };
+      c.check(turnStartIndex(h) === 0, `#189: ${label} is NOT a turn delimiter`);
+    }
   }
 
   console.log(`client.test: ${c.passes} passed, ${c.failures} failed`);
