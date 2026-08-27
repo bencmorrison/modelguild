@@ -2588,6 +2588,42 @@ export async function run(): Promise<number> {
         nothingDelivered("", 0, { ...base, patchPath: "/p.patch" }),
         "#121(K-edges): a patch PATH with zero changed files does not save it — the guard is filesChanged",
       );
+      // ISSUE #195: the report leg now reads `client.ts`'s `isBlank`, so a report of one
+      // zero-width character is no more a report than a newline is — the read and write paths
+      // cannot come to hold two definitions of "says nothing". Pre-fix `"\u200b".trim()` was
+      // non-empty, so this column read TRUE and the delegation was a success reporting one
+      // invisible character.
+      c.check(
+        nothingDelivered("\u200b", 0, base),
+        "#195(K-edges): a report of one U+200B is blank too — same definition as the read paths",
+      );
+      // AND THE SHARING WIDENS NOTHING ELSE. C74 keeps the two paths on different QUESTIONS: the
+      // deciding column here is still the turn's tool-call count, with `filesChanged` as the
+      // guard. Both must still save a blank-reported turn, or `isBlank` has leaked past the
+      // report leg into the predicate's shape.
+      c.check(
+        !nothingDelivered("\u200b", 1, base),
+        "#195(K-edges): ONE tool call still saves a zero-width report — the deciding column is unmoved",
+      );
+      c.check(
+        !nothingDelivered("\u200b", 0, { ...base, filesChanged: 1, patchPath: "/p.patch" }),
+        "#195(K-edges): a real patch still saves it — the guard is unmoved",
+      );
+      // The whole alphabet is shared, not just the `Cf` arm: a control character and a lone
+      // surrogate are blank on this path for the same reason they are on the read paths.
+      c.check(
+        nothingDelivered("\u0000", 0, base) &&
+          nothingDelivered("\u0085", 0, base) &&
+          nothingDelivered("\ud800", 0, base),
+        "#195(K-edges): a NUL, a NEL and a lone-surrogate report are blank too — one alphabet",
+      );
+      // And the residual CLASS is shared honestly: render-blank code points outside `Cf`/`Cc`/
+      // `Cs` — U+2800 (`So`), the variation selectors (`Mn`), the Hangul fillers (`Lo`) — are
+      // still reports on both paths. U+2800 is the exemplar; the class is pinned in client.test.
+      c.check(
+        !nothingDelivered("\u2800", 0, base),
+        "#195(K-edges) STATED RESIDUAL: a U+2800 report is NOT blank — no predicate reaches it",
+      );
     }
 
     // --- K-bound: `turnToolCallCount` is TURN-scoped, like finalAssistantText/Error. Unit-tested

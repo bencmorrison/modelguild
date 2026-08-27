@@ -466,6 +466,16 @@ export type TurnShape =
    */
   | "text-then-whitespace"
   /**
+   * ISSUE #195: the same arrangement as `text-then-whitespace`, but the trailing message holds
+   * one U+200B ZERO WIDTH SPACE. It is a SEPARATE shape rather than a parameter because the
+   * difference is the point: U+200B is category `Cf`, which ECMA-262's `WhiteSpace` production
+   * does not reach, so `trim()` left it non-empty. Pre-fix that made this the SILENT half of the
+   * defect — the trailing message won the walk, `requireAnswer` accepted it, and the call
+   * returned `ok` with an answer of one invisible character while a real one had been discarded.
+   * The whitespace shape above failed LOUDLY in the same position.
+   */
+  | "text-then-format-char"
+  /**
    * ISSUE #203: `text-then-whitespace` with NO TOOL CALL, which is the only way the write
    * path's refusal can be reached with this shape. `guild_delegate` refuses `empty-delegation`
    * on an empty report AND zero tool calls (C74), and every tool-bearing variant renders the
@@ -714,7 +724,10 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
     ];
   }
   // ISSUE #185: a real answer, then a trailing whitespace-only assistant message.
-  if (turn.shape === "text-then-whitespace") {
+  // ISSUE #195: the same, with the trailing message holding one U+200B instead — a `Cf`
+  // character `trim()` does not reach, which is why it was the silent half of the defect.
+  if (turn.shape === "text-then-whitespace" || turn.shape === "text-then-format-char") {
+    const trailing = turn.shape === "text-then-whitespace" ? "\n  " : "\u200b";
     return [
       user,
       toolMsg,
@@ -728,7 +741,7 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
       },
       {
         info: asst(`msg_asst_trailing_${n}`, { finish: "stop" }),
-        parts: [{ id: `t${n}p7`, type: "text", text: "\n  " }],
+        parts: [{ id: `t${n}p7`, type: "text", text: trailing }],
       },
     ];
   }

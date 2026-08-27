@@ -846,6 +846,57 @@ function joinPartText(m: HistoryMessage, type: string): string {
 }
 
 /**
+ * THE ONE DEFINITION OF "THIS STRING SAYS NOTHING" (issue #195, folding in #204).
+ *
+ * Every gate that decides whether a turn ANSWERED reads this: `answerSource`'s passes 1–2
+ * below, and `requireAnswer`'s refusal in `askViaAgent`. The invariant those two share is
+ * stated above `answerSource` — *every string a later pass can return is one `requireAnswer`
+ * refuses* — and it is true only while both sides ask the same question. They were two
+ * hand-written `trim() === ""` expressions 900 lines apart, coupled by that comment alone, so
+ * widening one and not the other made a blank-looking string fall through to the byte-preserving
+ * tier and then PASS the refusal: a success whose whole answer is one invisible character, with
+ * no signal on any channel (issue #204 reproduced it by construction). One exported predicate
+ * is what makes that desynchronization unwriteable rather than merely discouraged.
+ *
+ * **THIS DOES NOT COLLAPSE THE TIERS**, and the guard above `answerSource` forbidding that
+ * still stands — it is about the GATE STRUCTURE (blank-insensitive passes choose the message,
+ * byte-preserving passes keep the bytes), not about where "blank" is defined.
+ *
+ * **THE ALPHABET IS `trim()`'S PLUS UNICODE CATEGORIES `Cf`, `Cc` AND `Cs`, AND ITS EDGES ARE
+ * MEASURED RATHER THAN ASSUMED (issue #195).** ECMA-262's `WhiteSpace`/`LineTerminator`
+ * productions stop at `Zs` (so U+00A0, U+3000), U+FEFF and the four line terminators. Three
+ * categories sit outside them and each reached this gate as a real "answer":
+ *   - `Cf` (Format) — U+200B, U+180E, U+202E, U+00AD, U+2060, U+061C, U+200E;
+ *   - `Cc` (Control) — U+0000 NUL, U+007F DEL and **U+0085 NEL**, which Unicode's own
+ *     `White_Space=Yes` property DOES include while ECMA-262's `WhiteSpace` production does
+ *     not, so `trim()` returns it unchanged;
+ *   - `Cs` (Surrogate) — a LONE surrogate half. `\p{Cs}` matches one under the `u` flag
+ *     (probed: `/\p{Cs}/u.test("\uD800") === true`), and a well-formed PAIR is a single astral
+ *     code point which is NOT `Cs`, so an emoji-only answer stays an answer.
+ *
+ * **THE STATED RESIDUAL IS A CLASS, NOT A CHARACTER: render-blank code points OUTSIDE `Cf`/`Cc`/
+ * `Cs` are still answers.** Measured, all returned as answers today: U+2800 BRAILLE PATTERN
+ * BLANK (`So`, an ordinary PRINTING character whose glyph renders as nothing), the variation
+ * selectors U+FE0F/U+FE00 and U+034F CGJ (`Mn`), the Hangul fillers U+3164/U+115F/U+FFA0
+ * (`Lo` — letters that render as blank), U+17B4 (`Mn`) and U+2065 (`Cn`, unassigned). U+2800 is
+ * the pinned exemplar in the tests, with U+FE0F and U+3164 beside it so the CLASS is asserted
+ * rather than the one character. "The reader sees nothing" is a different question from "these
+ * code points carry no text", and only the second is answered here — enumerating render-blank
+ * glyphs is not a job for this predicate, and a category-based one cannot do it in any case.
+ *
+ * **THE GATE IS NOT A FILTER, and that is what keeps it clear of the evidence layer.** Nothing
+ * is ever stripped from a returned string: a turn whose only output is one of these characters
+ * is still captured BYTE-EXACT by passes 3–4 into `raw_response` (invariant 2) and then refused
+ * by `requireAnswer`. So `src/canonical.ts`'s U+007F rule and `src/log.ts`'s lone-surrogate
+ * uncleanliness rule are untouched — they govern how bytes are WRITTEN, this governs whether a
+ * turn ANSWERED, and widening the second cannot rewrite what the first records. Do not reach
+ * for this to normalize an answer's bytes.
+ */
+export function isBlank(s: string): boolean {
+  return /^[\s\p{Cf}\p{Cc}\p{Cs}]*$/u.test(s);
+}
+
+/**
  * THE MESSAGE OF THIS TURN THAT PRODUCED THE ANSWER, and the answer it produced.
  *
  * Four passes over the turn — two GATES × two CHANNELS — in strict priority order, and the
@@ -878,14 +929,17 @@ function joinPartText(m: HistoryMessage, type: string): string {
  *
  * **WHY THE GATE IS SPLIT IN TWO (issue #185), and it is the same defect twice.** One gate of
  * `length > 0` accepted a trailing message carrying only whitespace — `"\n"`, `"  "` — and so
- * DISCARDED a real answer emitted earlier in the same turn, which `requireAnswer` then trimmed
- * to `""` and refused. One gate of `trim() !== ""` would instead drop those bytes from
- * `raw_response` on a turn whose whole answer was whitespace, breaking invariant 2. That is a
+ * DISCARDED a real answer emitted earlier in the same turn, which `requireAnswer` then read as
+ * blank and refused. One gate of `!isBlank(text)` would instead drop those bytes from
+ * `raw_response` on a turn whose whole answer was blank, breaking invariant 2. That is a
  * false dichotomy between the GATE and the RETURNED VALUE: passes 1–2 decide **which message
  * answered** on a blank-insensitive test, passes 3–4 keep **the bytes** of a turn that produced
- * nothing else. A whitespace-only answer is still captured verbatim and still refused by
- * `requireAnswer`'s own `trim()`; nothing that used to be recorded is now recorded as `""`.
+ * nothing else. A blank-only answer is still captured verbatim and still refused by
+ * `requireAnswer`, which reads the SAME `isBlank`; nothing that used to be recorded is now
+ * recorded as `""`.
  * **Do not collapse the two gates back into one** — either direction reopens one of the two.
+ * That is about the TIER STRUCTURE and is untouched by the two gates sharing one definition of
+ * blank (issue #195, folding in #204): see `isBlank` above.
  *
  * Nothing observable is given up by a pass falling through: every string a later pass can
  * return is one `requireAnswer` refuses, so a later pass can only turn a refusal into an
@@ -913,7 +967,7 @@ function answerSource(
         if (m.role !== "assistant") continue;
         const text = joinPartText(m, channel);
         if (text.length === 0) continue;
-        if (!verbatim && text.trim() === "") continue;
+        if (!verbatim && isBlank(text)) continue;
         return { message: m, text, channel };
       }
     }
@@ -1432,9 +1486,10 @@ export class AgentFloorNotInForceError extends Error {
  * `AgentMismatchError` — so the existing ownership × outcome deletion matrix tears a
  * session we created down rather than orphaning it, and no second cleanup path exists.
  *
- * `text` is the byte-exact final text as read from history (`""`, or whitespace only). It is
- * carried so the evidence layer can still record what was actually produced: C25's byte-exact
- * rule does not get a hole cut in it just because the bytes turned out to be blank.
+ * `text` is the byte-exact final text as read from history (`""`, or blank per `isBlank` — see
+ * that predicate for the alphabet). It is carried so the evidence layer can still record what
+ * was actually produced: C25's byte-exact rule does not get a hole cut in it just because the
+ * bytes turned out to be blank.
  *
  * `providerError` is the turn's own `info.error`, whitelisted and bounded by
  * `finalAssistantError`. When opencode carried one it is QUOTED, because the alternative the
@@ -1458,7 +1513,8 @@ export class EmptyAnswerError extends Error {
   ) {
     super(
       "the model completed its turn and produced NO ANSWER (this turn's final assistant " +
-        "text is empty or whitespace only) — refusing to return silence as an answer. " +
+        "text is empty, or holds nothing but whitespace, format, control or surrogate code " +
+        "points) — refusing to return silence as an answer. " +
         (providerError !== undefined
           ? `The provider reported: ${providerError}`
           : "opencode reported no error for the turn, so the cause is not in the history — " +
@@ -1533,7 +1589,8 @@ export interface AskViaAgentOpts {
   expectedAgent?: string;
   /**
    * REQUIRE AN ANSWER (issue #117, C74). When set, a turn whose final assistant text is
-   * empty or whitespace-only throws `EmptyAnswerError` instead of returning `text: ""`.
+   * BLANK per `isBlank` — empty, or nothing but whitespace/format/control/surrogate code
+   * points — throws `EmptyAnswerError` instead of returning `text: ""`.
    * Left unset (the default, and `guild_delegate`'s deliberate choice — issue #121 did not
    * change it; the write path judges the same turn one layer up, after this spine returns, from
    * `toolCallCount` and `providerError`, which is the only place an empty report can be told
@@ -1789,14 +1846,19 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // and for the same mechanical reason: `succeeded` is still false, so the deletion
       // matrix below cleans up a session we created instead of leaking it.
       //
-      // TRIMMED-empty, not `=== ""`: a turn that produced only a newline or a run of spaces
-      // has said nothing either, and treating that as an answer would leave the exact hole
-      // this closes open to a one-whitespace-character difference. The byte-exact text still
-      // travels on the error, so nothing is lost from the record.
+      // BLANK, not `=== ""`: a turn that produced only a newline, a run of spaces or one
+      // zero-width, control or lone-surrogate character has said nothing either, and treating
+      // that as an answer would leave the exact hole this closes open to a one-character,
+      // invisible difference.
+      // The predicate is `isBlank` — THE SAME ONE `answerSource`'s passes 1–2 fall through on,
+      // which is what makes its invariant ("every string a later pass can return is one
+      // `requireAnswer` refuses") structural rather than a promise between two comments; do not
+      // re-inline a test here (issues #195/#204). The byte-exact text still travels on the
+      // error, so nothing is lost from the record.
       //
       // THIS CHECK IS ONLY AS GOOD AS `finalAssistantText`'S BOUND. Before that walk was
       // turn-scoped it reached back across turn boundaries, so on a `sessionId` continuation a
-      // silent turn inherited the PREVIOUS turn's answer, `text.trim()` was non-empty, and this
+      // silent turn inherited the PREVIOUS turn's answer, the text was non-blank, and this
       // line never fired — the guard failed open on exactly the drivers that continue sessions
       // (`/guild:collaborate`, `/guild:workshop` round 2). Do not unbound that walk.
       const providerError = finalAssistantError(history);
@@ -1811,7 +1873,7 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // Issue #168: absent unless the answer was PROMOTED off a non-text channel, so an
       // ordinary result carries no new field at all (C29's optional-field rule).
       const answerChannel = finalAssistantChannel(history);
-      if (opts.requireAnswer === true && text.trim() === "") {
+      if (opts.requireAnswer === true && isBlank(text)) {
         throw new EmptyAnswerError(sessionId, text, providerError, {
           toolCallCount,
           ...(completion !== undefined ? { completion } : {}),
