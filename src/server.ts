@@ -312,10 +312,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "ask-gated model on THIS panel call (panel-wide scope) — obtain it by asking the " +
         "user about this panel; never grant it yourself. A member whose turn produces NO " +
         "ANSWER is asked ONCE more in a fresh session before it is reported as failed " +
-        "(issue #187), so an empty-answer error here means the model was silent TWICE and " +
-        "calling the panel again to retry it is not your move; a member that needed the " +
-        "retry and then answered carries results[].attempts — say that it took two turns. " +
-        "Nothing else is retried, and GUILD_PANEL_RETRY_EMPTY=0 turns it off.",
+        "(issue #187), so an empty-answer error CARRYING results[].attempts means the model " +
+        "was silent TWICE; one WITHOUT attempts was asked once, because the retry is off " +
+        "(GUILD_PANEL_RETRY_EMPTY=0). Either way, calling the panel again to retry it is " +
+        "not your move; a member that needed the retry and then answered also carries " +
+        "results[].attempts — say that it took two turns. Nothing else is retried.",
       inputSchema: {
         type: "object",
         properties: {
