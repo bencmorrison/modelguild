@@ -27,6 +27,7 @@ import {
   type ConsultResult,
 } from "../src/consult.js";
 import { EvidenceLog } from "../src/log.js";
+import { canonicalStringify } from "../src/canonical.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
 import { Checker, fakeServeHandle } from "./harness.js";
@@ -1101,6 +1102,115 @@ export async function run(): Promise<number> {
         !r.ok && r.error.kind === "empty-answer",
         "#168 (whitespace): a whitespace-only reasoning part is still refused as empty-answer",
       );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 6m-sexies. THE REFUSAL'S DIAGNOSTICS REACH THE RECEIPT (issues #188/#191, C82).
+  //
+  //     C74 has claimed since #173 that an `empty-answer` is "self-diagnosing from the
+  //     receipts alone". It was not: `error.diagnostics` existed only on the MCP tool result,
+  //     i.e. in a Claude Code transcript, while `calls.jsonl` — the durable artefact a corpus
+  //     analysis reads — carried `exit_code:1` and a blank `raw_response` and nothing about
+  //     the cause. The DEEP-EQUAL is the assertion that matters: not "the receipt has some
+  //     diagnostics" but "it has the same object the caller was handed", which is the only
+  //     form in which the two surfaces cannot drift apart.
+  //
+  //     The fixture is `reasoning-and-empty-text` with a blank reasoning body, which is the
+  //     one live shape that is BOTH refused and carries reasoning beside an empty text part —
+  //     so `parts` shows #168's deciding cell (reasoning chars > 0, text chars 0) on a real
+  //     refusal. Here it also shows the refusal was RIGHT: those 6 characters are whitespace.
+  //     That is the point of a length rather than a verdict.
+  // -------------------------------------------------------------------------
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const BLANK_REASONING = "   \n\t ";
+    const fake = await startFakeOpencode({
+      historyText: BLANK_REASONING,
+      turnShapes: ["reasoning-and-empty-text"],
+      assistantTokens: { input: 500, output: 320, reasoning: 300, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "C82 setup: the turn is refused as empty-answer");
+      if (!r.ok && r.runId !== undefined) {
+        const entries = readEntries(logDir, r.runId);
+        const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+        const logged = completed[0]?.diagnostics as Record<string, unknown> | undefined;
+        c.check(completed.length === 1 && logged !== undefined, "#188: the refusal's completed entry carries `diagnostics`");
+        c.check(
+          logged !== undefined &&
+            r.error.diagnostics !== undefined &&
+            canonicalStringify(logged as never) === canonicalStringify(r.error.diagnostics as never),
+          "#188: the receipt's diagnostics DEEP-EQUAL the tool result's — one object, two surfaces",
+        );
+        const parts = logged?.parts as Array<Record<string, unknown>> | undefined;
+        const reasoning = parts?.find((p) => p.type === "reasoning");
+        const text = parts?.find((p) => p.type === "text");
+        c.check(
+          reasoning?.chars === BLANK_REASONING.length && text?.chars === 0,
+          "#191: the receipt records reasoning chars > 0 beside text chars 0 — #168's deciding cell, on disk",
+        );
+        // ORDER IS PART OF THE ANSWER: "reasoning, then an empty text" and "an empty text,
+        // then reasoning" are different turns, and only a sequence says which happened. The
+        // tool-bearing assistant message's parts lead, so this asserts the whole sequence.
+        c.check(
+          parts !== undefined &&
+            parts.map((p) => p.type).join(",") ===
+              "step-start,tool,step-finish,step-start,reasoning,text,step-finish",
+          "#191: the parts are IN ORDER across both assistant messages of the turn",
+        );
+        c.check(
+          parts !== undefined && parts.every((p) => !Object.prototype.hasOwnProperty.call(p, "text")),
+          "#191: lengths only — the reasoning body itself never reaches the evidence log",
+        );
+        // A structural part (`step-start`) has no `text` field at all, and that is DIFFERENT
+        // from one whose text is "" — absent vs 0. Zero-filling would erase the distinction
+        // the whole diagnostics shape exists to preserve (C74's absent-never-zero rule).
+        const stepStart = parts?.find((p) => p.type === "step-start");
+        c.check(
+          stepStart !== undefined && !Object.prototype.hasOwnProperty.call(stepStart, "chars"),
+          "#191: a part with no text carries NO chars — absent, never a fabricated 0",
+        );
+        c.check(
+          (logged?.completion as { tokens?: { output?: number } } | undefined)?.tokens?.output === 320,
+          "#188: the completion metadata rides into the receipt too, not just the census",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-septies. C29 IN THE OTHER DIRECTION: a SUCCESSFUL consult's completed entry is
+  //     byte-identical to a pre-#188 one — no `diagnostics` key at all, absent rather than
+  //     `undefined`. Without this the optional-field rule is a claim, not a property.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "a perfectly ordinary answer" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "C82/C29 setup: an ordinary consult succeeds");
+      if (r.ok) {
+        const entries = readEntries(logDir, r.attribution.runId);
+        const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+        c.check(
+          completed.length === 1 && !Object.prototype.hasOwnProperty.call(completed[0], "diagnostics"),
+          "C82/C29: a successful call's receipt has NO diagnostics key",
+        );
+      }
     } finally {
       await fake.close();
     }

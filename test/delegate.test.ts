@@ -49,6 +49,7 @@ import {
 } from "../src/delegate.js";
 import { turnToolCallCount, toolParts, fetchHistory } from "../src/client.js";
 import { EvidenceLog } from "../src/log.js";
+import { canonicalStringify } from "../src/canonical.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
@@ -2514,7 +2515,8 @@ export async function run(): Promise<number> {
     //     that a refusal may never hide reviewable work.
     {
       const repo = initRepo({ "a.txt": "A\n" });
-      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const kjLogDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: kjLogDir, GUILD_AGENT_DIR: defDirWithBuild() });
       const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
       try {
         const r = await delegate(
@@ -2537,6 +2539,29 @@ export async function run(): Promise<number> {
             readFileSync(r.capture.patchPath, "utf8").includes("+A-CHANGED"),
           "#121(K-j): ...carrying the change, so nothing reviewable was hidden behind a refusal",
         );
+        // C82's SUPERSET, PINNED — this is the one live shape where the spine's turn-side
+        // predicate fires on a call that SUCCEEDED, so the receipt carries diagnostics beside
+        // `exit_code: 0`. Left unasserted, C82's "a superset in the informative direction"
+        // would be a claim about a branch nothing exercises; here it is a fact about K-j.
+        // The discriminator the clause names is asserted too: the sibling `delegate-diff`
+        // entry with `files_changed > 0` is what tells a receipt reader this call DELIVERED,
+        // where an `empty-delegation` writes none.
+        if (r.ok) {
+          const entries = readFileSync(path.join(kjLogDir, r.attribution.runId, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const done = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            done.length === 1 && done[0].exit_code === 0 && done[0].diagnostics !== undefined,
+            "C82(K-j): the superset IS reachable — a SUCCESSFUL call's receipt carries diagnostics",
+          );
+          const diff = entries.filter((e) => e.type === "delegate-diff" && e.call_id === r.attribution.callId);
+          c.check(
+            diff.length === 1 && (diff[0].files_changed as number) > 0,
+            "C82(K-j): ...and the sibling delegate-diff with files_changed > 0 is the discriminator that says so",
+          );
+        }
       } finally {
         await fake.close();
       }
@@ -2665,6 +2690,8 @@ export async function run(): Promise<number> {
       const repo = initRepo({ "a.txt": "A\n" });
       const logDir = tmp("m8-logs-");
       const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      // A named run so the receipt can be located: `DelegateFail` carries no attribution.
+      const DIAG_RUN = "run-empty-delegation-diag";
       const fake = await startFakeOpencode({
         historyText: "unused",
         turnShapes: ["rejected"],
@@ -2672,7 +2699,7 @@ export async function run(): Promise<number> {
       });
       try {
         const r = await delegate(
-          { task: "do the thing", model: "github-copilot/gpt-5.5" },
+          { task: "do the thing", model: "github-copilot/gpt-5.5", runId: DIAG_RUN },
           { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
         );
         const f = asFail(r, "#168(K): a produced-nothing delegation");
@@ -2698,6 +2725,62 @@ export async function run(): Promise<number> {
           err.diagnostics?.completion?.tokens?.input === 1234,
           "#168(K): diagnostics survive the MCP boundary on structuredContent.error",
         );
+        // ISSUES #188/#191 (C82) — AND THIS IS THE HARD HALF. The write path decides
+        // `empty-delegation` AFTER the spine has written `completed` and after the capture, so
+        // the receipt cannot be written from the refusal; the spine writes it on the turn-side
+        // half of the same predicate (blank report + zero tool calls). This asserts the two
+        // agree anyway — deep-equal against the refusal's own object — which is the only thing
+        // that makes "one object, two surfaces" true across that seam rather than nearly true.
+        {
+          const entries = readFileSync(path.join(logDir, DIAG_RUN, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const done = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            done.length === 1 &&
+              done[0].diagnostics !== undefined &&
+              f.error.diagnostics !== undefined &&
+              canonicalStringify(done[0].diagnostics as never) ===
+                canonicalStringify(f.error.diagnostics as never),
+            "#188(K): the empty-delegation receipt carries the refusal's diagnostics, deep-equal",
+          );
+          c.check(
+            new EvidenceLog({ env }).verify(DIAG_RUN).code === 0,
+            "#188(K): the run still verifies clean with the field present",
+          );
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(#188-success): C29 IN THE OTHER DIRECTION on the write path. A delegation that
+    //     actually delivered writes a `completed` entry byte-identical to a pre-#188 one — no
+    //     `diagnostics` key. Without this, "absent on every ordinary call" is a claim about a
+    //     branch nothing exercises.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({ historyText: "edited a.txt as asked" });
+      try {
+        const r = await delegate(
+          { task: "do the thing", model: "openai/m" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#188(K-success) setup: an ordinary delegation succeeds");
+        if (r.ok) {
+          const entries = readFileSync(path.join(logDir, r.attribution.runId, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const done = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            done.length === 1 && !Object.prototype.hasOwnProperty.call(done[0], "diagnostics"),
+            "#188(K-success): a delivered delegation's receipt has NO diagnostics key",
+          );
+        }
       } finally {
         await fake.close();
       }

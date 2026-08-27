@@ -15,12 +15,14 @@ import {
   mkdirSync,
   writeFileSync,
   readdirSync,
+  readFileSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { research, researchToToolResult, type ResearchResult } from "../src/research.js";
 import { EvidenceLog } from "../src/log.js";
+import { canonicalStringify } from "../src/canonical.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
 import { Checker, fakeServeHandle } from "./harness.js";
@@ -284,6 +286,30 @@ export async function run(): Promise<number> {
           error: { diagnostics?: { toolCallCount: number } };
         }).error;
         c.check(err.diagnostics?.toolCallCount === 1, "#168 research: diagnostics survive the MCP boundary");
+        // ISSUES #188/#191 (C82) — `guild_research` never touches `log.completed`; the write
+        // can only have come from the shared lifecycle spine's refusal catch. Asserted here
+        // rather than assumed from consult's case, because "inherited" is exactly the kind of
+        // claim that stays true right up until someone forks the path.
+        c.check(r.runId !== undefined, "#188 research setup: the refusal names its run");
+        if (r.runId !== undefined) {
+          const entries = readFileSync(path.join(logDir, r.runId, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const done = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            done.length === 1 &&
+              done[0].diagnostics !== undefined &&
+              r.error.diagnostics !== undefined &&
+              canonicalStringify(done[0].diagnostics as never) ===
+                canonicalStringify(r.error.diagnostics as never),
+            "#188 research: the receipt's diagnostics DEEP-EQUAL the tool result's",
+          );
+          c.check(
+            new EvidenceLog({ env }).verify(r.runId).code === 0,
+            "#188 research: the run still verifies clean",
+          );
+        }
       }
     } finally {
       await fake.close();
