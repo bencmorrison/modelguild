@@ -66,6 +66,10 @@ import {
   lineHash,
   type JsonValue,
 } from "./canonical.js";
+// TYPE-ONLY, and deliberately so: it is erased at compile time, so the evidence layer keeps
+// its runtime dependency set (node + fsguard + canonical) exactly as it was, while the
+// diagnostics shape stays ONE definition rather than a copy here that drifts from the client's.
+import type { TurnDiagnostics } from "./client.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,6 +101,85 @@ function policyFields(
   if (tier !== undefined) out.tier = tier;
   if (confirmed !== undefined) out.confirmed = confirmed;
   return out;
+}
+
+/**
+ * `diagnostics` on a `completed` entry — WHY THE REFUSAL WAS MADE, in the receipts (issue #188).
+ *
+ * C74 has claimed since #173 that an `empty-answer`/`empty-delegation` is "self-diagnosing from
+ * the receipts alone". It was not: the diagnostics existed only on the MCP tool result, i.e. in
+ * whichever Claude Code transcript happened to make the call, while `calls.jsonl` — the only
+ * durable artefact, and what "receipts" means everywhere else here — recorded `exit_code:1` and
+ * a byte-exact empty `raw_response` and nothing about the cause. A corpus analysis reads
+ * `calls.jsonl`; there was nothing there to read.
+ *
+ * REBUILT FIELD BY FIELD RATHER THAN SPREAD, for three reasons that all point the same way:
+ * the payload must be `JsonValue` (an interface with optional members is not assignable to an
+ * index signature); an absent number must stay ABSENT rather than become `null` or `0`, which
+ * is the whole point of the shape (C74 — a real zero is the evidence); and a field added to
+ * `TurnDiagnostics` later must not reach the log until someone decides it should, because the
+ * one thing this must never carry is model CONTENT. `parts` is lengths only, by construction
+ * (see `TurnPart`).
+ *
+ * NEVER THROWS (C31). A diagnostics object that cannot be built — a wrong-shaped value from a
+ * caller, a non-finite number — yields `{}`, so the field is simply ABSENT and the entry is
+ * the one that would have been written before this existed. Losing a diagnostic is a cost;
+ * failing the call that carries it is not on the table.
+ *
+ * THE INNER KEYS STAY camelCase, AGAINST THIS FILE'S OWN snake_case CONVENTION, and that is a
+ * decision rather than an oversight: the point of the field is that the receipt and the tool
+ * result cannot disagree, which is a property a test asserts by DEEP-EQUALLING one against the
+ * other. Rename a key here and that assertion is no longer available in either direction —
+ * every reader would have to hold a translation table, and the drift this closes would reopen
+ * one level down. The entry's own top-level fields are unaffected and stay snake_case.
+ */
+function diagnosticsField(d: TurnDiagnostics | undefined): { [k: string]: JsonValue } {
+  if (d === undefined) return {};
+  try {
+    const out: { [k: string]: JsonValue } = {};
+    if (typeof d.toolCallCount === "number" && Number.isFinite(d.toolCallCount)) {
+      out.toolCallCount = d.toolCallCount;
+    }
+    const c = d.completion;
+    if (c !== undefined && c !== null) {
+      const comp: { [k: string]: JsonValue } = {};
+      // Opaque by contract: `finish` has no enum in opencode's own schema (C74), so it is
+      // carried as whatever string arrived and no vocabulary is asserted about it.
+      if (typeof c.finish === "string") comp.finish = c.finish;
+      if (typeof c.cost === "number" && Number.isFinite(c.cost)) comp.cost = c.cost;
+      const t = c.tokens;
+      if (t !== undefined && t !== null) {
+        const tok: { [k: string]: JsonValue } = {};
+        for (const k of ["input", "output", "reasoning", "cacheRead", "cacheWrite", "total"] as const) {
+          const v = t[k];
+          if (typeof v === "number" && Number.isFinite(v)) tok[k] = v;
+        }
+        if (Object.keys(tok).length > 0) comp.tokens = tok;
+      }
+      if (Object.keys(comp).length > 0) out.completion = comp;
+    }
+    if (d.partTypes !== undefined && d.partTypes !== null) {
+      const pt: { [k: string]: JsonValue } = {};
+      for (const k of Object.keys(d.partTypes)) {
+        const v = d.partTypes[k];
+        if (typeof v === "number" && Number.isFinite(v)) pt[k] = v;
+      }
+      if (Object.keys(pt).length > 0) out.partTypes = pt;
+    }
+    if (Array.isArray(d.parts) && d.parts.length > 0) {
+      const parts: JsonValue[] = [];
+      for (const p of d.parts) {
+        if (p === undefined || p === null || typeof p.type !== "string") continue;
+        const one: { [k: string]: JsonValue } = { type: p.type };
+        if (typeof p.chars === "number" && Number.isFinite(p.chars)) one.chars = p.chars;
+        parts.push(one);
+      }
+      if (parts.length > 0) out.parts = parts;
+    }
+    return Object.keys(out).length > 0 ? { diagnostics: out } : {};
+  } catch {
+    return {};
+  }
 }
 
 /** Every write method returns this instead of throwing (C31). `ok:false` carries a
@@ -924,6 +1007,16 @@ export class EvidenceLog {
      * (C29's optional-field rule).
      */
     answerChannel?: string;
+    /**
+     * WHY THIS CALL WAS REFUSED, in the receipts (issue #188, extended by #191).
+     *
+     * The same object the tool result's `error.diagnostics` carries — not a summary of it and
+     * not a re-derivation, so the durable record and the transcript cannot disagree. Written
+     * only on a turn that produced nothing, so every ordinary entry is byte-identical to one
+     * written before this field existed (C29's optional-field rule). See `diagnosticsField`
+     * for what is copied, why lengths and never content, and why it cannot throw.
+     */
+    diagnostics?: TurnDiagnostics;
     run?: string;
   }): Promise<WriteResult> {
     if (args.captureState !== "complete" && args.captureState !== "failed") {
@@ -962,6 +1055,7 @@ export class EvidenceLog {
         ...(args.answerChannel !== undefined && args.answerChannel.length > 0
           ? { answer_channel: args.answerChannel }
           : {}),
+        ...diagnosticsField(args.diagnostics),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, false);
       return { ok: r.ok };

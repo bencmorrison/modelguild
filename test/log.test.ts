@@ -1508,6 +1508,134 @@ export async function run(): Promise<number> {
     c.check(!renderThrew, "F7: rendering a circular/BigInt/throwing value in the error never throws (and never accepts)");
   }
 
+  // -------------------------------------------------------------------------
+  // G. `diagnostics` ON `completed` (issues #188/#191, C82) — the refusal's evidence in the
+  //    receipt rather than only in a Claude Code transcript. Four properties, and the
+  //    ABSENCE one is not a formality: C29's rule is that an untouched call's entry is
+  //    byte-identical to a pre-#188 one, which `!== undefined` would not catch (a JSON
+  //    round-trip renders a written `undefined` as an absent key too, so the key must
+  //    genuinely never be emitted).
+  // -------------------------------------------------------------------------
+  {
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "run-diag" });
+    const log = new EvidenceLog({ env });
+    const diagnostics = {
+      toolCallCount: 5,
+      completion: {
+        finish: "stop",
+        tokens: { input: 4321, output: 0, reasoning: 12, cacheRead: 7, cacheWrite: 3 },
+        cost: 0.0042,
+      },
+      partTypes: { "step-start": 2, tool: 5, reasoning: 1, text: 1, "step-finish": 2 },
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", chars: 812 },
+        { type: "text", chars: 0 },
+        { type: "step-finish" },
+      ],
+    };
+    await log.expect({ callId: "dg", model: "m/x", agent: "guild-read" });
+    const st = await log.started({ callId: "dg", model: "m/x", agent: "guild-read", prompt: "p" });
+    await log.completed({
+      callId: "dg",
+      exit: 1,
+      turn: st.turn,
+      captureState: "complete",
+      response: "",
+      diagnostics,
+    });
+    const file = path.join(dir, "run-diag", "calls.jsonl");
+    const done = parsed(file).filter((e) => e.type === "call" && e.status === "completed");
+    const d = done[0]?.diagnostics as Record<string, unknown> | undefined;
+    c.check(done.length === 1 && d !== undefined, "C82: a refusal's completed entry carries `diagnostics`");
+    // Compared through the canonical serializer, which sorts keys — so this asserts deep
+    // EQUALITY and not the insertion order the file happens to have been written in.
+    c.check(
+      d !== undefined &&
+        canonicalStringify(d as never) === canonicalStringify(diagnostics as never),
+      "C82: it is the tool result's object VERBATIM — same names, same nesting, deep-equal",
+    );
+    c.check(
+      Array.isArray(d?.parts) &&
+        (d!.parts as Array<Record<string, unknown>>)[1].chars === 812 &&
+        (d!.parts as Array<Record<string, unknown>>)[2].chars === 0,
+      "#191: the per-part census records reasoning chars > 0 beside text chars 0 — #168's deciding cell",
+    );
+    c.check(
+      Array.isArray(d?.parts) &&
+        (d!.parts as Array<Record<string, unknown>>).every(
+          (p) => !Object.prototype.hasOwnProperty.call(p, "text"),
+        ),
+      "#191: lengths only — no part carries its text into the evidence log",
+    );
+    const v = log.verify("run-diag");
+    c.check(v.ok && v.code === 0, "C82: verify() ACCEPTS an entry carrying the new field (no field whitelist)");
+
+    // The chain covers it like any other field: edit one `chars` count on disk and verify
+    // must fail on the hash, not shrug because the field is not one it reads.
+    const raw = readFileSync(file, "utf8");
+    c.check(raw.includes('"chars":812'), "C82 setup: the count is on disk to be tampered with");
+    writeFileSync(file, raw.replace('"chars":812', '"chars":1'));
+    const v2 = log.verify("run-diag");
+    c.check(
+      !v2.ok && v2.code === 7 && /entry_hash mismatch/.test(v2.message),
+      "C82: a mutated diagnostics value fails the hash chain (exit-analogue 7)",
+    );
+  }
+
+  {
+    // ABSENT, not `undefined`: an ordinary call's entry must not grow the key at all.
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "run-nodiag" });
+    const log = new EvidenceLog({ env });
+    await log.expect({ callId: "nd", model: "m/x", agent: "guild-read" });
+    const st = await log.started({ callId: "nd", model: "m/x", agent: "guild-read", prompt: "p" });
+    await log.completed({ callId: "nd", exit: 0, turn: st.turn, captureState: "complete", response: "a" });
+    const file = path.join(dir, "run-nodiag", "calls.jsonl");
+    const done = parsed(file).filter((e) => e.type === "call" && e.status === "completed");
+    c.check(
+      done.length === 1 && !Object.prototype.hasOwnProperty.call(done[0], "diagnostics"),
+      "C82/C29: an ordinary completed entry has NO diagnostics key (absent, not undefined)",
+    );
+    c.check(!lines(file).some((l) => l.includes("diagnostics")), "C82/C29: the string never reaches the bytes either");
+    c.check(log.verify("run-nodiag").ok, "C82: a run with no diagnostics anywhere still verifies");
+  }
+
+  {
+    // C31: a diagnostics object that cannot be represented leaves the field ABSENT and never
+    // fails the write. The hostile shapes are the ones a wrong caller could actually produce.
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "run-baddiag" });
+    const log = new EvidenceLog({ env });
+    await log.expect({ callId: "bd", model: "m/x", agent: "guild-read" });
+    const st = await log.started({ callId: "bd", model: "m/x", agent: "guild-read", prompt: "p" });
+    const hostile = {
+      toolCallCount: Number.NaN,
+      completion: { finish: 7, tokens: { input: Number.POSITIVE_INFINITY } },
+      partTypes: { text: "many" },
+      parts: [{ chars: 3 }, { type: "text", chars: Number.NaN }],
+    } as unknown as Parameters<EvidenceLog["completed"]>[0]["diagnostics"];
+    const w = await log.completed({
+      callId: "bd",
+      exit: 1,
+      turn: st.turn,
+      captureState: "complete",
+      response: "",
+      diagnostics: hostile,
+    });
+    const file = path.join(dir, "run-baddiag", "calls.jsonl");
+    const done = parsed(file).filter((e) => e.type === "call" && e.status === "completed");
+    const d = done[0]?.diagnostics as Record<string, unknown> | undefined;
+    c.check(w.ok, "C31: an unrepresentable diagnostics object never fails the write");
+    c.check(
+      d !== undefined &&
+        canonicalStringify(d as never) === canonicalStringify({ parts: [{ type: "text" }] } as never),
+      "C31: only the representable pieces survive — no NaN, no Infinity, no non-string finish",
+    );
+    c.check(log.verify("run-baddiag").ok, "C31: the run still verifies");
+  }
+
   // cleanup
   for (const d of tmpDirs) {
     try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }

@@ -727,6 +727,10 @@ export async function delegate(
       toolCallCount: outcome.toolCallCount,
       ...(outcome.completion !== undefined ? { completion: outcome.completion } : {}),
       ...(outcome.partTypes !== undefined ? { partTypes: outcome.partTypes } : {}),
+      // Issue #191: the ordered, measured census. THIS OBJECT IS ALSO ON THE RECEIPT — the spine
+      // wrote the identical content onto `completed` when the turn came back blank and toolless
+      // (issue #188); see the note beside that write for why the receipt cannot be written here.
+      ...(outcome.parts !== undefined ? { parts: outcome.parts } : {}),
     };
     const fail: DelegateFail = {
       ok: false,

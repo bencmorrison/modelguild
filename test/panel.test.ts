@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { panel, panelToToolResult, type PanelResult } from "../src/panel.js";
 import { EvidenceLog } from "../src/log.js";
+import { canonicalStringify } from "../src/canonical.js";
 import {
   startFakeOpencode,
   hardenedAgent,
@@ -1047,6 +1048,36 @@ export async function run(): Promise<number> {
         c.check(
           beta?.error?.diagnostics?.toolCallCount === 1,
           "#187 double-empty: error.diagnostics is still present (the LAST attempt's) — #173's shape is unchanged",
+        );
+        // ISSUES #188/#191 (C82) — THE PANEL INHERITS THE RECEIPT WRITE, and this is the case
+        // that proves it is inherited rather than reimplemented: `guild_panel` never touches
+        // `log.completed`, so both attempts' entries can only have been written by the shared
+        // spine's refusal catch. Per ATTEMPT, deep-equal to that attempt's own diagnostics —
+        // two silent turns is #168's strongest evidence shape, and it is worthless if the
+        // receipts carry one attempt's numbers under both call ids.
+        const entries = readEntries(logDir, r.runId);
+        for (const [i, label] of [[0, "first"], [1, "second"]] as const) {
+          const att = beta?.attempts?.[i];
+          const done = entries.find(
+            (e) => e.call_id === att?.callId && e.type === "call" && e.status === "completed",
+          );
+          c.check(
+            done?.diagnostics !== undefined &&
+              att?.diagnostics !== undefined &&
+              canonicalStringify(done.diagnostics as never) ===
+                canonicalStringify(att.diagnostics as never),
+            `#188 panel: the ${label} attempt's receipt carries ITS OWN diagnostics, deep-equal`,
+          );
+        }
+        // The sibling that answered adds no field at all (C29).
+        const alphaDone = entries.find(
+          (e) =>
+            e.call_id === r.results.find((m) => m.model === "alpha/ok")?.callId &&
+            e.status === "completed",
+        );
+        c.check(
+          alphaDone !== undefined && !Object.prototype.hasOwnProperty.call(alphaDone, "diagnostics"),
+          "#188 panel: the member that answered has NO diagnostics key on its receipt",
         );
         c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#187 double-empty: the run verifies clean");
       }
