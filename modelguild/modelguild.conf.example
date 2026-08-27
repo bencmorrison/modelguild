@@ -43,14 +43,23 @@
 # question ONCE more, in a fresh session. On by default. A panel that loses a member still
 # returns something useful-looking, so the synthesis quietly proceeds a voice short — and a
 # member that answered nothing has already paid for its tool calls without producing any
-# output, so the retry costs about what a member that worked costs. ONE retry, no backoff: if
+# output, so the retry costs about what a member that worked costs. Not evenly, though: the
+# silences #187 measured were on the LARGEST-CONTEXT members, so the doubling lands
+# preferentially on the expensive ones. ONE retry, no backoff: if
 # the second turn is also silent the member fails exactly as it would have, carrying BOTH
 # attempts' diagnostics. It applies to an empty answer and to nothing else — a policy refusal,
 # a mismatched or unhardened agent, an ungated session or a failed call are decisions or
 # errors, not silences, and repeating them would only re-run what was just refused. What it
 # costs: a second model turn on the failing member (so up to twice that member's tokens, and
 # its wall clock, which is the panel's whenever the silent member is the slow one), a second
-# opencode session, and a second set of lifecycle entries in the run.
+# opencode session, and a second set of lifecycle entries in the run. Three more, because the
+# retry is a fresh call in a fresh session: if you have set GUILD_APPROVE_EGRESS=ask, the
+# retry ASKS YOU AGAIN for every gated web call the model makes -- INCLUDING ones you already
+# declined, which nothing here can remember -- and on a panel you walked away from, the 120s
+# fail-closed approval stall doubles for that member; under GUILD_SERVE_PER_CALL=1 the retry
+# is a second full `opencode serve` spawn, readiness poll and teardown; and the resolved-agent
+# check runs once more for that member (free on the shared child, but a control-plane call
+# plus one more permanently cached verdict under GUILD_SERVE_PER_CALL=1).
 # GUILD_PANEL_RETRY_EMPTY=0      # on (default) | 0 | off. Set it to 0 if you would rather
 #                                 # have the panel come back a voice short than spend a
 #                                 # second turn. Lenient like GUILD_ACTIVITY: only `0` and
