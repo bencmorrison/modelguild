@@ -2738,6 +2738,89 @@ export async function run(): Promise<number> {
         await fake.close();
       }
     }
+
+    // --- K(#185-whitespace): THE WRITE PATH INHERITS THE WHITESPACE HALF OF #185 TOO, and the
+    //     thing it changes is the REPORT — the model's only account of what it did, handed to
+    //     the human beside the diff at `/guild:delegate` step 3. A turn that answered and then
+    //     emitted a trailing whitespace-only assistant message used to have that answer
+    //     discarded and reach the tool as `report: "\n  "`. Nothing in this file noticed
+    //     (issue #203): reverting the fix left the whole suite green.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const REPORT = "I edited a.txt and ran the tests.";
+      const fake = await startFakeOpencode({
+        historyText: REPORT,
+        turnShapes: ["text-then-whitespace"],
+      });
+      try {
+        const r = await delegate(
+          { task: "edit a.txt", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(r.ok, "#203(K-whitespace): the delegation succeeds");
+        c.check(
+          r.ok && r.report === REPORT,
+          `#203(K-whitespace): the REPORT is the real answer, not the trailing whitespace (got ${
+            r.ok ? JSON.stringify(r.report) : "a refusal"
+          })`,
+        );
+        if (r.ok) {
+          const entries = readFileSync(path.join(logDir, r.attribution.runId, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const completed = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            completed.length === 1 && completed[0].raw_response === REPORT,
+            "#203(K-whitespace): and the receipt records that same answer byte-exact",
+          );
+          c.check(
+            completed.length === 1 && completed[0].answer_channel === undefined,
+            "#203(K-whitespace): no promotion happened — this is the TEXT channel, so C29 keeps the field absent",
+          );
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(#185-whitespace-no-tools): THE REFUSAL FLIP, which the shape above cannot reach.
+    //     `empty-delegation` needs an empty report AND zero tool calls, and every tool-bearing
+    //     fixture renders the shared tool-call message — so the tool-call-free variant is what
+    //     makes the write path's JUDGEMENT, not just its report text, assertable. Pre-#185 the
+    //     trailing `"\n  "` was the report, `report.trim() === ""` held, and this turn was
+    //     REFUSED as empty-delegation; it is now an ordinary success carrying the real report.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const REPORT = "I looked and changed nothing, because a.txt is already correct.";
+      const fake = await startFakeOpencode({
+        historyText: REPORT,
+        turnShapes: ["text-then-whitespace-no-tools"],
+      });
+      try {
+        const r = await delegate(
+          { task: "check a.txt", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          r.ok,
+          `#203(K-whitespace-no-tools): NOT refused as empty-delegation (got ${
+            r.ok ? "ok" : r.error.kind
+          })`,
+        );
+        c.check(r.ok && r.report === REPORT, "#203(K-whitespace-no-tools): the real answer is the report");
+        c.check(
+          r.ok && r.capture.filesChanged === 0,
+          "#203(K-whitespace-no-tools): fixture — nothing was edited, so only the report stands between this and the refusal",
+        );
+      } finally {
+        await fake.close();
+      }
+    }
   }
 
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
