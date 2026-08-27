@@ -49,6 +49,7 @@ Run the checks (all are fast; only the last two need a model / opencode auth):
 ```bash
 npx tsc --noEmit                             # typecheck the TypeScript
 npm test                                     # the TS suite — every test/*.test.ts (see test/run.ts); spawning opencode serve is free, no model call
+                                              # `npx tsx test/run.ts <name>...` runs only the named suite(s) (issue #194); an unknown name refuses, naming the known ones, before anything starts
 bash modelguild/tests/check-frontmatter.sh       # command/agent frontmatter structure
 bash modelguild/tests/check-docs.sh --self-test  # command names + MCP-grant lint (+ its self-test)
 bash modelguild/tests/check-contract-counts.sh --self-test # CONTRACT.md prose counts + clause-id uniqueness (+ self-test)
