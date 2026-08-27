@@ -19,6 +19,8 @@ import {
   finalAssistantError,
   servingAgent,
   turnStartIndex,
+  turnToolCallCount,
+  turnAssistantPartTypes,
   toolParts,
   splitModel,
   OpencodeHttpError,
@@ -26,7 +28,7 @@ import {
   type ServeProvider,
   type SessionHistory,
 } from "../src/client.js";
-import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
+import { startFakeOpencode, COMPACTION_TOOL_CALLS, type FakeOpencode } from "./fake-opencode-server.js";
 import { Checker, fakeServeHandle } from "./harness.js";
 
 /** A `ServeProvider` that points `withServe` at an already-running fake — the M1
@@ -883,6 +885,120 @@ export async function run(): Promise<number> {
     const flat = finalAssistantError(noisy) ?? "";
     c.check(!/[\n\t]/.test(flat), "provider error: control characters are stripped, not passed through");
     c.check(flat.length <= 301, `provider error: bounded (${flat.length} chars)`);
+  }
+
+  // --- ISSUE #189: A MID-TURN AUTO-COMPACTION IS NOT A TURN BOUNDARY ----------------------
+  //
+  // opencode compacts INSIDE one `POST /session/{id}/message`, appending a `user` message
+  // carrying a `compaction` part and then a second one carrying a `synthetic` continue text
+  // part. Taking the last `user` message as the delimiter truncated "this turn" to the
+  // post-compaction remainder, so every extractor under-reported — silently, and always in
+  // that direction. Driven through the FAKE rather than a hand-built history because the same
+  // rendered shape is what `consult`/`delegate` assert against, so the three suites cannot
+  // disagree about what a compacted turn looks like.
+  {
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["text", "compaction-then-text"],
+      turnTexts: ["BANANA", "POST-COMPACTION ANSWER"],
+    });
+    try {
+      const post = async (q: string) =>
+        sendMessage({
+          baseUrl: fake.baseUrl,
+          sessionId: "ses_fake",
+          agent: "guild-read",
+          model: "openai/gpt-fake",
+          parts: [{ type: "text", text: q }],
+        });
+      await post("Reply with exactly: BANANA");
+      await post("Now do the big one");
+      const h = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: "ses_fake" });
+
+      // The delimiter is the CALLER's message — turn 2's own user message, not either of the
+      // two opencode appended after it.
+      const callerUserIdx = h.messages.findIndex((m) => m.info.id === "msg_user_2");
+      c.check(callerUserIdx >= 0, "#189: the fake really renders the caller's turn-2 user message");
+      c.check(
+        turnStartIndex(h) === callerUserIdx + 1,
+        `#189: the turn starts just past the CALLER's user message, not past the compaction ones (got ${turnStartIndex(h)}, want ${callerUserIdx + 1})`,
+      );
+      const compactionIdx = h.messages.findIndex((m) => m.info.id === "msg_user_compaction_2");
+      c.check(
+        compactionIdx > turnStartIndex(h),
+        "#189: turnStartIndex lands BEFORE the compaction messages, so they are inside the turn",
+      );
+
+      // The consequences, one per consumer that takes the bound.
+      c.check(
+        turnToolCallCount(h) === COMPACTION_TOOL_CALLS,
+        `#189: turnToolCallCount reports the PRE-compaction calls (got ${turnToolCallCount(h)}, want ${COMPACTION_TOOL_CALLS})`,
+      );
+      const types = turnAssistantPartTypes(h);
+      c.check(
+        (types.tool ?? 0) === COMPACTION_TOOL_CALLS,
+        `#189: the part-type census sees the pre-compaction tool parts (got ${String(types.tool)})`,
+      );
+      c.check(
+        finalAssistantText(h) === "POST-COMPACTION ANSWER",
+        "#189: the answer is still the turn's OWN answer, not anything earlier",
+      );
+
+      // THE BOUND STILL HOLDS — the BANANA property, asserted explicitly. Turn 1's answer sits
+      // in the same payload; widening the walk past the caller's own message would return it.
+      c.check(
+        turnStartIndex(h) > h.messages.findIndex((m) => m.info.id === "msg_asst_final_1"),
+        "#189: the walk still stops before the PREVIOUS turn — the BANANA bound is not unbounded",
+      );
+      c.check(
+        !finalAssistantText(h).includes("BANANA"),
+        "#189: turn 1's BANANA is unreachable from turn 2 (the #117 defect stays fixed)",
+      );
+      c.check(
+        turnToolCallCount(h) !== COMPACTION_TOOL_CALLS * 2,
+        "#189: turn 1's tool calls are NOT counted into turn 2",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // A `user` message the payload does not mark is still a delimiter — the skip fails toward
+  // the pre-#189 bound, so a renamed or dropped marker can never unbound the walk.
+  {
+    const u = (parts: Array<Record<string, unknown>>) => ({
+      role: "user",
+      info: { role: "user" } as Record<string, unknown>,
+      parts,
+    });
+    const a = (text: string) => ({
+      role: "assistant",
+      info: { role: "assistant", finish: "stop" } as Record<string, unknown>,
+      parts: [{ type: "text", text }] as Array<Record<string, unknown>>,
+    });
+    const cases: Array<[string, Array<Record<string, unknown>>]> = [
+      ["no parts at all", []],
+      ["an unknown part type", [{ type: "future-part-opencode-adds" }]],
+      ["plain caller text", [{ type: "text", text: "q" }]],
+      ["synthetic: false", [{ type: "text", text: "q", synthetic: false }]],
+      ["a non-boolean marker", [{ type: "text", text: "q", synthetic: "true" }]],
+      ["a marked part beside an unmarked one", [{ type: "text", text: "q" }, { type: "text", text: "x", synthetic: true }]],
+    ];
+    for (const [label, parts] of cases) {
+      const h: SessionHistory = { messages: [a("OLD"), u(parts), a("NEW")] };
+      c.check(turnStartIndex(h) === 2, `#189: ${label} is still a turn delimiter (fails toward the old bound)`);
+    }
+    // Both markers work on their own, and a compaction part is enough by itself.
+    const marked: Array<[string, Array<Record<string, unknown>>]> = [
+      ["a compaction part", [{ type: "compaction", auto: true, overflow: true }]],
+      ["synthetic: true", [{ type: "text", text: "continue", synthetic: true }]],
+      ["metadata.compaction_continue", [{ type: "text", text: "continue", metadata: { compaction_continue: true } }]],
+      ["a compaction part beside an unknown one", [{ type: "compaction", auto: true }, { type: "future-part" }]],
+    ];
+    for (const [label, parts] of marked) {
+      const h: SessionHistory = { messages: [a("OLD"), u(parts), a("NEW")] };
+      c.check(turnStartIndex(h) === 0, `#189: ${label} is NOT a turn delimiter`);
+    }
   }
 
   console.log(`client.test: ${c.passes} passed, ${c.failures} failed`);

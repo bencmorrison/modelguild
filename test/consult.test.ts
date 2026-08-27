@@ -27,7 +27,7 @@ import {
   type ConsultResult,
 } from "../src/consult.js";
 import { EvidenceLog } from "../src/log.js";
-import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
+import { startFakeOpencode, COMPACTION_TOOL_CALLS, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
 import { Checker, fakeServeHandle } from "./harness.js";
 
@@ -1036,6 +1036,47 @@ export async function run(): Promise<number> {
           "#173 tokens: zero output BESIDE a nonzero input — the provider emitted nothing",
         );
         c.check(d?.toolCallCount === 1, "#173: the turn's tool-call count rides out");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-ter-quater. ISSUE #189: opencode auto-compacted MID-TURN and the turn then said nothing.
+  //     The refusal is CORRECT — nothing was answered on either channel — but the diagnostics
+  //     attached to it were read through a boundary that took opencode's own compaction-appended
+  //     `user` messages as the start of the turn, so `toolCallCount` reported 0 and the receipt
+  //     said "the turn made NO tool calls" about a turn that had made two. #173's headline
+  //     diagnostic, silently wrong and only ever in the under-reporting direction.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["compaction-then-silent"],
+      assistantTokens: { input: 500, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#189: a compacted turn that answered nothing is still empty-answer");
+      if (!r.ok) {
+        const d = r.error.diagnostics;
+        c.check(
+          d?.toolCallCount === COMPACTION_TOOL_CALLS,
+          `#189: toolCallCount counts the PRE-compaction calls (got ${String(d?.toolCallCount)}, want ${COMPACTION_TOOL_CALLS})`,
+        );
+        c.check(
+          d?.partTypes?.tool === COMPACTION_TOOL_CALLS,
+          `#189: the part-type census reaches back past the compaction (got ${String(d?.partTypes?.tool)})`,
+        );
+        c.check(
+          r.error.message.includes(`the turn made ${COMPACTION_TOOL_CALLS} tool calls before it ended`),
+          `#189: the corrected count reaches the message a human reads: ${r.error.message}`,
+        );
       }
     } finally {
       await fake.close();

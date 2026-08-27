@@ -807,7 +807,8 @@ export async function fetchHistory(opts: FetchHistoryOpts): Promise<SessionHisto
 }
 
 /**
- * WHERE THIS TURN STARTS — the index just past the LAST `user` message (issue #117 review).
+ * WHERE THIS TURN STARTS — the index just past the last `user` message THE CALLER SENT
+ * (issue #117 review; compaction-aware since issue #189).
  *
  * `fetchHistory` returns the WHOLE session, and every extractor below walks it backwards.
  * Unbounded, that walk crosses turn boundaries, which on a `sessionId` continuation is not a
@@ -817,22 +818,80 @@ export async function fetchHistory(opts: FetchHistoryOpts): Promise<SessionHisto
  * `deepseek-v4-flash-free` answered `"BANANA"`, a quota-exhausted `gpt-5.6-terra` was asked
  * something else on the same session, and `"BANANA"` came back as the new answer with
  * `ok:true`, recorded as this call's byte-exact `raw_response` with `exit_code: 0`).
+ * **DO NOT UNBOUND THIS WALK.** Bounding KEEPS the reason the backward walk exists — opencode
+ * splits one turn into a tool-call-only assistant message followed by a text-bearing one, and
+ * the walk is what skips the former — while removing its reach into anything the caller did
+ * not just ask.
  *
- * A `user` message is the only turn delimiter opencode's history has, and it is a reliable
- * one: a turn is exactly one `POST /session/{id}/message` and that POST is what appends the
- * user message. Bounding here KEEPS the reason the backward walk exists — opencode splits one
- * turn into a tool-call-only assistant message followed by a text-bearing one, and the walk is
- * what skips the former — while removing its reach into anything the caller did not just ask.
+ * **A `user` message is the only delimiter opencode's history has, and NOT EVERY ONE OF THEM
+ * IS THE CALLER'S** (issue #189). The former version of this comment asserted that a turn is
+ * exactly one `POST /session/{id}/message` and that POST is what appends the user message; the
+ * second half is false. opencode's auto-compaction runs INSIDE one POST: on context overflow
+ * it appends a `user` message carrying a `compaction` part, and its autocontinue path appends
+ * a second `user` message carrying a `synthetic` text part. Treating either as the boundary
+ * silently truncates "this turn" to the post-compaction remainder, and every consumer below
+ * then UNDER-reports — `turnToolCallCount` (C74's deciding column on the write path, and
+ * #168's headline diagnostic on the read path) counts only what happened after the compaction,
+ * which on the write path is a FALSE `empty-delegation` refusal.
  *
- * No `user` message at all ⇒ index 0, i.e. the whole history is the turn. That is the honest
- * reading of a payload with no delimiter, and it keeps every low-level fixture that serves
- * assistant messages alone behaving exactly as before.
+ * **THE SKIP IS EVIDENCE-BASED, AND ITS DEFAULT IS THE OLD BEHAVIOUR** — a `user` message is
+ * a delimiter unless the payload positively marks it as opencode's own, so an opencode bump
+ * that renames or drops a marker degrades to the pre-#189 bound rather than to an unbounded
+ * walk. No parts at all, or parts of types this does not recognize, is a delimiter.
+ *
+ * Markers, from opencode 1.18.18's `GET /doc` (re-probed 2026-08-27):
+ *   - `CompactionPart` — `type: "compaction"`, `auto` required, `overflow`/`tail_start_id`
+ *     optional. A member of the `Part` union that `GET /session/{sessionID}/message` returns.
+ *     No caller-sent message carries one, so ONE such part is enough.
+ *   - `TextPart.synthetic` — an optional `boolean`, plus a free-form `metadata` object, where
+ *     the autocontinue path records `compaction_continue: true`. Weaker evidence than a
+ *     compaction part (a caller's own message is text too), so this leg requires that EVERY
+ *     part of the message be marked: a message holding any unmarked part is still a delimiter.
+ *
+ * STATED RESIDUAL: the other compaction branch replays the retained tail as a fresh `user`
+ * message, copying real parts across — those carry no marker, and this cannot tell them from
+ * the caller's own message. It is bounded there exactly as it was before #189.
+ *
+ * No `user` message at all — or only compaction-appended ones — ⇒ index 0, i.e. the whole
+ * history is the turn. That is the honest reading of a payload with no caller delimiter, and
+ * it keeps every low-level fixture that serves assistant messages alone behaving as before.
  */
 export function turnStartIndex(history: SessionHistory): number {
   for (let i = history.messages.length - 1; i >= 0; i--) {
-    if (history.messages[i].role === "user") return i + 1;
+    const m = history.messages[i];
+    if (m.role !== "user") continue;
+    if (isCompactionAppendedUser(m)) continue;
+    return i + 1;
   }
   return 0;
+}
+
+/** A `compaction` part — opencode's own marker, on a message it created for it alone. */
+function isCompactionPart(p: Record<string, unknown>): boolean {
+  return p.type === "compaction";
+}
+
+/** A text part opencode wrote rather than the caller: `synthetic: true`, or the autocontinue
+ * path's `metadata.compaction_continue: true`. Both are read defensively — `metadata` is an
+ * untyped object in the schema, so anything but the literal `true` is not evidence. */
+function isSyntheticTextPart(p: Record<string, unknown>): boolean {
+  if (p.type !== "text") return false;
+  if (p.synthetic === true) return true;
+  const meta = typeof p.metadata === "object" && p.metadata !== null ? (p.metadata as Record<string, unknown>) : {};
+  return meta.compaction_continue === true;
+}
+
+/**
+ * Was this `user` message appended by opencode's compaction machinery rather than by the
+ * caller's `POST /session/{id}/message`? (issue #189)
+ *
+ * Fails toward "the caller sent it", which is the pre-#189 bound: absent evidence this returns
+ * `false` and the message delimits the turn, so no marker change can widen the walk.
+ */
+function isCompactionAppendedUser(m: HistoryMessage): boolean {
+  if (m.parts.length === 0) return false;
+  if (m.parts.some(isCompactionPart)) return true;
+  return m.parts.every(isSyntheticTextPart);
 }
 
 /** The `type` parts of `m` carrying a string `text`, concatenated verbatim in order with NO

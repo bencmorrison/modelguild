@@ -493,7 +493,48 @@ export type TurnShape =
    * from context — behind a trailing blank message. The behaviour under test is the
    * extractor's, and that does not depend on how the turn was produced.
    */
-  | "text-then-whitespace-no-tools";
+  | "text-then-whitespace-no-tools"
+  /**
+   * ISSUE #189: opencode auto-compacted MID-TURN. Two tool calls land, the context overflows,
+   * opencode appends a `user` message carrying a `compaction` part and then a second `user`
+   * message carrying a `synthetic` continue text part, and only then does the model answer.
+   * `turnStartIndex` used to take the LAST `user` message as the boundary, so everything before
+   * the compaction — here both tool calls — fell outside "this turn" and every extractor
+   * under-reported.
+   *
+   * PROVENANCE, per this file's convention. **PROBED** (opencode 1.18.18, `GET /doc`,
+   * 2026-08-27): `CompactionPart` is a member of the `Part` union the history endpoint returns,
+   * with `type: "compaction"`, `auto` required and `overflow`/`tail_start_id` optional; and
+   * `TextPart` carries an optional `synthetic: boolean` beside a free-form `metadata` object.
+   * **CONSTRUCTED**: that these parts ride on `role:"user"` messages, in this order, inside one
+   * `POST /session/{id}/message` — that comes from issue #189's `strings` read of the minified
+   * Bun binary, not from a capture. Nobody has observed `GET /session/{id}/message` returning
+   * these messages; if opencode filters them out, the product's skip is a no-op and this shape
+   * models a payload that never occurs.
+   */
+  | "compaction-then-text"
+  /**
+   * ISSUE #189/#190: `compaction-then-text` where the post-compaction assistant says nothing —
+   * an empty text part, no `info.error`, and no further tool call. This is the shape that made
+   * the boundary defect BEHAVIOURAL rather than merely diagnostic: the read paths refuse it as
+   * `empty-answer` (correctly — it answered nothing) but reported `toolCallCount: 0`, and
+   * `guild_delegate` refused it as `empty-delegation` on that same zero, which is a FALSE
+   * refusal of a turn that made two tool calls. Same provenance as `compaction-then-text`.
+   */
+  | "compaction-then-silent"
+  /**
+   * THE INVERSION for the two above: the compaction messages are present and the turn makes NO
+   * tool call at all, on either side of them. The write path's `empty-delegation` must still
+   * fire here — the fix moves the BOUNDARY, it does not disable the refusal — so this is what
+   * separates "the count is now right" from "the count is now always non-zero". Same
+   * provenance; the tool messages are simply absent.
+   */
+  | "compaction-silent-no-tools";
+
+/** How many tool calls the issue-#189 compaction shapes make BEFORE opencode compacts. Read by
+ * the assertions so "the count is the pre-compaction count" is checked against one number. */
+export const COMPACTION_TOOL_CALLS = 2;
+
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -654,6 +695,76 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
       { id: `t${n}p3`, type: "step-finish" },
     ],
   };
+  // ISSUE #189: the mid-turn auto-compaction shapes. `COMPACTION_TOOL_CALLS` is the count the
+  // assertions read; it is 2 rather than 1 so a pass cannot be confused with the single tool
+  // call every other tool-bearing shape renders.
+  if (
+    turn.shape === "compaction-then-text" ||
+    turn.shape === "compaction-then-silent" ||
+    turn.shape === "compaction-silent-no-tools"
+  ) {
+    // The second tool message. Two SEPARATE assistant messages rather than two parts of one,
+    // because that is how opencode splits a turn and it is what the backward walk crosses.
+    const toolMsg2 = {
+      info: asst(`msg_asst_tool2_${n}`, { finish: "tool-calls" }),
+      parts: [
+        { id: `t${n}q1`, type: "step-start" },
+        {
+          id: `t${n}q2`,
+          type: "tool",
+          callID: `call2_${n}`,
+          tool: "grep",
+          state: {
+            status: "completed",
+            input: { pattern: "MARKER" },
+            output: "MARKER-GREP-HIT",
+          },
+        },
+        { id: `t${n}q3`, type: "step-finish" },
+      ],
+    };
+    // opencode's own two messages. NEITHER is a turn delimiter: the first carries a
+    // `compaction` part, the second a `synthetic` continue text part with the autocontinue
+    // path's `metadata.compaction_continue`. Both markers are asserted on, so a product that
+    // recognized only one of them still fails the other case.
+    const compactionUser = {
+      info: { id: `msg_user_compaction_${n}`, role: "user", time: { created: n } },
+      parts: [{ id: `t${n}c1`, type: "compaction", auto: true, overflow: true }],
+    };
+    const continueUser = {
+      info: { id: `msg_user_continue_${n}`, role: "user", time: { created: n } },
+      parts: [
+        {
+          id: `t${n}c2`,
+          type: "text",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+          text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        },
+      ],
+    };
+    const finalParts =
+      turn.shape === "compaction-then-text"
+        ? [
+            { id: `t${n}p4`, type: "step-start" },
+            { id: `t${n}p5`, type: "text", text: turn.text },
+            { id: `t${n}p6`, type: "step-finish" },
+          ]
+        : [
+            { id: `t${n}p4`, type: "step-start" },
+            { id: `t${n}p5`, type: "text", text: "" },
+            { id: `t${n}p6`, type: "step-finish" },
+          ];
+    const toolMsgs =
+      turn.shape === "compaction-silent-no-tools" ? [] : [toolMsg, toolMsg2];
+    return [
+      user,
+      ...toolMsgs,
+      compactionUser,
+      continueUser,
+      { info: asst(`msg_asst_final_${n}`, { finish: "stop" }), parts: finalParts },
+    ];
+  }
   // ISSUE #168's LEADING CANDIDATE: output arrived, as `reasoning`, and the extractor reads
   // only `text` — so the receipts say "empty" while the model demonstrably produced tokens.
   if (turn.shape === "reasoning-only") {

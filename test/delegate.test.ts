@@ -49,7 +49,7 @@ import {
 } from "../src/delegate.js";
 import { turnToolCallCount, toolParts, fetchHistory } from "../src/client.js";
 import { EvidenceLog } from "../src/log.js";
-import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
+import { startFakeOpencode, COMPACTION_TOOL_CALLS, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
 import { Checker, fixtureGitEnv, fakeServeHandle } from "./harness.js";
@@ -2871,6 +2871,87 @@ export async function run(): Promise<number> {
             `#203(K-whitespace-no-tools): premise — the served turn made ZERO tool calls, so the refusal really was armable (got ${turnToolCallCount(
               served,
             )})`,
+          );
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(#189/#190): A MID-TURN AUTO-COMPACTION IS NOT A TURN BOUNDARY, and on this path the
+    //     consequence is a FALSE REFUSAL rather than a wrong number. A delegation that made two
+    //     tool calls, overflowed, compacted, then wrote no report and changed no files was
+    //     refused as `empty-delegation` — with a message stating it made no tool calls — because
+    //     `nothingDelivered` reads `turnToolCallCount` through the same bound, and the bound
+    //     stopped at the LAST `user` message, which after a compaction is opencode's own.
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        turnShapes: ["compaction-then-silent"],
+      });
+      try {
+        const r = await delegate(
+          { task: "do the big one", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          r.ok,
+          `#189(K-compaction): a compacted turn with ${COMPACTION_TOOL_CALLS} tool calls is NOT refused as empty-delegation (got ${
+            r.ok ? "ok" : r.error.kind
+          })`,
+        );
+        c.check(
+          r.ok && r.capture.filesChanged === 0,
+          "#189(K-compaction): fixture — nothing was edited, so the tool-call column is the only thing standing between this and the refusal",
+        );
+        // THE PREMISE, read off the turn the PRODUCT read, through the product's own predicate:
+        // the served turn really did make its tool calls BEFORE the compaction, so this asserts
+        // the corrected boundary and not merely that the refusal did not fire.
+        const servedSession = fake.recorded.historyGets[0];
+        c.check(typeof servedSession === "string", "#189(K-compaction): fixture — the product read a history to identify");
+        if (typeof servedSession === "string") {
+          const served = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: servedSession });
+          c.check(
+            turnToolCallCount(served) === COMPACTION_TOOL_CALLS,
+            `#189(K-compaction): premise — the served turn's tool calls are counted across the compaction (got ${turnToolCallCount(
+              served,
+            )}, want ${COMPACTION_TOOL_CALLS})`,
+          );
+        }
+      } finally {
+        await fake.close();
+      }
+    }
+
+    // --- K(#189-inversion): THE REFUSAL STILL ARMS. Same compaction messages, no tool call on
+    //     either side of them, empty report, nothing edited — `empty-delegation`. Without this
+    //     the case above is equally satisfied by a fix that simply stopped counting, and the
+    //     write path would have lost the C74 refusal instead of gaining a correct boundary.
+    //     (Its no-compaction sibling — zero tool calls, no compaction — is K-b/K-c above.)
+    {
+      const repo = initRepo({ "a.txt": "A\n" });
+      const logDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithBuild() });
+      const fake = await startFakeOpencode({
+        historyText: "unused",
+        turnShapes: ["compaction-silent-no-tools"],
+      });
+      try {
+        const r = await delegate(
+          { task: "do the big one", model: "github-copilot/gpt-5.5" },
+          { serve: fakeServe(fake), env, repoDir: repo, messageTimeoutMs: 5_000 },
+        );
+        c.check(
+          !r.ok && r.error.kind === "empty-delegation",
+          `#189(K-inversion): a compacted turn that reached for NOTHING is still refused (got ${r.ok ? "ok" : r.error.kind})`,
+        );
+        if (!r.ok) {
+          c.check(
+            r.error.diagnostics?.toolCallCount === 0,
+            `#189(K-inversion): and the count it reports is a real zero (got ${String(r.error.diagnostics?.toolCallCount)})`,
           );
         }
       } finally {
