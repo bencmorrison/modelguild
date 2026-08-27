@@ -14,8 +14,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { panel, panelToToolResult, type PanelResult } from "../src/panel.js";
 import { EvidenceLog } from "../src/log.js";
-import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
+import {
+  startFakeOpencode,
+  hardenedAgent,
+  voidedAgent,
+  type FakeOpencode,
+} from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
+import { AgentFloorChecker } from "../src/agentfloor.js";
+import type { ElicitationRequester } from "../src/approve.js";
 import { Checker, fakeServeHandle } from "./harness.js";
 
 /** A `ServeProvider` pointing `withServe` at an already-running fake (no opencode). */
@@ -47,6 +54,19 @@ function rootWithPolicy(policy: string): string {
 function defDirWithRead(): string {
   const dir = tmp("m6-agent-");
   writeFileSync(path.join(dir, "guild-read.md"), "---\nmode: all\n---\nfake\n");
+  return dir;
+}
+
+/** An agent-def dir holding the SHIPPED `guild-read.md`, byte for byte.
+ * `defDirWithRead` above writes a stub with no permission map, which is enough for the
+ * presence gate but NOT for the approval bridge: since review finding H3 it intersects the
+ * gated tier with the allow-set it PARSES from the def in force, and a def it cannot parse
+ * refuses to arm — which would refuse the whole panel before any member ran, i.e. the wrong
+ * failure. Only the `GUILD_APPROVE_EGRESS` case below needs this. */
+function defDirWithRealRead(): string {
+  const dir = tmp("m6-agent-real-");
+  const src = new URL("../.opencode/agent/guild-read.md", import.meta.url);
+  writeFileSync(path.join(dir, "guild-read.md"), readFileSync(src, "utf8"));
   return dir;
 }
 
@@ -642,8 +662,13 @@ export async function run(): Promise<number> {
         c.check(beta?.sessionId === undefined, "empty-member: beta has NO sessionId under keepSessions (round-2 skips it)");
         // TWO since issue #187: this fixture is silent on EVERY turn, so beta is retried once
         // and both of its sessions must be cleaned up. The property is unchanged — no orphan,
-        // no leak — and the count is the only thing the retry moved.
-        c.check(fake.recorded.deletes.length === 2, "empty-member: both of beta's sessions deleted (no orphan, no leak)");
+        // no leak — and the count is the only thing the retry moved. DISTINCT ids, not a count
+        // (issue #199): `deletes.length === 2` is satisfied by deleting ONE session twice while
+        // the other leaks, which is the exact failure the property names.
+        c.check(
+          new Set(fake.recorded.deletes).size === 2,
+          "empty-member: both of beta's sessions deleted (no orphan, no leak)",
+        );
         c.check(
           alpha?.sessionId !== undefined && !fake.recorded.deletes.includes(alpha.sessionId),
           "empty-member: the kept sibling session was NOT deleted",
@@ -1024,6 +1049,173 @@ export async function run(): Promise<number> {
           "#187 double-empty: error.diagnostics is still present (the LAST attempt's) — #173's shape is unchanged",
         );
         c.check(new EvidenceLog({ env }).verify(r.runId).code === 0, "#187 double-empty: the run verifies clean");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 12i–12k. ISSUE #199: THE REST OF THE BOUNDARY C81 STATES. 12f pins `call-failed`; the
+  //      clause names three more kinds that reach the retry decision and are NOT retried,
+  //      because each is a DECISION about the configuration the turn would run under, so a
+  //      second identical attempt re-runs what this server has just refused. Only
+  //      `call-failed` had a test, so a guard widened from `=== "empty-answer"` to a set, a
+  //      negation or a truthiness check would have gone red in ONE case out of four.
+  //
+  //      ONE MEMBER EACH, deliberately: every knob that produces these three kinds is a
+  //      property of the SERVE (a served agent name, a build that drops the ruleset, a
+  //      resolved agent), not of a member, so a sibling would fail identically and prove
+  //      nothing that 12b does not already prove about per-member independence.
+  //
+  //      `attempts === undefined` and the RUN'S TOTAL ENTRY COUNT are the assertions that
+  //      bite. Filtering entries by the member's `callId` does NOT: a retry's second attempt
+  //      writes its own complete lifecycle under its own call id, and that id is the one the
+  //      member reports — so "3 entries under beta's call id" is true either way. The count
+  //      of entries in the whole run is what tells one attempt from two.
+  // -------------------------------------------------------------------------
+
+  // 12i. agent-mismatch — opencode served a DIFFERENT agent than the hardened one requested.
+  //      The turn RAN (the mismatch is caught post-call), so the turn count bites here too.
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({
+      historyText: "served by the wrong agent",
+      servedAgent: "build", // NOT guild-read — opencode resolved something else
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["beta/mismatch"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#199 boundary: the panel itself is ok");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/mismatch");
+        c.check(beta?.error?.kind === "agent-mismatch", "#199 boundary: the member is agent-mismatch");
+        c.check(beta?.attempts === undefined, "#199 boundary: an agent-mismatch member records NO attempts");
+        c.check(
+          fake.recorded.messageBodies.length === 1,
+          "#199 boundary: exactly ONE turn — an agent-mismatch member is NOT retried",
+        );
+        const entries = readEntries(logDir, r.runId);
+        c.check(entries.length === 3, "#199 boundary: ONE lifecycle in the run, not two");
+        const mine = entries.filter((e) => e.call_id === beta?.callId);
+        c.check(mine.length === 3, "#199 boundary: all three entries are the member's own");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 12j. approval-not-applied — the bridge is armed (`GUILD_APPROVE_EGRESS=ask` gates the read
+  //      paths' web egress) and opencode does NOT store the ruleset, so the turn is refused
+  //      rather than run ungated. The session is created and the turn is never sent, which is
+  //      why the CREATE count is the turn-side witness here.
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({
+      GUILD_ROOT: root,
+      GUILD_LOG_DIR: logDir,
+      GUILD_AGENT_DIR: defDirWithRealRead(),
+      GUILD_APPROVE_EGRESS: "ask",
+    });
+    // A channel that COULD answer, so the bridge arms rather than refusing the panel up front.
+    // It is never consulted: the refusal lands before the turn, so no permission is ever asked.
+    const elicitation: ElicitationRequester = {
+      available: true,
+      ask: async () => "decline",
+    };
+    const fake = await startFakeOpencode({
+      historyText: "MUST NOT BE REACHED",
+      ignoreSessionPermission: true,
+    });
+    try {
+      const r = await panel(
+        { question: "draft", models: ["beta/ungated"] },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000, elicitation },
+      );
+      c.check(r.ok, "#199 boundary: the panel itself is ok (the refusal is per member)");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/ungated");
+        c.check(
+          beta?.error?.kind === "approval-not-applied",
+          `#199 boundary: the member is approval-not-applied (got ${beta?.error?.kind})`,
+        );
+        c.check(
+          beta?.attempts === undefined,
+          "#199 boundary: an approval-not-applied member records NO attempts",
+        );
+        c.check(
+          fake.recorded.messageBodies.length === 0,
+          "#199 boundary: no turn was sent — it refused BEFORE the turn",
+        );
+        c.check(
+          fake.recorded.createBodies.length === 1,
+          "#199 boundary: exactly ONE session was created — no second attempt at an ungated session",
+        );
+        const entries = readEntries(logDir, r.runId);
+        c.check(entries.length === 3, "#199 boundary: ONE lifecycle in the run, not two");
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 12k. agent-unhardened in its LATE shape — the in-lease re-check (issue #111 A3), which is
+  //      the one that reaches the retry decision: it lands after `expect`/`started`, inside the
+  //      member's own serve lease. The early gate says the floor is in force and the child that
+  //      would serve the turn says it is not, exactly as `GUILD_SERVE_PER_CALL=1` produces.
+  //      There is no turn and no session here, so the FLOOR-CHECK count and the entry count are
+  //      what distinguish one attempt from two.
+  {
+    const root = rootWithPolicy("");
+    const logDir = tmp("m6-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    let asked = 0;
+    const checker = new AgentFloorChecker({
+      warn: () => {},
+      list: async () => {
+        asked += 1;
+        return [asked === 1 ? hardenedAgent("guild-read", ["read"]) : voidedAgent("guild-read")];
+      },
+    });
+    const fake = await startFakeOpencode({ historyText: "MUST NOT BE REACHED" });
+    // Distinct handles per lease, so the member's lease is a genuine cache MISS — the same
+    // thing a per-call respawn does via a fresh `instanceId`.
+    const handles = [fakeServeHandle(fake.baseUrl), fakeServeHandle(fake.baseUrl)];
+    let lease = 0;
+    const serve: ServeProvider = {
+      withServe: (fn) => fn(handles[Math.min(lease++, 1)]),
+    };
+    try {
+      const r = await panel(
+        { question: "draft", models: ["beta/unhardened"] },
+        { serve, env, messageTimeoutMs: 5_000, agentFloor: checker },
+      );
+      c.check(r.ok, "#199 boundary: the panel itself is ok (the LATE refusal is per member)");
+      if (r.ok) {
+        const beta = r.results.find((m) => m.model === "beta/unhardened");
+        c.check(
+          beta?.error?.kind === "agent-unhardened",
+          `#199 boundary: the member is agent-unhardened (got ${beta?.error?.kind})`,
+        );
+        c.check(
+          beta?.attempts === undefined,
+          "#199 boundary: an agent-unhardened member records NO attempts",
+        );
+        c.check(
+          asked === 2,
+          `#199 boundary: the floor was checked ONCE per lease and no lease was taken twice (got ${asked})`,
+        );
+        c.check(
+          fake.recorded.messageBodies.length === 0 && fake.recorded.createBodies.length === 0,
+          "#199 boundary: nothing was routed — no turn, no session",
+        );
+        const entries = readEntries(logDir, r.runId);
+        c.check(entries.length === 3, "#199 boundary: ONE lifecycle in the run, not two");
       }
     } finally {
       await fake.close();
