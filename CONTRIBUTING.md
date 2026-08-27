@@ -64,7 +64,7 @@ bash modelguild/verify-guild-read.sh            # resolved-config + runtime proo
 bash modelguild/verify-guild-build.sh           # same, for the write agent
 ```
 
-CI runs the opencode-free subset on every push/PR: three jobs — `shell` (`bash -n`, ShellCheck, the surviving lints + their `--self-test`s, host-config confinement), `macos` (the same lints on stock bash 3.2 + BSD userland), and `node` (`tsc --noEmit` + the offline TS suites, run individually by name — the workflow's name list in `.github/workflows/ci.yml` is the source of truth for which, and the suites that need the real opencode binary are named there as excluded). Suite counts are deliberately not stated in prose: they drift the moment a suite is added. It never installs or authenticates opencode, so the resolved-config `verify-guild-*.sh` proofs run locally.
+CI runs the opencode-free subset on every push/PR: three jobs — `shell` (`bash -n`, ShellCheck, the surviving lints + their `--self-test`s, host-config confinement), `macos` (the same lints on stock bash 3.2 + BSD userland), and `node` (`tsc --noEmit` + the offline TS suites via `npm run test:offline` — `test/run.ts`'s `OFFLINE_EXCLUDED` is the source of truth for which suites need the real opencode binary, and the run prints them as excluded). Suite counts are deliberately not stated in prose: they drift the moment a suite is added. It never installs or authenticates opencode, so the resolved-config `verify-guild-*.sh` proofs run locally.
 
 ## Where rationale goes
 
