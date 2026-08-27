@@ -473,6 +473,15 @@ export type TurnShape =
    * #185 fix's effect there is invisible. Dropping the tool message makes the flip assertable:
    * pre-#185 the trailing whitespace message WAS the report and the turn was REFUSED; now the
    * real answer is the report and it is a success.
+   *
+   * CONSTRUCTED, NOT PROBED — stated because this file's convention is to say which (`rejected`
+   * and the `reasoning-*` shapes are rebuilt from live captures, this one is not). It is
+   * `text-then-whitespace`'s own construction minus the tool message; nobody has corpus
+   * evidence of a real provider emitting a trailing whitespace-only assistant message on a
+   * delegate turn, and issue #203 records that as an open unknown. What it models is a
+   * delegation that INSPECTED nothing and wrote a real report — the model answered the task
+   * from context — behind a trailing blank message. The behaviour under test is the
+   * extractor's, and that does not depend on how the turn was produced.
    */
   | "text-then-whitespace-no-tools";
 interface TurnRecord {
@@ -599,11 +608,19 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
       user,
       {
         info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
-        parts: [{ id: `t${n}p1`, type: "text", text: turn.text }],
+        // The step-start/step-finish wrapper every other answering message carries, so this
+        // shape's `partTypes` census (issue #168) is representative of a real turn rather than
+        // of the one part the assertions happen to read.
+        parts: [
+          { id: `t${n}p1`, type: "step-start" },
+          { id: `t${n}p2`, type: "text", text: turn.text },
+          { id: `t${n}p3`, type: "step-finish" },
+        ],
       },
       {
+        // Bare, exactly as `text-then-whitespace`'s trailing message is.
         info: asst(`msg_asst_trailing_${n}`, { finish: "stop" }),
-        parts: [{ id: `t${n}p2`, type: "text", text: "\n  " }],
+        parts: [{ id: `t${n}p4`, type: "text", text: "\n  " }],
       },
     ];
   }

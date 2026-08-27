@@ -47,7 +47,7 @@ import {
   type DelegateFail,
   type DelegateResult,
 } from "../src/delegate.js";
-import { turnToolCallCount, toolParts } from "../src/client.js";
+import { turnToolCallCount, toolParts, fetchHistory } from "../src/client.js";
 import { EvidenceLog } from "../src/log.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import { scaffoldDigest, EMPTY_SCAFFOLD_DIGEST } from "../src/snapshot.js";
@@ -2817,6 +2817,26 @@ export async function run(): Promise<number> {
           r.ok && r.capture.filesChanged === 0,
           "#203(K-whitespace-no-tools): fixture — nothing was edited, so only the report stands between this and the refusal",
         );
+        // THE PREMISE, ASSERTED RATHER THAN ASSUMED. This case only exercises the refusal flip
+        // while the served turn really made zero tool calls — that is the column that lets
+        // `empty-delegation` arm at all. `DelegateOk` does not expose `toolCallCount` and must
+        // not grow it for a test, so the premise is read off the turn the PRODUCT read, through
+        // the product's own predicate: a tool part added to this render branch later would
+        // silently retire the flip, and this line is what goes red instead.
+        const servedSession = fake.recorded.historyGets[0];
+        c.check(
+          typeof servedSession === "string",
+          "#203(K-whitespace-no-tools): fixture — the product read a history to identify",
+        );
+        if (typeof servedSession === "string") {
+          const served = await fetchHistory({ baseUrl: fake.baseUrl, sessionId: servedSession });
+          c.check(
+            turnToolCallCount(served) === 0,
+            `#203(K-whitespace-no-tools): premise — the served turn made ZERO tool calls, so the refusal really was armable (got ${turnToolCallCount(
+              served,
+            )})`,
+          );
+        }
       } finally {
         await fake.close();
       }
