@@ -1272,6 +1272,37 @@ export interface TurnDiagnostics {
    * is the column that would say so. Absent when the turn carried no assistant parts at all.
    */
   partTypes?: Record<string, number>;
+  /**
+   * THE SAME PARTS AGAIN, IN ORDER, WITH THEIR LENGTHS (issue #191).
+   *
+   * `partTypes` says a `reasoning` part existed; it cannot say whether that part carried
+   * anything, and an EMPTY reasoning part counts there exactly like a full one. The deciding
+   * cell for issue #168 is `reasoning` chars > 0 beside `text` chars == 0 on the refused turn,
+   * and only a per-part length answers it. Ordered because "reasoning, then an empty text" and
+   * "an empty text, then reasoning" are different turns.
+   *
+   * LENGTHS ONLY, NEVER CONTENT, and that is the whole reason this shape was chosen over
+   * issue #191's other remedy (dumping the turn's raw history beside the run). The raw history
+   * carries model output and tool outputs — i.e. file contents the model read — which is the
+   * sensitivity class `GUILD_LOG_PROMPTS=full` and `GUILD_ACTIVITY_DETAIL=full` are gated
+   * behind, and this field is written to the evidence log unconditionally. A character count
+   * settles the question and discloses nothing, so it needs no knob. Do not add the text.
+   *
+   * `chars` is `String.length` (UTF-16 code units, not code points or bytes) of that part's
+   * own `text` where it has a string one, and ABSENT otherwise — a part with no text is not a
+   * part with zero characters, and a zero here is a real observation about a part that has a
+   * text field holding "".
+   */
+  parts?: TurnPart[];
+}
+
+/** One assistant part of the turn, named and measured (issue #191) — see
+ * `TurnDiagnostics.parts`. */
+export interface TurnPart {
+  /** Read verbatim off the wire, `"(unknown)"` for a non-string — same rule as `partTypes`. */
+  type: string;
+  /** Length of this part's own `text`, absent when it has none. NEVER the text itself. */
+  chars?: number;
 }
 
 function numberOrUndefined(v: unknown): number | undefined {
@@ -1335,29 +1366,74 @@ export function finalAssistantCompletion(history: SessionHistory): TurnCompletio
 }
 
 /**
- * THE TURN'S ASSISTANT PART TYPES, counted (issue #168).
+ * THE TURN'S ASSISTANT PARTS, IN ORDER, WITH THEIR LENGTHS (issue #191).
  *
  * TURN-SCOPED like its neighbours. Assistant messages only: a `user` message's parts are the
  * caller's own prompt and say nothing about what the model produced.
  *
  * The type is read verbatim off the wire and NOT validated against a known set — opencode's
  * `Part` union has twelve members on 1.18.18 and a bump may add more, and the whole value of
- * this field is naming a type the extractor did not expect. A non-string `type` is counted
- * under `"(unknown)"` rather than dropped, for the same reason.
+ * this census is naming a type the extractor did not expect. A non-string `type` is recorded
+ * as `"(unknown)"` rather than dropped, for the same reason. Bounding and sanitizing that
+ * string is the EVIDENCE LAYER's job, not this one's (`diagnosticsField` in `src/log.ts`):
+ * here it stays whatever arrived, so a caller reasoning about the turn sees the real value.
+ *
+ * THE ORDERED FORM IS THE PRIMARY WALK AND `turnAssistantPartTypes` FOLDS IT, deliberately:
+ * `TurnDiagnostics` carries both, and the gate deciding whether either is attached tests only
+ * one of them. Two independent walks would leave that gate sound only for as long as they
+ * happened to agree — a silent coupling no test can see — whereas a fold cannot disagree with
+ * its own input.
  */
-export function turnAssistantPartTypes(history: SessionHistory): Record<string, number> {
+export function turnAssistantParts(history: SessionHistory): TurnPart[] {
   const start = turnStartIndex(history);
-  const out: Record<string, number> = {};
+  const out: TurnPart[] = [];
   for (let i = start; i < history.messages.length; i++) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
     if (isCompactionSummary(m)) continue; // opencode's own parts, not the model's (#189)
     for (const p of m.parts) {
-      const t = typeof p.type === "string" && p.type.length > 0 ? p.type : "(unknown)";
-      out[t] = (out[t] ?? 0) + 1;
+      const type = typeof p.type === "string" && p.type.length > 0 ? p.type : "(unknown)";
+      // A part with no string `text` gets NO `chars` — absent is "this part has no text
+      // field", 0 is "it has one and it is empty", and #168 needs those apart.
+      out.push(typeof p.text === "string" ? { type, chars: p.text.length } : { type });
     }
   }
   return out;
+}
+
+/** THE TURN'S ASSISTANT PART TYPES, counted (issue #168) — the aggregate of
+ * `turnAssistantParts`, folded rather than re-walked so the two cannot diverge. */
+export function turnAssistantPartTypes(history: SessionHistory): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const p of turnAssistantParts(history)) out[p.type] = (out[p.type] ?? 0) + 1;
+  return out;
+}
+
+/**
+ * THE ONE PLACE A `TurnDiagnostics` IS SHAPED (issues #168/#188/#191, C82).
+ *
+ * Three callers build one: the `empty-answer` throw in this file, the lifecycle spine's
+ * receipt write, and `guild_delegate`'s `empty-delegation` refusal. C82's guarantee is that
+ * the receipt and the tool result carry the SAME object — a claim a test can only assert by
+ * deep-equalling one against the other, and one that two hand-written literals make true by
+ * coincidence rather than by construction. This makes it structural.
+ *
+ * Absent stays absent: every optional field is omitted when its source is `undefined`, so an
+ * `AskResult` or a `LifecycleOutcome` carrying no census yields diagnostics with no census
+ * rather than one holding `undefined`.
+ */
+export function buildTurnDiagnostics(src: {
+  toolCallCount: number;
+  completion?: TurnCompletion;
+  partTypes?: Record<string, number>;
+  parts?: TurnPart[];
+}): TurnDiagnostics {
+  return {
+    toolCallCount: src.toolCallCount,
+    ...(src.completion !== undefined ? { completion: src.completion } : {}),
+    ...(src.partTypes !== undefined ? { partTypes: src.partTypes } : {}),
+    ...(src.parts !== undefined ? { parts: src.parts } : {}),
+  };
 }
 
 /**
@@ -1809,6 +1885,10 @@ export interface AskResult {
   /** The turn's assistant part types, counted (issue #168) — see `TurnDiagnostics.partTypes`.
    * Absent when the turn carried no assistant parts. */
   partTypes?: Record<string, number>;
+  /** The same parts ordered and measured (issue #191) — see `TurnDiagnostics.parts`. Threaded
+   * for `guild_delegate`, which builds its own diagnostics from this outcome rather than from
+   * an `EmptyAnswerError` it never sees. Absent when the turn carried no assistant parts. */
+  parts?: TurnPart[];
   /**
    * WHICH CHANNEL `text` CAME OFF (issue #168), present ONLY when it was not the ordinary one.
    *
@@ -2005,15 +2085,25 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       const completion = finalAssistantCompletion(history);
       const partTypes = turnAssistantPartTypes(history);
       const hasPartTypes = Object.keys(partTypes).length > 0;
+      // Issue #191: the ordered, measured form of the same census. Gated on the SAME emptiness
+      // test as `partTypes` — they are two views of one walk and must appear and vanish
+      // together, or a reader has to work out which of them to trust.
+      const turnParts = turnAssistantParts(history);
       // Issue #168: absent unless the answer was PROMOTED off a non-text channel, so an
       // ordinary result carries no new field at all (C29's optional-field rule).
       const answerChannel = finalAssistantChannel(history);
       if (opts.requireAnswer === true && isBlank(text)) {
-        throw new EmptyAnswerError(sessionId, text, providerError, {
-          toolCallCount,
-          ...(completion !== undefined ? { completion } : {}),
-          ...(hasPartTypes ? { partTypes } : {}),
-        });
+        throw new EmptyAnswerError(
+          sessionId,
+          text,
+          providerError,
+          buildTurnDiagnostics({
+            toolCallCount,
+            completion,
+            partTypes: hasPartTypes ? partTypes : undefined,
+            parts: hasPartTypes ? turnParts : undefined,
+          }),
+        );
       }
 
       const result: AskResult = {
@@ -2024,6 +2114,7 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
         toolCallCount,
         ...(completion !== undefined ? { completion } : {}),
         ...(hasPartTypes ? { partTypes } : {}),
+        ...(hasPartTypes ? { parts: turnParts } : {}),
         ...(answerChannel !== undefined ? { answerChannel } : {}),
         history,
         // OPTIONAL-FIELD DISCIPLINE (C29's rule, applied to a wire-adjacent shape): written only

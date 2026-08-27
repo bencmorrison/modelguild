@@ -38,11 +38,14 @@ import {
   EmptyAnswerError,
   AgentFloorNotInForceError,
   SessionPermissionMismatchError,
+  isBlank,
+  buildTurnDiagnostics,
   type PreTurnAgentCheck,
   type ServeProvider,
   type ServeRouter,
   type TurnCompletion,
   type TurnDiagnostics,
+  type TurnPart,
 } from "./client.js";
 import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
@@ -1006,6 +1009,9 @@ export type LifecycleOutcome =
       /** The turn's assistant part types, counted (issue #168) — threaded for the same reason
        * as `completion`: only `guild_delegate` builds its own diagnostics. */
       partTypes?: Record<string, number>;
+      /** The same parts ordered and measured (issue #191) — threaded for the same reason as
+       * `partTypes`, and it is the half that answers #168's deciding cell. */
+      parts?: TurnPart[];
       /** Bounded activity summary for this call; absent when the layer is off. */
       activity?: ActivitySummary;
       /** Approval record for this call; absent unless the bridge was armed. */
@@ -1197,6 +1203,35 @@ export async function runAgentLifecycle(
       askOpts.approval = approver;
     }
     const result = await askViaAgent(d.serve, askOpts);
+    // THE WRITE PATH'S REFUSAL CANNOT REACH ITS OWN RECEIPT, SO THE SPINE WRITES IT (issue #188).
+    //
+    // `guild_delegate` decides `empty-delegation` after this function has returned AND after its
+    // capture — by which time `completed` is written and C24 allows exactly one per `call_id`,
+    // so there is no second entry to carry the diagnostics and no amending the first. The three
+    // options were: defer the `completed` write out of the shared spine for all four tools (the
+    // change C74 already weighed and declined as far larger than the defect earns), leave the
+    // write path's refusal undiagnosable in the receipts (the defect itself), or write the
+    // diagnostics here on the TURN-SIDE half of `nothingDelivered` — blank answer AND no tool
+    // calls — which is what this does.
+    //
+    // WHAT THAT COSTS, STATED, AND THE SHAPE IT COSTS ON IS REAL — do not write it off as
+    // hypothetical. The condition is a SUPERSET of the refusal by exactly the
+    // `capture.filesChanged === 0` guard, so a turn that made no tool calls and said nothing
+    // beside a tree that changed anyway carries diagnostics on a receipt whose call SUCCEEDED.
+    // `test/delegate.test.ts` K-j has produced exactly that since issue #121 — the mutation is
+    // external to the model (a concurrent writer, a path opencode itself touched) — and issue
+    // #189 gives it a production route, since tool calls made before a context compaction are
+    // invisible to `turnToolCallCount`. So the honest statement is not "nothing produces this";
+    // it is that on such a receipt `exit_code` is 0 and the diagnostics describe a turn that
+    // DID deliver. **The discriminator a receipt reader needs is the sibling `delegate-diff`
+    // entry under the same `call_id`: present with `files_changed > 0` means work was
+    // delivered; absent means the tool refused as `empty-delegation`.** A superset in the
+    // informative direction, then, never a gap — but one that needs that sentence beside it.
+    //
+    // NO READ-PATH ENTRY MOVES. `requireAnswer` throws on a blank answer, so a read tool never
+    // reaches this line with one — the branch is unreachable for `guild_consult`/`guild_panel`/
+    // `guild_research` by construction, not by a flag someone could forget to pass.
+    const silentTurn = isBlank(result.text) && result.toolCallCount === 0;
     await d.log.completed({
       ...common,
       exit: 0,
@@ -1207,6 +1242,10 @@ export async function runAgentLifecycle(
       // Issue #168: absent unless the answer was promoted off a non-text channel, so an
       // ordinary call's entry is byte-identical to a pre-#168 one.
       ...(result.answerChannel !== undefined ? { answerChannel: result.answerChannel } : {}),
+      // Through the SHARED builder `guild_delegate`'s refusal also calls, so "the receipt and
+      // the tool result carry the same object" is structural rather than two literals that
+      // happen to agree today.
+      ...(silentTurn ? { diagnostics: buildTurnDiagnostics(result) } : {}),
     });
     const ok: LifecycleOutcome = {
       ok: true,
@@ -1221,6 +1260,7 @@ export async function runAgentLifecycle(
     if (result.providerError !== undefined) ok.providerError = result.providerError;
     if (result.completion !== undefined) ok.completion = result.completion;
     if (result.partTypes !== undefined) ok.partTypes = result.partTypes;
+    if (result.parts !== undefined) ok.parts = result.parts;
     return ok;
   } catch (err) {
     const mismatch = err instanceof AgentMismatchError;
@@ -1258,6 +1298,14 @@ export async function runAgentLifecycle(
       ...(empty
         ? { captureState: "complete" as const, response: err.text }
         : { captureState: "failed" as const }),
+      // ISSUE #188: THE REFUSAL'S EVIDENCE GOES IN THE RECEIPT, NOT ONLY IN THE TOOL RESULT.
+      // C74 has claimed since #173 that an `empty-answer` is self-diagnosing from the receipts
+      // alone; it was not, because the diagnostics were attached to the returned object a few
+      // lines below and to nothing on disk. The tool result lives in a Claude Code transcript;
+      // `calls.jsonl` is the durable artefact, and it is what a corpus analysis reads. Same
+      // object as `failed.diagnostics` below — deliberately the identical value rather than a
+      // second construction, so the two surfaces cannot drift.
+      ...(empty && err.diagnostics !== undefined ? { diagnostics: err.diagnostics } : {}),
     });
     const failed: LifecycleOutcome = {
       ok: false,
