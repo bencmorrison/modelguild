@@ -1,6 +1,6 @@
 {
   "name": "modelguild",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "type": "module",
   "description": "An MCP server fronting `opencode serve`, letting Claude Code collaborate with other LLMs (consult, panel, research, review, delegate). Ships slash commands + hardened opencode agents; `npx modelguild init` wires it into a project. The bash layer in modelguild/ was retired at 0.5.0 (M12); this is the sole path now.",
   "license": "MIT",
