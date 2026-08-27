@@ -862,24 +862,35 @@ function joinPartText(m: HistoryMessage, type: string): string {
  * still stands — it is about the GATE STRUCTURE (blank-insensitive passes choose the message,
  * byte-preserving passes keep the bytes), not about where "blank" is defined.
  *
- * **THE ALPHABET IS `trim()`'S PLUS UNICODE CATEGORY `Cf`, AND ITS EDGES ARE MEASURED.**
- * ECMA-262's `WhiteSpace`/`LineTerminator` productions stop at `Zs` (so U+00A0, U+3000),
- * U+FEFF and the four line terminators; they do not reach category `Cf` (Format), which is what
- * U+200B, U+180E, U+202E, U+00AD, U+2060 and U+061C are. `\p{Cf}` closes exactly that gap.
- * **What it does NOT cover, verified rather than assumed** (issue #195's second comment):
- * U+0085 NEL and U+0000/U+007F are `Cc` controls, a lone surrogate is `Cs`, and U+2800 BRAILLE
- * PATTERN BLANK is a PRINTING character (`So`) that merely renders as nothing — none of them
- * matches here, so a turn whose whole output is one of those five is still returned as an
- * answer. A category predicate cannot reach U+2800 at all; "the reader sees nothing" is a
- * different question from "these bytes are format characters", and only the second is answered.
+ * **THE ALPHABET IS `trim()`'S PLUS UNICODE CATEGORIES `Cf`, `Cc` AND `Cs`, AND ITS EDGES ARE
+ * MEASURED RATHER THAN ASSUMED (issue #195).** ECMA-262's `WhiteSpace`/`LineTerminator`
+ * productions stop at `Zs` (so U+00A0, U+3000), U+FEFF and the four line terminators. Three
+ * categories sit outside them and each reached this gate as a real "answer":
+ *   - `Cf` (Format) — U+200B, U+180E, U+202E, U+00AD, U+2060, U+061C, U+200E;
+ *   - `Cc` (Control) — U+0000 NUL, U+007F DEL and **U+0085 NEL**, which Unicode's own
+ *     `White_Space=Yes` property DOES include while ECMA-262's `WhiteSpace` production does
+ *     not, so `trim()` returns it unchanged;
+ *   - `Cs` (Surrogate) — a LONE surrogate half. `\p{Cs}` matches one under the `u` flag
+ *     (probed: `/\p{Cs}/u.test("\uD800") === true`), and a well-formed PAIR is a single astral
+ *     code point which is NOT `Cs`, so an emoji-only answer stays an answer.
  *
- * **THE GATE IS NOT A FILTER.** Nothing is ever stripped from a returned string: a turn whose
- * only output is one `Cf` character is still captured BYTE-EXACT by passes 3–4 into
- * `raw_response` (invariant 2) and then refused by `requireAnswer`. Do not reach for this to
- * normalize an answer's bytes.
+ * **U+2800 BRAILLE PATTERN BLANK IS THE ONE STATED RESIDUAL.** It is category `So` — an
+ * ordinary PRINTING character whose glyph happens to render as nothing — so no category
+ * predicate reaches it, and a turn whose whole output is one U+2800 is still returned as an
+ * answer. "The reader sees nothing" is a different question from "these code points carry no
+ * text", and only the second is answered here; enumerating render-blank glyphs is not a job for
+ * this predicate.
+ *
+ * **THE GATE IS NOT A FILTER, and that is what keeps it clear of the evidence layer.** Nothing
+ * is ever stripped from a returned string: a turn whose only output is one of these characters
+ * is still captured BYTE-EXACT by passes 3–4 into `raw_response` (invariant 2) and then refused
+ * by `requireAnswer`. So `src/canonical.ts`'s U+007F rule and `src/log.ts`'s lone-surrogate
+ * uncleanliness rule are untouched — they govern how bytes are WRITTEN, this governs whether a
+ * turn ANSWERED, and widening the second cannot rewrite what the first records. Do not reach
+ * for this to normalize an answer's bytes.
  */
 export function isBlank(s: string): boolean {
-  return /^[\s\p{Cf}]*$/u.test(s);
+  return /^[\s\p{Cf}\p{Cc}\p{Cs}]*$/u.test(s);
 }
 
 /**
@@ -1830,8 +1841,9 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // matrix below cleans up a session we created instead of leaking it.
       //
       // BLANK, not `=== ""`: a turn that produced only a newline, a run of spaces or one
-      // zero-width format character has said nothing either, and treating that as an answer
-      // would leave the exact hole this closes open to a one-invisible-character difference.
+      // zero-width, control or lone-surrogate character has said nothing either, and treating
+      // that as an answer would leave the exact hole this closes open to a one-character,
+      // invisible difference.
       // The predicate is `isBlank` — THE SAME ONE `answerSource`'s passes 1–2 fall through on,
       // which is what makes its invariant ("every string a later pass can return is one
       // `requireAnswer` refuses") structural rather than a promise between two comments; do not

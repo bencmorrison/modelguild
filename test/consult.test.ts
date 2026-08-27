@@ -1060,6 +1060,85 @@ export async function run(): Promise<number> {
     }
   }
 
+
+  // 6m-septies. ISSUE #195, the `Cc` arm END-TO-END: a turn whose whole output is one NUL.
+  //     `Cc` is a second category outside ECMA-262's `WhiteSpace` — U+0085 NEL is the one that
+  //     breaks the "it is all format characters" framing, since Unicode's own White_Space
+  //     property DOES include it. NUL is chosen for the end-to-end case because it is one of the
+  //     two characters `src/canonical.ts` / `src/log.ts` model as special, so this is also the
+  //     proof that widening the GATE did not disturb how the receipt WRITES those bytes.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "\u0000" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#195 (NUL only): refuses with empty-answer");
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      const completed = readEntries(logDir, runId).find(
+        (e) => e.type === "call" && e.status === "completed",
+      );
+      c.check(
+        !!completed && completed.raw_response === "\u0000",
+        "#195 (NUL only): raw_response keeps the exact byte — the gate strips nothing",
+      );
+      c.check(!!completed && completed.capture_state === "complete", "#195 (NUL only): capture_state stays complete");
+      c.check(new EvidenceLog({ env }).verify(runId).code === 0, "#195 (NUL only): run verifies clean");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-octies. ISSUE #195, the `Cs` arm END-TO-END: a turn whose whole output is one LONE
+  //     surrogate. The other character the evidence layer models specially — `src/log.ts`
+  //     deliberately treats a line carrying a lone surrogate as UNCLEAN so TS `verify` and jq
+  //     cannot disagree — so this case pins BOTH that the bytes reach the receipt intact and
+  //     that the pre-existing uncleanliness rule is unchanged by the widened gate. `verify()`
+  //     therefore reports the integrity code here, and that is the CORRECT pre-existing
+  //     behaviour, asserted rather than papered over.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "\ud800" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(
+        !r.ok && r.error.kind === "empty-answer",
+        "#195 (lone surrogate only): refuses with empty-answer",
+      );
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      const completed = readEntries(logDir, runId).find(
+        (e) => e.type === "call" && e.status === "completed",
+      );
+      c.check(
+        !!completed && completed.raw_response === "\ud800",
+        "#195 (lone surrogate only): raw_response keeps the exact bytes — the gate strips nothing",
+      );
+      c.check(
+        !!completed && completed.capture_state === "complete",
+        "#195 (lone surrogate only): capture_state stays complete",
+      );
+      // PRE-EXISTING, and asserted rather than left silent: `src/log.ts` treats a line carrying
+      // a lone surrogate as UNCLEAN on purpose (jq rejects the escape, so TS verify and bash
+      // verify must not disagree), so this run reports the integrity code. That was equally
+      // true before #195 — the same bytes reached the same receipt, the turn was merely called
+      // a success — so the widened gate changed the VERDICT on the turn, not the log's rule.
+      c.check(
+        new EvidenceLog({ env }).verify(runId).code === 7,
+        "#195 (lone surrogate only): verify still reports the pre-existing unclean-line code (7)",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
   // 6m-ter. A turn that said nothing on EITHER channel is still refused, with the issue-#173
   //     diagnostics intact. The fallback narrows what counts as empty; it does not remove the
   //     refusal, and the part-type census still reports the shape it found.

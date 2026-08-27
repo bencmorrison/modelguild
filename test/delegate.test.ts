@@ -2609,11 +2609,19 @@ export async function run(): Promise<number> {
         !nothingDelivered("\u200b", 0, { ...base, filesChanged: 1, patchPath: "/p.patch" }),
         "#195(K-edges): a real patch still saves it — the guard is unmoved",
       );
-      // The residual is shared too, honestly: `Cc`/`Cs`/`So` are outside the alphabet, so a
-      // report of one NUL is still a report on both paths.
+      // The whole alphabet is shared, not just the `Cf` arm: a control character and a lone
+      // surrogate are blank on this path for the same reason they are on the read paths.
       c.check(
-        !nothingDelivered("\u0000", 0, base),
-        "#195(K-edges) STATED RESIDUAL: a NUL report is NOT blank — the alphabet is trim() + Cf only",
+        nothingDelivered("\u0000", 0, base) &&
+          nothingDelivered("\u0085", 0, base) &&
+          nothingDelivered("\ud800", 0, base),
+        "#195(K-edges): a NUL, a NEL and a lone-surrogate report are blank too — one alphabet",
+      );
+      // And the residual is shared honestly: `So` is outside the alphabet, so U+2800 — a
+      // printing character that renders as nothing — is still a report on both paths.
+      c.check(
+        !nothingDelivered("\u2800", 0, base),
+        "#195(K-edges) STATED RESIDUAL: a U+2800 report is NOT blank — no predicate reaches it",
       );
     }
 

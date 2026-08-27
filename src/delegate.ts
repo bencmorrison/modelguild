@@ -368,14 +368,15 @@ function modelLabel(requestedModel: string): string {
  * what it did.
  *
  * BLANK, not `=== ""`, mirroring C74: a turn that produced one newline — or one zero-width
- * format character — has said nothing either, and a one-invisible-character difference must not
- * decide this. **The definition is SHARED, the predicate is not** (issue #195, decision folding
- * in #204): the report leg reads `client.ts`'s `isBlank`, the same one both read-path gates
- * read, so "this string says nothing" cannot come to mean two things in one codebase. What is
- * NOT shared is the question — C74 is explicit that the two paths ask different ones, and the
- * deciding column here stays the turn's tool-call count, because this path's answer is the
- * PATCH. Sharing the definition therefore widens nothing beyond the report leg: a blank report
- * beside one tool call, or beside a real patch, is still a success.
+ * format, control or lone-surrogate character — has said nothing either, and a one-invisible-
+ * character difference must not decide this. **The definition is SHARED, the predicate is not**
+ * (issue #195, decision folding in #204): the report leg reads `client.ts`'s `isBlank`, the
+ * same one both read-path gates read, so "this string says nothing" cannot come to mean two
+ * things in one codebase. What is NOT shared is the QUESTION — C74 is explicit that the two
+ * paths ask different ones, and the deciding column here stays the turn's tool-call count,
+ * because this path's answer is the PATCH. Sharing the definition therefore widens nothing
+ * beyond the report leg: a blank report beside one tool call, or beside a real patch, is
+ * still a success.
  *
  * THREE SHAPES STAY SUCCESSES, all live:
  *   (a) an empty report beside a REAL PATCH — a terse model that edited files and wrote no

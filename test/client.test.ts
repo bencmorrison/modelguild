@@ -715,26 +715,44 @@ export async function run(): Promise<number> {
     );
 
     // --- ISSUE #195: THE BLANK ALPHABET, AND THE TWO GATES AGREEING ON IT -------------------
-    // #185 split the gate in two; #195 is that the PREDICATE feeding it stopped at ECMA-262's
-    // `WhiteSpace`, which does not reach Unicode category `Cf`. A trailing message of one U+200B
-    // therefore won the walk AND passed `requireAnswer` — the SILENT half of the defect, where
-    // the whitespace half at least failed loudly. Both gates now read one exported `isBlank`
-    // (issue #204's constraint): widening one site alone is what produced the silent half, so
-    // the table below asserts the invariant itself, not merely the new characters.
+    // #185 split the gate in two; #195 is that the PREDICATE feeding it was ECMA-262's
+    // `WhiteSpace`, which stops at `Zs` / U+FEFF / the line terminators. A trailing message of
+    // one U+200B therefore won the walk AND passed `requireAnswer` — the SILENT half of the
+    // defect, where the whitespace half at least failed loudly. Both gates now read one exported
+    // `isBlank` (issue #204's constraint): widening one site alone is what produced the silent
+    // half, so the table below asserts the invariant itself, not merely the new characters.
+    // The alphabet is `trim()` plus `Cf` (format), `Cc` (control) and `Cs` (lone surrogate);
+    // U+2800 is the one deliberate hole and has its own block below.
     const BLANK_TABLE: Array<[string, string]> = [
-      ["U+200B ZERO WIDTH SPACE", "\u200b"],
-      ["U+180E MONGOLIAN VOWEL SEPARATOR", "\u180e"],
-      ["U+202E RIGHT-TO-LEFT OVERRIDE", "\u202e"],
-      ["U+00AD SOFT HYPHEN", "\u00ad"],
-      ["U+2060 WORD JOINER", "\u2060"],
-      ["U+061C ARABIC LETTER MARK", "\u061c"],
-      ["U+200E LEFT-TO-RIGHT MARK", "\u200e"],
+      // `Cf` — format characters, the shape the issue was filed on.
+      ["U+200B ZERO WIDTH SPACE (Cf)", "\u200b"],
+      ["U+180E MONGOLIAN VOWEL SEPARATOR (Cf)", "\u180e"],
+      ["U+202E RIGHT-TO-LEFT OVERRIDE (Cf)", "\u202e"],
+      ["U+00AD SOFT HYPHEN (Cf)", "\u00ad"],
+      ["U+2060 WORD JOINER (Cf)", "\u2060"],
+      ["U+061C ARABIC LETTER MARK (Cf)", "\u061c"],
+      ["U+200E LEFT-TO-RIGHT MARK (Cf)", "\u200e"],
+      // `Cc` — controls. U+0085 is the one that breaks the "it is all format characters"
+      // framing: Unicode's own `White_Space=Yes` includes it, ECMA-262's `WhiteSpace`
+      // production does not, so `trim()` returns it unchanged.
+      ["U+0085 NEXT LINE (Cc)", "\u0085"],
+      ["U+0000 NUL (Cc)", "\u0000"],
+      ["U+007F DELETE (Cc)", "\u007f"],
+      ["U+0001 START OF HEADING (Cc)", "\u0001"],
+      ["U+009F APPLICATION PROGRAM COMMAND (Cc)", "\u009f"],
+      // `Cs` — a LONE surrogate half. `\p{Cs}` matches one under the `u` flag; a well-formed
+      // PAIR is a single astral code point and is NOT `Cs`, which the emoji control below pins.
+      ["lone surrogate U+D800 (Cs)", "\ud800"],
+      ["lone surrogate U+DFFF (Cs)", "\udfff"],
+      // Already inside `trim()`'s own alphabet — kept so a widening that somehow lost one fails.
       ["U+00A0 NO-BREAK SPACE", "\u00a0"],
       ["U+FEFF ZERO WIDTH NO-BREAK SPACE", "\ufeff"],
       ["U+3000 IDEOGRAPHIC SPACE", "\u3000"],
       ["U+2028 LINE SEPARATOR", "\u2028"],
       ["U+2029 PARAGRAPH SEPARATOR", "\u2029"],
+      // Mixtures: the predicate is over the WHOLE string, not over its first character.
       ["space + U+200B + space", " \u200b "],
+      ["NUL + lone surrogate", "\u0000\ud800"],
       ["plain whitespace", " \t\n"],
     ];
     for (const [name, ch] of BLANK_TABLE) {
@@ -755,31 +773,29 @@ export async function run(): Promise<number> {
         `#195/#204: ${name} alone is kept BYTE-EXACT and is still blank ⇒ requireAnswer refuses`,
       );
     }
-    // A real answer is not blank — the direction that would make the gate refuse everything.
+    // NON-BLANK, the direction that would make the gate refuse everything. The emoji is the
+    // `Cs` control: a well-formed surrogate PAIR is one astral code point, not a surrogate, so
+    // widening to `\p{Cs}` must not swallow an answer that is a single emoji.
     c.check(
-      !isBlank("THE REAL ANSWER") && !isBlank("a") && !isBlank("\u200ba"),
-      "#195: a real answer, a single letter, and a letter behind a ZWSP are all NON-blank",
+      !isBlank("THE REAL ANSWER") && !isBlank("a") && !isBlank("\u200ba") && !isBlank("\u0000a"),
+      "#195: a real answer, a single letter, and a letter behind a ZWSP or a NUL are NON-blank",
     );
-    // THE STATED RESIDUAL, pinned so nobody reads `Cf` as "every invisible character". These
-    // five are four other categories — `Cc` controls (NEL/NUL/DEL), `Cs` (a lone surrogate) and
-    // `So` (U+2800 renders as nothing but is a PRINTING character) — and a category predicate
-    // cannot reach the last one at all. They still win the walk and are still returned as
-    // answers; that is a known limit of this fix, not an oversight.
-    const NOT_BLANK_RESIDUAL: Array<[string, string]> = [
-      ["U+0085 NEXT LINE (Cc)", "\u0085"],
-      ["U+0000 NUL (Cc)", "\u0000"],
-      ["U+007F DELETE (Cc)", "\u007f"],
-      ["U+2800 BRAILLE PATTERN BLANK (So)", "\u2800"],
-      ["lone surrogate U+D800 (Cs)", "\ud800"],
-    ];
-    for (const [name, ch] of NOT_BLANK_RESIDUAL) {
-      c.check(
-        !isBlank(ch) &&
-          finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText(ch)] }) ===
-            ch,
-        `#195 STATED RESIDUAL: ${name} is not blank here and still wins the walk`,
-      );
-    }
+    c.check(
+      !isBlank("\u{1F600}") &&
+        finalAssistantText({ messages: [user("q"), answered("REAL"), wsText("\u{1F600}")] }) ===
+          "\u{1F600}",
+      "#195: a well-formed surrogate PAIR is NOT `Cs` — an emoji-only answer is still an answer",
+    );
+    // THE ONE STATED RESIDUAL, pinned so nobody reads the widening as "every invisible
+    // character". U+2800 is category `So` — an ordinary PRINTING character whose glyph renders
+    // as nothing — so no category predicate reaches it. It still wins the walk and is still
+    // returned as an answer; that is a known limit of this fix, not an oversight.
+    c.check(
+      !isBlank("\u2800") &&
+        finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText("\u2800")] }) ===
+          "\u2800",
+      "#195 STATED RESIDUAL: U+2800 BRAILLE PATTERN BLANK (So) is not blank and still wins the walk",
+    );
     // THE CHANNEL-CROSSING CASE from the issue: pass 1 used to accept the ZWSP text and never
     // reach the reasoning, so a promoted answer was lost AND the receipt recorded no channel.
     c.check(
