@@ -6,7 +6,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,22 @@ export const serverEntry = path.join(repoRoot, "src", "server.ts");
 let nextFakeInstanceId = 1;
 export function fakeServeHandle(baseUrl: string, pid = 0): ServeHandle {
   return { baseUrl, port: 0, pid, instanceId: nextFakeInstanceId++ };
+}
+
+/**
+ * Thrown by `runBounded` when `tsxBin` does not exist (issue #200) — i.e. the harness
+ * itself is broken, not the thing under test. Distinct from a red assertion on purpose:
+ * a worktree with no `node_modules` used to make every FIFO/symlink case in
+ * `test/config.test.ts` fail as `value: undefined`, indistinguishable from the probe
+ * having run and gotten the wrong answer. A thrown, named error can't be mistaken for
+ * that — it names the missing path and the fix (`npm ci` in this checkout) instead of
+ * four misleading FAILs.
+ */
+export class MissingTestHarnessError extends Error {
+  constructor(missingTsxBin: string) {
+    super(`test harness broken: ${missingTsxBin} does not exist — run 'npm ci' in this checkout to fix it`);
+    this.name = "MissingTestHarnessError";
+  }
 }
 
 /** The result of `runBounded`: `timedOut` is the assertion that matters most. */
@@ -60,11 +76,19 @@ export interface BoundedRun {
  * Spawned as `node <tsx> <entry>` rather than through the `tsx` bin shim, so the child does not
  * need `node` on its PATH — which lets a caller shadow PATH completely (as `doctor.test.ts`
  * does) without breaking the spawn itself.
+ *
+ * Checks `tsxBin` exists before spawning (issue #200) and throws `MissingTestHarnessError`
+ * if not: a worktree with no `node_modules` has no `tsx` binary, so the spawn used to fail
+ * with `Cannot find module` and get reported as an ordinary `status !== 0` — indistinguishable
+ * from the FIFO/symlink guard itself misbehaving. Every OTHER failure cause (blocked, crashed,
+ * wrong answer) still falls through to the plain `value`/`status` fields below, fail-toward-red
+ * as before — this check narrows only the one cause that means "the harness can't run at all".
  */
 export function runBounded(
   args: string[],
   opts: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number } = {},
 ): BoundedRun {
+  if (!existsSync(tsxBin)) throw new MissingTestHarnessError(tsxBin);
   const r = spawnSync(process.execPath, [tsxBin, ...args], {
     encoding: "utf8",
     timeout: opts.timeoutMs ?? 30_000,

@@ -1,7 +1,9 @@
 /**
  * Test runner: isolates suites in child processes, atomically prints their bounded,
  * emission-ordered output, and runs up to four at once. `--offline` omits the three
- * suites needing real opencode.
+ * suites needing real opencode. Non-flag arguments (issue #194) name which suites to
+ * run — an unknown name refuses before any suite starts, rather than silently running
+ * everything, which is what made `npx tsx test/run.ts <typo>` a trap.
  */
 
 import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
@@ -46,13 +48,42 @@ export interface RunResult {
   failures: string[];
 }
 
-function defaultSuites(offline: boolean): Suite[] {
-  const excluded = new Set<string>(offline ? OFFLINE_EXCLUDED : []);
-  return ALL_SUITES.filter((name) => !excluded.has(name)).map((name) => ({
+function suiteEntry(name: string): Suite {
+  return {
     name,
     command: process.execPath,
     args: [tsxBin, path.join(repoRoot, "test", `${name}.test.ts`)],
-  }));
+  };
+}
+
+/**
+ * Resolve which suite names an invocation asked for (issue #194).
+ *
+ * No names ⇒ every suite, unchanged from before this issue. Named suites run ONLY
+ * those — an unknown name is reported rather than silently ignored, which is the
+ * defect: `npx tsx test/run.ts <typo>` used to start the entire suite with no
+ * warning. `unknown` is checked by the caller before anything runs.
+ */
+export function resolveRequestedNames(names: string[]): { names: string[]; unknown: string[] } {
+  if (names.length === 0) return { names: [...ALL_SUITES], unknown: [] };
+  const known = new Set<string>(ALL_SUITES);
+  const unknown = names.filter((name) => !known.has(name));
+  return { names, unknown };
+}
+
+/**
+ * Split requested names into what actually runs and what `--offline` excludes
+ * (issue #194). A named suite that is also in `OFFLINE_EXCLUDED` is reported as
+ * excluded, not silently dropped — composing `--offline` with an explicit name is
+ * the same "excluded, and it says so" contract the no-args case already has, rather
+ * than a second, stricter behaviour (an error) that only bites when a name is given.
+ */
+export function partitionForOffline(names: string[], offline: boolean): { toRun: string[]; excluded: string[] } {
+  const excludedSet = new Set<string>(offline ? OFFLINE_EXCLUDED : []);
+  return {
+    toRun: names.filter((name) => !excludedSet.has(name)),
+    excluded: names.filter((name) => excludedSet.has(name)),
+  };
 }
 
 function output(name: string, buffer: Buffer, outputBytes: number, truncated: boolean, outputLimitBytes: number, write: (text: string) => void): void {
@@ -128,11 +159,24 @@ export async function runSuites(suites: Suite[], options: RunOptions = {}): Prom
 }
 
 async function main(): Promise<void> {
-  const offline = process.argv.slice(2).includes("--offline");
-  if (offline) {
-    console.log(`Offline mode: excluding ${OFFLINE_EXCLUDED.join(", ")} (need real opencode).\n`);
+  const argv = process.argv.slice(2);
+  const offline = argv.includes("--offline");
+  const requestedNames = argv.filter((arg) => arg !== "--offline");
+
+  const { names, unknown } = resolveRequestedNames(requestedNames);
+  if (unknown.length > 0) {
+    console.error(`Unknown suite name(s): ${unknown.join(", ")}.`);
+    console.error(`Known suites: ${ALL_SUITES.join(", ")}.`);
+    process.exitCode = 1;
+    return;
   }
-  const result = await runSuites(defaultSuites(offline));
+
+  const { toRun, excluded } = partitionForOffline(names, offline);
+  if (excluded.length > 0) {
+    console.log(`Offline mode: excluding ${excluded.join(", ")} (need real opencode).\n`);
+  }
+
+  const result = await runSuites(toRun.map(suiteEntry));
   if (result.failures.length > 0) {
     console.error(`FAILED: ${result.failures.length} suite(s) failed: ${result.failures.join(", ")}.`);
     process.exitCode = 1;
