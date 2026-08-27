@@ -49,7 +49,7 @@
  * and the server's start-up notice (`src/notice.ts`). Same posture as drift: REPORT only,
  * never a failure, never an exit-code change.
  *
- * SYMLINKS AT A DESTINATION differ BY MODE (issue #156, maintainer decision 2026-08-05).
+ * SYMLINKS AT A DESTINATION differ BY MODE (issue #156).
  * PROJECT mode is unchanged: `safeJoin` refuses a symlink at any existing component.
  * `--global` writes into the user's OWN config (`~/.claude`, `<xdg>/opencode`), and a
  * dotfiles manager (GNU stow, chezmoi, a hand-rolled `ln -s`) makes those DIRECTORIES
@@ -78,8 +78,10 @@
  * ownership half of the message is gated on the record having parsed non-empty FROM that path,
  * and claims only what that parse carries — our JSON is behind the link NOW, by a route this
  * run cannot identify; the ungated half reports what this run could not read, never a property
- * of the user's file. See the removal branch in `init`. Provenance: the ask and the global-only
- * scope are the maintainer's (issue #156); the shape is Claude's.
+ * of the user's file. See the removal branch in `init`. Provenance: the ask is the maintainer's,
+ * one sentence — issue #156, "Init will not allow symlinks, this is likely a bad idea."
+ * Everything below it is Claude's, including the global-only scope, the leaf rule and the
+ * record write-through.
  *
  * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
  * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
@@ -613,9 +615,8 @@ function validRel(rel: string): boolean {
 /**
  * Resolve `<base>/<rel>` refusing a symlinked DIRECTORY component, and a LIVE symlinked leaf —
  * the safe_dest_rel guard: a planted symlink must not redirect a write outside `base`. PROJECT
- * MODE ONLY since issue #156; `--global` uses `globalJoin` below (maintainer decision
- * 2026-08-05 — the project target is somebody's source repo, the global target is the user's
- * own config).
+ * MODE ONLY since issue #156; `--global` uses `globalJoin` below — the project target is
+ * somebody's source repo, the global target is the user's own config.
  *
  * THE GATE IS `lstat`, NOT `existsSync` (issue #159). `existsSync` FOLLOWS, so it answered
  * **false** for a DANGLING link and the guard skipped that component entirely. At a directory
@@ -909,8 +910,8 @@ function resolveRecordLink(recordPath: string): { target: string; live: boolean 
  * because the record path is the one destination `planFor` already resolves eagerly, so the
  * refusal lands where the mode's other record-path decisions do.
  *
- * THREE NAMED CONDITIONS, ENUMERATED — still NOT a general "can this write succeed?" predicate
- * (maintainer decision 2026-08-05): the target's directory is ABSENT (`ENOENT`), it is present
+ * THREE NAMED CONDITIONS, ENUMERATED — still NOT a general "can this write succeed?" predicate:
+ * the target's directory is ABSENT (`ENOENT`), it is present
  * but NOT A DIRECTORY (`ENOTDIR`), or — added for the symlink LOOP that reproduced the identical
  * state, 13 files on disk and no record — the record path cannot be RESOLVED at all although its
  * target's directory is fine. Each is refused with wording naming which it is. Anything else is
@@ -1003,8 +1004,8 @@ function assertRecordLinkWritable(recordPath: string): void {
 }
 
 /**
- * The ownership record's own path is a SYMLINK: say so (issue #156, maintainer decision
- * 2026-08-05). It is not skipped, and — except for the two shapes `assertRecordLinkWritable`
+ * The ownership record's own path is a SYMLINK: say so (issue #156). It is not skipped, and —
+ * except for the two shapes `assertRecordLinkWritable`
  * refuses above — not refused either: the record is written THROUGH the link,
  * because only init writes this file, so there is no user content it is expected to
  * preserve, and a dotfiles manager that links files individually (GNU stow does, when the
