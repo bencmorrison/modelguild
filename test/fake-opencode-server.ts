@@ -474,7 +474,26 @@ export type TurnShape =
    * returned `ok` with an answer of one invisible character while a real one had been discarded.
    * The whitespace shape above failed LOUDLY in the same position.
    */
-  | "text-then-format-char";
+  | "text-then-format-char"
+  /**
+   * ISSUE #203: `text-then-whitespace` with NO TOOL CALL, which is the only way the write
+   * path's refusal can be reached with this shape. `guild_delegate` refuses `empty-delegation`
+   * on an empty report AND zero tool calls (C74), and every tool-bearing variant renders the
+   * shared tool-call message — so on `text-then-whitespace` the refusal can never arm and the
+   * #185 fix's effect there is invisible. Dropping the tool message makes the flip assertable:
+   * pre-#185 the trailing whitespace message WAS the report and the turn was REFUSED; now the
+   * real answer is the report and it is a success.
+   *
+   * CONSTRUCTED, NOT PROBED — stated because this file's convention is to say which (`rejected`
+   * and the `reasoning-*` shapes are rebuilt from live captures, this one is not). It is
+   * `text-then-whitespace`'s own construction minus the tool message; nobody has corpus
+   * evidence of a real provider emitting a trailing whitespace-only assistant message on a
+   * delegate turn, and issue #203 records that as an open unknown. What it models is a
+   * delegation that INSPECTED nothing and wrote a real report — the model answered the task
+   * from context — behind a trailing blank message. The behaviour under test is the
+   * extractor's, and that does not depend on how the turn was produced.
+   */
+  | "text-then-whitespace-no-tools";
 interface TurnRecord {
   question: string;
   shape: TurnShape;
@@ -590,6 +609,30 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
   // no provider error to quote, which `rejected` can never reach because it always carries one.
   if (turn.shape === "silent") {
     return [user, { info: asst(`msg_asst_${n}`, { finish: "stop" }), parts: [] }];
+  }
+  // ISSUE #203: the answer, then a whitespace-only trailing message, and NO tool message — so
+  // `toolCallCount` is 0 and the write path's `empty-delegation` predicate can actually arm.
+  // Rendered above `toolMsg` precisely because its absence is the point.
+  if (turn.shape === "text-then-whitespace-no-tools") {
+    return [
+      user,
+      {
+        info: asst(`msg_asst_final_${n}`, { finish: "stop" }),
+        // The step-start/step-finish wrapper every other answering message carries, so this
+        // shape's `partTypes` census (issue #168) is representative of a real turn rather than
+        // of the one part the assertions happen to read.
+        parts: [
+          { id: `t${n}p1`, type: "step-start" },
+          { id: `t${n}p2`, type: "text", text: turn.text },
+          { id: `t${n}p3`, type: "step-finish" },
+        ],
+      },
+      {
+        // Bare, exactly as `text-then-whitespace`'s trailing message is.
+        info: asst(`msg_asst_trailing_${n}`, { finish: "stop" }),
+        parts: [{ id: `t${n}p4`, type: "text", text: "\n  " }],
+      },
+    ];
   }
   // Every other shape keeps the MULTI-MESSAGE turn the backward walk exists for: a tool-call
   // assistant message with no text, then the text-bearing one.
