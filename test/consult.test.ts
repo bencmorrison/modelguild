@@ -994,6 +994,72 @@ export async function run(): Promise<number> {
     }
   }
 
+  // 6m-quinquies. ISSUE #195, END-TO-END, BOTH HALVES. A real answer followed by a trailing
+  //     message of one U+200B. This was the SILENT half of the defect: `Cf` is outside ECMA-262's
+  //     `WhiteSpace`, so the trailing message won the walk AND passed `requireAnswer`, and the
+  //     call returned ok with `answer` holding one invisible character — no marker on any
+  //     surface, `raw_response` recording the same invisible character. Only an end-to-end case
+  //     shows that; the extractor unit test cannot, because there the loss looks like a refusal.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const ANSWER = "the real answer, emitted before one invisible character followed it";
+    const fake = await startFakeOpencode({
+      historyText: ANSWER,
+      turnShapes: ["text-then-format-char"],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, "#195: a trailing U+200B no longer replaces the answer");
+      c.check(r.ok && r.answer === ANSWER, "#195: the answer is the real text, byte-exact");
+      if (r.ok) {
+        const completed = readEntries(logDir, r.attribution.runId).filter(
+          (e) => e.type === "call" && e.status === "completed",
+        );
+        c.check(
+          completed.length === 1 && completed[0].raw_response === ANSWER,
+          "#195: the receipt records the answer, not the zero-width character",
+        );
+      }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-sexies. ISSUE #195, the other half: a turn whose WHOLE output is one U+200B. It must be
+  //     REFUSED (the gate widened) while `raw_response` keeps those exact bytes (the
+  //     byte-preserving passes). Asserting both together is the #204 invariant end-to-end:
+  //     widening only `answerSource` would return the character as an answer instead.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const fake = await startFakeOpencode({ historyText: "\u200b" });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(!r.ok && r.error.kind === "empty-answer", "#195 (zero-width only): refuses with empty-answer");
+      const runId = readdirSync(logDir).find((d) => d !== "latest") ?? "";
+      const completed = readEntries(logDir, runId).find(
+        (e) => e.type === "call" && e.status === "completed",
+      );
+      c.check(
+        !!completed && completed.raw_response === "\u200b",
+        "#195 (zero-width only): raw_response keeps the exact bytes — nothing is stripped",
+      );
+      c.check(!!completed && completed.capture_state === "complete", "#195 (zero-width only): capture_state stays complete");
+      c.check(new EvidenceLog({ env }).verify(runId).code === 0, "#195 (zero-width only): run verifies clean");
+    } finally {
+      await fake.close();
+    }
+  }
+
   // 6m-ter. A turn that said nothing on EITHER channel is still refused, with the issue-#173
   //     diagnostics intact. The fallback narrows what counts as empty; it does not remove the
   //     refusal, and the part-type census still reports the shape it found.

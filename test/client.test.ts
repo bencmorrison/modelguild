@@ -11,6 +11,7 @@
 import {
   askViaAgent,
   createSession,
+  isBlank,
   sendMessage,
   fetchHistory,
   finalAssistantText,
@@ -713,6 +714,86 @@ export async function run(): Promise<number> {
       "#185: the byte-preserving passes are turn-scoped — no borrowing across a user message",
     );
 
+    // --- ISSUE #195: THE BLANK ALPHABET, AND THE TWO GATES AGREEING ON IT -------------------
+    // #185 split the gate in two; #195 is that the PREDICATE feeding it stopped at ECMA-262's
+    // `WhiteSpace`, which does not reach Unicode category `Cf`. A trailing message of one U+200B
+    // therefore won the walk AND passed `requireAnswer` — the SILENT half of the defect, where
+    // the whitespace half at least failed loudly. Both gates now read one exported `isBlank`
+    // (issue #204's constraint): widening one site alone is what produced the silent half, so
+    // the table below asserts the invariant itself, not merely the new characters.
+    const BLANK_TABLE: Array<[string, string]> = [
+      ["U+200B ZERO WIDTH SPACE", "\u200b"],
+      ["U+180E MONGOLIAN VOWEL SEPARATOR", "\u180e"],
+      ["U+202E RIGHT-TO-LEFT OVERRIDE", "\u202e"],
+      ["U+00AD SOFT HYPHEN", "\u00ad"],
+      ["U+2060 WORD JOINER", "\u2060"],
+      ["U+061C ARABIC LETTER MARK", "\u061c"],
+      ["U+200E LEFT-TO-RIGHT MARK", "\u200e"],
+      ["U+00A0 NO-BREAK SPACE", "\u00a0"],
+      ["U+FEFF ZERO WIDTH NO-BREAK SPACE", "\ufeff"],
+      ["U+3000 IDEOGRAPHIC SPACE", "\u3000"],
+      ["U+2028 LINE SEPARATOR", "\u2028"],
+      ["U+2029 PARAGRAPH SEPARATOR", "\u2029"],
+      ["space + U+200B + space", " \u200b "],
+      ["plain whitespace", " \t\n"],
+    ];
+    for (const [name, ch] of BLANK_TABLE) {
+      // Half one: the answering gate. A trailing message of nothing but this must not win.
+      c.check(
+        finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText(ch)] }) ===
+          "THE REAL ANSWER",
+        `#195: a trailing ${name} message no longer discards a real answer`,
+      );
+      // Half two: THE INVARIANT, stated as code (issue #204). A turn whose ONLY output is this
+      // falls through to the byte-preserving passes — so the bytes survive verbatim — and every
+      // string those passes can return must be one `requireAnswer` refuses. Asserting both
+      // together is what a single-site widening would fail: the bytes would come back and the
+      // refusal would not fire.
+      const alone = finalAssistantText({ messages: [user("q"), wsText(ch)] });
+      c.check(
+        alone === ch && isBlank(alone),
+        `#195/#204: ${name} alone is kept BYTE-EXACT and is still blank ⇒ requireAnswer refuses`,
+      );
+    }
+    // A real answer is not blank — the direction that would make the gate refuse everything.
+    c.check(
+      !isBlank("THE REAL ANSWER") && !isBlank("a") && !isBlank("\u200ba"),
+      "#195: a real answer, a single letter, and a letter behind a ZWSP are all NON-blank",
+    );
+    // THE STATED RESIDUAL, pinned so nobody reads `Cf` as "every invisible character". These
+    // five are four other categories — `Cc` controls (NEL/NUL/DEL), `Cs` (a lone surrogate) and
+    // `So` (U+2800 renders as nothing but is a PRINTING character) — and a category predicate
+    // cannot reach the last one at all. They still win the walk and are still returned as
+    // answers; that is a known limit of this fix, not an oversight.
+    const NOT_BLANK_RESIDUAL: Array<[string, string]> = [
+      ["U+0085 NEXT LINE (Cc)", "\u0085"],
+      ["U+0000 NUL (Cc)", "\u0000"],
+      ["U+007F DELETE (Cc)", "\u007f"],
+      ["U+2800 BRAILLE PATTERN BLANK (So)", "\u2800"],
+      ["lone surrogate U+D800 (Cs)", "\ud800"],
+    ];
+    for (const [name, ch] of NOT_BLANK_RESIDUAL) {
+      c.check(
+        !isBlank(ch) &&
+          finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText(ch)] }) ===
+            ch,
+        `#195 STATED RESIDUAL: ${name} is not blank here and still wins the walk`,
+      );
+    }
+    // THE CHANNEL-CROSSING CASE from the issue: pass 1 used to accept the ZWSP text and never
+    // reach the reasoning, so a promoted answer was lost AND the receipt recorded no channel.
+    c.check(
+      finalAssistantText({ messages: [user("q"), reasoningOnly("REASONED ANSWER"), wsText("\u200b")] }) ===
+        "REASONED ANSWER",
+      "#195: a trailing ZWSP no longer discards a promoted REASONING answer",
+    );
+    c.check(
+      finalAssistantChannel({
+        messages: [user("q"), reasoningOnly("REASONED ANSWER"), wsText("\u200b")],
+      }) === "reasoning",
+      "#195: ...and the promotion is reported on the reasoning channel, not left undefined",
+    );
+
     // --- THE CHANNEL IS RECORDED (issue #168) ----------------------------------------------
     c.check(
       finalAssistantChannel(reasoned) === "reasoning",
@@ -727,8 +808,11 @@ export async function run(): Promise<number> {
         undefined,
       "#168: a turn that answered nothing reports no channel",
     );
-    // #185: the byte-preserving passes report their channel on the same rule — a receipt that
-    // records whitespace reasoning is still recording a PROMOTION, refused or not.
+    // #185: the byte-preserving passes report their channel on the same rule — a turn kept for
+    // its bytes alone still came off `reasoning`, and the EXTRACTOR says so. Scoped to the
+    // extractor deliberately (issue #202): `EmptyAnswerError` carries no channel field, so the
+    // read tools' refusal RECEIPT omits `answer_channel` — do not read this as a claim about
+    // what `calls.jsonl` records for a refused turn.
     c.check(
       finalAssistantChannel({ messages: [user("q"), wsReasoning("  ")] }) === "reasoning",
       "#185: whitespace reasoning kept for its bytes still reports the reasoning channel",
