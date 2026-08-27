@@ -27,7 +27,7 @@ import {
   type ConsultResult,
 } from "../src/consult.js";
 import { EvidenceLog } from "../src/log.js";
-import { startFakeOpencode, COMPACTION_TOOL_CALLS, type FakeOpencode } from "./fake-opencode-server.js";
+import { startFakeOpencode, COMPACTION_TOOL_CALLS, COMPACTION_SUMMARY_TEXT, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider } from "../src/client.js";
 import { Checker, fakeServeHandle } from "./harness.js";
 
@@ -1077,7 +1077,51 @@ export async function run(): Promise<number> {
           r.error.message.includes(`the turn made ${COMPACTION_TOOL_CALLS} tool calls before it ended`),
           `#189: the corrected count reaches the message a human reads: ${r.error.message}`,
         );
+        // THE REVIEW'S F1, AT THE TOOL BOUNDARY. Correcting the turn bound pulls opencode's own
+        // compaction-summary assistant message INTO the turn, and it is the only non-blank
+        // assistant text there — so without the skip this call returns `ok:true` carrying a
+        // summary of the session as the model's answer, or fails `agent-mismatch` on
+        // `agent: "compaction"`. Both are worse than the refusal this must stay.
+        c.check(
+          !r.error.message.includes(COMPACTION_SUMMARY_TEXT),
+          "#189(F1): opencode's summary is not smuggled into the refusal either",
+        );
+        c.check(
+          r.error.kind !== "agent-mismatch",
+          `#189(F1): and the summariser's agent never trips the masquerade check (kind=${r.error.kind})`,
+        );
       }
+    } finally {
+      await fake.close();
+    }
+  }
+
+  // 6m-ter-quinquies. ISSUE #189 REVIEW (F3): THE REFUSAL SET MOVED, stated rather than found
+  //     later. The model answered, THEN the context overflowed and opencode compacted, and the
+  //     post-compaction remainder was silent. Pre-#189 "this turn" was that remainder and the
+  //     call was refused as `empty-answer`; the compaction is inside the turn, so the answer is
+  //     now returned — C74's existing same-turn preamble rule, extended across the compaction.
+  {
+    const root = makeGuildRoot();
+    const logDir = tmp("m5-logs-");
+    const env = envWith({ GUILD_ROOT: root, GUILD_LOG_DIR: logDir, GUILD_AGENT_DIR: defDirWithRead() });
+    const ANSWER = "THE ANSWER, GIVEN BEFORE THE CONTEXT OVERFLOWED";
+    const fake = await startFakeOpencode({
+      historyText: "unused",
+      turnShapes: ["compaction-after-answer"],
+      turnTexts: [ANSWER],
+    });
+    try {
+      const r = await consult(
+        { question: "q", model: "openai/allow-model" },
+        { serve: fakeServe(fake), env, messageTimeoutMs: 5_000 },
+      );
+      c.check(r.ok, `#189(F3): an answer given before the compaction is returned, not refused (got ${r.ok ? "ok" : r.error.kind})`);
+      c.check(r.ok && r.answer === ANSWER, `#189(F3): and it is the model's answer verbatim (got ${r.ok ? JSON.stringify(r.answer) : "n/a"})`);
+      c.check(
+        r.ok && !r.answer.includes(COMPACTION_SUMMARY_TEXT),
+        "#189(F3): never opencode's session summary",
+      );
     } finally {
       await fake.close();
     }

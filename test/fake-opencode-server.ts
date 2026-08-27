@@ -496,21 +496,32 @@ export type TurnShape =
   | "text-then-whitespace-no-tools"
   /**
    * ISSUE #189: opencode auto-compacted MID-TURN. Two tool calls land, the context overflows,
-   * opencode appends a `user` message carrying a `compaction` part and then a second `user`
-   * message carrying a `synthetic` continue text part, and only then does the model answer.
-   * `turnStartIndex` used to take the LAST `user` message as the boundary, so everything before
-   * the compaction — here both tool calls — fell outside "this turn" and every extractor
-   * under-reported.
+   * opencode appends THREE messages — a `user` message carrying a `compaction` part, then its
+   * OWN summariser's assistant message carrying the session summary as text, then a second
+   * `user` message carrying a `synthetic` + `metadata.compaction_continue` text part — and only
+   * then does the model answer. `turnStartIndex` used to take the LAST `user` message as the
+   * boundary, so everything before the compaction — here both tool calls — fell outside "this
+   * turn" and every extractor under-reported.
+   *
+   * THE SUMMARY ASSISTANT MESSAGE IS NOT DECORATION. With the boundary corrected but that
+   * message still in the walk, `servingAgent` reads `agent: "compaction"` and every compacted
+   * read call fails with a hard `AgentMismatchError`, and where `info.agent` is absent
+   * `finalAssistantText` returns opencode's summary of the session as the model's answer. The
+   * assertions on these shapes cover both.
    *
    * PROVENANCE, per this file's convention. **PROBED** (opencode 1.18.18, `GET /doc`,
    * 2026-08-27): `CompactionPart` is a member of the `Part` union the history endpoint returns,
-   * with `type: "compaction"`, `auto` required and `overflow`/`tail_start_id` optional; and
-   * `TextPart` carries an optional `synthetic: boolean` beside a free-form `metadata` object.
-   * **CONSTRUCTED**: that these parts ride on `role:"user"` messages, in this order, inside one
-   * `POST /session/{id}/message` — that comes from issue #189's `strings` read of the minified
-   * Bun binary, not from a capture. Nobody has observed `GET /session/{id}/message` returning
-   * these messages; if opencode filters them out, the product's skip is a no-op and this shape
-   * models a payload that never occurs.
+   * with `type: "compaction"`, `auto` required and `overflow`/`tail_start_id` optional;
+   * `TextPart` carries an optional `synthetic: boolean` beside a free-form `metadata` object;
+   * and `AssistantMessage` carries `summary?: boolean` plus REQUIRED `mode`/`agent` strings.
+   * **BINARY-READ** (`strings` on the installed 1.18.18 executable, not a capture): that these
+   * parts ride on `role:"user"` messages in this order inside one `POST /session/{id}/message`,
+   * and that the summariser's message is built as `{role:"assistant",parentID:<the compaction
+   * user msg>,mode:"compaction",agent:"compaction",summary:!0,cost:0,tokens:{output:0,input:0,
+   * …}}`. **CONSTRUCTED**: the summary text itself, the ids, and the exact part wrappers.
+   * Nobody has observed the message LIST endpoint returning these messages — opencode's own
+   * copilot plugin reads them off the SINGLE-message endpoint — so if the list endpoint filters
+   * them the product's skip is a no-op and this shape models a payload that never occurs.
    */
   | "compaction-then-text"
   /**
@@ -529,11 +540,25 @@ export type TurnShape =
    * separates "the count is now right" from "the count is now always non-zero". Same
    * provenance; the tool messages are simply absent.
    */
-  | "compaction-silent-no-tools";
+  | "compaction-silent-no-tools"
+  /**
+   * ISSUE #189 REVIEW (F3): the model ANSWERS, then the context overflows, opencode compacts,
+   * and the post-compaction remainder is silent. Pre-#189 this was refused as `empty-answer`
+   * (the "turn" was the remainder, which said nothing); it now returns the pre-compaction
+   * answer, which is C74's existing same-turn preamble rule — "a preamble before a dead final
+   * message passes, returning the preamble" — extended across the compaction, since the
+   * compaction is INSIDE the turn. That is a change to the refusal SET, so it is fixtured and
+   * asserted rather than left to be discovered. Same provenance as the shapes above.
+   */
+  | "compaction-after-answer";
 
 /** How many tool calls the issue-#189 compaction shapes make BEFORE opencode compacts. Read by
  * the assertions so "the count is the pre-compaction count" is checked against one number. */
 export const COMPACTION_TOOL_CALLS = 2;
+
+/** The text opencode's own compaction summariser streams into its assistant message. It must
+ * never be returned as a model answer, so the assertions look for this exact string. */
+export const COMPACTION_SUMMARY_TEXT = "SUMMARY-OF-THE-SESSION-THAT-MUST-NOT-BE-AN-ANSWER";
 
 interface TurnRecord {
   question: string;
@@ -701,7 +726,8 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
   if (
     turn.shape === "compaction-then-text" ||
     turn.shape === "compaction-then-silent" ||
-    turn.shape === "compaction-silent-no-tools"
+    turn.shape === "compaction-silent-no-tools" ||
+    turn.shape === "compaction-after-answer"
   ) {
     // The second tool message. Two SEPARATE assistant messages rather than two parts of one,
     // because that is how opencode splits a turn and it is what the backward walk crosses.
@@ -723,13 +749,38 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
         { id: `t${n}q3`, type: "step-finish" },
       ],
     };
-    // opencode's own two messages. NEITHER is a turn delimiter: the first carries a
-    // `compaction` part, the second a `synthetic` continue text part with the autocontinue
-    // path's `metadata.compaction_continue`. Both markers are asserted on, so a product that
-    // recognized only one of them still fails the other case.
+    // opencode's own THREE messages, in the order the binary builds them. NONE of them is this
+    // turn's boundary or this turn's output: the first `user` carries a `compaction` part, the
+    // ASSISTANT between them is opencode's summariser, and the second `user` carries a
+    // `synthetic` continue text part with the autocontinue path's `metadata.compaction_continue`.
+    // Every marker is asserted on somewhere, so a product recognizing only some of them fails.
     const compactionUser = {
       info: { id: `msg_user_compaction_${n}`, role: "user", time: { created: n } },
       parts: [{ id: `t${n}c1`, type: "compaction", auto: true, overflow: true }],
+    };
+    // THE SUMMARISER'S MESSAGE. `asst()` is deliberately NOT used: this message is not built
+    // like a model turn — opencode gives it `cost: 0`, all-zero tokens, and the compaction
+    // agent/mode — and using the model-turn helper would have hidden exactly the fields the
+    // product keys on. `servedAgent` is not applied either: this message's agent is opencode's.
+    const summaryAssistant = {
+      info: {
+        id: `msg_asst_summary_${n}`,
+        role: "assistant",
+        parentID: `msg_user_compaction_${n}`,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        cost: 0,
+        tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        providerID: "openai",
+        modelID: "gpt-fake",
+      },
+      parts: [
+        { id: `t${n}s1`, type: "step-start" },
+        { id: `t${n}s2`, type: "text", text: COMPACTION_SUMMARY_TEXT },
+        { id: `t${n}s3`, type: "step-finish" },
+      ],
     };
     const continueUser = {
       info: { id: `msg_user_continue_${n}`, role: "user", time: { created: n } },
@@ -757,10 +808,26 @@ function renderTurn(turn: TurnRecord, n: number, opts: FakeOpencodeOpts): unknow
           ];
     const toolMsgs =
       turn.shape === "compaction-silent-no-tools" ? [] : [toolMsg, toolMsg2];
+    // F3: the answer arrives BEFORE the compaction, and the remainder is silent.
+    const preCompactionAnswer =
+      turn.shape === "compaction-after-answer"
+        ? [
+            {
+              info: asst(`msg_asst_pre_${n}`, { finish: "stop" }),
+              parts: [
+                { id: `t${n}a1`, type: "step-start" },
+                { id: `t${n}a2`, type: "text", text: turn.text },
+                { id: `t${n}a3`, type: "step-finish" },
+              ],
+            },
+          ]
+        : [];
     return [
       user,
       ...toolMsgs,
+      ...preCompactionAnswer,
       compactionUser,
+      summaryAssistant,
       continueUser,
       { info: asst(`msg_asst_final_${n}`, { finish: "stop" }), parts: finalParts },
     ];

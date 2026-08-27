@@ -826,13 +826,15 @@ export async function fetchHistory(opts: FetchHistoryOpts): Promise<SessionHisto
  * **A `user` message is the only delimiter opencode's history has, and NOT EVERY ONE OF THEM
  * IS THE CALLER'S** (issue #189). The former version of this comment asserted that a turn is
  * exactly one `POST /session/{id}/message` and that POST is what appends the user message; the
- * second half is false. opencode's auto-compaction runs INSIDE one POST: on context overflow
- * it appends a `user` message carrying a `compaction` part, and its autocontinue path appends
- * a second `user` message carrying a `synthetic` text part. Treating either as the boundary
- * silently truncates "this turn" to the post-compaction remainder, and every consumer below
- * then UNDER-reports — `turnToolCallCount` (C74's deciding column on the write path, and
- * #168's headline diagnostic on the read path) counts only what happened after the compaction,
- * which on the write path is a FALSE `empty-delegation` refusal.
+ * second half is false. opencode's auto-compaction runs INSIDE one POST and appends THREE
+ * messages: a `user` message carrying a `compaction` part, then its own summariser's assistant
+ * message (see `isCompactionSummary`), then — on the autocontinue path — a second `user`
+ * message carrying a `synthetic` + `metadata.compaction_continue` text part. Treating either
+ * user message as the boundary silently truncates "this turn" to the post-compaction
+ * remainder, and every consumer below then UNDER-reports — `turnToolCallCount` (C74's deciding
+ * column on the write path, and #168's headline diagnostic on the read path) counts only what
+ * happened after the compaction, which on the write path is a FALSE `empty-delegation`
+ * refusal.
  *
  * **THE SKIP IS EVIDENCE-BASED, AND ITS DEFAULT IS THE OLD BEHAVIOUR** — a `user` message is
  * a delimiter unless the payload positively marks it as opencode's own, so an opencode bump
@@ -845,8 +847,15 @@ export async function fetchHistory(opts: FetchHistoryOpts): Promise<SessionHisto
  *     No caller-sent message carries one, so ONE such part is enough.
  *   - `TextPart.synthetic` — an optional `boolean`, plus a free-form `metadata` object, where
  *     the autocontinue path records `compaction_continue: true`. Weaker evidence than a
- *     compaction part (a caller's own message is text too), so this leg requires that EVERY
- *     part of the message be marked: a message holding any unmarked part is still a delimiter.
+ *     compaction part (a caller's own message is text too), so BOTH markers are required and
+ *     EVERY part of the message must carry them — see `isCompactionContinuePart` for why
+ *     `synthetic` alone is not enough.
+ *
+ * That opencode's message API really carries these parts is corroborated by opencode's own
+ * copilot plugin, which reads a message back over the HTTP API and tests `data.parts` for
+ * exactly them (binary read, not a live capture). It reads the SINGLE-message endpoint, so
+ * whether the LIST endpoint this code calls includes the compaction messages at all is still
+ * inferred rather than observed; if it filters them, this skip is a no-op.
  *
  * STATED RESIDUAL: the other compaction branch replays the retained tail as a fresh `user`
  * message, copying real parts across — those carry no marker, and this cannot tell them from
@@ -871,12 +880,25 @@ function isCompactionPart(p: Record<string, unknown>): boolean {
   return p.type === "compaction";
 }
 
-/** A text part opencode wrote rather than the caller: `synthetic: true`, or the autocontinue
- * path's `metadata.compaction_continue: true`. Both are read defensively — `metadata` is an
- * untyped object in the schema, so anything but the literal `true` is not evidence. */
-function isSyntheticTextPart(p: Record<string, unknown>): boolean {
-  if (p.type !== "text") return false;
-  if (p.synthetic === true) return true;
+/**
+ * The autocontinue path's text part — `synthetic: true` **AND**
+ * `metadata.compaction_continue: true`, BOTH, which is opencode's own predicate for it.
+ *
+ * **`synthetic` ALONE IS NOT A COMPACTION MARKER, and reading it as one would have skipped a
+ * real caller message.** opencode sets `synthetic: !0` at ~31 construction sites — file and MCP
+ * attachment expansions, the plan-mode instruction, and the background-result injection, which
+ * calls `promptAsync({parts:[{type:"text",synthetic:!0,…}]})` and so produces a `user` message
+ * whose ONLY part is synthetic. Under `every(...)` that message would have stopped delimiting
+ * the turn and the walk would have run back past it. opencode's copilot plugin tests the pair
+ * (`W.type==="text"&&W.synthetic&&W.metadata?.compaction_continue===!0`), so the pair is what
+ * this tests: opencode is the authority on its own payload, and being NARROWER than opencode
+ * can only fail toward the pre-#189 bound, which is the safe direction.
+ *
+ * `metadata` is an untyped object in the published schema, so anything but the literal `true`
+ * is not evidence.
+ */
+function isCompactionContinuePart(p: Record<string, unknown>): boolean {
+  if (p.type !== "text" || p.synthetic !== true) return false;
   const meta = typeof p.metadata === "object" && p.metadata !== null ? (p.metadata as Record<string, unknown>) : {};
   return meta.compaction_continue === true;
 }
@@ -885,13 +907,55 @@ function isSyntheticTextPart(p: Record<string, unknown>): boolean {
  * Was this `user` message appended by opencode's compaction machinery rather than by the
  * caller's `POST /session/{id}/message`? (issue #189)
  *
+ * The two legs take DIFFERENT evidence, and deliberately: a `compaction` part is unambiguous —
+ * nothing but the compactor creates one — so ONE suffices, while a marked text part sits in the
+ * same union as the caller's own prompt, so EVERY part must be marked before the message stops
+ * delimiting the turn.
+ *
  * Fails toward "the caller sent it", which is the pre-#189 bound: absent evidence this returns
  * `false` and the message delimits the turn, so no marker change can widen the walk.
  */
 function isCompactionAppendedUser(m: HistoryMessage): boolean {
   if (m.parts.length === 0) return false;
   if (m.parts.some(isCompactionPart)) return true;
-  return m.parts.every(isSyntheticTextPart);
+  return m.parts.every(isCompactionContinuePart);
+}
+
+/**
+ * OPENCODE'S COMPACTION SUMMARY MESSAGE — an `assistant` message NO MODEL IN THIS TURN WROTE
+ * (issue #189 review).
+ *
+ * Compaction emits THREE messages, not two: between the `compaction`-part `user` message and
+ * the autocontinue `user` message, opencode creates its own assistant message and streams a
+ * SUMMARY OF THE CONVERSATION into its text parts. Read from `strings` on the installed
+ * 1.18.18 binary — `{…,role:"assistant",parentID:w.parentID,sessionID,mode:"compaction",
+ * agent:"compaction",summary:!0,cost:0,tokens:{output:0,input:0,…}}` immediately followed by
+ * `updateMessage(N)` and the summariser's own `process(…)` — and opencode's own trimmer
+ * locates it as `role==="assistant" && info.summary && info.finish && !info.error` whose
+ * `parentID` is a `compaction`-part user message.
+ *
+ * **Skipping it is not tidiness; both failure modes are severe and neither is a near-miss.**
+ * With the turn bound corrected but this message still in the walk: `servingAgent` reads
+ * `agent: "compaction"` and every compacted-then-silent read call fails with a hard
+ * `AgentMismatchError` instead of the correct `empty-answer`; and where `info.agent` is absent
+ * `finalAssistantText` returns OPENCODE'S SUMMARY OF THE SESSION as the model's answer,
+ * `ok:true`, byte-exact into `raw_response`. The second is the same class of defect as the
+ * BANANA one — a confident answer to a question nobody asked.
+ *
+ * **Its parts are opencode's, so it is excluded from the census and the tool-call count too**,
+ * and from the completion metadata (its `cost:0`/all-zero `tokens` would otherwise be reported
+ * as the turn's, which is exactly the "a real zero is evidence" field #168 built) and from the
+ * error search (a summariser failure is not the model's verdict on this turn — a stated cost:
+ * such a failure is not quoted into the refusal, and the activity trace is where it shows).
+ *
+ * `summary`, `mode` and `agent` are all schema-backed on `AssistantMessage` at `GET /doc`
+ * (1.18.18): `summary?: boolean`, and `mode`/`agent` REQUIRED strings. Any ONE is enough —
+ * unlike the user-message legs this is an OR, because a false positive here costs a refusal
+ * (loud) while a false negative costs a summary returned as an answer (silent).
+ */
+function isCompactionSummary(m: HistoryMessage): boolean {
+  if (m.role !== "assistant") return false;
+  return m.info.summary === true || m.info.agent === "compaction" || m.info.mode === "compaction";
 }
 
 /** The `type` parts of `m` carrying a string `text`, concatenated verbatim in order with NO
@@ -1024,6 +1088,9 @@ function answerSource(
       for (let i = history.messages.length - 1; i >= start; i--) {
         const m = history.messages[i];
         if (m.role !== "assistant") continue;
+        // Issue #189 review: opencode's compaction SUMMARY is an assistant message inside this
+        // turn that no model wrote. Returning it would answer with a summary of the session.
+        if (isCompactionSummary(m)) continue;
         const text = joinPartText(m, channel);
         if (text.length === 0) continue;
         if (!verbatim && isBlank(text)) continue;
@@ -1122,6 +1189,7 @@ export function finalAssistantError(history: SessionHistory): string | undefined
   for (let i = history.messages.length - 1; i >= start; i--) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
+    if (isCompactionSummary(m)) continue; // opencode's summariser, not this turn's model (#189)
     const err = m.info.error;
     if (err === null || typeof err !== "object") continue;
     const e = err as Record<string, unknown>;
@@ -1228,6 +1296,10 @@ export function finalAssistantCompletion(history: SessionHistory): TurnCompletio
   for (let i = history.messages.length - 1; i >= start; i--) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
+    // #189 review: the summariser's message carries `cost:0` and all-zero tokens. Reporting
+    // those as the turn's completion would fabricate exactly the zero this field treats as
+    // evidence.
+    if (isCompactionSummary(m)) continue;
     const finish = typeof m.info.finish === "string" && m.info.finish.length > 0 ? m.info.finish : undefined;
     const cost = numberOrUndefined(m.info.cost);
     const raw = (typeof m.info.tokens === "object" && m.info.tokens !== null ? m.info.tokens : {}) as Record<
@@ -1279,6 +1351,7 @@ export function turnAssistantPartTypes(history: SessionHistory): Record<string, 
   for (let i = start; i < history.messages.length; i++) {
     const m = history.messages[i];
     if (m.role !== "assistant") continue;
+    if (isCompactionSummary(m)) continue; // opencode's own parts, not the model's (#189)
     for (const p of m.parts) {
       const t = typeof p.type === "string" && p.type.length > 0 ? p.type : "(unknown)";
       out[t] = (out[t] ?? 0) + 1;
@@ -1377,6 +1450,9 @@ export function turnToolCallCount(history: SessionHistory): number {
   const start = turnStartIndex(history);
   let n = 0;
   for (let i = start; i < history.messages.length; i++) {
+    // #189 review: the compaction summariser runs with `tools:{}` and its message is not the
+    // model reaching for anything, so its parts are out of this count as well as the census.
+    if (isCompactionSummary(history.messages[i])) continue;
     for (const p of history.messages[i].parts) if (p.type === "tool") n++;
   }
   return n;
