@@ -2617,8 +2617,9 @@ export async function run(): Promise<number> {
           nothingDelivered("\ud800", 0, base),
         "#195(K-edges): a NUL, a NEL and a lone-surrogate report are blank too — one alphabet",
       );
-      // And the residual is shared honestly: `So` is outside the alphabet, so U+2800 — a
-      // printing character that renders as nothing — is still a report on both paths.
+      // And the residual CLASS is shared honestly: render-blank code points outside `Cf`/`Cc`/
+      // `Cs` — U+2800 (`So`), the variation selectors (`Mn`), the Hangul fillers (`Lo`) — are
+      // still reports on both paths. U+2800 is the exemplar; the class is pinned in client.test.
       c.check(
         !nothingDelivered("\u2800", 0, base),
         "#195(K-edges) STATED RESIDUAL: a U+2800 report is NOT blank — no predicate reaches it",

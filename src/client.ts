@@ -874,12 +874,15 @@ function joinPartText(m: HistoryMessage, type: string): string {
  *     (probed: `/\p{Cs}/u.test("\uD800") === true`), and a well-formed PAIR is a single astral
  *     code point which is NOT `Cs`, so an emoji-only answer stays an answer.
  *
- * **U+2800 BRAILLE PATTERN BLANK IS THE ONE STATED RESIDUAL.** It is category `So` — an
- * ordinary PRINTING character whose glyph happens to render as nothing — so no category
- * predicate reaches it, and a turn whose whole output is one U+2800 is still returned as an
- * answer. "The reader sees nothing" is a different question from "these code points carry no
- * text", and only the second is answered here; enumerating render-blank glyphs is not a job for
- * this predicate.
+ * **THE STATED RESIDUAL IS A CLASS, NOT A CHARACTER: render-blank code points OUTSIDE `Cf`/`Cc`/
+ * `Cs` are still answers.** Measured, all returned as answers today: U+2800 BRAILLE PATTERN
+ * BLANK (`So`, an ordinary PRINTING character whose glyph renders as nothing), the variation
+ * selectors U+FE0F/U+FE00 and U+034F CGJ (`Mn`), the Hangul fillers U+3164/U+115F/U+FFA0
+ * (`Lo` — letters that render as blank), U+17B4 (`Mn`) and U+2065 (`Cn`, unassigned). U+2800 is
+ * the pinned exemplar in the tests, with U+FE0F and U+3164 beside it so the CLASS is asserted
+ * rather than the one character. "The reader sees nothing" is a different question from "these
+ * code points carry no text", and only the second is answered here — enumerating render-blank
+ * glyphs is not a job for this predicate, and a category-based one cannot do it in any case.
  *
  * **THE GATE IS NOT A FILTER, and that is what keeps it clear of the evidence layer.** Nothing
  * is ever stripped from a returned string: a turn whose only output is one of these characters
@@ -1483,9 +1486,10 @@ export class AgentFloorNotInForceError extends Error {
  * `AgentMismatchError` — so the existing ownership × outcome deletion matrix tears a
  * session we created down rather than orphaning it, and no second cleanup path exists.
  *
- * `text` is the byte-exact final text as read from history (`""`, or whitespace only). It is
- * carried so the evidence layer can still record what was actually produced: C25's byte-exact
- * rule does not get a hole cut in it just because the bytes turned out to be blank.
+ * `text` is the byte-exact final text as read from history (`""`, or blank per `isBlank` — see
+ * that predicate for the alphabet). It is carried so the evidence layer can still record what
+ * was actually produced: C25's byte-exact rule does not get a hole cut in it just because the
+ * bytes turned out to be blank.
  *
  * `providerError` is the turn's own `info.error`, whitelisted and bounded by
  * `finalAssistantError`. When opencode carried one it is QUOTED, because the alternative the
@@ -1509,7 +1513,8 @@ export class EmptyAnswerError extends Error {
   ) {
     super(
       "the model completed its turn and produced NO ANSWER (this turn's final assistant " +
-        "text is empty or whitespace only) — refusing to return silence as an answer. " +
+        "text is empty, or holds nothing but whitespace, format, control or surrogate code " +
+        "points) — refusing to return silence as an answer. " +
         (providerError !== undefined
           ? `The provider reported: ${providerError}`
           : "opencode reported no error for the turn, so the cause is not in the history — " +
@@ -1584,7 +1589,8 @@ export interface AskViaAgentOpts {
   expectedAgent?: string;
   /**
    * REQUIRE AN ANSWER (issue #117, C74). When set, a turn whose final assistant text is
-   * empty or whitespace-only throws `EmptyAnswerError` instead of returning `text: ""`.
+   * BLANK per `isBlank` — empty, or nothing but whitespace/format/control/surrogate code
+   * points — throws `EmptyAnswerError` instead of returning `text: ""`.
    * Left unset (the default, and `guild_delegate`'s deliberate choice — issue #121 did not
    * change it; the write path judges the same turn one layer up, after this spine returns, from
    * `toolCallCount` and `providerError`, which is the only place an empty report can be told

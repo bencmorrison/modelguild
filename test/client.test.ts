@@ -762,15 +762,17 @@ export async function run(): Promise<number> {
           "THE REAL ANSWER",
         `#195: a trailing ${name} message no longer discards a real answer`,
       );
-      // Half two: THE INVARIANT, stated as code (issue #204). A turn whose ONLY output is this
-      // falls through to the byte-preserving passes — so the bytes survive verbatim — and every
-      // string those passes can return must be one `requireAnswer` refuses. Asserting both
-      // together is what a single-site widening would fail: the bytes would come back and the
-      // refusal would not fire.
+      // Half two: the byte-preserving passes. A turn whose ONLY output is this falls through
+      // passes 1-2 and is returned VERBATIM by 3-4, and `isBlank` is true of exactly those
+      // bytes. THAT IS ALL THIS PINS — it calls `isBlank` directly and never reaches
+      // `requireAnswer`, so it stays green under a single-site desync and is NOT the bite for
+      // #204's invariant. The invariant is pinned END-TO-END by `test/consult.test.ts`'s three
+      // refusal cases (6m-sexies/septies/octies), which go red the moment the two gates read
+      // different predicates. Do not restate this check as if it covered that.
       const alone = finalAssistantText({ messages: [user("q"), wsText(ch)] });
       c.check(
         alone === ch && isBlank(alone),
-        `#195/#204: ${name} alone is kept BYTE-EXACT and is still blank ⇒ requireAnswer refuses`,
+        `#195: ${name} alone is kept BYTE-EXACT by the verbatim passes, and isBlank is true of it`,
       );
     }
     // NON-BLANK, the direction that would make the gate refuse everything. The emoji is the
@@ -786,16 +788,27 @@ export async function run(): Promise<number> {
           "\u{1F600}",
       "#195: a well-formed surrogate PAIR is NOT `Cs` — an emoji-only answer is still an answer",
     );
-    // THE ONE STATED RESIDUAL, pinned so nobody reads the widening as "every invisible
-    // character". U+2800 is category `So` — an ordinary PRINTING character whose glyph renders
-    // as nothing — so no category predicate reaches it. It still wins the walk and is still
-    // returned as an answer; that is a known limit of this fix, not an oversight.
-    c.check(
-      !isBlank("\u2800") &&
-        finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText("\u2800")] }) ===
-          "\u2800",
-      "#195 STATED RESIDUAL: U+2800 BRAILLE PATTERN BLANK (So) is not blank and still wins the walk",
-    );
+    // THE STATED RESIDUAL IS A CLASS, NOT A CHARACTER — pinned as a table so nobody reads the
+    // widening as "every invisible character". Render-blank code points OUTSIDE `Cf`/`Cc`/`Cs`
+    // are still answers, and they span at least four more categories: `So` (U+2800, an ordinary
+    // PRINTING character whose glyph renders as nothing), `Mn` (the variation selectors, CGJ),
+    // `Lo` (the Hangul fillers — letters that render as blank) and `Cn` (unassigned). No
+    // category predicate reaches that set, which is why the alphabet stops where it does.
+    // Three of them are asserted rather than one, so a future widening that swallowed only
+    // U+2800 could not read as having closed the class.
+    const RENDER_BLANK_RESIDUAL: Array<[string, string]> = [
+      ["U+2800 BRAILLE PATTERN BLANK (So)", "\u2800"],
+      ["U+FE0F VARIATION SELECTOR-16 (Mn)", "\ufe0f"],
+      ["U+3164 HANGUL FILLER (Lo)", "\u3164"],
+    ];
+    for (const [name, ch] of RENDER_BLANK_RESIDUAL) {
+      c.check(
+        !isBlank(ch) &&
+          finalAssistantText({ messages: [user("q"), answered("THE REAL ANSWER"), wsText(ch)] }) ===
+            ch,
+        `#195 STATED RESIDUAL: ${name} is not blank and still wins the walk`,
+      );
+    }
     // THE CHANNEL-CROSSING CASE from the issue: pass 1 used to accept the ZWSP text and never
     // reach the reasoning, so a promoted answer was lost AND the receipt recorded no channel.
     c.check(
