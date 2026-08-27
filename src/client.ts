@@ -952,6 +952,12 @@ function isCompactionAppendedUser(m: HistoryMessage): boolean {
  * (1.18.18): `summary?: boolean`, and `mode`/`agent` REQUIRED strings. Any ONE is enough —
  * unlike the user-message legs this is an OR, because a false positive here costs a refusal
  * (loud) while a false negative costs a summary returned as an answer (silent).
+ *
+ * ACCEPTED COST of that OR: a genuine turn served under an agent literally named `compaction`
+ * is skipped too, so `servingAgent` returns `undefined`, the masquerade check fails OPEN (issue
+ * #78's direction) and the call is refused as `empty-answer` rather than named as
+ * `agent-mismatch` — a loss of diagnostic precision, not of the refusal, and `compaction` is
+ * opencode's own reserved compaction agent rather than a name a caller would choose.
  */
 function isCompactionSummary(m: HistoryMessage): boolean {
   if (m.role !== "assistant") return false;

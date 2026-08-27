@@ -1112,6 +1112,55 @@ export async function run(): Promise<number> {
     };
     c.check(finalAssistantText(ordinary) === "REAL ANSWER", "#189: `summary: false` on a normal message changes nothing");
     c.check(servingAgent(ordinary) === "guild-read", "#189: a normal message's agent still reaches servingAgent");
+
+    // THE SUMMARISER LAST, WITH A REAL ANSWER BEHIND IT — the variant every other case here
+    // leaves untested, and the one that fails if any of the five skips is ever written as a
+    // `break` instead of a `continue`. Breaking would end the walk AT the summariser and report
+    // this turn as silent, agentless, zero-cost and error-free while a real answer, a real
+    // provider error and a real tool call sit one message earlier.
+    const behind: SessionHistory = {
+      messages: [
+        u(),
+        {
+          role: "assistant",
+          info: {
+            role: "assistant",
+            finish: "length",
+            agent: "guild-read",
+            cost: 0.5,
+            tokens: { input: 900, output: 77, reasoning: 0, cache: { read: 0, write: 0 } },
+            error: { name: "APIError", data: { message: "REAL-PROVIDER-ERROR", statusCode: 402 } },
+          } as Record<string, unknown>,
+          parts: [
+            { type: "text", text: "REAL ANSWER FROM THE MODEL" },
+            { type: "tool", tool: "read", state: { status: "completed" } },
+          ] as Array<Record<string, unknown>>,
+        },
+        summary({ summary: true }),
+      ],
+    };
+    c.check(
+      finalAssistantText(behind) === "REAL ANSWER FROM THE MODEL",
+      `#189(summary last): the walk continues PAST the summariser to the real answer (got ${JSON.stringify(finalAssistantText(behind))})`,
+    );
+    c.check(servingAgent(behind) === "guild-read", "#189(summary last): and reports the real serving agent, not undefined");
+    c.check(
+      finalAssistantCompletion(behind)?.cost === 0.5 && finalAssistantCompletion(behind)?.tokens?.output === 77,
+      `#189(summary last): the completion is the MODEL'S, not the summariser's zeros (got ${JSON.stringify(finalAssistantCompletion(behind))})`,
+    );
+    c.check(
+      (finalAssistantError(behind) ?? "").includes("REAL-PROVIDER-ERROR"),
+      `#189(summary last): the provider error is the model's, and is still reachable (got ${String(finalAssistantError(behind))})`,
+    );
+    c.check(
+      turnToolCallCount(behind) === 1,
+      `#189(summary last): the model's tool call is counted and the summariser's is not (got ${turnToolCallCount(behind)})`,
+    );
+    const behindTypes = turnAssistantPartTypes(behind);
+    c.check(
+      behindTypes.text === 1 && behindTypes.tool === 1,
+      `#189(summary last): the census is the model's parts alone (got ${JSON.stringify(behindTypes)})`,
+    );
   }
 
   // A `user` message the payload does not mark is still a delimiter — the skip fails toward
