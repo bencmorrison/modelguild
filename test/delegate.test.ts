@@ -2515,7 +2515,8 @@ export async function run(): Promise<number> {
     //     that a refusal may never hide reviewable work.
     {
       const repo = initRepo({ "a.txt": "A\n" });
-      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: tmp("m8-logs-"), GUILD_AGENT_DIR: defDirWithBuild() });
+      const kjLogDir = tmp("m8-logs-");
+      const env = envWith({ GUILD_ROOT: tmp("m8-guild-"), GUILD_LOG_DIR: kjLogDir, GUILD_AGENT_DIR: defDirWithBuild() });
       const fake = await startFakeOpencode({ historyText: "unused", turnShapes: ["rejected"] });
       try {
         const r = await delegate(
@@ -2538,6 +2539,29 @@ export async function run(): Promise<number> {
             readFileSync(r.capture.patchPath, "utf8").includes("+A-CHANGED"),
           "#121(K-j): ...carrying the change, so nothing reviewable was hidden behind a refusal",
         );
+        // C82's SUPERSET, PINNED — this is the one live shape where the spine's turn-side
+        // predicate fires on a call that SUCCEEDED, so the receipt carries diagnostics beside
+        // `exit_code: 0`. Left unasserted, C82's "a superset in the informative direction"
+        // would be a claim about a branch nothing exercises; here it is a fact about K-j.
+        // The discriminator the clause names is asserted too: the sibling `delegate-diff`
+        // entry with `files_changed > 0` is what tells a receipt reader this call DELIVERED,
+        // where an `empty-delegation` writes none.
+        if (r.ok) {
+          const entries = readFileSync(path.join(kjLogDir, r.attribution.runId, "calls.jsonl"), "utf8")
+            .split("\n")
+            .filter((l) => l.length > 0)
+            .map((l) => JSON.parse(l) as Record<string, unknown>);
+          const done = entries.filter((e) => e.type === "call" && e.status === "completed");
+          c.check(
+            done.length === 1 && done[0].exit_code === 0 && done[0].diagnostics !== undefined,
+            "C82(K-j): the superset IS reachable — a SUCCESSFUL call's receipt carries diagnostics",
+          );
+          const diff = entries.filter((e) => e.type === "delegate-diff" && e.call_id === r.attribution.callId);
+          c.check(
+            diff.length === 1 && (diff[0].files_changed as number) > 0,
+            "C82(K-j): ...and the sibling delegate-diff with files_changed > 0 is the discriminator that says so",
+          );
+        }
       } finally {
         await fake.close();
       }

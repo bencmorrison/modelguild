@@ -1603,6 +1603,85 @@ export async function run(): Promise<number> {
   }
 
   {
+    // THE PROVIDER'S STRINGS ARE SANITIZED, AND "NEVER THROWS" WOULD NOT HAVE COVERED THIS.
+    // `finish` and the part-type names are carried verbatim by design (no enum; naming an
+    // unexpected type is the census's value), so they arrive from OUTSIDE this process. A lone
+    // surrogate in one writes perfectly well — C31 holds literally — and then verify() fails
+    // the WHOLE RUN as "not clean JSONL" and jq refuses the file: the field added to protect
+    // the receipts would have destroyed the file holding them. Same C25/jq scar `boundedDetail`
+    // already carries, pointed at the same kind of string (ours to sanitize, unlike
+    // `raw_response`, whose lone surrogate MUST still fail — test 2b).
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "run-hostilediag" });
+    const log = new EvidenceLog({ env });
+    const LONG_TYPE = "x".repeat(500);
+    await log.expect({ callId: "hd", model: "m/x", agent: "guild-read" });
+    const st = await log.started({ callId: "hd", model: "m/x", agent: "guild-read", prompt: "p" });
+    await log.completed({
+      callId: "hd",
+      exit: 1,
+      turn: st.turn,
+      captureState: "complete",
+      response: "",
+      diagnostics: {
+        toolCallCount: 0,
+        completion: { finish: "stop\ud800truncated" },
+        partTypes: { [LONG_TYPE]: 2, "text\udfff": 1 },
+        parts: [{ type: LONG_TYPE, chars: 3 }, { type: "text\udfff", chars: 0 }],
+      },
+    });
+    const file = path.join(dir, "run-hostilediag", "calls.jsonl");
+    c.check(
+      !readFileSync(file, "utf8").includes("\\ud800") && !readFileSync(file, "utf8").includes("\\udfff"),
+      "C82/C25: an unpaired surrogate from the provider never reaches the stored line",
+    );
+    const v = log.verify("run-hostilediag");
+    c.check(v.ok && v.code === 0, "C82/C25: the run VERIFIES — the diagnostics field cannot poison calls.jsonl");
+    const jq = spawnSync("jq", ["-c", "."], { input: readFileSync(file, "utf8"), encoding: "utf8" });
+    c.check(jq.status === 0, "C82/C25: jq still reads the whole file (the tool an auditor actually uses)");
+    const d = (parsed(file).filter((e) => e.status === "completed")[0] as Record<string, unknown>)
+      .diagnostics as Record<string, unknown>;
+    c.check(
+      (d.completion as { finish?: string }).finish === "stoptruncated",
+      "C82: the surrogate is DROPPED from finish, the rest of the value kept",
+    );
+    const boundedType = (d.parts as Array<{ type: string }>)[0].type;
+    c.check(
+      boundedType.length === 128 && Object.prototype.hasOwnProperty.call(d.partTypes, boundedType),
+      "C82: a 500-char part type is bounded, and the census key is bounded the SAME way",
+    );
+  }
+
+  {
+    // Two type names that differ only PAST the cap collide once bounded. Their counts are
+    // ADDED, never overwritten: an over-reported bucket is a wrong number, a dropped one is a
+    // part that vanished from the census entirely.
+    const dir = tmp();
+    const env = envFor(dir, { GUILD_RUN_ID: "run-collide" });
+    const log = new EvidenceLog({ env });
+    await log.expect({ callId: "cl", model: "m/x", agent: "guild-read" });
+    const st = await log.started({ callId: "cl", model: "m/x", agent: "guild-read", prompt: "p" });
+    await log.completed({
+      callId: "cl",
+      exit: 1,
+      turn: st.turn,
+      captureState: "complete",
+      response: "",
+      diagnostics: {
+        toolCallCount: 0,
+        partTypes: { ["y".repeat(130) + "A"]: 2, ["y".repeat(130) + "B"]: 3 },
+      },
+    });
+    const file = path.join(dir, "run-collide", "calls.jsonl");
+    const d = (parsed(file).filter((e) => e.status === "completed")[0] as Record<string, unknown>)
+      .diagnostics as { partTypes: Record<string, number> };
+    c.check(
+      Object.keys(d.partTypes).length === 1 && Object.values(d.partTypes)[0] === 5,
+      "C82: colliding bounded census keys MERGE their counts (2+3), losing no part",
+    );
+  }
+
+  {
     // C31: a diagnostics object that cannot be represented leaves the field ABSENT and never
     // fails the write. The hostile shapes are the ones a wrong caller could actually produce.
     const dir = tmp();

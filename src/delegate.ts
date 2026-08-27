@@ -65,6 +65,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import {
   describeTurnDiagnostics,
+  buildTurnDiagnostics,
   isBlank,
   type ServeProvider,
   type ServeRouter,
@@ -723,15 +724,11 @@ export async function delegate(
     // deletion matrix has already torn it down under `created here + success + !keepSession`.
     // C74's continued-session row — a caller's id kept alive because the caller owns it — has no
     // counterpart here and no new row is added to that matrix.
-    const delegateDiagnostics: TurnDiagnostics = {
-      toolCallCount: outcome.toolCallCount,
-      ...(outcome.completion !== undefined ? { completion: outcome.completion } : {}),
-      ...(outcome.partTypes !== undefined ? { partTypes: outcome.partTypes } : {}),
-      // Issue #191: the ordered, measured census. THIS OBJECT IS ALSO ON THE RECEIPT — the spine
-      // wrote the identical content onto `completed` when the turn came back blank and toolless
-      // (issue #188); see the note beside that write for why the receipt cannot be written here.
-      ...(outcome.parts !== undefined ? { parts: outcome.parts } : {}),
-    };
+    // THE SAME OBJECT IS ALREADY ON THE RECEIPT (issue #188): the spine wrote it onto
+    // `completed` when the turn came back blank and toolless — see the note beside that write
+    // for why it cannot be written from here — and through the SAME builder, so C82's
+    // one-object-two-surfaces claim holds by construction rather than by two literals agreeing.
+    const delegateDiagnostics: TurnDiagnostics = buildTurnDiagnostics(outcome);
     const fail: DelegateFail = {
       ok: false,
       rootConflict,

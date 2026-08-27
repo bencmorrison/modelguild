@@ -1235,38 +1235,23 @@ export function finalAssistantCompletion(history: SessionHistory): TurnCompletio
 }
 
 /**
- * THE TURN'S ASSISTANT PART TYPES, counted (issue #168).
+ * THE TURN'S ASSISTANT PARTS, IN ORDER, WITH THEIR LENGTHS (issue #191).
  *
  * TURN-SCOPED like its neighbours. Assistant messages only: a `user` message's parts are the
  * caller's own prompt and say nothing about what the model produced.
  *
  * The type is read verbatim off the wire and NOT validated against a known set — opencode's
  * `Part` union has twelve members on 1.18.18 and a bump may add more, and the whole value of
- * this field is naming a type the extractor did not expect. A non-string `type` is counted
- * under `"(unknown)"` rather than dropped, for the same reason.
- */
-export function turnAssistantPartTypes(history: SessionHistory): Record<string, number> {
-  const start = turnStartIndex(history);
-  const out: Record<string, number> = {};
-  for (let i = start; i < history.messages.length; i++) {
-    const m = history.messages[i];
-    if (m.role !== "assistant") continue;
-    for (const p of m.parts) {
-      const t = typeof p.type === "string" && p.type.length > 0 ? p.type : "(unknown)";
-      out[t] = (out[t] ?? 0) + 1;
-    }
-  }
-  return out;
-}
-
-/**
- * THE TURN'S ASSISTANT PARTS, IN ORDER, WITH THEIR LENGTHS (issue #191).
+ * this census is naming a type the extractor did not expect. A non-string `type` is recorded
+ * as `"(unknown)"` rather than dropped, for the same reason. Bounding and sanitizing that
+ * string is the EVIDENCE LAYER's job, not this one's (`diagnosticsField` in `src/log.ts`):
+ * here it stays whatever arrived, so a caller reasoning about the turn sees the real value.
  *
- * The census `turnAssistantPartTypes` aggregates, kept ordered and measured — see
- * `TurnDiagnostics.parts` for why a count of types is not enough and why this records lengths
- * and never text. Same turn bound and same assistant-only rule as its neighbour, and the same
- * verbatim `type` handling: this exists to name a part type the extractor did not expect, so
- * validating against a known set would delete the finding.
+ * THE ORDERED FORM IS THE PRIMARY WALK AND `turnAssistantPartTypes` FOLDS IT, deliberately:
+ * `TurnDiagnostics` carries both, and the gate deciding whether either is attached tests only
+ * one of them. Two independent walks would leave that gate sound only for as long as they
+ * happened to agree — a silent coupling no test can see — whereas a fold cannot disagree with
+ * its own input.
  */
 export function turnAssistantParts(history: SessionHistory): TurnPart[] {
   const start = turnStartIndex(history);
@@ -1282,6 +1267,41 @@ export function turnAssistantParts(history: SessionHistory): TurnPart[] {
     }
   }
   return out;
+}
+
+/** THE TURN'S ASSISTANT PART TYPES, counted (issue #168) — the aggregate of
+ * `turnAssistantParts`, folded rather than re-walked so the two cannot diverge. */
+export function turnAssistantPartTypes(history: SessionHistory): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const p of turnAssistantParts(history)) out[p.type] = (out[p.type] ?? 0) + 1;
+  return out;
+}
+
+/**
+ * THE ONE PLACE A `TurnDiagnostics` IS SHAPED (issues #168/#188/#191, C82).
+ *
+ * Three callers build one: the `empty-answer` throw in this file, the lifecycle spine's
+ * receipt write, and `guild_delegate`'s `empty-delegation` refusal. C82's guarantee is that
+ * the receipt and the tool result carry the SAME object — a claim a test can only assert by
+ * deep-equalling one against the other, and one that two hand-written literals make true by
+ * coincidence rather than by construction. This makes it structural.
+ *
+ * Absent stays absent: every optional field is omitted when its source is `undefined`, so an
+ * `AskResult` or a `LifecycleOutcome` carrying no census yields diagnostics with no census
+ * rather than one holding `undefined`.
+ */
+export function buildTurnDiagnostics(src: {
+  toolCallCount: number;
+  completion?: TurnCompletion;
+  partTypes?: Record<string, number>;
+  parts?: TurnPart[];
+}): TurnDiagnostics {
+  return {
+    toolCallCount: src.toolCallCount,
+    ...(src.completion !== undefined ? { completion: src.completion } : {}),
+    ...(src.partTypes !== undefined ? { partTypes: src.partTypes } : {}),
+    ...(src.parts !== undefined ? { parts: src.parts } : {}),
+  };
 }
 
 /**
@@ -1938,12 +1958,17 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
       // ordinary result carries no new field at all (C29's optional-field rule).
       const answerChannel = finalAssistantChannel(history);
       if (opts.requireAnswer === true && isBlank(text)) {
-        throw new EmptyAnswerError(sessionId, text, providerError, {
-          toolCallCount,
-          ...(completion !== undefined ? { completion } : {}),
-          ...(hasPartTypes ? { partTypes } : {}),
-          ...(hasPartTypes ? { parts: turnParts } : {}),
-        });
+        throw new EmptyAnswerError(
+          sessionId,
+          text,
+          providerError,
+          buildTurnDiagnostics({
+            toolCallCount,
+            completion,
+            partTypes: hasPartTypes ? partTypes : undefined,
+            parts: hasPartTypes ? turnParts : undefined,
+          }),
+        );
       }
 
       const result: AskResult = {

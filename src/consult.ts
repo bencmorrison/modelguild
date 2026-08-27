@@ -39,6 +39,7 @@ import {
   AgentFloorNotInForceError,
   SessionPermissionMismatchError,
   isBlank,
+  buildTurnDiagnostics,
   type PreTurnAgentCheck,
   type ServeProvider,
   type ServeRouter,
@@ -1213,12 +1214,19 @@ export async function runAgentLifecycle(
     // diagnostics here on the TURN-SIDE half of `nothingDelivered` — blank answer AND no tool
     // calls — which is what this does.
     //
-    // WHAT THAT COSTS, STATED: the condition is a SUPERSET of the refusal by exactly the
-    // `capture.filesChanged === 0` guard, so a turn that made no tool calls, said nothing, and
-    // somehow changed files would carry diagnostics on a receipt whose call SUCCEEDED. A model
-    // that reached for no tool cannot have edited a file (C74's own reasoning), so that is not a
-    // shape anyone has produced — and if it ever appears, a diagnosed receipt is the surface you
-    // would want it on. It is a superset in the informative direction, never a gap.
+    // WHAT THAT COSTS, STATED, AND THE SHAPE IT COSTS ON IS REAL — do not write it off as
+    // hypothetical. The condition is a SUPERSET of the refusal by exactly the
+    // `capture.filesChanged === 0` guard, so a turn that made no tool calls and said nothing
+    // beside a tree that changed anyway carries diagnostics on a receipt whose call SUCCEEDED.
+    // `test/delegate.test.ts` K-j has produced exactly that since issue #121 — the mutation is
+    // external to the model (a concurrent writer, a path opencode itself touched) — and issue
+    // #189 gives it a production route, since tool calls made before a context compaction are
+    // invisible to `turnToolCallCount`. So the honest statement is not "nothing produces this";
+    // it is that on such a receipt `exit_code` is 0 and the diagnostics describe a turn that
+    // DID deliver. **The discriminator a receipt reader needs is the sibling `delegate-diff`
+    // entry under the same `call_id`: present with `files_changed > 0` means work was
+    // delivered; absent means the tool refused as `empty-delegation`.** A superset in the
+    // informative direction, then, never a gap — but one that needs that sentence beside it.
     //
     // NO READ-PATH ENTRY MOVES. `requireAnswer` throws on a blank answer, so a read tool never
     // reaches this line with one — the branch is unreachable for `guild_consult`/`guild_panel`/
@@ -1234,18 +1242,10 @@ export async function runAgentLifecycle(
       // Issue #168: absent unless the answer was promoted off a non-text channel, so an
       // ordinary call's entry is byte-identical to a pre-#168 one.
       ...(result.answerChannel !== undefined ? { answerChannel: result.answerChannel } : {}),
-      // Built from the same three values `guild_delegate` builds `delegateDiagnostics` from,
-      // so the receipt and that refusal's `error.diagnostics` are the same object's content.
-      ...(silentTurn
-        ? {
-            diagnostics: {
-              toolCallCount: result.toolCallCount,
-              ...(result.completion !== undefined ? { completion: result.completion } : {}),
-              ...(result.partTypes !== undefined ? { partTypes: result.partTypes } : {}),
-              ...(result.parts !== undefined ? { parts: result.parts } : {}),
-            } satisfies TurnDiagnostics,
-          }
-        : {}),
+      // Through the SHARED builder `guild_delegate`'s refusal also calls, so "the receipt and
+      // the tool result carry the same object" is structural rather than two literals that
+      // happen to agree today.
+      ...(silentTurn ? { diagnostics: buildTurnDiagnostics(result) } : {}),
     });
     const ok: LifecycleOutcome = {
       ok: true,

@@ -126,6 +126,22 @@ function policyFields(
  * the one that would have been written before this existed. Losing a diagnostic is a cost;
  * failing the call that carries it is not on the table.
  *
+ * **AND "NEVER THROWS" IS NOT THE SAME AS "NEVER DAMAGES THE FILE", WHICH IS WHY EVERY STRING
+ * HERE GOES THROUGH `boundedDetail`.** Three of them arrive from OUTSIDE this process — the
+ * provider's `finish`, and the part `type` names that reach both `parts[].type` and the
+ * `partTypes` keys — and all three are carried verbatim on purpose (`finish` has no enum,
+ * and naming an unexpected part type is the census's whole value). A lone surrogate in any of
+ * them writes perfectly well and then makes `verify()` fail the WHOLE RUN as "not clean
+ * JSONL", with `jq` refusing the file: a field added to protect the receipts would have
+ * destroyed the file holding them. That is the C25/jq scar `boundedDetail` already carries,
+ * and its rule applies unchanged here — sanitizing is legitimate **because this field is
+ * OURS**, synthesized metadata about a turn, not `raw_response`'s byte-exact receipt of
+ * another party's words. Bounding also caps a hostile or bloated type name.
+ *
+ * Two bounded keys can collide (two long type names differing only past the cap), so the
+ * `partTypes` counts are ADDED rather than overwritten — a merged count over-reports one
+ * bucket, a dropped one loses a part entirely.
+ *
  * THE INNER KEYS STAY camelCase, AGAINST THIS FILE'S OWN snake_case CONVENTION, and that is a
  * decision rather than an oversight: the point of the field is that the receipt and the tool
  * result cannot disagree, which is a property a test asserts by DEEP-EQUALLING one against the
@@ -133,6 +149,12 @@ function policyFields(
  * every reader would have to hold a translation table, and the drift this closes would reopen
  * one level down. The entry's own top-level fields are unaffected and stay snake_case.
  */
+/** Cap for the three provider-supplied strings in `diagnostics`. Far shorter than
+ * `boundedDetail`'s 1000-code-point default for a crash message, because these are an
+ * enum-shaped `finish` and part-type identifiers — long enough that a real value is never
+ * truncated, short enough that a hostile one cannot pad the entry. */
+const DIAG_STRING_MAX = 128;
+
 function diagnosticsField(d: TurnDiagnostics | undefined): { [k: string]: JsonValue } {
   if (d === undefined) return {};
   try {
@@ -145,7 +167,7 @@ function diagnosticsField(d: TurnDiagnostics | undefined): { [k: string]: JsonVa
       const comp: { [k: string]: JsonValue } = {};
       // Opaque by contract: `finish` has no enum in opencode's own schema (C74), so it is
       // carried as whatever string arrived and no vocabulary is asserted about it.
-      if (typeof c.finish === "string") comp.finish = c.finish;
+      if (typeof c.finish === "string") comp.finish = boundedDetail(c.finish, DIAG_STRING_MAX);
       if (typeof c.cost === "number" && Number.isFinite(c.cost)) comp.cost = c.cost;
       const t = c.tokens;
       if (t !== undefined && t !== null) {
@@ -162,7 +184,10 @@ function diagnosticsField(d: TurnDiagnostics | undefined): { [k: string]: JsonVa
       const pt: { [k: string]: JsonValue } = {};
       for (const k of Object.keys(d.partTypes)) {
         const v = d.partTypes[k];
-        if (typeof v === "number" && Number.isFinite(v)) pt[k] = v;
+        if (typeof v !== "number" || !Number.isFinite(v)) continue;
+        const key = boundedDetail(k, DIAG_STRING_MAX);
+        const prev = pt[key];
+        pt[key] = (typeof prev === "number" ? prev : 0) + v;
       }
       if (Object.keys(pt).length > 0) out.partTypes = pt;
     }
@@ -170,7 +195,7 @@ function diagnosticsField(d: TurnDiagnostics | undefined): { [k: string]: JsonVa
       const parts: JsonValue[] = [];
       for (const p of d.parts) {
         if (p === undefined || p === null || typeof p.type !== "string") continue;
-        const one: { [k: string]: JsonValue } = { type: p.type };
+        const one: { [k: string]: JsonValue } = { type: boundedDetail(p.type, DIAG_STRING_MAX) };
         if (typeof p.chars === "number" && Number.isFinite(p.chars)) one.chars = p.chars;
         parts.push(one);
       }
