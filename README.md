@@ -28,6 +28,7 @@ Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:
 - **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)** — install, register, verify, update, uninstall
 - **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)** — picking models, the policy and config files, timeouts, permission prompts
 - **[docs/operations.md](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md)** — watching a call live, approving before it acts, the evidence log, troubleshooting
+- **[docs/backend-requirements.md](https://github.com/bencmorrison/modelguild/blob/main/docs/backend-requirements.md)** — what ModelGuild needs of the CLI underneath it, and what each tool does when it isn't there
 - [Notes & limits](#notes--limits) · [Bugs & feedback](#bugs--feedback)
 - [Working on ModelGuild itself](#working-on-modelguild-itself) — and **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)**
 
