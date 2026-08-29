@@ -1,14 +1,14 @@
 # Backend requirements — what ModelGuild needs to run a model
 
-What a backend has to provide for ModelGuild's published guarantees to hold, and what each tool does when it cannot. **opencode is the reference backend**: every requirement below is stated in the abstract and then, on one line, as the thing opencode actually does, with the file that reads it. This is an inventory of requirements, not an evaluation — **no CLI is assessed here**, and nothing below claims a second backend exists. Back to [README.md](../README.md).
+What a backend has to provide for ModelGuild's tools and receipts to work as documented, and what each tool does when it cannot. **opencode is the reference backend**: every requirement below is stated in the abstract and then, on one line, as the thing opencode actually does, with the file that reads it. Not all of it is a gate: the permission model (§7) is optional for a substitute, and ModelGuild is a way to reach another model and keep receipts of what it said, not a way to fence one. This is an inventory of requirements, not an evaluation — **no CLI is assessed here**, and nothing below claims a second backend exists. Back to [README.md](../README.md).
 
-- [The requirements](#the-requirements) — [lifecycle](#1-process-lifecycle), [the turn](#2-the-model-turn), [transcript](#3-transcript-readback), [permissions](#4-permission-model-with-readback), [events and gating](#5-event-stream-and-gating), [enumeration](#6-model-enumeration), [auth](#7-auth)
+- [The requirements](#the-requirements) — [lifecycle](#1-process-lifecycle), [the turn](#2-the-model-turn), [transcript](#3-transcript-readback), [events and gating](#4-event-stream-and-gating), [enumeration](#5-model-enumeration), [auth](#6-auth), [permissions, optional](#7-permission-model-with-readback)
 - [When a requirement is missing](#when-a-requirement-is-missing)
 - [Not a backend concern](#not-a-backend-concern)
 
 ## The requirements
 
-In dependency order: each one assumes the ones above it.
+In dependency order: each one assumes the ones above it. The last is optional — a substitute need not provide it, and nothing else here rests on it.
 
 ### 1. Process lifecycle
 
@@ -34,15 +34,7 @@ In dependency order: each one assumes the ones above it.
 
 **Minimum for a substitute:** an authoritative post-turn transcript carrying every part type — text, reasoning, and tool calls with their inputs and outputs — with the answer's bytes unmodified, and **a per-turn delimiter**. The delimiter is a hard conformance requirement, not a nicety: without one the backward walk that assembles an answer reaches into the previous turn and records it as this one, with `exit_code: 0` and a confident answer to a different question. It must also be a delimiter the backend marks as the *caller's* — opencode's own compaction appends `user` messages mid-turn, and reading those as boundaries truncates the turn and under-counts its tool calls. A backend that streams tokens and keeps no transcript can still be supported, but byte-exactness then becomes a property of the adapter's reassembly rather than of the wire, which is a weaker claim than the receipts make today and has to be labelled as one.
 
-### 4. Permission model, with readback
-
-**Used by** the four hardened tools, and it is what C16, C47/C48 and C73 are about.
-
-**opencode** resolves an agent definition from the serve cwd's `.opencode/agent/` or the global opencode agent dir, whose presence is checked before the call (`src/config.ts:243`); `GET /agent` then returns every agent **as opencode resolved it**, with its permission rule array (`src/client.ts:506`), and the effective action for a sentinel tool no definition grants must come back `deny` (`src/agentfloor.ts:180`, probe name at `src/agentfloor.ts:103`).
-
-**Minimum for a substitute:** three things, and all three together. (a) The backend enforces a declarative per-agent permission map itself. (b) It will report what it **resolved**, not what the file said. (c) The map can express a catch-all, so a default-deny floor is representable at all. (a) without (b) is a configuration that fails silently — the entire reason the check has a second stage is that a presence test cannot answer whether the floor is in force. Absent any of the three, `agent-def-missing` and `agent-unhardened` have nothing to check.
-
-### 5. Event stream and gating
+### 4. Event stream and gating
 
 **Used by** the live activity trace (C59–C64) and the opt-in approval bridge (C65–C69).
 
@@ -52,15 +44,15 @@ In dependency order: each one assumes the ones above it.
 
 **Minimum for gating**, which is a strictly larger ask: a ruleset attachable to one session or turn that the backend **echoes back**, so "did the gate take?" is answerable without trusting it; a signal that a request was raised; an endpoint that settles one; and the load-bearing one — the backend must genuinely **block** the tool call until the request is settled. A backend that runs the tool while the prompt is still outstanding cannot be gated, and a bridge reporting itself armed over it is exactly the outcome C69 exists to forbid.
 
-### 6. Model enumeration
+### 5. Model enumeration
 
 **Used by** `guild_models` and `/guild:configure`.
 
 **opencode** answers `GET /config/providers` with the authed provider configuration (`src/models.ts:162`) — per provider, not per model, so a listed id can still be rejected at call time.
 
-**Minimum for a substitute:** a list of ids the user's auth can actually reach, in the same `provider/model` shape the policy layer matches on. A backend without it can still run a model the user names, so this is the one requirement whose absence costs a convenience rather than a guarantee — but `/guild:configure` has nothing to interview the user about.
+**Minimum for a substitute:** a list of ids the user's auth can actually reach, in the same `provider/model` shape the policy layer matches on. A backend without it can still run a model the user names, so its absence costs a convenience rather than a guarantee — but `/guild:configure` has nothing to interview the user about.
 
-### 7. Auth
+### 6. Auth
 
 **Used by** nothing on the model path: ModelGuild reads no credential to make a call.
 
@@ -68,17 +60,25 @@ In dependency order: each one assumes the ones above it.
 
 **Minimum for a substitute:** the backend holds its own credentials. ModelGuild stores, forwards and reads no API key, so a backend that requires one to be handed to ModelGuild does not meet this requirement as it is currently stated — changing that is a product decision about the no-API-keys claim, not an adapter detail. A backend whose auth state cannot be probed costs `doctor` a check, not a call: report *unknown*, never *unauthenticated*.
 
+### 7. Permission model, with readback
+
+**Used by** the four hardened tools **on opencode** — C16, C47/C48 and C73 check that opencode is applying the definition it resolved. That is a property of the opencode path, not the point of ModelGuild, and not a bar a substitute has to clear.
+
+**opencode** resolves an agent definition from the serve cwd's `.opencode/agent/` or the global opencode agent dir, whose presence is checked before the call (`src/config.ts:243`); `GET /agent` then returns every agent **as opencode resolved it**, with its permission rule array (`src/client.ts:506`), and the effective action for a sentinel tool no definition grants must come back `deny` (`src/agentfloor.ts:180`, probe name at `src/agentfloor.ts:103`).
+
+**Minimum for a substitute: none — this one is optional** (maintainer decision, issue #21). Hardening was never the point, and a model on a substitute backend should run whatever tooling helps it. Where a backend provides a permission model ModelGuild may use it; where it provides none the model runs with the backend's default tool access. Either way the result states which, because *which fence was in force* is a fact about the answer the reader is owed, not a gate on getting one. Where one is offered, three properties decide whether it is usable rather than decorative: the backend enforces the map itself, it reports what it **resolved** rather than what the file said, and the map can express a catch-all so a default-deny floor is representable at all. Enforcement without readback is a configuration that fails silently — the entire reason opencode's check has a second stage is that a presence test cannot answer whether the floor is in force. `agent-def-missing` and `agent-unhardened` are opencode-specific: on a backend with no permission model they have nothing to check, and their absence is not a missing guarantee.
+
 ## When a requirement is missing
 
 Three tiers, and the boundaries between them are deliberate.
 
-**Hard refuse.** No permission model with readback (§4) ⇒ the four hardened tools refuse on that backend, with a named kind, before any model turn, any session and any evidence entry. Every published guarantee about those tools is a permission-model guarantee; offering them unenforced converts what SECURITY.md calls *verified* into model compliance. One exception is worth arguing rather than assuming: a backend with **no tool surface at all** is trivially read-only, and could serve the read tools with the capability difference stated — that is a capability reduction, not an unenforced claim, and it is a maintainer's call.
+**Hard refuse.** Reserved for what cannot be served at all, which is two things. No headless surface (§1) — a backend that cannot be started, driven and stopped without a human at a terminal — leaves nothing to call, so there is nothing to degrade to. No transcript readback of any kind (§3) ⇒ refuse rather than answer, and that is the judgement in this tier worth pressing on: the receipts are the product, so a `completed` entry whose `raw_response` is the adapter's paraphrase is worse than no receipt at all, because it reads as one. Two neighbours are deliberately outside the tier. A backend that streams and keeps no transcript, but whose stream the adapter can reassemble, is the degrade case below — supported, with byte-exactness labelled as a property of the reassembly rather than of the wire. A backend with a transcript but **no caller-marked turn delimiter** is a refusal again, because the walk that assembles an answer then reaches into the previous turn and records it as this one with `exit_code: 0`.
 
-**Degrade loudly.** No event stream (§5) ⇒ `activity.degraded` carrying a reason that names the cause, never a silently empty trace. No lifecycle control (§1) — a remote or in-process backend with nothing to kill — ⇒ the no-orphan guarantee reported *not applicable*, not quietly claimed. Degradation is for visibility; it is never a substitute for enforcement.
+**Degrade loudly.** No event stream (§4) ⇒ `activity.degraded` carrying a reason that names the cause, never a silently empty trace. No lifecycle control (§1) — a remote or in-process backend with nothing to kill — ⇒ the no-orphan guarantee reported *not applicable*, not quietly claimed. Degradation is for visibility; it is never a substitute for enforcement.
 
-**Refuse to arm.** `GUILD_APPROVE` or `GUILD_APPROVE_EGRESS` set on a backend that cannot gate (§5) ⇒ refuse the call up front. Never silently un-arm: a user who set the knob believes edits are gated, and a typo in that knob is already an error rather than a quiet `off`.
+**Refuse to arm.** `GUILD_APPROVE` or `GUILD_APPROVE_EGRESS` set on a backend that cannot gate (§4) ⇒ refuse the call up front. Never silently un-arm: a user who set the knob believes edits are gated, and a typo in that knob is already an error rather than a quiet `off`.
 
-**What exists today, and what does not.** All three tiers exist as *shapes* — but as refusals inside the one backend, not as a backend-capability branch. `agent-def-missing` (C16, `src/consult.ts:1401` and its three siblings) and `agent-unhardened` (C73, `src/panel.ts:394`) are the hard-refuse shape; `activity.degraded` (C61) is the degrade-loudly shape; C67's refusal when no channel can answer, and C65's error on an unrecognized knob value, are the refuse-to-arm shape. **The per-backend rules above are not implemented** — there is one backend, and no capability declaration to branch on. Treat this section as the specification a second backend would have to satisfy, and do not cite it as behaviour.
+**What exists today, and what does not.** The tiers exist as *shapes* — refusals and degradations inside the one backend, not a backend-capability branch. `agent-def-missing` (C16, `src/consult.ts:1401` and its three siblings) and `agent-unhardened` (C73, `src/panel.ts:394`) refuse with a named kind before any model turn, any session and any evidence entry, which is the shape a hard refuse takes — but they are opencode's checks over §7, not instances of the tier above, and a backend without a permission model is not refused for lacking them. `activity.degraded` (C61) is the degrade-loudly shape; C67's refusal when no channel can answer, and C65's error on an unrecognized knob value, are the refuse-to-arm shape. **The per-backend rules above are not implemented** — there is one backend, and no capability declaration to branch on. Treat this section as the specification a second backend would have to satisfy, and do not cite it as behaviour.
 
 ## Not a backend concern
 
