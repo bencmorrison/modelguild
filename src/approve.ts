@@ -625,6 +625,10 @@ export function checkStoredRuleset(
     const action = typeof s.action === "string" ? s.action : "";
     const permission = typeof s.permission === "string" ? s.permission : "";
     if (action === "ask") continue;
+    // `readPaths` is the one non-approval rule the read lifecycle generates. Its paths were
+    // canonicalized before this session was created; it extends only opencode's directory
+    // fence, never the agent's tool allow-set.
+    if (action === "allow" && permission === "external_directory") continue;
     // A non-`ask` rule is only acceptable for a tool the def ALREADY allows — anything else
     // is the session having been widened past the agent's own permission map.
     if (!allowSet.has(permission)) {

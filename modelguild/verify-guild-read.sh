@@ -142,6 +142,63 @@ else
   pass "no file created and opencode exited 0 (consistent with mutation deny)"
 fi
 rm -f "$probe"
+
+echo "== 4. RUNTIME (issue #221): explicit external read path =="
+# This is the end-to-end proof the `readPaths` feature needs: a session rule must allow an
+# out-of-root read, but the turn must still be served by guild-read. A raw v2 permission
+# evaluation is deliberately not used here: it does not consult the v1 session rules.
+command -v curl >/dev/null 2>&1 || { inc "curl is unavailable — cannot probe session-scoped external_directory"; }
+if command -v curl >/dev/null 2>&1; then
+  depdir="$(mktemp -d)"
+  depfile="$depdir/evidence.txt"
+  mkdir "$depdir/nested"
+  nested="$depdir/nested/evidence.txt"
+  sibling="${depdir}-sibling"
+  mkdir "$sibling"
+  printf 'MODEL-GUILD-READ-PROBE\n' >"$depfile"
+  printf 'MODEL-GUILD-READ-PROBE\n' >"$nested"
+  printf 'MODEL-GUILD-READ-PROBE\n' >"$sibling/evidence.txt"
+  port=$((40000 + (RANDOM % 20000)))
+  serve_log="$(mktemp)"
+  opencode serve --port "$port" --hostname 127.0.0.1 >"$serve_log" 2>&1 &
+  serve_pid=$!
+  ready=""
+  for _ in $(seq 1 60); do
+    curl -sf -m 2 "http://127.0.0.1:$port/doc" -o /dev/null 2>/dev/null && { ready=1; break; }
+    kill -0 "$serve_pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ -z "$ready" ]; then
+    inc "opencode serve did not start — external-directory runtime probe could not run"
+  else
+    provider="${model%%/*}"
+    model_id="${model#*/}"
+    create="$(jq -nc --arg a "$agent" --arg p "$depdir/*" --arg provider "$provider" --arg model_id "$model_id" '{agent:$a,title:"guild-read external-directory probe",model:{providerID:$provider,id:$model_id},permission:[{permission:"external_directory",pattern:$p,action:"allow"}]}')"
+    session="$(curl -sS -m 20 -X POST "http://127.0.0.1:$port/session" -H 'content-type: application/json' -d "$create" | jq -r '.id // empty')"
+    if [ -z "$session" ]; then
+      inc "could not create a guild-read session with an external-directory rule"
+    else
+      prompt="$(jq -nc --arg a "$agent" --arg read "$nested" --arg root "$depdir" --arg sibling "$sibling/evidence.txt" '{agent:$a,parts:[{type:"text",text:("Use read on " + $read + ", glob to locate evidence.txt beneath " + $root + ", grep for MODEL-GUILD-READ-PROBE beneath " + $root + ", then try read on " + $sibling + ". Reply only after all four tool calls.")}]}')"
+      curl -sS -m 120 -X POST "http://127.0.0.1:$port/session/$session/message" -H 'content-type: application/json' -d "$prompt" -o /dev/null 2>&1
+      history="$(curl -sS -m 20 "http://127.0.0.1:$port/session/$session/message" 2>/dev/null)"
+      if printf '%s' "$history" | jq -e --arg a "$agent" --arg p "$nested" --arg root "$depdir" --arg sibling "$sibling/evidence.txt" '
+        any(.[]; .info.role == "assistant" and .info.agent == $a) and
+        any(.[]; any(.parts[]?; .type == "tool" and .tool == "read" and .state.input.filePath == $p and .state.status == "completed")) and
+        any(.[]; any(.parts[]?; .type == "tool" and .tool == "glob" and .state.status == "completed")) and
+        any(.[]; any(.parts[]?; .type == "tool" and .tool == "grep" and .state.status == "completed")) and
+        any(.[]; any(.parts[]?; .type == "tool" and .tool == "read" and .state.input.filePath == $sibling and .state.status == "error"))' >/dev/null 2>&1; then
+        pass "guild-read allows nested read/grep/glob under its session rule and denies a sibling path"
+      else
+        bad "external-directory rule did not allow nested read/grep/glob and deny the sibling path under guild-read"
+        printf '     history: %s\n' "$(printf '%s' "$history" | jq -c '[.[] | {role:.info.role,agent:.info.agent,parts:[.parts[]? | {type,tool,state}]}]' 2>/dev/null || printf '%s' "$history")"
+      fi
+      curl -sS -m 5 -X DELETE "http://127.0.0.1:$port/session/$session" -o /dev/null 2>&1 || true
+    fi
+  fi
+  kill "$serve_pid" 2>/dev/null || true
+  wait "$serve_pid" 2>/dev/null || true
+  rm -rf "$depdir" "$sibling" "$serve_log"
+fi
 fi  # end runtime probes (skipped under --static)
 
 echo

@@ -105,6 +105,17 @@ function resolveWorktreeArg(
   return { value: raw };
 }
 
+function resolveReadPathsArg(
+  tool: string,
+  raw: unknown,
+): { value: string[] | undefined } | { error: string } {
+  if (raw === undefined) return { value: undefined };
+  if (!Array.isArray(raw) || !raw.every((path) => typeof path === "string" && path.trim().length > 0)) {
+    return { error: `${tool}: 'readPaths' must be an array of non-empty directory paths.` };
+  }
+  return { value: raw as string[] };
+}
+
 /* `resolveRunIdArg` — the `runId` counterpart of `resolveTimeoutArg` — lives in
  * `src/log.ts` beside the grammar it enforces, so it can be unit-tested: importing THIS
  * file constructs the MCP server and connects the stdio transport at module top level. */
@@ -292,6 +303,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "CONTINUATION do not repeat it: the root is inherited from the session itself, " +
               "and a worktree that disagrees with the session's own directory is refused.",
           },
+          readPaths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional explicit dependency directories to allow this fresh read-only session to inspect. Each existing path is canonicalized and becomes a session-scoped external-directory grant; it may reach the model provider. Not supported with sessionId.",
+          },
           timeoutMs: TIMEOUT_MS_PROP,
         },
         required: ["question"],
@@ -368,6 +384,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "server was launched in. It widens what the external model can read — and therefore what " +
               "can reach a third-party provider — by exactly that worktree.",
           },
+          readPaths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional explicit dependency directories every panel member may inspect. Each existing path is canonicalized and may reach the model provider.",
+          },
           timeoutMs: TIMEOUT_MS_PROP,
         },
         required: ["question"],
@@ -430,6 +451,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "can reach a third-party provider — by exactly that worktree. On a sessionId " +
               "CONTINUATION do not repeat it: the root is inherited from the session itself, " +
               "and a worktree that disagrees with the session's own directory is refused.",
+          },
+          readPaths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional explicit dependency directories this fresh read-only session may inspect. Each existing path is canonicalized and may reach the model provider.",
           },
           timeoutMs: TIMEOUT_MS_PROP,
         },
@@ -622,6 +648,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in wt) {
       return { content: [{ type: "text", text: wt.error }], isError: true };
     }
+    const readPaths = resolveReadPathsArg(CONSULT_TOOL, a.readPaths);
+    if ("error" in readPaths) return { content: [{ type: "text", text: readPaths.error }], isError: true };
     const result = await withProgress(progressExtra, CONSULT_TOOL, (onActivity) =>
       consult(
         {
@@ -632,6 +660,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
           keepSession: a.keepSession === true,
           worktree: wt.value,
+          readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
         { serve: lifecycle, router: servePool, onActivity, elicitation },
@@ -673,6 +702,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in wt) {
       return { content: [{ type: "text", text: wt.error }], isError: true };
     }
+    const readPaths = resolveReadPathsArg(PANEL_TOOL, a.readPaths);
+    if ("error" in readPaths) return { content: [{ type: "text", text: readPaths.error }], isError: true };
     const result = await withProgress(progressExtra, PANEL_TOOL, (onActivity) =>
       panel(
         {
@@ -682,6 +713,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           confirmed: a.confirmed === true,
           keepSessions: a.keepSessions === true,
           worktree: wt.value,
+          readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
         { serve: lifecycle, router: servePool, onActivity, elicitation },
@@ -711,6 +743,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     if ("error" in wt) {
       return { content: [{ type: "text", text: wt.error }], isError: true };
     }
+    const readPaths = resolveReadPathsArg(RESEARCH_TOOL, a.readPaths);
+    if ("error" in readPaths) return { content: [{ type: "text", text: readPaths.error }], isError: true };
     const result = await withProgress(progressExtra, RESEARCH_TOOL, (onActivity) =>
       research(
         {
@@ -719,6 +753,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           runId: rid.value,
           confirmed: a.confirmed === true,
           worktree: wt.value,
+          readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
         { serve: lifecycle, router: servePool, onActivity, elicitation },
