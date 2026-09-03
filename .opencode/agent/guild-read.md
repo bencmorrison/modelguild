@@ -17,13 +17,14 @@ mode: all
 permission:
   # DEFAULT-DENY ALLOWLIST scoped to a review subagent's tools. `"*": deny` flips
   # opencode's built-in `"*": allow` catch-all (last-match-wins), so EVERY tool —
-  # bash, edit, write, patch, task, todowrite, lsp, skill, and anything a future
-  # opencode adds — is denied unless re-allowed below. The granted capabilities are
-  # exactly a read-only reviewer's: read + grep + glob + web fetch/search.
+  # bash, edit, write, patch, task, and anything a future opencode adds — is denied
+  # unless re-allowed below. The granted capabilities are a read-only reviewer's:
+  # read + grep + glob + web fetch/search, plus todowrite/lsp/skill.
   #
   # KEEP no-write and no-`task`: they are the ROLE (a read-only consultant), the same
   # scoping you'd give a Claude reviewer — `task` would escape to a write-capable
-  # agent. That scoping stays; it is role definition, not a floor.
+  # agent, and a Claude Code subagent has no Agent tool either. That scoping stays; it is
+  # role definition, not a floor.
   #
   # The former secret-glob read-denies and the grep/glob denies were REMOVED
   # (2026-07-22 permission realignment): both were vendor-asymmetry bias in a
@@ -47,6 +48,14 @@ permission:
   glob: allow
   webfetch: allow
   websearch: allow
+  # Every Claude Code subagent has these three, and none of them mutates the repo or
+  # spawns an agent: task-list bookkeeping, LSP queries, and loading a skill (opencode
+  # discovers .claude/skills natively, so these are the driver's own skills). Denying
+  # them was vendor-asymmetry with no harness difference behind it; re-allowed
+  # 2026-09-03 (maintainer, PARITY).
+  todowrite: allow
+  lsp: allow
+  skill: allow
   # NOTE: guild-read and guild-research now have IDENTICAL permission maps.
   # This convergence is expected (both are the read-only ROLE). Do NOT merge the two
   # defs — both names are referenced by commands (guild-read: consult/panel/review/
