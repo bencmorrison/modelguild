@@ -176,7 +176,7 @@ Milestone history is in git history.
 - **C76** (added 2026-08-03, issue #151) — **The MCP handshake's `serverInfo.version` is the RUNNING package's real version**, resolved by `packageVersion(PACKAGE_ROOT)` imported from `src/init.ts` — the same `import.meta.url`-derived root C72 defines as "shipped", so it is correct under `npx`, `npm i -g` and a source checkout alike and is not redirectable by a cwd or an env var. It was hardcoded `"0.0.0"`, so the one surface every MCP client sees identified nothing while README's bug-report checklist asked for it. **A resolution failure falls back to `"0.0.0"` rather than throwing** — `packageVersion` returns `""` on an unreadable `package.json` and never throws, and start-up must not break over a version string.
 
 ## G. Security doctrine invariants
-*Oracle: `.opencode/agent/guild-*.md`; `AGENTS.md` Conventions/Gotchas; `check-agent-permissions.sh`; `verify-guild-*.sh`.*
+*Oracle: `.opencode/agent/guild-*.md`; `AGENTS.md` Conventions and `docs/architecture.md` (the hardened agent defs); `check-agent-permissions.sh`; `verify-guild-*.sh`.*
 
 > **Amended 2026-07-22 (permission realignment) — supersedes the original area-G freeze on the secret-glob model.** C48–C50 below are the amended text; the read paths (`guild-read`/`guild-research`) now carry a Claude review subagent's tools (`read`+`grep`+`glob`+web) with **no** secret-glob read-denies and **no** `grep`/`glob` denials, per the maintainer decision recorded in AGENTS.md Conventions (PARITY, the 2026-07-22 permission realignment). The default-deny-allowlist *shape* (C47) is unchanged; only the read-path allow-sets and the harness-difference justification changed.
 

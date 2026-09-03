@@ -15,6 +15,22 @@
 # catch semantic restatement in novel words (a shared rule paraphrased so no literal
 # marker fires); that half stays human judgment in review.
 #
+# AGENTS.md's own account of that history, moved here from its intro when the file was
+# cut to the always-loaded shape:
+# **This relationship is machine-checked again — structurally.** `CLAUDE.md` was once a
+# *symlink* to this file (divergence impossible by construction); later a regular file guarded
+# by `doctor.sh` (which checked the `@AGENTS.md` import, the four unique guardrails, and a
+# 60-line anti-fork ceiling); then, when the bash `doctor.sh` retired with the bash layer
+# (M12), nothing — `modelguild doctor` does not check this repo-internal invariant, so the
+# thin-pointer shape was hand-held discipline for a while. **`modelguild/tests/check-claude-
+# md.sh` (CI, issue #28) restored the mechanical half:** it asserts the `@AGENTS.md` first
+# line, that `CLAUDE.md` is a regular file (not a symlink), the 60-line ceiling, and that no
+# distinctive literal marker of a shared rule (`default-deny`, `Every script starts with`, the
+# PARITY forcing question, …) has been copied down. What it **cannot** catch is a shared rule
+# *paraphrased in novel words* so no literal marker fires — **that** half is still judgment,
+# held by hand in review. The evidence log and the test suite remain the mechanical controls
+# for everything else.
+#
 # Opencode-free and token-free, so CI (the shell + macOS jobs) runs it. bash-3.2-safe
 # (the macOS CI job runs stock bash 3.2 + BSD awk/grep).
 #
@@ -121,6 +137,18 @@ else
   done
 fi
 
+# Path-scoped rules in .claude/rules/ load beside CLAUDE.md (Claude Code on a matching path,
+# opencode through opencode.json's `instructions`), so a rule that restates a shared rule is
+# the CLAUDE.md fork under a new filename — the shape issue #122 named. Same tripwires.
+for rule in .claude/rules/*.md; do
+  [ -e "$rule" ] || continue
+  for m in ${markers[@]+"${markers[@]}"}; do
+    if grep -Fiq -- "$m" "$rule"; then
+      bad "$rule contains the shared-rule marker '$m'; that rule belongs in AGENTS.md, not restated in a path-scoped rule (point at AGENTS.md instead)"
+    fi
+  done
+done
+
 [ "$failed" -eq 0 ] || exit 1
 echo "CLAUDE.md thin-pointer lint: PASS"
 
@@ -133,6 +161,8 @@ if [ "${1:-}" = "--self-test" ]; then
   # AGENTS.md is checked (every marker must still appear in it) and is also the symlink
   # fixture's real target.
   cp -a AGENTS.md "$baseline/"
+  # The rules directory is scanned too; the fixture below adds a restating rule to it.
+  if [ -d .claude/rules ]; then mkdir -p "$baseline/.claude"; cp -a .claude/rules "$baseline/.claude/"; fi
 
   self_test_failed=0
   expect_rejected() {
@@ -174,6 +204,12 @@ if [ "${1:-}" = "--self-test" ]; then
   sed 's/State the capability cost\./State what a change costs in capability./' \
     "$baseline/AGENTS.md" > "$fixture/AGENTS.md"
   expect_rejected "AGENTS.md rewording away the shared-rule marker 'State the capability cost.'" "$fixture"
+
+  fixture="$tmp/restating-rule"
+  cp -a "$baseline" "$fixture"
+  mkdir -p "$fixture/.claude/rules"
+  printf -- '---\npaths:\n  - "src/**"\n---\n\nA restated shared rule: %s\n' "${markers[0]}" > "$fixture/.claude/rules/restated.md"
+  expect_rejected ".claude/rules restating the shared-rule marker '${markers[0]}'" "$fixture"
 
   fixture="$tmp/second-import"
   cp -a "$baseline" "$fixture"

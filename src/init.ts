@@ -89,7 +89,7 @@
  * one sentence — issue #156, "Init will not allow symlinks, this is likely a bad idea."
  * Everything below it is Claude's, including the global-only scope, the leaf rule and the
  * record write-through.
- * An earlier version of the AGENTS.md bullet attributed those to a "maintainer decision
+ * An earlier version of the AGENTS.md bullet (now in docs/architecture.md) attributed those to a "maintainer decision
  * 2026-08-05"; the maintainer has since confirmed he does not recall making them, and nothing in
  * the tracker or git evidences them. Do not cite his authority for a design choice an agent made
  * — that attribution survived seven flagged escalations and ten merged issues before it was
