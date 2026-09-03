@@ -32,7 +32,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 /** `git worktree list` output is small; this is a sanity bound, not a tuning knob. */
@@ -67,6 +67,42 @@ export type WorktreeResolution =
       isDefault: boolean;
     }
   | { ok: false; message: string };
+
+/** Resolve caller-named dependency directories for a read-only turn. These are deliberately
+ * not constrained to git worktrees: package caches and vendored dependencies are outside the
+ * repository. The caller opts in path by path, and the canonical paths become the only
+ * session-scoped `external_directory` grants we emit. */
+export function resolveReadPaths(
+  paths: readonly string[] | undefined,
+  baseDir: string,
+): { ok: true; paths: string[] } | { ok: false; message: string } {
+  if (paths === undefined || paths.length === 0) return { ok: true, paths: [] };
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+      return { ok: false, message: "readPaths entries must be non-empty directory paths." };
+    }
+    let canonical: string;
+    try {
+      canonical = realpathSync(path.resolve(baseDir, raw));
+    } catch {
+      return { ok: false, message: `readPaths entry '${raw}' does not exist.` };
+    }
+    try {
+      if (!statSync(canonical).isDirectory()) {
+        return { ok: false, message: `readPaths entry '${raw}' resolves to '${canonical}', which is not a directory.` };
+      }
+    } catch {
+      return { ok: false, message: `readPaths entry '${raw}' could not be inspected.` };
+    }
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      resolved.push(canonical);
+    }
+  }
+  return { ok: true, paths: resolved };
+}
 
 /**
  * Every worktree of the repository containing `projectDir`, realpath-resolved.

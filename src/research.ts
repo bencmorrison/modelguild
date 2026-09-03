@@ -40,11 +40,13 @@ import {
   resolveReadRoot,
   gateAgentFloor,
   readRootBlocks,
+  readPathBlocks,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
 import { type ActivityEvent, type ActivitySummary } from "./activity.js";
 import { type ApprovalSummary, type ElicitationRequester } from "./approve.js";
+import { resolveReadPaths } from "./worktree.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -70,6 +72,7 @@ export interface ResearchParams {
    * local reads at. Validated against `git worktree list`; anything else is refused by name.
    */
   worktree?: string;
+  readPaths?: string[];
   /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Precedence over `GUILD_MESSAGE_TIMEOUT_MS` env/conf/default;
@@ -115,6 +118,7 @@ export type ResearchErrorKind =
   | "agent-unhardened"
   /** The named read root is not a worktree of this repository (issue #96). */
   | "worktree-invalid"
+  | "read-path-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -141,6 +145,7 @@ export interface ResearchAttribution {
   callId: string;
   /** The read root this call ran against; present only when a worktree was targeted (#96). */
   worktree?: string;
+  readPaths?: string[];
 }
 
 export interface ResearchError {
@@ -233,6 +238,10 @@ export async function research(
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
+  if (!resolvedReadPaths.ok) {
+    return { ok: false, rootConflict, error: { kind: "read-path-invalid", model: "", exitAnalogue: null, message: resolvedReadPaths.message } };
+  }
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
@@ -362,6 +371,7 @@ export async function research(
       // A read path with no text produced nothing at all (issue #117, C74).
       requireAnswer: true,
       ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+      ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
     },
     {
       serve,
@@ -386,6 +396,7 @@ export async function research(
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+        ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
       },
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
@@ -446,7 +457,7 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
     // The read-root note rides as a SECOND text block, never a prefix — `content[0]` must
     // stay the byte-exact answer (issue #96, review finding L7; see `readRootBlocks`).
     return {
-      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree)],
+      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree), ...readPathBlocks(r.attribution.readPaths)],
       structuredContent: structured,
     };
   }

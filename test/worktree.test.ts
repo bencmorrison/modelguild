@@ -33,11 +33,12 @@ import {
   existsSync,
   rmSync,
   readdirSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
-import { resolveWorktreeTarget } from "../src/worktree.js";
+import { resolveReadPaths, resolveWorktreeTarget } from "../src/worktree.js";
 import { consult, consultToToolResult } from "../src/consult.js";
 import { panel } from "../src/panel.js";
 import { research } from "../src/research.js";
@@ -148,6 +149,25 @@ export async function run(): Promise<number> {
     c.check(r.ok && r.isDefault === false, "a sibling worktree is not the default root");
   }
   {
+    const dependency = tmp("m221-dependency-");
+    const alias = path.join(tmp("m221-alias-"), "dependency");
+    symlinkSync(dependency, alias);
+    const r = resolveReadPaths([dependency, alias], repo);
+    c.check(
+      r.ok && r.paths.length === 1 && r.paths[0] === dependency,
+      "readPaths: canonicalizes and de-duplicates explicit dependency directories",
+    );
+    const file = path.join(dependency, "source.swift");
+    writeFileSync(file, "x");
+    const notDir = resolveReadPaths([file], repo);
+    c.check(!notDir.ok && notDir.message.includes("not a directory"), "readPaths: a file is refused");
+    const missing = resolveReadPaths([path.join(dependency, "missing")], repo);
+    c.check(!missing.ok && missing.message.includes("does not exist"), "readPaths: a missing directory is refused");
+    const relative = resolveReadPaths([path.relative(repo, dependency)], repo);
+    c.check(relative.ok && relative.paths[0] === dependency,
+      "readPaths: a relative path is anchored to the effective read root");
+  }
+  {
     const r = resolveWorktreeTarget(repo, { projectDir: repo });
     c.check(r.ok && r.isDefault === true, "the main checkout is accepted AND flagged default");
   }
@@ -225,6 +245,72 @@ export async function run(): Promise<number> {
         "consult: the serve child is rooted at the WORKTREE (router asked for exactly that root)");
       c.check(r.ok && r.attribution.worktree === wt,
         "consult: the result reports the read root it actually used");
+    } finally {
+      await fake.close();
+    }
+  }
+
+  {
+    const logDir = tmp("m221-logs-");
+    const dependency = tmp("m221-dependency-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const fake = await startFakeOpencode({ historyText: "dependency reviewed" });
+    try {
+      const r = await consult(
+        { question: "review dependency", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(r.ok && r.attribution.readPaths?.[0] === dependency,
+        "consult: reports the explicit dependency directory it granted");
+      c.check(
+        JSON.stringify(fake.recorded.createBodies[0]?.permission) === JSON.stringify([
+          { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+        ]),
+        "consult: creates only the generated external-directory allow rule",
+      );
+      if (r.ok) {
+        const run = readdirSync(logDir).find((name) => name !== "latest");
+        const entries = readFileSync(path.join(logDir, run ?? "", "calls.jsonl"), "utf8");
+        c.check(entries.includes('"read_paths"'), "consult: records granted paths in the receipt");
+      }
+      const continued = await consult(
+        { question: "retry", model: "openai/m", readPaths: [dependency], keepSession: true },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(!continued.ok && continued.error.kind === "read-path-invalid",
+        "consult: a read-path grant cannot be retained in a kept session");
+      const keptPanel = await panel(
+        { question: "panel dependency", models: ["openai/m", "openai/n"], readPaths: [dependency], keepSessions: true },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(!keptPanel.ok && keptPanel.error.kind === "read-path-invalid",
+        "panel: a read-path grant cannot be retained in kept member sessions");
+      const oneShotPanel = await panel(
+        { question: "panel dependency", models: ["openai/m", "openai/n"], readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(oneShotPanel.ok && oneShotPanel.readPaths?.[0] === dependency,
+        "panel: reports its shared explicit dependency directory");
+      c.check(
+        fake.recorded.createBodies.slice(-2).every((body) =>
+          JSON.stringify(body.permission) === JSON.stringify([
+            { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+          ]),
+        ),
+        "panel: grants the same generated external-directory rule to every member",
+      );
+      const researched = await research(
+        { question: "research dependency", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(researched.ok && researched.attribution.readPaths?.[0] === dependency,
+        "research: reports the explicit dependency directory it granted");
+      c.check(
+        JSON.stringify(fake.recorded.createBodies.at(-1)?.permission) === JSON.stringify([
+          { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+        ]),
+        "research: creates only the generated external-directory allow rule",
+      );
     } finally {
       await fake.close();
     }

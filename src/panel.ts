@@ -47,7 +47,7 @@
 
 import os from "node:os";
 import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
-import { type GitRunner } from "./worktree.js";
+import { resolveReadPaths, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
@@ -107,6 +107,7 @@ export interface PanelParams {
    * would make their answers incomparable while looking as if they disagreed.
    */
   worktree?: string;
+  readPaths?: string[];
   /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Applies to EVERY member of this panel. Precedence: over
@@ -250,6 +251,7 @@ export interface PanelOk {
   agentUnverified?: string;
   /** The read root every member ran against; present only when one was targeted (#96). */
   worktree?: string;
+  readPaths?: string[];
 }
 
 export interface PanelFail {
@@ -267,6 +269,7 @@ export interface PanelFail {
     // The named read root is not a worktree of this repository (issue #96). Panel-wide,
     // like the def check, and refused before any member runs.
     | { kind: "worktree-invalid"; message: string; exitAnalogue: null }
+    | { kind: "read-path-invalid"; message: string; exitAnalogue: null }
     // Panel-wide, like the def check: every member runs the same agent, so a bad approval
     // knob or a missing answering channel refuses the WHOLE panel up front — before any log
     // write, and before a single member is dispatched.
@@ -331,6 +334,22 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
+  if (!resolvedReadPaths.ok) {
+    return { ok: false, warnings: [], rootConflict, error: { kind: "read-path-invalid", message: resolvedReadPaths.message, exitAnalogue: null } };
+  }
+  if (params.keepSessions === true && resolvedReadPaths.paths.length > 0) {
+    return {
+      ok: false,
+      warnings: [],
+      rootConflict,
+      error: {
+        kind: "read-path-invalid",
+        message: "readPaths can only be used on a one-shot panel: opencode fixes session permissions when it creates the session.",
+        exitAnalogue: null,
+      },
+    };
+  }
 
   if (!hardenedDefPresentIn(PANEL_AGENT, agentDefDirs).present) {
     return {
@@ -499,6 +518,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
             // `text` rendered as a blank line and the synthesis proceeded a voice short.
             requireAnswer: true,
             ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+            ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
             ...(retryOf !== undefined ? { retryOf } : {}),
           },
           {
@@ -611,6 +631,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     rootConflict,
     ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
     ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+    ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
   };
 }
 
