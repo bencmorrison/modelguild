@@ -9,7 +9,7 @@
 # denied. No-write/no-task is the ROLE and is still asserted.
 #
 # What guild-research claims, and what this proves:
-#   * It CAN research — read + grep + glob + webfetch/websearch resolve to `allow`
+#   * It CAN research — read + grep + glob + webfetch/websearch (+ todowrite/lsp/skill) resolve to `allow`
 #     (else /guild:research is broken). Asserted positively.
 #   * It CANNOT mutate — bash/edit/write/patch resolve to `deny`, and `task` (escape
 #     to a write-capable agent) is denied. That no-write/no-task scoping is the ROLE.
@@ -75,12 +75,12 @@ effective_action() {
 
 # The read-only researcher's tool surface MUST be allowed: read + grep + glob + web
 # (else /guild:research is broken). grep/glob are now ALLOWED (2026-07-22 realignment).
-for cap in read grep glob webfetch websearch; do
+for cap in read grep glob webfetch websearch todowrite lsp skill; do
   if [ "$(effective_action "$cap")" = "allow" ]; then pass "$cap => allow (research path works)"; else bad "$cap is NOT allow — read-only researcher capability missing"; fi
 done
 
 # Mutation and sub-agent escape MUST be denied — that no-write/no-task scoping is the ROLE.
-for cap in bash edit write patch task todowrite lsp skill; do
+for cap in bash edit write patch task; do
   if [ "$(effective_action "$cap")" = "deny" ]; then pass "$cap => deny (effective)"; else bad "$cap is NOT effectively denied — research path can mutate/shell out/escape"; fi
 done
 
@@ -131,9 +131,9 @@ fi  # end runtime probe (skipped under --static)
 echo
 if [ "$fail" -eq 0 ] && [ "$inconclusive" -eq 0 ]; then
   if [ -n "$static_only" ]; then
-    printf '\033[32mguild-research VERIFIED (static)\033[0m — read/grep/glob/webfetch/websearch=allow; bash/edit/write/patch/task=deny; no secret-glob read-deny remains (resolved config). Runtime probe not run (--static). NOTE: read + egress coexist BY DESIGN under the trusted-repo posture — repo contents plus web are accepted exposure, not a boundary. Identical map to guild-read.\n'
+    printf '\033[32mguild-research VERIFIED (static)\033[0m — read/grep/glob/webfetch/websearch/todowrite/lsp/skill=allow; bash/edit/write/patch/task=deny; no secret-glob read-deny remains (resolved config). Runtime probe not run (--static). NOTE: read + egress coexist BY DESIGN under the trusted-repo posture — repo contents plus web are accepted exposure, not a boundary. Identical map to guild-read.\n'
   else
-    printf '\033[32mguild-research VERIFIED\033[0m — read/grep/glob/web reachable; mutation + task denied at the tool layer. NOTE: read + egress coexist BY DESIGN — repo contents plus web are accepted exposure, not a boundary. Identical map to guild-read.\n'
+    printf '\033[32mguild-research VERIFIED\033[0m — read/grep/glob/web/todowrite/lsp/skill reachable; mutation + task denied at the tool layer. NOTE: read + egress coexist BY DESIGN — repo contents plus web are accepted exposure, not a boundary. Identical map to guild-read.\n'
   fi
 elif [ "$fail" -ne 0 ]; then
   printf '\033[31mguild-research NOT verified\033[0m — permission shape is wrong; check the agent def against verify-guild-read.sh conventions.\n'

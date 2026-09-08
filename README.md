@@ -8,7 +8,7 @@ Works in stdio MCP clients. Claude Code has `/guild:*` commands; Codex CLI and t
 
 ## Quickstart
 
-Needs [Node.js](https://nodejs.org) 20 or newer, [Claude Code](https://claude.com/claude-code), and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
+Needs [Node.js](https://nodejs.org) 20 or newer, Claude Code or Codex, and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
 
 ```bash
 opencode auth login
@@ -31,15 +31,19 @@ For Codex, run `npx modelguild init --driver codex` in your project, merge the p
 - **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)** — picking models, the policy and config files, timeouts, permission prompts
 - **[docs/operations.md](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md)** — watching a call live, approving before it acts, the evidence log, troubleshooting
 - **[docs/backend-requirements.md](https://github.com/bencmorrison/modelguild/blob/main/docs/backend-requirements.md)** — what ModelGuild needs of the CLI underneath it, and what each tool does when it isn't there
+- **[docs/architecture.md](https://github.com/bencmorrison/modelguild/blob/main/docs/architecture.md)** — what each module does and the decisions behind its shape
+- **[docs/testing.md](https://github.com/bencmorrison/modelguild/blob/main/docs/testing.md)** — every suite, lint and local proof, and what each asserts
+- **[docs/parity.md](https://github.com/bencmorrison/modelguild/blob/main/docs/parity.md)** — the worked PARITY audits of each shipped restriction and loosening
+- **[docs/devcontainer.md](https://github.com/bencmorrison/modelguild/blob/main/docs/devcontainer.md)** — the dev container, auth persistence and host imports
 - [Notes & limits](#notes--limits) · [Bugs & feedback](#bugs--feedback)
 - [Working on ModelGuild itself](#working-on-modelguild-itself) — and **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)**
 
 ## How it works
 
-Claude Code cannot itself run a non-Anthropic model (its agent and subagents are always Claude). So it calls a **local MCP server** — `modelguild`, a small TypeScript stdio server you register with Claude Code (per-project or global, your choice) — which fronts `opencode serve`, model-agnostic, over its HTTP API:
+Your driver calls a **local MCP server** — `modelguild`, a small TypeScript stdio server you register with Claude Code or Codex (per-project or global, your choice) — which fronts `opencode serve`, model-agnostic, over its HTTP API:
 
 ```
-Claude Code  ──(MCP tool call)──▶  modelguild MCP server  ──▶  opencode serve  ──▶  GPT / Copilot / Gemini / …
+Your driver  ──(MCP tool call)──▶  modelguild MCP server  ──▶  opencode serve  ──▶  GPT / Copilot / Gemini / …
      ▲                                                                                       │
      └────────────────────  reads the other model's answer, then reasons over it  ───────────┘
 ```
@@ -48,8 +52,9 @@ ModelGuild adds to a project:
 
 | What | Where |
 |---|---|
-| The `modelguild` MCP server | Registered with Claude Code by you (`claude mcp add`, launched on demand as `npx -y modelguild serve`). It exposes the tools the slash commands call: `guild_consult`, `guild_panel`, `guild_research`, `guild_delegate`, `guild_models`. |
+| The `modelguild` MCP server | Registered by you with Claude Code (`claude mcp add`) or Codex (the init-generated TOML), launched on demand as `npx -y modelguild serve`. It exposes the tools the slash commands call: `guild_consult`, `guild_panel`, `guild_research`, `guild_delegate`, `guild_models`. |
 | The slash commands | `.claude/commands/guild/*.md` — thin prompts that drive those tools. They appear as `/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`, `/guild:research`, `/guild:delegate`, `/guild:collaborate`, `/guild:configure` — so they can't clash with commands you already have. |
+| The Codex skills | `.agents/skills/guild-*/SKILL.md` plus shared guidance, installed with `--driver codex` or `--driver both`. |
 | Three **hardened** opencode agents | `.opencode/agent/` — `guild-read` (read-only reviewer + web), `guild-build` (the `/guild:delegate` write path), `guild-research` (the `/guild:research` source-backed path). `opencode serve` enforces their permission maps. |
 | The model policy + config template | `modelguild/models.policy` and `modelguild/modelguild.conf.example`. |
 | The record | `modelguild/logs/` (git-ignored) — every model call, on disk and yours to read (see [The record it keeps](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#the-record-it-keeps)). |
@@ -104,4 +109,4 @@ What helps most in a bug report:
 
 ## Working on ModelGuild itself
 
-Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code and opencode in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)** and **[AGENTS.md](https://github.com/bencmorrison/modelguild/blob/main/AGENTS.md)**.
+Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code, opencode and Codex CLI in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)** and **[AGENTS.md](https://github.com/bencmorrison/modelguild/blob/main/AGENTS.md)**.

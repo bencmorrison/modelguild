@@ -27,7 +27,7 @@ user_files=(
 obsolete='(^|[^[:alnum:]_.-])/((configure-collab)|(consult|panel|workshop|review|research|delegate|collaborate|witness|configure|consensus))([[:space:]<`"'"'"'(,.:]|$)'
 obsolete_matches="$(grep -RInE --exclude=check-docs.sh "$obsolete" "${user_files[@]}" || true)"
 obsolete_matches="$(printf '%s\n' "$obsolete_matches" | grep -Ev \
-  '^AGENTS\.md:.*(where `/consult`, `/review` and `/panel`|Our `/review` was found colliding|Renamed from `/consensus`)' || true)"
+  '^(AGENTS\.md|docs/architecture\.md):.*(where `/consult`, `/review` and `/panel`|Our `/review` was found colliding|Renamed from `/consensus`)' || true)"
 if [ -n "$obsolete_matches" ]; then
   printf '%s\n' "$obsolete_matches" >&2
   bad "obsolete unnamespaced command reference found; use /guild:<name>"

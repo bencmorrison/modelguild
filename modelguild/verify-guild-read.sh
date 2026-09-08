@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify-guild-read.sh — prove the `guild-read` opencode agent has the read-only
-# ROLE shape: read + grep + glob + web ALLOWED, mutation (bash/edit/write/patch) and
-# sub-agent spawning (task) DENIED, under a `"*": deny` floor.
+# ROLE shape: read + grep + glob + web + todowrite/lsp/skill ALLOWED, mutation
+# (bash/edit/write/patch) and sub-agent spawning (task) DENIED, under a `"*": deny` floor.
 #
 # 2026-07-22 permission realignment: guild-read is now a Claude review
 # subagent's tool surface. grep/glob are ALLOWED and the secret-glob read-denies were
@@ -85,11 +85,12 @@ effective_action() {
 # Mutation/escape tools must be EFFECTIVELY denied — that no-write/no-task scoping is
 # the read-only ROLE. grep/glob are NO LONGER here: they are ALLOWED (a review subagent
 # searches the tree). The secret-glob read-denies were removed (2026-07-22 realignment).
-for cap in bash edit write patch task todowrite lsp skill; do
+for cap in bash edit write patch task; do
   if [ "$(effective_action "$cap")" = "deny" ]; then pass "$cap => deny (effective)"; else bad "$cap is NOT effectively denied — mutation/escape path open"; fi
 done
-# Review-subagent tool surface: read + grep + glob + web are ALLOWED.
-for cap in read grep glob webfetch websearch; do
+# Review-subagent tool surface: read + grep + glob + web are ALLOWED, and so are
+# todowrite/lsp/skill (2026-09-03, PARITY: every Claude Code subagent has them).
+for cap in read grep glob webfetch websearch todowrite lsp skill; do
   if [ "$(effective_action "$cap")" = "allow" ]; then pass "$cap => allow (effective)"; else bad "$cap is NOT effectively allowed — read-only reviewer capability missing"; fi
 done
 # read must be a plain allow with NO secret-glob carve-outs (the fences were removed).
@@ -147,9 +148,9 @@ fi  # end runtime probes (skipped under --static)
 echo
 if [ "$fail" -eq 0 ] && [ "$inconclusive" -eq 0 ]; then
   if [ -n "$static_only" ]; then
-    printf '\033[32mguild-read VERIFIED (static)\033[0m — read/grep/glob/webfetch/websearch allowed; mutation (bash/edit/write/patch) + task denied; no secret-glob read-deny remains (resolved config). Runtime probes not run (--static).\n'
+    printf '\033[32mguild-read VERIFIED (static)\033[0m — read/grep/glob/webfetch/websearch/todowrite/lsp/skill allowed; mutation (bash/edit/write/patch) + task denied; no secret-glob read-deny remains (resolved config). Runtime probes not run (--static).\n'
   else
-    printf '\033[32mguild-read VERIFIED\033[0m — read/grep/glob/webfetch/websearch allowed; mutation + task denied; no secret-glob read-deny remains, with no runtime contradiction.\n'
+    printf '\033[32mguild-read VERIFIED\033[0m — read/grep/glob/webfetch/websearch/todowrite/lsp/skill allowed; mutation + task denied; no secret-glob read-deny remains, with no runtime contradiction.\n'
   fi
   printf '  NOTE: read-only ROLE, not a security boundary — trusted-repo posture. Repo contents (including any secrets present) plus web are accepted exposure; this agent enforces no-write/no-task, nothing more. See AGENTS.md (2026-07-22 realignment).\n'
 elif [ "$fail" -ne 0 ]; then
