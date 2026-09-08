@@ -96,6 +96,8 @@
  * match") and the entry is rewritten with both fields on that same run.
  */
 
+import { installedDriver } from "./driver.js";
+import type { Driver } from "./init.js";
 import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import os from "node:os";
@@ -281,12 +283,14 @@ export function writeNoticeState(file: string, state: NoticeState): boolean {
 export function formatSkewNote(opts: {
   skewed: PayloadFileState[];
   version: string;
+  driver?: Driver;
   indent?: string;
   /** Cap the file list (the notice is bounded; `doctor` passes Infinity and lists them all). */
   maxFiles?: number;
   unsolicited?: boolean;
 }): string[] {
   const indent = opts.indent ?? "";
+  const driverFlag = opts.driver && opts.driver !== "claude" ? ` --driver ${opts.driver}` : "";
   const max = opts.maxFiles ?? Infinity;
   const n = opts.skewed.length;
   const versionBit = opts.version.length > 0 ? ` (${opts.version})` : "";
@@ -323,12 +327,12 @@ export function formatSkewNote(opts: {
   // running version is what makes "fix either way" true instead of merely reassuring.
   out.push(
     opts.version.length > 0
-      ? `${indent}  Fix either way: \`npx modelguild@${opts.version} init\` — pinned to the ` +
+      ? `${indent}  Fix either way: \`npx modelguild@${opts.version} init${driverFlag}\` — pinned to the ` +
           `version running here, so it converges whichever side is ahead (plain \`npx ` +
           `modelguild init\` installs the LATEST payload, which does not converge on a pinned ` +
           `older server). These files are unedited, so init rewrites them in place; it still ` +
           `never overwrites anything you changed.`
-      : `${indent}  Fix: \`npx modelguild init\` — these files are unedited, so init rewrites ` +
+      : `${indent}  Fix: \`npx modelguild init${driverFlag}\` — these files are unedited, so init rewrites ` +
           `them in place (it still never overwrites anything you changed). This server's ` +
           `version could not be read, so the command cannot be pinned to it: that installs the ` +
           `LATEST payload, which converges only if this server is the latest release.`,
@@ -493,7 +497,8 @@ export function emitPayloadSkewNotice(
       return { outcome: "already-shown", skewed: scan.skewed, lines: [], version, statePath, key, fingerprint };
     }
 
-    const lines = formatSkewNote({ skewed: scan.skewed, version, maxFiles: 8, unsolicited: true });
+    const driver = installedDriver(resolveProjectDir(env, cwd), gdirs);
+    const lines = formatSkewNote({ skewed: scan.skewed, version, driver, maxFiles: 8, unsolicited: true });
     const write = opts.write ?? ((t: string) => void process.stderr.write(t));
     // ONE write for the whole block: stderr is shared with the serve child's own output, and a
     // per-line loop can be interleaved mid-notice by it.

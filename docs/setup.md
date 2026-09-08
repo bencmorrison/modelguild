@@ -2,11 +2,90 @@
 
 Exactly what you do, start to finish, plus every variant off the happy path. Back to [README.md](../README.md).
 
+- [Codex CLI and IDE extension](#codex-cli-and-ide-extension)
 - [The seven steps](#the-seven-steps)
 - [Installation variants](#installation-variants) — from source, `--global`, registering by hand
 - [Global vs project config](#global-vs-project-config)
 - [Keeping it up to date](#keeping-it-up-to-date) — updating, upgrade drift, payload skew
 - [Uninstall](#uninstall)
+
+## Codex CLI and IDE extension
+
+Needs Node.js 20+, Codex, and authenticated opencode on PATH in the environment that
+starts the MCP server. The backend remains opencode; Codex login authenticates the
+driver, and `opencode auth login` authenticates its workers. Claude Code is not required.
+
+```bash
+cd /path/to/your/project
+npx modelguild init --driver codex
+```
+
+For an unreleased source build, run `npm ci && npm run build` in the ModelGuild checkout,
+then `node /absolute/path/to/modelguild/dist/cli.js init --driver codex --abs --dir /path/to/your/project`.
+The printed configuration launches that exact build. Do not use published `npx modelguild`
+commands to test an unreleased installer.
+
+Merge the printed table into the project's `.codex/config.toml`, preserving other servers
+and settings. A published installation looks like this (substitute your real project path):
+
+```toml
+[mcp_servers.modelguild]
+command = "npx"
+args = ["-y", "modelguild", "serve"]
+cwd = "/path/to/your/project"
+startup_timeout_sec = 60
+tool_timeout_sec = 2100
+
+[mcp_servers.modelguild.env]
+GUILD_PROJECT_DIR = "/path/to/your/project"
+```
+
+Codex loads project configuration only for trusted projects. Restart Codex CLI or the
+IDE extension, check `/mcp`, and run `npx modelguild doctor --driver codex` in the project.
+Then use `$guild-configure` and `$guild-consult`. The skills are installed at
+`.agents/skills/guild-*/SKILL.md`, with shared guidance at `.agents/skills/modelguild-common.md`.
+They cover all eight Claude workflows with Codex-native invocation and model-choice guidance.
+
+`init --driver both` installs both workflow sets. `init` without a driver retains its
+Claude default. `doctor` detects installed workflow sets, or accepts `--driver claude`,
+`--driver codex`, or `--driver both` explicitly. These files may be committed by the repo;
+detection is an inventory, not a claim about your preferred client. An absent Codex CLI
+produces a warning because registration cannot be checked, matching the Claude path.
+For inferred `both`, a missing registration warns when the other client is registered
+or cannot be checked; two known missing registrations fail. An explicit `--driver`
+selection still fails on a known missing registration. Disabled Codex registrations
+and Codex diagnostic errors remain failures. An unusually short tool timeout produces a
+warning. Registration is inspected
+with `codex mcp get modelguild --json` in the checked directory.
+
+For all projects, use `init --driver codex --global`. Skills go into `~/.agents/skills`;
+merge the printed MCP table into `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
+The global table omits cwd and GUILD_PROJECT_DIR so it can follow the client workspace.
+Check the reported root when using an IDE or worktrees; use a project table with explicit
+paths if the client starts its server in a different directory.
+
+Both drivers share `<project>/modelguild` over the legacy `~/.claude/modelguild` baseline,
+including preferences, policy, and install ownership. That directory name is retained
+for compatibility; creating it does not install or require Claude. No preferences are
+copied into a competing Codex-specific ModelGuild root.
+
+Upgrade by rerunning the same `init --driver ...` command. Remove a workflow set with
+`init --driver codex --uninstall` (add `--global` for a global install). User edits survive.
+Shared backend/config assets and ownership survive while the other driver is installed.
+Use `--driver both --uninstall` to remove both sets. Codex registration remains user-owned:
+remove its table from the TOML file you used, or use `codex mcp remove modelguild` for a
+user-level registration. `--driver both --write-mcp` writes the Claude `.mcp.json` entry
+and prints Codex TOML registration instructions. `--driver codex --write-mcp` is refused
+because a Codex-only install has no Claude registration to write.
+
+The 2,100-second outer tool timeout allows two default 15-minute model turns plus overhead
+for a panel member that retries once. Increase it when raising ModelGuild's turn timeout;
+a heartbeat does not guarantee that Codex resets this deadline. See
+[timeouts](configuration.md#timeouts) and [approvals](operations.md#answer-before-it-acts-opt-in-off-by-default).
+
+Client validation and limits are recorded under [Codex compatibility](operations.md#codex-compatibility).
+Official references: [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+and [skill discovery](https://learn.chatgpt.com/docs/build-skills).
 
 ## The seven steps
 

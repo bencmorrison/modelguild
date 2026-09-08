@@ -81,3 +81,31 @@ A refused or stalled call names its failure. Search for the name you were given:
 | `agent-mismatch` | opencode served the turn with a different agent than the one asked for. | [SECURITY.md](../SECURITY.md#other-guardrails) |
 | `approval-config` / `approval-channel-missing` | `GUILD_APPROVE` has an unrecognised value, or the bridge is armed with no way to ask you. Refused up front rather than hanging the turn. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
 | `unsettled` / `contested` / `refused` / `undelivered` | How an approval reply that didn't land is reported. `unsettled` means nobody's decision took effect and the request is still open — that is the one that explains a hung call. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
+
+## Codex compatibility
+
+Codex uses the same ModelGuild tools and evidence log as Claude Code. The Codex installer
+prints a 60-second startup deadline and 2,100-second tool deadline; see
+[Codex setup](setup.md#codex-cli-and-ide-extension). Calling a worker uses opencode's
+credentials, independently of the Codex driver's login.
+
+`npm run test:codex` is an opt-in compatibility probe requiring Codex on PATH. It builds
+the package and uses real Codex App Server and ModelGuild processes with a scripted
+opencode fixture. It makes no model calls and uses an isolated Codex home. This checks
+skill discovery, MCP results/errors, continuation, panel results, approval accept/decline/
+cancel, the watch approval fallback, worktree diff capture, a 65-second call, and shutdown
+while a worker is running. The fixture does not establish model reasoning quality or
+provider entitlement. The client version and observed results belong in #226 / its PR.
+
+App Server's direct tool-call interface on the tested Codex 0.153.4 did not expose MCP
+progress notifications to the probe. Completed results retained their activity summary;
+use `modelguild watch` for live activity. Protocol-level elicitation replies were tested;
+interactive CLI and IDE approval-button rendering still require a manual check. App
+Server itself is experimental; this does not add it as a production dependency of
+ModelGuild, which continues to expose standard stdio MCP.
+
+Closing the Codex client closes its MCP transport and triggers ModelGuild's existing
+backend teardown. Merely cancelling a tool wait is a different operation: ModelGuild
+does not currently propagate the MCP request's cancellation signal to the opencode turn.
+Do not assume a cancelled wait stops the worker or rolls back edits while its MCP
+transport stays open. Inspect the worktree and receipts before retrying a write task.

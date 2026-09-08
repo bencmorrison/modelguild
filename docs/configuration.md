@@ -12,13 +12,13 @@ Most of what follows lives in two files under your chosen **guild root** — `~/
 
 ## Picking the model
 
-To see the exact provider/model ids your auth offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). Pass a specific model to any command; omit it to use your configured default.
+To see the exact provider/model ids your auth offers, ask your driver to run the `guild_models` tool (or run `opencode models` yourself). Pass a specific model to any command; omit it to use your configured default.
 
-Prefer a **non-Claude** model for consults so the second opinion is genuinely independent — Claude already brings the Anthropic perspective to the exchange.
+For independent opinions, prefer a different model family from the actual driver when choosing models. Honor explicit model choices and persistent defaults. A hosting provider can serve several families; provider diversity alone does not establish model diversity (issue #225).
 
 ## Persistent defaults
 
-To set a default single model for `/guild:consult` and a default panel set for `/guild:panel`, run **`/guild:configure`** — it walks you through it, including whether to set them globally or per project. By hand, copy `modelguild/modelguild.conf.example` to `modelguild.conf.local` in your chosen root and set:
+To set a default single model for `/guild:consult` and a default panel set for `/guild:panel`, run **`/guild:configure`** in Claude Code or **`$guild-configure`** in Codex — it walks you through it, including whether to set them globally or per project. By hand, copy `modelguild/modelguild.conf.example` to `modelguild.conf.local` in your chosen root and set:
 
 ```
 GUILD_MODEL=openai/gpt-5
@@ -44,6 +44,12 @@ GUILD_MESSAGE_TIMEOUT_MS=1800000
 ```
 
 Only the model-turn call uses it; the fast control-plane calls keep their own short timeout. A value of 0, negative, or non-numeric falls back to the default; the literal `max` uses the longest timeout Node can honour (~24.8 days). This is the default — for a single long-running call, the assistant can also pass a `timeoutMs` (a number of ms, or `"max"`) directly to `guild_consult`/`guild_panel`/`guild_research`/`guild_delegate`, which overrides it for that call.
+
+Codex also has an outer MCP deadline. Set `tool_timeout_sec = 2100` in its
+`[mcp_servers.modelguild]` table for default ModelGuild turns and a possible panel retry;
+increase it for longer configured/per-call deadlines. `doctor --driver codex` warns
+when that setting is missing or shorter. `startup_timeout_sec = 60` accommodates a cold
+server launch. Progress notifications do not replace these settings.
 
 ## Skip the permission prompts
 

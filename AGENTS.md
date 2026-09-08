@@ -1,6 +1,6 @@
 # ModelGuild — agent guide
 
-ModelGuild lets **Claude Code** collaborate with **other LLMs** (OpenAI, GitHub Copilot, Google Gemini, …) through **[opencode](https://opencode.ai)** as an auth gateway; this repo stores and manages no API keys. Where to look:
+ModelGuild lets **Claude Code and Codex** collaborate with **other LLMs** (OpenAI, GitHub Copilot, Google Gemini, …) through **[opencode](https://opencode.ai)** as an auth gateway; this repo stores and manages no API keys. Where to look:
 
 | Question | Read |
 | --- | --- |
@@ -27,6 +27,8 @@ ModelGuild lets **Claude Code** collaborate with **other LLMs** (OpenAI, GitHub 
 
 ## Architecture
 
+- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
+
 Claude Code cannot run a non-Anthropic model itself, so it calls a **local MCP server** — `modelguild`, a TypeScript stdio server the user registers with Claude Code (per-project or global; `init` no longer writes `.mcp.json` by default) — which fronts `opencode serve` over its HTTP API:
 
 ```
@@ -50,8 +52,9 @@ The reference implementation is the `src/` TypeScript. One row per module; the h
 | `src/activity.ts`, `src/progress.ts` | Live activity while a turn runs: `activity.jsonl`, `npx modelguild watch`, `structuredContent.activity`, MCP progress notifications. Never the evidence log, never containment. |
 | `src/config.ts`, `src/policy.ts` | Layered resolution, project over global: guild root, `modelguild.conf.local` knobs, and the model policy chain (first matching rule wins, malformed file anywhere denies). |
 | `src/models.ts` | `guild_models` enumerates the running serve's authed provider configuration, per provider, so a listed id can still be rejected at call time. |
-| `src/init.ts`, `src/notice.ts`, `src/fsguard.ts`, `src/cli.ts` | The installer (`modelguild init`, per-project or `--global`; SHA-256 ownership, never-clobber, drift and skew reporting, symlink rules: C72, C77, C79), the start-up skew notice, the one path-shape predicate to use before any read or write of a user-controlled path (C78), and `doctor`, `logs clean`, `watch`, `serve`. |
+| `src/init.ts`, `src/driver.ts`, `src/notice.ts`, `src/fsguard.ts`, `src/cli.ts` | The installer (`modelguild init`, per-project or `--global`; SHA-256 ownership, never-clobber, drift and skew reporting, symlink rules: C72, C77, C79), the start-up skew notice, the one path-shape predicate to use before any read or write of a user-controlled path (C78), and `doctor`, `logs clean`, `watch`, `serve`. |
 | `.opencode/agent/guild-*.md` | The three hardened defs (`guild-read`, `guild-build`, `guild-research`): default-deny allowlists (`"*": deny` plus re-allows, `mode: all`), enforced by opencode, unchanged by the rewrite. Every def allows what a Claude Code subagent doing that task has; `task` is denied on all three because a Claude Code subagent has no Agent tool either. The read paths are **not** confidentiality boundaries. A tool whose def is missing or not in force **refuses**; nothing falls back to opencode's built-in `build`/`plan`. Rules for editing them: `.claude/rules/agent-defs.md`. |
+| `.agents/skills/` | Eight Codex `$guild-*` skills and their shared guidance. Codex model choice follows the actual driver family and available tools; the Claude-specific Task/Agent fallback below applies to Claude Code. |
 | `.claude/commands/guild/` | The eight slash commands, thin prompts that drive the MCP tools, namespaced as `/guild:<name>` because the subdirectory is the prefix. |
 | `install.sh` | A thin bootstrap that runs `npx modelguild init`; the real installer is `init`. |
 
