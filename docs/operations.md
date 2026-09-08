@@ -105,11 +105,11 @@ receipts and the delegated patch for inspection. See [live testing](testing.md).
 App Server's direct tool-call interface on the tested Codex 0.153.4 did not expose MCP
 progress notifications to the probe. Completed results retained their activity summary;
 use `modelguild watch` for live activity. Protocol-level elicitation replies were tested;
-the interactive CLI also displayed all eight skill choices, the running tool call,
-and both the MCP-call and ModelGuild webfetch approval prompts; accepting the latter
-released the real worker. IDE rendering and interactive decline/cancel still require
-a manual check. App Server itself is experimental; this does not add it as a production dependency of
-ModelGuild, which continues to expose standard stdio MCP.
+the interactive CLI skill list, running tool call, MCP-call approval prompt and
+ModelGuild webfetch approval prompt are verified on 0.153.4. IDE rendering and
+interactive decline/cancel are not verified. App Server itself is experimental;
+this does not add it as a production dependency of ModelGuild, which continues to
+expose standard stdio MCP.
 
 Closing the Codex client closes its MCP transport and triggers ModelGuild's existing
 backend teardown. Merely cancelling a tool wait is a different operation: ModelGuild

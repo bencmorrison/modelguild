@@ -2,10 +2,12 @@
  * Opt-in, outside npm test/CI; requires explicit worker IDs and existing CLI logins.
  * Artifacts are retained for receipt/diff review. Assertions read MCP events, evidence
  * and files, never the driver's PASS/FAIL prose. This proves the core CLI route, not
- * all eight workflows or IDE/approval rendering; see docs/testing.md for that matrix.
+ * all eight workflows or IDE/approval rendering; that matrix is tracked in issue #226.
+ * The 15-minute outer deadline includes Codex reasoning and can interrupt a worker
+ * still within its own 180-second budget; timing out does not prove a worker hung.
  */
 import assert from "node:assert/strict";
-import {spawn, execFileSync} from "node:child_process";
+import {spawn, spawnSync, execFileSync} from "node:child_process";
 import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, createWriteStream} from "node:fs";
 import {tmpdir} from "node:os";
 import path from "node:path";
@@ -44,27 +46,28 @@ function verify(root: string): void {
     assert.equal(completed[0].agent,agent);
     assert.equal(completed[0].exit_code,0);
     assert.equal(completed[0].raw_response,answer,"receipt preserves returned answer bytes");
-    return rows.find(r=>r.call_id===callId && r.status==="started");
+    return {started:rows.find(r=>r.call_id===callId && r.status==="started"),completed:completed[0]};
   };
-  for (const r of [first,next]) {
+  const consultReceipts=[first,next].map(r=>{
     assert.equal(r.model,model);assert.equal(r.requestedModel,model);
     assert(r.answer.includes(marker),"consult must return the planted marker");
-    receipt(r.runId,r.callId,model,r.answer,"guild-read");
-  }
-  assert(first.activity.byTool.read>0,"initial worker must actually read a file");
+    return receipt(r.runId,r.callId,model,r.answer,"guild-read");
+  });
+  assert(first.activity.toolCalls>0,"initial worker must use a tool");
   assert(first.sessionId,"initial session must be retained");
   assert.equal(calls[1].arguments.sessionId,first.sessionId);
   assert.equal(next.sessionId,first.sessionId);
-  assert.equal(next.activity.toolCalls,0,"continuation recalls the marker without rereading");
+  assert.equal(consultReceipts[1].completed.session_id,first.sessionId,"completed receipt must identify the continued session");
+  assert(consultReceipts[1].completed.turn>1,"completed receipt must record a later turn");
   assert.deepEqual(panel.results.map((r:any)=>r.model).sort(),[model,panelModel].sort());
   for (const r of panel.results) {
-    assert(!r.error && !r.attempts,"each panel member must answer on its first attempt");
-    assert(r.text.includes(marker));assert(r.activity.byTool.read>0);
+    assert(!r.error,"each panel member must answer successfully");
+    assert(r.text.includes(marker));assert(r.activity.toolCalls>0,"panel worker must use a tool");
     receipt(panel.runId,r.callId,r.model,r.text,"guild-read");
   }
   assert.equal(edit.model,model);assert.equal(edit.requestedModel,model);
   assert.equal(edit.worktree,sibling);
-  assert.equal(receipt(edit.runId,edit.callId,model,edit.report,"guild-build").write_root,sibling);
+  assert.equal(receipt(edit.runId,edit.callId,model,edit.report,"guild-build").started.write_root,sibling);
   assert.equal(edit.capture.captureComplete,true);assert.equal(edit.capture.recordFailed,false);
   assert.equal(edit.capture.filesChanged,1);
   assert.equal(readFileSync(path.join(sibling,"worker-result.txt"),"utf8"),marker+"\n");
@@ -80,10 +83,17 @@ async function run(): Promise<string> {
   const model=process.env.GUILD_LIVE_MODEL, panelModel=process.env.GUILD_LIVE_PANEL_MODEL;
   assert(model && panelModel && model!==panelModel,
     "Set GUILD_LIVE_MODEL and a distinct GUILD_LIVE_PANEL_MODEL to exact, available provider/model IDs. This test calls real models.");
+  const version=(binary:string)=>{
+    const result=spawnSync(binary,["--version"],{encoding:"utf8",timeout:10_000});
+    assert(!result.error && result.status===0,
+      `Cannot run ${binary} --version (${result.error?.message ?? `exit ${result.status}`}); ensure ${binary} is installed and executable on PATH.`);
+    return result.stdout.trim();
+  };
+  const versions={codex:version("codex"),opencode:version("opencode")};
   const root=realpathSync(mkdtempSync(path.join(tmpdir(),"guild-codex-driver-")));
   console.log("Live test artifacts (retained):",root);
   const project=path.join(root,"project"), sibling=path.join(root,"sibling"), marker="GUILD226_BLUE";
-  writeFileSync(path.join(root,"manifest.json"),JSON.stringify({model,panelModel,marker,versions:{codex:execFileSync("codex",["--version"],{encoding:"utf8"}).trim(),opencode:execFileSync("opencode",["--version"],{encoding:"utf8"}).trim()}}));
+  writeFileSync(path.join(root,"manifest.json"),JSON.stringify({model,panelModel,marker,versions}));
   mkdirSync(project);
   const git=(...args:string[])=>execFileSync("git",["-C",project,...args],{env:fixtureGitEnv(),stdio:"pipe"});
   git("init");

@@ -27,7 +27,7 @@ ModelGuild lets **Claude Code and Codex** collaborate with **other LLMs** (OpenA
 
 ## Architecture
 
-- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`; opt-in real-model smoke: `npm run test:codex:models` (see [testing](docs/testing.md)). See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
+- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
 
 Claude Code cannot run a non-Anthropic model itself, so it calls a **local MCP server** — `modelguild`, a TypeScript stdio server the user registers with Claude Code (per-project or global; `init` no longer writes `.mcp.json` by default) — which fronts `opencode serve` over its HTTP API:
 
@@ -64,6 +64,7 @@ The reference implementation is the `src/` TypeScript. One row per module; the h
 | --- | --- |
 | `npm run test:offline` | What CI runs: `npx tsc --noEmit` plus every suite that needs no opencode. Run it before pushing. |
 | `npm test` | The whole suite; three suites spawn a real `opencode serve` and have no graceful skip without the binary. `npx tsx test/run.ts <suite>…` runs one. |
+| `npm run test:codex` / `npm run test:codex:models` | Opt-in Codex checks: scripted backend compatibility / real-model driver smoke. Prerequisites and usage in [testing](docs/testing.md). |
 | `bash modelguild/tests/check-<name>.sh` then `… --self-test` | The lints: `shebangs`, `frontmatter`, `docs`, `contract-counts`, `claude-md`, `agents-size`, `v1-permission-pin`, `agent-permissions`, `shellcheck`. Some `--self-test` runs short-circuit the repo scan, so run both forms. |
 | `bash modelguild/verify-guild-read.sh` / `-build.sh` / `-research.sh`, `bash modelguild/verify-permission-surface.sh` | After any opencode or agent-def bump. Local only, needs a logged-in opencode, never CI. |
 | `npx modelguild doctor` | Token-free health check of the install, the MCP registration, opencode on PATH and auth, and payload skew or drift. |
