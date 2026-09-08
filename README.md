@@ -1,10 +1,10 @@
 # ModelGuild
 
-Let **Claude Code** collaborate with **other LLMs** (OpenAI, GitHub Copilot's model stack, Google Gemini, or anything else) for a second opinion, a multi-model panel, code review, or delegated coding — using **[opencode](https://opencode.ai)** as the gateway.
+Let **Claude Code or Codex** collaborate with **other LLMs** (OpenAI, GitHub Copilot's model stack, Google Gemini, or anything else) for a second opinion, a multi-model panel, code review, or delegated coding — using **[opencode](https://opencode.ai)** as the gateway.
 
-Claude Code stays the driver. You add ModelGuild to **your own project**, and Claude gains a few slash commands backed by a small local **MCP server**. opencode handles model access and auth, so this works off **whatever providers your opencode auth gives you — paid subscriptions or free tiers — with no API keys stored or managed by this tool**.
+Your chosen agent stays the driver. You add ModelGuild to **your own project**, and your driver gains collaboration workflows backed by a small local **MCP server**. opencode handles model access and auth, so this works off **whatever providers your opencode auth gives you — paid subscriptions or free tiers — with no API keys stored or managed by this tool**.
 
-Works in any stdio MCP client. **Claude Code is the first-class — and currently the only — driver** (slash commands + the verify-each-finding workflow); support for other drivers is planned.
+Works in stdio MCP clients. Claude Code has `/guild:*` commands; Codex CLI and the IDE extension have `$guild-*` skills. Both use the same MCP server, opencode backend, preferences, and evidence log. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for registration and verified-client limitations.
 
 ## Quickstart
 
@@ -19,6 +19,8 @@ npx modelguild doctor
 ```
 
 Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:consult` — `doctor` warns when opencode has no credentials at all, but it calls no model, so that consult is what proves your opencode auth actually works. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
+
+For Codex, run `npx modelguild init --driver codex` in your project, merge the printed MCP table into `.codex/config.toml`, and restart Codex. Then run `npx modelguild doctor --driver codex` and try `$guild-consult`. Use `--driver both` to install both workflow sets. [Complete Codex setup](docs/setup.md#codex-cli-and-ide-extension).
 
 ## Contents
 
@@ -54,7 +56,7 @@ ModelGuild adds to a project:
 
 ## Usage
 
-Run these inside Claude Code in a project you've installed into:
+Run these inside Claude Code in a project you've installed into. Codex has the same eight workflows as `$guild-consult`, `$guild-panel`, `$guild-workshop`, `$guild-review`, `$guild-research`, `$guild-delegate`, `$guild-collaborate`, and `$guild-configure`:
 
 | Command | What it does |
 |---|---|
@@ -75,7 +77,7 @@ Examples:
 /guild:delegate Add bounds checking to the ring buffer in src/buffer.c and a test
 ```
 
-Pass a specific `provider/model` id to any command, or omit it to use your configured default. `/guild:configure` sets persistent defaults; to see the ids your auth actually offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). Prefer a **non-Claude** model for consults so the second opinion is genuinely independent. Model choice, the policy file, and the per-turn timeout are covered in **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)**.
+Pass a specific `provider/model` id to any command, or omit it to use your configured default. `/guild:configure` sets persistent defaults; to see the ids your auth actually offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). When choosing an independent opinion, prefer a different model family from the driver; honor explicitly requested models and configured preferences. Model choice, the policy file, and the per-turn timeout are covered in **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)**.
 
 While a call runs you can [tail what the other model is doing](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#watch-it-live) (`npx modelguild watch`), optionally make it [ask before it acts](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#answer-before-it-acts-opt-in-off-by-default), and read the [receipts](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#the-record-it-keeps) it leaves in `modelguild/logs/`. A refused or stalled call is [named and explained](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#common-failures-by-name) on the same page.
 
