@@ -4,14 +4,14 @@
 # auth status.
 set -euo pipefail
 
-# Claude Code and opencode are installed HERE rather than in the Dockerfile: a RUN
+# Claude Code, opencode and Codex CLI are installed HERE rather than in the Dockerfile: a RUN
 # layer is cached, so a rebuild would keep reinstalling nothing and serve the image's
 # original versions indefinitely. This runs on every container create, so a rebuild
 # gets the current release of each. `|| true` because a registry hiccup must not fail
 # container creation — the version report below prints MISSING if it does.
 # Note: opencode's `run` flags are verified at the version recorded in AGENTS.md; a
 # newer one landing here is expected, not pinned.
-sudo npm install -g @anthropic-ai/claude-code@latest opencode-ai@latest 2>&1 | tail -1 || true
+sudo npm install -g @anthropic-ai/claude-code@latest opencode-ai@latest @openai/codex@latest 2>&1 | tail -1 || true
 
 # The repo's own dependencies: `npm test`, `npx tsc --noEmit` and `npm start` need
 # tsx/typescript from devDependencies, and nothing installed them before. Non-fatal
@@ -25,7 +25,7 @@ fi
 # The bind sources are created host-user-owned by prepare-host-state.sh, which
 # lines up with `node` (uid 1000) on the hosts this targets. chown defensively for
 # the hosts where it does not — Docker creates a missing bind source root-owned.
-sudo chown node:node "$HOME/.claude" "$HOME/.local/share/opencode" "$HOME/.config/gh" 2>/dev/null || true
+sudo chown node:node "$HOME/.claude" "$HOME/.local/share/opencode" "$HOME/.config/gh" "$HOME/.codex" 2>/dev/null || true
 # Keep the verify/lint scripts executable. They are all tracked 755, so this is a
 # no-op safety net rather than a source of mode-only diffs in the worktree.
 chmod +x modelguild/verify-guild-*.sh modelguild/tests/*.sh 2>/dev/null || true
@@ -94,6 +94,7 @@ report_tool node      node     --version
 report_tool npm       npm      --version
 report_tool claude    claude   --version
 report_tool opencode  opencode --version
+report_tool codex     codex    --version
 report_tool git       git      --version
 report_tool gh        gh       --version
 report_tool jq        jq       --version
@@ -128,6 +129,13 @@ if opencode auth list 2>/dev/null | grep -qiE '[1-9][0-9]* credential|: '; then
   echo "opencode: has credentials"
 else
   echo "opencode: no credentials — run 'opencode auth login' inside this container"
+fi
+# `codex login status` exits 1 and prints "Not logged in" when there is no auth.json
+# (probed on codex-cli 0.153.4); it calls no model.
+if codex login status >/dev/null 2>&1; then
+  echo "codex:    logged in"
+else
+  echo "codex:    NOT logged in — run 'codex login' (or 'codex login --device-auth') inside this container"
 fi
 if gh auth status >/dev/null 2>&1; then
   echo "gh:       logged in"

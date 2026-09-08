@@ -1,5 +1,5 @@
 {
-  // ModelGuild dev container — Claude Code + opencode both run in here.
+  // ModelGuild dev container — Claude Code, opencode and Codex CLI all run in here.
   //
   // Auth model: you log in ONCE inside the container. Login state is kept in the
   // host directories bind-mounted below, so it survives rebuilds AND volume
@@ -10,6 +10,7 @@
   //
   //   claude                 -> then /login  (device-code OAuth in your browser)
   //   opencode auth login    -> pick OpenAI / Copilot / Gemini
+  //   codex login            -> ChatGPT sign-in (codex login --device-auth for a one-time code)
   "name": "ModelGuild",
   "build": { "dockerfile": "Dockerfile" },
   "remoteUser": "node",
@@ -24,8 +25,9 @@
   },
 
   "mounts": [
-    // Persistent login/state, bind-mounted from the HOST (all three were named
-    // volumes until 2026-07-25). A named volume survives a rebuild but not `docker
+    // Persistent login/state, bind-mounted from the HOST (the first three were
+    // named volumes until 2026-07-25; codex was added 2026-09-08 straight onto a
+    // bind mount and never had a volume). A named volume survives a rebuild but not `docker
     // volume prune` / Docker Desktop "Clean / Purge data" — and that silently took
     // every session transcript and OAuth token with it. A host dir survives those
     // and is backup-able. `initializeCommand` (prepare-host-state.sh) creates the
@@ -33,6 +35,9 @@
     // and the non-root `node` user could not write them.
     "source=${localEnv:HOME}/.modelguild/claude,target=/home/node/.claude,type=bind",
     "source=${localEnv:HOME}/.modelguild/opencode,target=/home/node/.local/share/opencode,type=bind",
+    // Codex CLI keeps auth.json (tokens) and config.toml in ~/.codex, its CODEX_HOME
+    // default. The whole dir is mounted, as opencode's is, so config persists too.
+    "source=${localEnv:HOME}/.modelguild/codex,target=/home/node/.codex,type=bind",
     // gh CLI auth (device-code login persists here across rebuilds).
     "source=${localEnv:HOME}/.modelguild/gh,target=/home/node/.config/gh,type=bind"
 
@@ -50,10 +55,12 @@
 
   "customizations": {
     "vscode": {
-      // Both agents' editor extensions, so the container matches the CLIs
+      // All three agents' editor extensions, so the container matches the CLIs
       // postCreate.sh installs. sst-dev.opencode is the official one (publisher
-      // SST, source github.com/sst/opencode — same repo as the CLI).
-      "extensions": ["anthropic.claude-code", "sst-dev.opencode"]
+      // SST, source github.com/sst/opencode — same repo as the CLI); openai.chatgpt
+      // is OpenAI's own Codex extension (marketplace name "Codex – OpenAI's coding
+      // agent"), which drives the codex CLI postCreate.sh installs.
+      "extensions": ["anthropic.claude-code", "sst-dev.opencode", "openai.chatgpt"]
     }
   },
 
