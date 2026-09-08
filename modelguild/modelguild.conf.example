@@ -223,8 +223,8 @@
 #                                 # capture.recoveryHint), and the wait is spent inside the
 #                                 # SAME GUILD_MESSAGE_TIMEOUT_MS budget as the model turn.
 # GUILD_APPROVE_EGRESS=ask        # off (default) | ask. SEPARATE knob, also opt-in: put
-#                                 # webfetch/websearch behind the same prompt on the READ
-#                                 # paths (guild-read/guild-research), i.e. /guild:consult,
+#                                 # webfetch/websearch behind the same prompt on every agent
+#                                 # whose def allows them (all three since 2026-09-03), i.e. /guild:consult,
 #                                 # /guild:panel, /guild:research and friends.
 #                                 # PROVENANCE, because this one is an asymmetry: the read
 #                                 # paths are deliberately NOT fenced (the 2026-07-22

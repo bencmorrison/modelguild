@@ -73,6 +73,7 @@ The docs carry the rule. The reasoning goes where it stays true.
 
 - **Module-scoped** → that module's header comment. It is reviewed in the same diff as the code it explains, which is why `src/` is the least rot-prone store here. Machine-enforced instance: the `V1 PIN` block in `src/client.ts`, held by `modelguild/tests/check-v1-permission-pin.sh`.
 - **Cross-cutting** → the GitHub issue that produced it. **Link it; never transcribe it.**
+- **Module narrative** — what a module does and the decisions behind its shape, once category 3 has moved — → [docs/architecture.md](docs/architecture.md). **A convention that only matters in one part of the tree** → a path-scoped `.claude/rules/*.md`, listed in [opencode.json](opencode.json)'s `instructions` so opencode reads the same file. **A multi-step procedure** → `.claude/skills/<name>/SKILL.md`. `AGENTS.md` holds only what every session of every agent needs, and `modelguild/tests/check-agents-size.sh` (CI) keeps it under Claude Code's 40,000-character memory-file floor.
 - **No new file.** No rationale archive, no changelog — the evidence against both is in [#122](https://github.com/bencmorrison/modelguild/issues/122).
 
 Three categories. Sort every sentence you are about to add to `AGENTS.md`, `CONTRACT.md`, `SECURITY.md` or this file:

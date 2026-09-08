@@ -5,8 +5,10 @@
 # What guild-build claims, and what this proves:
 #   * It CAN edit — edit/write/patch/bash resolve to `allow` (else /guild:delegate is
 #     broken). This script asserts that positively.
-#   * The tool-native escape/egress paths are REMOVED — task, webfetch, websearch,
-#     grep and glob resolve to `deny`, and `read` is a plain allow.
+#   * It has a Claude Code coding subagent's abilities — grep/glob, webfetch/websearch,
+#     todowrite/lsp/skill resolve to `allow` too (2026-09-03, maintainer, PARITY), and
+#     `read` is a plain allow. ONLY `task` resolves to `deny`: a Claude Code subagent
+#     cannot spawn subagents either.
 #
 # NO SECRET-READ ASSERTION ANY MORE (changed 2026-07-29, maintainer decision, issue
 # #29). This script used to assert that the `read` tool denied a canonical list of
@@ -77,14 +79,12 @@ effective_action() {
 [ "$(last_action '*')" = "deny" ] && pass "'*' catch-all => deny (default-deny allowlist)" \
   || bad "'*' catch-all is NOT deny — un-listed tools would be ALLOWED"
 # The mutation set MUST be allowed (else /guild:delegate can't edit).
-for cap in edit write patch bash; do
-  if [ "$(effective_action "$cap")" = "allow" ]; then pass "$cap => allow (edit path works)"; else bad "$cap is NOT allow — /guild:delegate cannot edit"; fi
+for cap in edit write patch bash grep glob webfetch websearch todowrite lsp skill; do
+  if [ "$(effective_action "$cap")" = "allow" ]; then pass "$cap => allow (edit path works)"; else bad "$cap is NOT allow — /guild:delegate lacks a coding subagent's ability"; fi
 done
-# Everything else — escape hatch, egress, AND the tool-native secret-search routes
-# (grep/glob) a compliant model would default to — must be effectively denied.
-for cap in task webfetch websearch grep glob todowrite lsp skill; do
-  if [ "$(effective_action "$cap")" = "deny" ]; then pass "$cap => deny (effective)"; else bad "$cap is NOT effectively denied"; fi
-done
+# The ONE denied tool — sub-agent spawning — must be effectively denied; it is the only
+# ability a Claude Code subagent lacks too.
+if [ "$(effective_action task)" = "deny" ]; then pass "task => deny (effective)"; else bad "task is NOT effectively denied"; fi
 # read must be a plain allow with NO secret-glob carve-outs (same shape, and the same
 # assertion, as the read paths since their own realignment).
 [ "$(last_action read '*')" = "allow" ] && pass "read '*' => allow (agent can read the repo it must edit)" \
@@ -132,11 +132,11 @@ fi  # end runtime probe (skipped under --static)
 echo
 if [ "$fail" -eq 0 ] && [ "$inconclusive" -eq 0 ]; then
   if [ -n "$static_only" ]; then
-    printf '\033[32mguild-build VERIFIED (static)\033[0m — edit/write/patch/bash=allow; read=allow; task/grep/glob/webfetch/websearch=deny (resolved config). Runtime edit probe not run (--static).\n'
+    printf '\033[32mguild-build VERIFIED (static)\033[0m — edit/write/patch/bash/grep/glob/webfetch/websearch/todowrite/lsp/skill=allow; read=allow; task=deny (resolved config). Runtime edit probe not run (--static).\n'
   else
-    printf '\033[32mguild-build VERIFIED\033[0m — edit path works; task/grep/glob/webfetch/websearch are denied at the tool layer.\n'
+    printf '\033[32mguild-build VERIFIED\033[0m — edit path works; every tool a Claude Code coding subagent has is allowed; task is denied at the tool layer.\n'
   fi
-  printf '  NOTE: bash is allowed by design, so the remaining denies are defense-in-depth, NOT by construction, and there is no secret-read fence at all (removed 2026-07-29, issue #29 — bash bypassed it). This agent can read any repo file, credentials included; the /guild:delegate diff review is the trust boundary.\n'
+  printf '  NOTE: bash is allowed by design and so are the web and search tools (PARITY, 2026-09-03), and there is no secret-read fence at all (removed 2026-07-29, issue #29 — bash bypassed it). This agent can read any repo file, credentials included; the /guild:delegate diff review is the trust boundary.\n'
 elif [ "$fail" -ne 0 ]; then
   printf '\033[31mguild-build NOT verified\033[0m — permission shape is wrong; check the agent def against verify-guild-read.sh conventions.\n'
 else

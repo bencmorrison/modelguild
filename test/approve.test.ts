@@ -303,8 +303,9 @@ export async function run(): Promise<number> {
       );
     }
     c.check(
-      gatedToolsFor(buildSet, SETTINGS("off", "ask")).length === 0,
-      "egress: the write agent has no web tools, so the egress knob gates nothing there",
+      JSON.stringify(gatedToolsFor(buildSet, SETTINGS("off", "ask"))) ===
+        JSON.stringify(["webfetch", "websearch"]),
+      "egress: the write agent allows the web tools too (PARITY, 2026-09-03), so the egress knob gates them there as well",
     );
     c.check(
       gatedToolsFor(new Set<string>(), SETTINGS("all", "ask")).length === 0,
@@ -389,7 +390,9 @@ export async function run(): Promise<number> {
     const widened = checkStoredRuleset(
       [
         { permission: "bash", pattern: "*", action: "ask" },
-        { permission: "webfetch", pattern: "*", action: "allow" },
+        // `task` is the one tool every def denies (PARITY, 2026-09-03: webfetch is allowed
+        // on guild-build now, so it no longer widens anything).
+        { permission: "task", pattern: "*", action: "allow" },
       ],
       required,
       buildSet,
@@ -1533,8 +1536,8 @@ export async function run(): Promise<number> {
       `H3: guild-build's def allows edit/write/patch/bash (got ${[...build].sort().join(",")})`,
     );
     c.check(
-      !build.has("webfetch") && !build.has("websearch"),
-      "H3: guild-build's def does NOT allow the web tools",
+      build.has("webfetch") && build.has("websearch") && !build.has("task"),
+      "H3: guild-build's def allows the web tools and denies task (PARITY, 2026-09-03)",
     );
     for (const agent of ["guild-read", "guild-research"]) {
       const set = shippedAllowSet(agent);

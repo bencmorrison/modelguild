@@ -147,7 +147,8 @@ export type ApprovalTier = "off" | "write" | "all";
 
 /**
  * `GUILD_APPROVE_EGRESS` — a SEPARATE, opt-in, default-off knob offering `ask` on
- * `webfetch`/`websearch` for the READ paths (`guild-read`/`guild-research`).
+ * `webfetch`/`websearch` for every agent whose def allows them — the read paths, and
+ * `guild-build` since 2026-09-03 (PARITY).
  *
  * PROVENANCE, because this one needs it (maintainer decision, 2026-07-28, answering design
  * open question 8): the read paths are deliberately NOT fenced — the 2026-07-22 realignment

@@ -60,8 +60,15 @@
  * install with no ownership record when only `<xdg>/opencode` was. In GLOBAL mode a LEAF payload file that is a symlink is not
  * written through and not refused: it takes the existing never-clobber path — skipped
  * with a warning, `init` completes, the ownership record is still written. (Project mode
- * still REFUSES a live leaf link; only the dangling case changed there.) The RECORD's own
- * path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
+ * still REFUSES a live leaf link; only the dangling case changed there.)
+ * (#165 made `--global` write THROUGH such a link when the bytes hashed to the record; that was
+ * REVERTED — the gate was a hash of a file published in the npm tarball, so it bought freshness
+ * and never authority, and no narrowing keeps the stow case while closing that. The defect it
+ * fixed was real and survives the revert: `doctor` called the file C72 SKEW and named `init` as
+ * the remedy while `init` declined to act. That contradiction is closed in the REPORTING instead
+ * — `PayloadFileState.linkTarget`, so the skew note says init will skip those and the note will
+ * not clear, and the skip names the link, its target and the two routes that work.)
+ * The RECORD's own path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
  * there is written THROUGH — deliberately, since only init writes the record and there is
  * no user content to preserve, but never silently (`recordSymlinkWarning`). TWO enumerated
  * shapes of record link are REFUSED instead, at plan time and before any byte is written
@@ -82,6 +89,11 @@
  * one sentence — issue #156, "Init will not allow symlinks, this is likely a bad idea."
  * Everything below it is Claude's, including the global-only scope, the leaf rule and the
  * record write-through.
+ * An earlier version of the AGENTS.md bullet (now in docs/architecture.md) attributed those to a "maintainer decision
+ * 2026-08-05"; the maintainer has since confirmed he does not recall making them, and nothing in
+ * the tracker or git evidences them. Do not cite his authority for a design choice an agent made
+ * — that attribution survived seven flagged escalations and ten merged issues before it was
+ * corrected, which is how a label becomes a fact.
  *
  * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
  * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
@@ -825,6 +837,10 @@ function checkGlobalDirChain(base: string, rel: string, what: string): void {
  * True when a path has an entry of its own — a DANGLING symlink included, which `existsSync`
  * (it follows) reports as absent. The install loop gates its never-clobber check on this so a
  * dangling leaf link reaches the not-a-regular-file branch instead of being written THROUGH.
+ * It holds in both modes, and that is **two** behaviour changes in project mode from one root
+ * cause: a dangling leaf was written *through* (payload bytes outside the target), and where the
+ * link's target directory did not exist that write was a mid-loop `ENOENT` crash. Both are now a
+ * clean skip.
  */
 function entryExists(p: string): boolean {
   try {
