@@ -16,18 +16,19 @@ set -euo pipefail
 
 state_root="${MODELGUILD_HOST_STATE:-$HOME/.modelguild}"
 
-for dir in claude opencode gh; do
+for dir in claude opencode gh codex; do
   mkdir -p "$state_root/$dir"
 done
 
 # Tokens live in here. Keep the tree off other local accounts.
-chmod 700 "$state_root" "$state_root/claude" "$state_root/opencode" "$state_root/gh"
+chmod 700 "$state_root" "$state_root/claude" "$state_root/opencode" "$state_root/gh" "$state_root/codex"
 
 printf 'host state: %s\n' "$state_root"
 
 # A rebuild stops mounting the old named volumes but does not delete them, so state
 # from a pre-bind-mount container is still recoverable. Only ever prints — copying a
-# credential store is the user's call.
+# credential store is the user's call. codex has no hint: it was added (2026-09-08)
+# after the switch, so there was never a volume to recover from.
 migration_hint() { # <state-dir> <old-volume>
   local dir="$1" vol="$2"
   [ -z "$(ls -A "$state_root/$dir" 2>/dev/null)" ] || return 0
