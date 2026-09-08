@@ -34,7 +34,7 @@ export function codexConfig(targetDir: string, launch: ServerLaunch, global = fa
 }
 
 /** A null verdict means Codex is absent, so registration could not be checked. */
-export function codexRegistration(targetDir: string): { ok: boolean | null; messages: string[] } {
+export function codexRegistration(targetDir: string): { ok: boolean | null; unregistered?: boolean; messages: string[] } {
   const res = spawnSync("codex", ["mcp", "get", "modelguild", "--json"], {
     cwd: targetDir, encoding: "utf8", timeout: 15_000,
   });
@@ -42,7 +42,10 @@ export function codexRegistration(targetDir: string): { ok: boolean | null; mess
     return { ok: null, messages: ["Cannot inspect Codex MCP registration: codex is not on PATH. Available workflow files do not establish which client you use; check with `codex mcp get modelguild --json` in your Codex environment, or select `--driver claude`."] };
   }
   if (res.error) return { ok: false, messages: ["Cannot inspect Codex MCP registration: check that codex is installed and answering `codex mcp get modelguild --json`."] };
-  if (res.status !== 0) return { ok: false, messages: ["Codex MCP server 'modelguild' is not available; check that the init-generated table is in .codex/config.toml or $CODEX_HOME/config.toml (default ~/.codex/config.toml). If the project table is already present, check project trust: Codex ignores project configuration in untrusted projects."] };
+  // Only the CLI's observed no-entry response is an optional registration miss.
+  // A config-parse error or another failed command must not disappear behind a working client.
+  const noEntry = `${res.stdout ?? ""}\n${res.stderr ?? ""}`.includes("No MCP server named 'modelguild' found");
+  if (res.status !== 0) return { ok: false, unregistered: noEntry, messages: ["Codex MCP server 'modelguild' is not available; check that the init-generated table is in .codex/config.toml or $CODEX_HOME/config.toml (default ~/.codex/config.toml). If the project table is already present, check project trust: Codex ignores project configuration in untrusted projects."] };
   try {
     const config = JSON.parse(res.stdout);
     if (config.enabled === false || !config.transport) return { ok: false, messages: ["Codex MCP server 'modelguild' is disabled or has no transport."] };

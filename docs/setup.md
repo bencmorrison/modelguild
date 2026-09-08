@@ -51,8 +51,11 @@ Claude default. `doctor` detects installed workflow sets, or accepts `--driver c
 `--driver codex`, or `--driver both` explicitly. These files may be committed by the repo;
 detection is an inventory, not a claim about your preferred client. An absent Codex CLI
 produces a warning because registration cannot be checked, matching the Claude path.
-When Codex answers, missing/disabled registration fails its check; an unusually short
-tool timeout produces a warning. Registration is inspected
+For inferred `both`, a missing registration warns when the other client is registered
+or cannot be checked; two known missing registrations fail. An explicit `--driver`
+selection still fails on a known missing registration. Disabled Codex registrations
+and Codex diagnostic errors remain failures. An unusually short tool timeout produces a
+warning. Registration is inspected
 with `codex mcp get modelguild --json` in the checked directory.
 
 For all projects, use `init --driver codex --global`. Skills go into `~/.agents/skills`;

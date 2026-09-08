@@ -238,6 +238,53 @@ async function runCases(): Promise<number> {
   c.check(explicitCodex.code === 0, "explicit Codex selection still reports missing CLI as inconclusive");
   const explicitClaude = await captureDoctor(["--dir", bothProject, "--driver", "claude"], bothInject);
   c.check(explicitClaude.code === 0 && !explicitClaude.out.includes("Codex MCP"), "explicit Claude selection skips Codex registration");
+  // #226: both payloads can be tracked while only one client is used. Cover both
+  // directions and all registered/missing/absent pairs under the suite's isolated PATH.
+  const clientTools = tempDir();
+  const registeredConfig = JSON.stringify({enabled: true, transport: {type: "stdio"}, tool_timeout_sec: 2100});
+  const states = ["registered", "missing", "absent"] as const;
+  const setClient = (name: "claude" | "codex", state: typeof states[number]) => {
+    const file = path.join(clientTools, name);
+    rmSync(file, {force: true});
+    if (state !== "absent") writeFileSync(file, "#!/usr/bin/env bash\n" +
+      (state === "missing" ? `printf '%s\\n' "No MCP server named 'modelguild' found" >&2\nexit 1\n` : `printf '%s\\n' '${registeredConfig}'\n`), {mode: 0o755});
+  };
+  try {
+    await withPath(`${clientTools}:${process.env.PATH}`, async () => {
+      for (const claude of states) for (const codex of states) {
+        setClient("claude", claude); setClient("codex", codex);
+        const label = `Claude=${claude}, Codex=${codex}`;
+        const inferred = await captureDoctor(["--dir", bothProject], bothInject);
+        const bothMissing = claude === "missing" && codex === "missing";
+        c.check(inferred.code === (bothMissing ? 1 : 0), `inferred both: ${label}`);
+        if (!bothMissing && (claude === "missing" || codex === "missing")) {
+          c.check(!inferred.out.includes("✗") && inferred.out.includes("! "), `optional registration miss warns: ${label}`);
+        }
+        const explicit = await captureDoctor(["--dir", bothProject, "--driver", "both"], bothInject);
+        c.check(explicit.code === (claude === "missing" || codex === "missing" ? 1 : 0), `explicit both stays strict: ${label}`);
+      }
+      setClient("claude", "missing"); setClient("codex", "missing");
+      const mcpFile = path.join(bothProject, ".mcp.json");
+      writeFileSync(mcpFile, JSON.stringify({mcpServers: {modelguild: {command: "node"}}}));
+      try {
+        const projectRegistration = await captureDoctor(["--dir", bothProject], bothInject);
+        c.check(projectRegistration.code === 0 && projectRegistration.out.includes("✓ MCP server registered in project .mcp.json"),
+          "Claude's project-file fallback also supports an inferred Codex registration miss");
+      } finally { rmSync(mcpFile); }
+      setClient("claude", "registered");
+      writeFileSync(path.join(clientTools, "codex"), "#!/usr/bin/env bash\necho 'Error loading configuration: invalid TOML' >&2\nexit 1\n", {mode: 0o755});
+      const failedCommand = await captureDoctor(["--dir", bothProject], bothInject);
+      c.check(failedCommand.code === 1 && failedCommand.out.includes("✗ Codex"),
+        "a failed Codex command is not mistaken for an optional no-entry response");
+      for (const response of ["not-json", JSON.stringify({enabled: false, transport: {type: "stdio"}})]) {
+        writeFileSync(path.join(clientTools, "codex"), `#!/usr/bin/env bash\nprintf '%s\\n' '${response}'\n`, {mode: 0o755});
+        const brokenCodex = await captureDoctor(["--dir", bothProject], bothInject);
+        c.check(brokenCodex.code === 1 && brokenCodex.out.includes("✗ Codex"),
+          "inference does not hide malformed or disabled Codex registration behind a working Claude");
+      }
+    });
+  } finally { rmSync(clientTools, {recursive: true, force: true}); }
+
   for (const dest of [".claude/commands/guild/panel.md", ".agents/skills/guild-panel/SKILL.md", ".agents/skills/modelguild-common.md"]) {
     rmSync(path.join(bothProject, dest));
   }

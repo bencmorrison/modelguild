@@ -151,6 +151,8 @@ export async function run(): Promise<number> {
     writeFileSync(path.join(bin, "opencode"), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.18.11; else echo "1 credentials"; fi\n', {mode: 0o755});
     const codexStub = (body: string) => writeFileSync(path.join(bin, "codex"), '#!/bin/sh\ncat <<\'JSON\'\n' + body + '\nJSON\n', {mode: 0o755});
     // Only explicitly provided tools: never find an ambient Codex in /usr/bin on a dev box.
+    // Stubs use absolute #!/bin/sh and shell builtins; cat is their only external command.
+    // Add any new external stub dependency here instead of inheriting the host PATH.
     const cat = ["/bin/cat", "/usr/bin/cat"].find(existsSync)!;
     symlinkSync(cat, path.join(bin, "cat"));
     const oldPath = process.env.PATH;

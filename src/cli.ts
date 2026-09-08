@@ -432,6 +432,7 @@ export async function runDoctor(
   // registers GLOBALLY (`claude mcp add -s user`, which writes ~/.claude.json, NOT the
   // project .mcp.json) — so a project-file check alone would falsely fail a working global
   // setup. Prefer an any-scope check via the Claude CLI; fall back to the project file.
+  const registrations: ReturnType<typeof codexRegistration>[] = [];
   if (driver !== "codex") {
     const mcpPath = path.join(targetDir, ".mcp.json");
     let projectHasKey = false;
@@ -452,25 +453,30 @@ export async function runDoctor(
     const claudeGet = spawnSync("claude", ["mcp", "get", "modelguild"], { encoding: "utf8" });
     const claudeOnPath = !claudeGet.error; // ENOENT sets .error
     if (claudeOnPath && claudeGet.status === 0) {
-      console.log("✓ MCP server 'modelguild' registered (found via `claude mcp get`, any scope)");
+      registrations.push({ok: true, messages: ["MCP server 'modelguild' registered (found via `claude mcp get`, any scope)"]});
     } else if (projectHasKey) {
-      console.log("✓ MCP server registered in project .mcp.json under key 'modelguild'");
+      registrations.push({ok: true, messages: ["MCP server registered in project .mcp.json under key 'modelguild'"]});
     } else if (claudeOnPath) {
       // claude answered, no registration in any scope — a real miss.
-      line(false, "MCP server 'modelguild' not registered in any scope — run `claude mcp add modelguild -s user -- npx -y modelguild serve`");
+      registrations.push({ok: false, unregistered: true, messages: ["MCP server 'modelguild' not registered in any scope — run `claude mcp add modelguild -s user -- npx -y modelguild serve`"]});
     } else {
       // Can't check global scope (claude not on PATH) and no project key. Do NOT hard-fail: a
       // global/user-scope registration lives in ~/.claude.json, invisible here.
-      console.warn(
-        "! MCP server 'modelguild' not found in project .mcp.json, and the `claude` CLI isn't " +
+      registrations.push({ok: null, messages: [
+        "MCP server 'modelguild' not found in project .mcp.json, and the `claude` CLI isn't " +
           "on PATH to check global/user scope. If you registered with `-s user`, that's expected — " +
           "verify with `claude mcp get modelguild`.",
-      );
+      ]});
     }
   }
-  if (driver !== "claude") {
-    const registration = codexRegistration(targetDir);
-    if (registration.ok === null) console.warn(`! ${registration.messages[0]}`);
+  if (driver !== "claude") registrations.push(codexRegistration(targetDir));
+  // Inferred workflow inventory does not require two registrations (#226 / PR #231).
+  // Defer both verdicts so either client's registered/inconclusive check can support the
+  // other client's ordinary registration miss. Explicit choices and Codex diagnostic errors stay strict.
+  for (const registration of registrations) {
+    const otherUsable = registrations.some(other => other !== registration && other.ok !== false);
+    const optionalMiss = driverArg === undefined && driver === "both" && registration.unregistered && otherUsable;
+    if (registration.ok === null || optionalMiss) console.warn(`! ${registration.messages[0]}`);
     else line(registration.ok, registration.messages[0]);
     for (const message of registration.messages.slice(1)) console.warn(message);
   }
