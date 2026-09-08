@@ -157,7 +157,7 @@ function shellOnlyDir(): string {
 
 /**
  * Run `fn` with PATH replaced by `dir` plus the bash-only dir — `null` means the bash-only dir
- * alone, i.e. no `opencode` on PATH at all. `claude` is absent either way, which puts the MCP
+ * alone, i.e. no `opencode` on PATH at all. `claude` and `codex` are absent either way, which puts the MCP
  * check on its documented warning branch; that is what lets these cases assert ABSOLUTE exit
  * codes where the rest of this suite has to compare against `base`.
  */
@@ -212,7 +212,7 @@ async function captureDoctor(
  *     cases (a)-(r) would fail there for a reason those cases are not about.
  *   - A dev box HAS opencode and may or may not be logged in, so the verdict would differ
  *     between machines.
- *   - `claude` is off PATH here too, which puts the MCP-registration check on its documented
+ *   - `claude` and `codex` are off PATH here too, which puts the MCP-registration check on its documented
  *     warning branch — the same state CI has always had.
  *
  * Cases (s)-(z) nest their own `withPath` inside this one to vary the opencode state.
@@ -224,6 +224,76 @@ export async function run(): Promise<number> {
 async function runCases(): Promise<number> {
   const c = new Checker();
   console.log("== doctor.test ==");
+
+  // #226: source repos can commit both workflow sets without either client being installed.
+  const bothProject = tempDir();
+  const bothInject = {homeDir: tempDir(), xdgConfigHome: tempDir()};
+  init({targetDir: bothProject, packageRoot: repoRoot, serverLaunch: LAUNCH, driver: "both"});
+  rmSync(path.join(bothProject, "modelguild/.modelguild-install.json"));
+  const both = await captureDoctor(["--dir", bothProject], bothInject);
+  c.check(both.code === 0 && both.out.includes("doctor: OK"), "both payloads without client CLIs do not fail plain doctor");
+  c.check(both.out.includes("✓ Driver: both") && both.out.includes("override with --driver"), "driver inventory has a glyph and an explicit override");
+  c.check(both.out.includes("! Cannot inspect Codex MCP registration") && !both.out.includes("✗"), "absent Codex warns just like absent Claude");
+  const explicitCodex = await captureDoctor(["--dir", bothProject, "--driver", "codex"], bothInject);
+  c.check(explicitCodex.code === 0, "explicit Codex selection still reports missing CLI as inconclusive");
+  const explicitClaude = await captureDoctor(["--dir", bothProject, "--driver", "claude"], bothInject);
+  c.check(explicitClaude.code === 0 && !explicitClaude.out.includes("Codex MCP"), "explicit Claude selection skips Codex registration");
+  // #226: both payloads can be tracked while only one client is used. Cover both
+  // directions and all registered/missing/absent pairs under the suite's isolated PATH.
+  const clientTools = tempDir();
+  const registeredConfig = JSON.stringify({enabled: true, transport: {type: "stdio"}, tool_timeout_sec: 2100});
+  const states = ["registered", "missing", "absent"] as const;
+  const setClient = (name: "claude" | "codex", state: typeof states[number]) => {
+    const file = path.join(clientTools, name);
+    rmSync(file, {force: true});
+    if (state !== "absent") writeFileSync(file, "#!/usr/bin/env bash\n" +
+      (state === "missing" ? `printf '%s\\n' "No MCP server named 'modelguild' found" >&2\nexit 1\n` : `printf '%s\\n' '${registeredConfig}'\n`), {mode: 0o755});
+  };
+  try {
+    await withPath(`${clientTools}:${process.env.PATH}`, async () => {
+      for (const claude of states) for (const codex of states) {
+        setClient("claude", claude); setClient("codex", codex);
+        const label = `Claude=${claude}, Codex=${codex}`;
+        const inferred = await captureDoctor(["--dir", bothProject], bothInject);
+        const bothMissing = claude === "missing" && codex === "missing";
+        c.check(inferred.code === (bothMissing ? 1 : 0), `inferred both: ${label}`);
+        if (!bothMissing && (claude === "missing" || codex === "missing")) {
+          c.check(!inferred.out.includes("✗") && inferred.out.includes("! "), `optional registration miss warns: ${label}`);
+        }
+        const explicit = await captureDoctor(["--dir", bothProject, "--driver", "both"], bothInject);
+        c.check(explicit.code === (claude === "missing" || codex === "missing" ? 1 : 0), `explicit both stays strict: ${label}`);
+      }
+      setClient("claude", "missing"); setClient("codex", "missing");
+      const mcpFile = path.join(bothProject, ".mcp.json");
+      writeFileSync(mcpFile, JSON.stringify({mcpServers: {modelguild: {command: "node"}}}));
+      try {
+        const projectRegistration = await captureDoctor(["--dir", bothProject], bothInject);
+        c.check(projectRegistration.code === 0 && projectRegistration.out.includes("✓ MCP server registered in project .mcp.json"),
+          "Claude's project-file fallback also supports an inferred Codex registration miss");
+      } finally { rmSync(mcpFile); }
+      setClient("claude", "registered");
+      writeFileSync(path.join(clientTools, "codex"), "#!/usr/bin/env bash\necho 'Error loading configuration: invalid TOML' >&2\nexit 1\n", {mode: 0o755});
+      const failedCommand = await captureDoctor(["--dir", bothProject], bothInject);
+      c.check(failedCommand.code === 1 && failedCommand.out.includes("✗ Codex"),
+        "a failed Codex command is not mistaken for an optional no-entry response");
+      for (const response of ["not-json", JSON.stringify({enabled: false, transport: {type: "stdio"}})]) {
+        writeFileSync(path.join(clientTools, "codex"), `#!/usr/bin/env bash\nprintf '%s\\n' '${response}'\n`, {mode: 0o755});
+        const brokenCodex = await captureDoctor(["--dir", bothProject], bothInject);
+        c.check(brokenCodex.code === 1 && brokenCodex.out.includes("✗ Codex"),
+          "inference does not hide malformed or disabled Codex registration behind a working Claude");
+      }
+    });
+  } finally { rmSync(clientTools, {recursive: true, force: true}); }
+
+  for (const dest of [".claude/commands/guild/panel.md", ".agents/skills/guild-panel/SKILL.md", ".agents/skills/modelguild-common.md"]) {
+    rmSync(path.join(bothProject, dest));
+  }
+  const missing = await captureDoctor(["--dir", bothProject], bothInject);
+  const missingLine = missing.out.split("\n").find(line => line.includes("— missing:")) ?? "";
+  c.check(missing.code === 1 && missingLine.includes(".claude/commands/guild/panel.md") &&
+    missingLine.includes(".agents/skills/guild-panel/SKILL.md") && missingLine.includes(".agents/skills/modelguild-common.md (project)") &&
+    !missingLine.includes(bothProject), "missing workflow diagnostics consistently use install-relative paths");
+  c.check((missingLine.match(/modelguild-common\.md/g) ?? []).length === 1, "missing shared guidance is listed once, not once per reference plus its payload entry");
 
   // ---- (a) GLOBAL-only install: plain `doctor` (no --global) must PASS -----
   // Payload lands ONLY in the injected global dirs; the project dir is empty.
@@ -276,7 +346,7 @@ async function runCases(): Promise<number> {
   const f = await captureDoctor(["--dir", projMissing], { homeDir: tempDir(), xdgConfigHome: tempDir() });
   c.check(f.code === 1, `(f) one doc missing: plain doctor FAILS (exit ${f.code})`);
   c.check(f.out.includes("7/8 command docs"), "(f) reports 7/8 docs with one removed");
-  c.check(f.out.includes("missing: consult"), "(f) names the missing doc (consult)");
+  c.check(f.out.includes("missing: .claude/commands/guild/consult.md"), "(f) names the missing doc (consult)");
   c.check(f.out.includes("✗"), "(f) prints a ✗ line for the missing doc");
 
   // ---- (f2) A DIRECTORY at a def path must FAIL, agreeing with C16 (issue #175) ----

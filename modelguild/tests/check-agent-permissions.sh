@@ -340,12 +340,13 @@ if [ "${1:-}" = "--self-test" ]; then
   awk '{print} /^  bash: allow$/{print "  \"*\": allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
   run_variant "$d/agent" && st_no "MISSED a '\"*\": allow' after the floor on guild-build" || st_ok "catches a '\"*\": allow' overriding the deny floor"
 
-  # S7. An extra capability (webfetch) added to guild-build -> FAIL. Guards the
+  # S7. An extra capability (task) added to guild-build -> FAIL. Guards the
   # allow-set-is-exact invariant: the floor is intact and every intended tool still
   # resolves to allow, so only the "not in the intended allow-set" check can catch this.
+  # task is the one tool every def denies (a Claude Code subagent has no Agent tool).
   seed
-  awk '{print} /^  bash: allow$/{print "  webfetch: allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
-  run_variant "$d/agent" && st_no "MISSED webfetch added to guild-build's allow-set" || st_ok "catches an unintended capability added to the allow-set"
+  awk '{print} /^  bash: allow$/{print "  task: allow"}' "$REAL/guild-build.md" > "$d/agent/guild-build.md"
+  run_variant "$d/agent" && st_no "MISSED task added to guild-build's allow-set" || st_ok "catches an unintended capability added to the allow-set"
 
   # S8. `mode: subagent` appended AFTER `mode: all` on guild-read -> FAIL. The issue-#100
   # hole itself: the mode check was by PRESENCE, so `mode: all` still matched and every
@@ -428,23 +429,28 @@ if [ "${1:-}" = "--self-test" ]; then
 fi
 
 # guild-read: read-only reviewer ROLE (2026-07-22 realignment). read+grep+glob+web
-# ALLOWED like a Claude review subagent; read is a plain top-level allow (no secret
-# globs). no-write/no-task is the role.
-echo "== guild-read (allowlist: read/grep/glob/webfetch/websearch) =="
-check_agent "$AGENT_DIR/guild-read.md" "grep glob webfetch websearch"
+# ALLOWED like a Claude review subagent, plus todowrite/lsp/skill (2026-09-03, PARITY:
+# every Claude Code subagent has them and none mutates); read is a plain top-level
+# allow (no secret globs). no-write/no-task is the role — and a Claude Code subagent
+# has no Agent tool either.
+echo "== guild-read (allowlist: read/grep/glob/webfetch/websearch/todowrite/lsp/skill) =="
+check_agent "$AGENT_DIR/guild-read.md" "grep glob webfetch websearch todowrite lsp skill"
 
 # guild-build: the write path. edit/write/patch/bash + a plain read. Its secret-glob
 # read-denies were dropped 2026-07-29 (issue #29) — bash bypassed them, so they never bound
 # a determined model, though they did refuse a compliant one (the stated cost, SECURITY.md).
-# The def now states what is true. grep/glob/web/task stay denied.
-echo "== guild-build (allowlist: edit/write/patch/bash) =="
-check_agent "$AGENT_DIR/guild-build.md" "edit write patch bash"
+# The def now states what is true. grep/glob/webfetch/websearch/todowrite/lsp/skill were
+# re-allowed 2026-09-03 (maintainer, PARITY: a Claude Code coding subagent has all of
+# them, and bash reached every one anyway). ONLY task stays denied — a Claude Code
+# subagent cannot spawn subagents either — plus whatever a future opencode adds.
+echo "== guild-build (allowlist: edit/write/patch/bash/grep/glob/webfetch/websearch/todowrite/lsp/skill) =="
+check_agent "$AGENT_DIR/guild-build.md" "edit write patch bash grep glob webfetch websearch todowrite lsp skill"
 
 # guild-research is the source-backed /guild:research path — now IDENTICAL to
 # guild-read (2026-07-22 realignment): read+grep+glob+web allowed, no-write/no-task.
 # `bash` stays OUT of the allow-set (that no-shell/no-write scoping is the ROLE).
-echo "== guild-research (allowlist: read/grep/glob/webfetch/websearch) =="
-check_agent "$AGENT_DIR/guild-research.md" "grep glob webfetch websearch"
+echo "== guild-research (allowlist: read/grep/glob/webfetch/websearch/todowrite/lsp/skill) =="
+check_agent "$AGENT_DIR/guild-research.md" "grep glob webfetch websearch todowrite lsp skill"
 
 echo
 if [ "$fail" -eq 0 ]; then printf '\033[32magent permissions: allowlist invariants hold\033[0m\n'

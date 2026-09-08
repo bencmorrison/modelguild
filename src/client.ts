@@ -1062,6 +1062,9 @@ export function isBlank(s: string): boolean {
  * exactly the contrast issue #168 reports. Reading it as the answer is a FALLBACK and never a
  * merge: a message carrying BOTH kinds returns its `text` alone, so chain-of-thought never
  * lands beside an answer the model also wrote.
+ * **Whether that was THAT turn's cause is still unproven** and needs the live probe on the
+ * issue; two other candidates (the `guild-read` tool schema, the differing system prompt) remain
+ * live and untouched.
  *
  * **THE GATE IS ON THE JOINED STRING, NOT ON PART PRESENCE, AND THAT IS LOAD-BEARING.**
  * Requiring merely that a text PART exist made an `{type:"text", text:""}` part satisfy pass 1

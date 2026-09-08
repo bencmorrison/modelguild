@@ -872,6 +872,14 @@ const transport = new StdioServerTransport();
 // approach. The flagship orphan test drives production and spike modes through the
 // same code so the green/red difference is precisely the stdin watch, nothing else.
 // It has no effect on normal operation and is never set outside the test suite.
+// **`@modelcontextprotocol/sdk` 1.30.0 added a third route into that same teardown, and it runs
+// in the benign direction:** `StdioServerTransport`'s constructor now takes a `maxBufferSize`
+// (default 10 MiB) for its **inbound** `ReadBuffer`, and an over-cap `append` throws inside the
+// `data` handler — which the SDK now catches and converts into `close()`, so it reaches the
+// `onclose` the lifecycle already watches instead of being an uncaught listener exception. We
+// pass no options, so the 10 MiB default binds; it caps only what Claude Code sends **in**
+// (tool-call inputs and elicitation replies — nothing near it), and the outbound `send()` path
+// is unchanged, so a large tool result carrying `raw_response`/`activity` is not affected.
 const teardownSources =
   process.env.GUILD_TEARDOWN_MODE === "spike"
     ? { transport }

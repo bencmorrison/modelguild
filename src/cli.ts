@@ -23,6 +23,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   init,
+  parseDriver,
+  type Driver,
   locatePayload,
   mcpServerEntry,
   packageVersion,
@@ -48,6 +50,8 @@ import {
   watcherDirFor,
   type WatcherHeartbeat,
 } from "./approve.js";
+
+import { codexConfig, codexRegistration, installedDriver } from "./driver.js";
 
 const SELF = fileURLToPath(import.meta.url); // <pkg>/dist/cli.js  or  <pkg>/src/cli.ts
 // PACKAGE_ROOT comes from `init.ts` (issue #94): the installer's notion of "where the payload
@@ -87,6 +91,7 @@ function parseInitArgs(argv: string[]): {
   launch: ServerLaunch;
   writeMcp: boolean;
   global: boolean;
+  driver: Driver;
 } {
   let targetDir = process.cwd();
   let dirExplicit = false;
@@ -94,10 +99,13 @@ function parseInitArgs(argv: string[]): {
   let useAbs = false;
   let writeMcp = false;
   let global = false;
+  let driver: Driver = "claude";
   let customCommand: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--uninstall") uninstall = true;
+    if (a === "--driver") driver = parseDriver(argv[++i]);
+    else if (a.startsWith("--driver=")) driver = parseDriver(a.slice(9));
+    else if (a === "--uninstall") uninstall = true;
     // --npx is the default already; accepted as an explicit no-op for clarity.
     else if (a === "--npx") useAbs = false;
     else if (a === "--abs") useAbs = true;
@@ -130,12 +138,12 @@ function parseInitArgs(argv: string[]): {
   } else {
     launch = npxServeLaunch(); // SHIPPED DEFAULT
   }
-  return { targetDir, uninstall, launch, writeMcp, global };
+  return { targetDir, uninstall, launch, writeMcp, global, driver };
 }
 
 function runInit(argv: string[]): number {
-  const { targetDir, uninstall, launch, writeMcp, global } = parseInitArgs(argv);
-  const res = init({ targetDir, packageRoot: PACKAGE_ROOT, serverLaunch: launch, uninstall, writeMcp, global });
+  const { targetDir, uninstall, launch, writeMcp, global, driver } = parseInitArgs(argv);
+  const res = init({ targetDir, packageRoot: PACKAGE_ROOT, serverLaunch: launch, uninstall, writeMcp, global, driver });
   const g = resolveGlobalDirs({});
 
   // A BLOCKED ITEM MAKES THIS RUN FAIL (issue #164). `runInit` used to return 0 unconditionally,
@@ -159,7 +167,8 @@ function runInit(argv: string[]): number {
   } else if (global) {
     console.log(`Installed ModelGuild (MCP) GLOBAL payload — available in EVERY project${mark}`);
     console.log(`  ${res.installed.length} file(s) written, ${res.skipped.length} skipped`);
-    console.log(`  commands: ${path.join(g.homeDir, ".claude", "commands", "guild")}/`);
+    if (driver !== "codex") console.log(`  commands: ${path.join(g.homeDir, ".claude", "commands", "guild")}/`);
+    if (driver !== "claude") console.log(`  Codex skills: ${path.join(g.homeDir, ".agents", "skills")}/guild-*/SKILL.md`);
     console.log(`  agents:   ${path.join(g.xdgConfigHome, "opencode", "agent")}/`);
     console.log(`  policy:   ${path.join(g.homeDir, ".claude", "modelguild")}/`);
     console.log(`  .mcp.json: NOT written — register the server globally yourself (see below).`);
@@ -180,26 +189,39 @@ function runInit(argv: string[]): number {
     // only the first, and now reads as a contradiction next to the drift note ("you edited it
     // since init wrote it"). Same set, accurate for both cases.
     console.warn(
-      `  ! ${res.shadowed.length} /guild:* command(s) at our path hold content ModelGuild did ` +
+      `  ! ${res.shadowed.length} ${driver === "claude" ? "/guild:* command(s)" : "workflow(s)"} at our path hold content ModelGuild did ` +
         `not write — your own command, or your edit of ours (shadowing): ` +
-        `${res.shadowed.join(", ")}. Those are the commands Claude Code will run; delete or ` +
+        `${res.shadowed.join(", ")}. Those are the workflows your driver will run; delete or ` +
         `rename one and re-run to get ModelGuild's version back.`,
     );
   }
-  if (res.drifted.length > 0) printDriftNote(res.drifted, "  ");
-  if (!uninstall && !writeMcp) printRegisterInstructions(targetDir, launch, global);
+  if (res.drifted.length > 0) printDriftNote(res.drifted, "  ", driver, global);
+  if (!uninstall) {
+    if (!writeMcp && driver !== "codex") printRegisterInstructions(targetDir, launch, global);
+    if (driver !== "claude") {
+      console.log("Register Codex: merge this table into " + (global
+        ? "$CODEX_HOME/config.toml (default ~/.codex/config.toml):"
+        : ".codex/config.toml in this project (Codex must trust the project):"));
+      console.log(codexConfig(targetDir, launch, global));
+      console.log("Keep existing MCP servers and unrelated settings. Restart Codex CLI / the IDE extension, then use /mcp and $guild-configure.");
+      console.log("The 35-minute tool deadline covers default turns plus one panel retry; increase it for longer configured turns. init does not edit Codex configuration.");
+    }
+  }
+  if (uninstall && driver !== "claude") console.log("Codex registration is user-owned: remove its modelguild table from the config.toml you used (or `codex mcp remove modelguild` for a user registration).");
   if (!uninstall) {
     console.log("Next steps:");
     console.log("  1. Authenticate opencode:  opencode auth login");
     if (writeMcp) {
-      console.log("  2. (Done — --write-mcp wrote the project .mcp.json for you.)");
-    } else if (global) {
+      console.log(driver === "both"
+        ? "  2. Claude registration written to .mcp.json; register Codex using the TOML above."
+        : "  2. (Done — --write-mcp wrote the project .mcp.json for you.)");
+    } else if (global && driver === "claude") {
       console.log("  2. Register the MCP server globally, once (see above): `claude mcp add modelguild -s user -- …`.");
     } else {
       console.log("  2. Register the MCP server (see 'Register the MCP server' above).");
     }
-    console.log("  3. Restart Claude Code so it picks up the MCP server.");
-    console.log(`  4. Check the setup:        npx modelguild doctor${global ? " --global" : ""}`);
+    console.log(`  3. Restart ${driver === "both" ? "Claude Code and Codex" : driver === "codex" ? "Codex" : "Claude Code"} so it picks up the MCP server.`);
+    console.log(`  4. Check the setup:        npx modelguild doctor --driver ${driver}${global ? " --global" : ""}`);
   }
   if (incomplete) {
     console.warn(
@@ -222,7 +244,8 @@ function runInit(argv: string[]): number {
  * offered: overwriting an edit on the user's behalf is exactly what the ownership model exists
  * to prevent, and a flag that does it invites the mistake the skip was protecting against.
  */
-function printDriftNote(drifted: PayloadFileState[], indent: string): void {
+function printDriftNote(drifted: PayloadFileState[], indent: string, driver: Driver = "claude", global = false): void {
+  const flags = `${driver === "claude" ? "" : ` --driver ${driver}`}${global ? " --global" : ""}`;
   console.warn(
     `${indent}! ${drifted.length} file(s) you edited are STALE — this release ships a newer ` +
       `version of them, and init never overwrites your edits, so your copy stayed behind:`,
@@ -233,7 +256,7 @@ function printDriftNote(drifted: PayloadFileState[], indent: string): void {
   }
   console.warn(
     `${indent}  Keeping your version? Nothing to do. Want the current one? Save your copy, ` +
-      `delete the file, and re-run \`npx modelguild init\` (init rewrites a file only while ` +
+      `delete the file, and re-run \`npx modelguild init${flags}\` (init rewrites a file only while ` +
       `it can prove the file is unedited).`,
   );
 }
@@ -365,14 +388,19 @@ export async function runDoctor(
 ): Promise<number> {
   let targetDir = process.cwd();
   let global = false;
+  let driverArg: Driver | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--dir") targetDir = argv[++i] ?? targetDir;
+    if (a === "--driver") driverArg = parseDriver(argv[++i]);
+    else if (a.startsWith("--driver=")) driverArg = parseDriver(a.slice(9));
+    else if (a === "--dir") targetDir = argv[++i] ?? targetDir;
     else if (a.startsWith("--dir=")) targetDir = a.slice("--dir=".length);
     else if (a === "--global") global = true;
   }
   targetDir = path.resolve(targetDir);
   const gdirs = resolveGlobalDirs({ homeDir: inject?.homeDir, xdgConfigHome: inject?.xdgConfigHome });
+  const driver = driverArg ?? installedDriver(targetDir, gdirs, global);
+  console.log(`✓ Driver: ${driver}${driverArg ? "" : " (from available workflows; override with --driver)"}`);
   // THE ONE INPUT `doctor` RESOLVES DIFFERENTLY FROM THE IN-SERVER SURFACES, SURFACED RATHER
   // THAN HIDDEN (review finding L7). `guild_status` and the start-up notice scan
   // `resolveProjectDir` = `$GUILD_PROJECT_DIR` else cwd (what `.mcp.json` sets, and what the
@@ -404,39 +432,53 @@ export async function runDoctor(
   // registers GLOBALLY (`claude mcp add -s user`, which writes ~/.claude.json, NOT the
   // project .mcp.json) — so a project-file check alone would falsely fail a working global
   // setup. Prefer an any-scope check via the Claude CLI; fall back to the project file.
-  const mcpPath = path.join(targetDir, ".mcp.json");
-  let projectHasKey = false;
-  // `isRegularFile`, not `existsSync` (issue #162): a FIFO at `.mcp.json` satisfied `existsSync`
-  // and `readFileSync` then blocked forever — `doctor` never returned, and the `catch` below
-  // could not help, because a block is not an exception. Non-regular ⇒ no key, the same verdict
-  // the invalid-JSON branch already gives.
-  if (isRegularFile(mcpPath)) {
-    try {
-      const root = JSON.parse(readFileSync(mcpPath, "utf8")) as {
-        mcpServers?: Record<string, unknown>;
-      };
-      projectHasKey = !!root.mcpServers && Object.prototype.hasOwnProperty.call(root.mcpServers, "modelguild");
-    } catch {
-      /* invalid json → treated as no key */
+  const registrations: ReturnType<typeof codexRegistration>[] = [];
+  if (driver !== "codex") {
+    const mcpPath = path.join(targetDir, ".mcp.json");
+    let projectHasKey = false;
+    // `isRegularFile`, not `existsSync` (issue #162): a FIFO at `.mcp.json` satisfied `existsSync`
+    // and `readFileSync` then blocked forever — `doctor` never returned, and the `catch` below
+    // could not help, because a block is not an exception. Non-regular ⇒ no key, the same verdict
+    // the invalid-JSON branch already gives.
+    if (isRegularFile(mcpPath)) {
+      try {
+        const root = JSON.parse(readFileSync(mcpPath, "utf8")) as {
+          mcpServers?: Record<string, unknown>;
+        };
+        projectHasKey = !!root.mcpServers && Object.prototype.hasOwnProperty.call(root.mcpServers, "modelguild");
+      } catch {
+        /* invalid json → treated as no key */
+      }
+    }
+    const claudeGet = spawnSync("claude", ["mcp", "get", "modelguild"], { encoding: "utf8" });
+    const claudeOnPath = !claudeGet.error; // ENOENT sets .error
+    if (claudeOnPath && claudeGet.status === 0) {
+      registrations.push({ok: true, messages: ["MCP server 'modelguild' registered (found via `claude mcp get`, any scope)"]});
+    } else if (projectHasKey) {
+      registrations.push({ok: true, messages: ["MCP server registered in project .mcp.json under key 'modelguild'"]});
+    } else if (claudeOnPath) {
+      // claude answered, no registration in any scope — a real miss.
+      registrations.push({ok: false, unregistered: true, messages: ["MCP server 'modelguild' not registered in any scope — run `claude mcp add modelguild -s user -- npx -y modelguild serve`"]});
+    } else {
+      // Can't check global scope (claude not on PATH) and no project key. Do NOT hard-fail: a
+      // global/user-scope registration lives in ~/.claude.json, invisible here.
+      registrations.push({ok: null, messages: [
+        "MCP server 'modelguild' not found in project .mcp.json, and the `claude` CLI isn't " +
+          "on PATH to check global/user scope. If you registered with `-s user`, that's expected — " +
+          "verify with `claude mcp get modelguild`.",
+      ]});
     }
   }
-  const claudeGet = spawnSync("claude", ["mcp", "get", "modelguild"], { encoding: "utf8" });
-  const claudeOnPath = !claudeGet.error; // ENOENT sets .error
-  if (claudeOnPath && claudeGet.status === 0) {
-    console.log("✓ MCP server 'modelguild' registered (found via `claude mcp get`, any scope)");
-  } else if (projectHasKey) {
-    console.log("✓ MCP server registered in project .mcp.json under key 'modelguild'");
-  } else if (claudeOnPath) {
-    // claude answered, no registration in any scope — a real miss.
-    line(false, "MCP server 'modelguild' not registered in any scope — run `claude mcp add modelguild -s user -- npx -y modelguild serve`");
-  } else {
-    // Can't check global scope (claude not on PATH) and no project key. Do NOT hard-fail: a
-    // global/user-scope registration lives in ~/.claude.json, invisible here.
-    console.warn(
-      "! MCP server 'modelguild' not found in project .mcp.json, and the `claude` CLI isn't " +
-        "on PATH to check global/user scope. If you registered with `-s user`, that's expected — " +
-        "verify with `claude mcp get modelguild`.",
-    );
+  if (driver !== "claude") registrations.push(codexRegistration(targetDir));
+  // Inferred workflow inventory does not require two registrations (#226 / PR #231).
+  // Defer both verdicts so either client's registered/inconclusive check can support the
+  // other client's ordinary registration miss. Explicit choices and Codex diagnostic errors stay strict.
+  for (const registration of registrations) {
+    const otherUsable = registrations.some(other => other !== registration && other.ok !== false);
+    const optionalMiss = driverArg === undefined && driver === "both" && registration.unregistered && otherUsable;
+    if (registration.ok === null || optionalMiss) console.warn(`! ${registration.messages[0]}`);
+    else line(registration.ok, registration.messages[0]);
+    for (const message of registration.messages.slice(1)) console.warn(message);
   }
 
   // Command docs + agent defs + policy present. Each of these resolves at RUNTIME from the
@@ -460,7 +502,7 @@ export async function runDoctor(
 
   // Expected counts are derived from `payloadFiles()` (the same list `init` installs), so
   // adding a command or agent def can never silently desync doctor's threshold — nothing is
-  // hardcoded here. A missing piece is a HARD fail, named by basename (not a bare count).
+  // hardcoded here. Missing workflows use install-relative paths; agent defs use basenames.
   let docsPresent = 0;
   let docsTotal = 0;
   let agentsPresent = 0;
@@ -468,14 +510,21 @@ export async function runDoctor(
   const agentsWhere = new Set<Found>();
   const missingDocs: string[] = [];
   const missingAgents: string[] = [];
-  for (const { dest } of payloadFiles()) {
-    const isDoc = dest.startsWith(".claude/commands/");
+  for (const { dest } of payloadFiles(driver)) {
+    const isDoc = dest.startsWith(".claude/commands/") || dest.startsWith(".agents/skills/");
     if (isDoc) docsTotal++;
     const where = locate(dest);
     if (where === "none") {
-      if (isDoc) missingDocs.push(path.basename(dest, ".md"));
+      // A skill reference may already have named this shared file with its actual scope.
+      if (isDoc && !missingDocs.some(item => item === dest || item.startsWith(`${dest} (`))) missingDocs.push(dest);
       else if (dest.startsWith(".opencode/agent/")) missingAgents.push(path.basename(dest, ".md"));
       continue;
+    }
+    if (dest.endsWith("/SKILL.md")) {
+      const { base, rel } = payloadDest(dest, { targetDir, global: where === "global", global_dirs: gdirs });
+      const shared = path.resolve(path.dirname(path.join(base, rel)), "../modelguild-common.md");
+      const missingShared = `.agents/skills/modelguild-common.md (${where})`;
+      if (!isRegularFile(shared) && !missingDocs.includes(missingShared)) missingDocs.push(missingShared);
     }
     if (isDoc) { docsPresent++; docsWhere.add(where); }
     else if (dest.startsWith(".opencode/agent/")) { agentsPresent++; agentsWhere.add(where); }
@@ -490,12 +539,15 @@ export async function runDoctor(
     if (where.size > 1) return " [found: mixed project + global]";
     return [...where][0] === "global" ? " [found: global]" : " [found: project]";
   };
-  const docsLoc = global ? globalDocsDir : `.claude/commands/guild/ or ${globalDocsDir}`;
+  const docsLoc = driver === "claude"
+    ? (global ? globalDocsDir : `.claude/commands/guild/ or ${globalDocsDir}`)
+    : `${driver === "both" ? "Claude command docs and " : ""}Codex skills (.agents/skills${global ? " in your home" : " in the project or your home"})`;
   const agentsLoc = global ? globalAgentsDir : `.opencode/agent/ or ${globalAgentsDir}`;
+  const docsLabel = driver === "claude" ? "command docs" : "workflow files";
   const docsMsg =
     missingDocs.length === 0
-      ? `${docsPresent}/${docsTotal} command docs present in ${docsLoc}${whereSuffix(docsWhere)}`
-      : `${docsPresent}/${docsTotal} command docs present in ${docsLoc} — missing: ${missingDocs.join(", ")}`;
+      ? `${docsPresent}/${docsTotal} ${docsLabel} present in ${docsLoc}${whereSuffix(docsWhere)}`
+      : `${docsPresent}/${docsTotal} ${docsLabel} present in ${docsLoc} — missing: ${missingDocs.join(", ")}`;
   line(missingDocs.length === 0, docsMsg);
   // NEGATIVE FORMS, not one positive sentence under a ✗ (issue #151). `line(ok, msg)` picks the
   // glyph but cannot rewrite the words, so a single "present in …" string produced the outright
@@ -600,7 +652,7 @@ export async function runDoctor(
   // byte-identical evidence. Doctor reports those as UNJUDGEABLE and names the missing record
   // rather than guessing "stale". Neither case changes the exit code — an edit is supported.
   const drift = scanInstalledPayload({ packageRoot: PACKAGE_ROOT, ...locateOpts });
-  const anyPayload = payloadFiles().some(({ dest }) => locate(dest) !== "none");
+  const anyPayload = payloadFiles(driver).some(({ dest }) => locate(dest) !== "none");
   // PAYLOAD SKEW (issue #94) — ours, UNTOUCHED, and behind the release: a clean install the
   // server has moved past, which #22's drift predicate is deliberately silent about and which
   // therefore had no surface at all. Reported here (and by `guild_status`, and once per version
@@ -609,7 +661,7 @@ export async function runDoctor(
   // upgrade must not have `doctor` call their setup broken. `GUILD_PAYLOAD_NOTICE=off` silences
   // the start-up notice, NOT this: doctor was asked for (issue #23's `logs clean` precedent).
   if (drift.skewed.length > 0) {
-    for (const l of formatSkewNote({ skewed: drift.skewed, version: packageVersion(PACKAGE_ROOT) })) {
+    for (const l of formatSkewNote({ skewed: drift.skewed, version: packageVersion(PACKAGE_ROOT), driver })) {
       console.warn(l);
     }
     // Where the start-up notice records what it has already said (review finding L6). Printed
@@ -621,7 +673,7 @@ export async function runDoctor(
     );
   }
   if (drift.drifted.length > 0) {
-    printDriftNote(drift.drifted, "");
+    printDriftNote(drift.drifted, "", driver, global);
   }
   if (
     anyPayload &&
@@ -1507,7 +1559,8 @@ async function main(): Promise<number> {
     console.log("       [--npx]     Default launch line: `npx -y modelguild serve`.");
     console.log("       [--abs]     Pin an absolute path to this interpreter+entry (offline/no-registry).");
     console.log("       [--server-command \"cmd args\"]  Override the launch command verbatim.");
-    console.log("  doctor [--dir D] Token-free health check ([--global] checks the global locations).");
+    console.log("       [--driver claude|codex|both] Workflow payload (init defaults to claude). Codex registration is printed as TOML.");
+    console.log("  doctor [--driver claude|codex|both] [--dir D] Token-free health check ([--global] checks the global locations).");
     console.log("  watch            Tail LIVE what an external model is doing (reads, greps,");
     console.log("                   fetches, edits, shell commands) while a guild call runs.");
     console.log("       [--run ID]   watch one run instead of following the newest.");

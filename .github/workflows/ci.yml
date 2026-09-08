@@ -90,6 +90,11 @@ jobs:
         # words is still human judgment in review.
         run: bash modelguild/tests/check-claude-md.sh --self-test
 
+      - name: Always-loaded size ceiling (+ self-test)
+        # AGENTS.md, CLAUDE.md and .claude/rules/*.md under Claude Code's memory-file floor
+        # (issue #222); --self-test runs the check first, then proves it bites.
+        run: bash modelguild/tests/check-agents-size.sh --self-test
+
       - name: v1 permission-surface pin (+ self-test)
         # Issue #93 / CONTRACT C69a: the approval bridge speaks opencode's v1 permission
         # surface by decision. The v2 endpoints (/api/session/{id}/permission, …) do not
@@ -199,6 +204,11 @@ jobs:
         # Same lint on stock bash 3.2 + BSD awk/grep — its checks lean on awk and
         # grep -Fi, so the macOS job exercises the portability the Linux job can't.
         run: bash modelguild/tests/check-claude-md.sh --self-test
+
+      - name: Always-loaded size ceiling (+ self-test)
+        # AGENTS.md, CLAUDE.md and .claude/rules/*.md under Claude Code's memory-file floor
+        # (issue #222); --self-test runs the check first, then proves it bites.
+        run: bash modelguild/tests/check-agents-size.sh --self-test
 
       - name: v1 permission-surface pin (+ self-test)
         # Same lint on BSD grep/sed: it leans on `grep -RIn --include`, a `sed` that strips

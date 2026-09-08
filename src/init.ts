@@ -60,8 +60,15 @@
  * install with no ownership record when only `<xdg>/opencode` was. In GLOBAL mode a LEAF payload file that is a symlink is not
  * written through and not refused: it takes the existing never-clobber path — skipped
  * with a warning, `init` completes, the ownership record is still written. (Project mode
- * still REFUSES a live leaf link; only the dangling case changed there.) The RECORD's own
- * path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
+ * still REFUSES a live leaf link; only the dangling case changed there.)
+ * (#165 made `--global` write THROUGH such a link when the bytes hashed to the record; that was
+ * REVERTED — the gate was a hash of a file published in the npm tarball, so it bought freshness
+ * and never authority, and no narrowing keeps the stow case while closing that. The defect it
+ * fixed was real and survives the revert: `doctor` called the file C72 SKEW and named `init` as
+ * the remedy while `init` declined to act. That contradiction is closed in the REPORTING instead
+ * — `PayloadFileState.linkTarget`, so the skew note says init will skip those and the note will
+ * not clear, and the skip names the link, its target and the two routes that work.)
+ * The RECORD's own path is the exception in both modes: `writeRecords` is outside that loop, so a symlink
  * there is written THROUGH — deliberately, since only init writes the record and there is
  * no user content to preserve, but never silently (`recordSymlinkWarning`). TWO enumerated
  * shapes of record link are REFUSED instead, at plan time and before any byte is written
@@ -82,6 +89,11 @@
  * one sentence — issue #156, "Init will not allow symlinks, this is likely a bad idea."
  * Everything below it is Claude's, including the global-only scope, the leaf rule and the
  * record write-through.
+ * An earlier version of the AGENTS.md bullet (now in docs/architecture.md) attributed those to a "maintainer decision
+ * 2026-08-05"; the maintainer has since confirmed he does not recall making them, and nothing in
+ * the tracker or git evidences them. Do not cite his authority for a design choice an agent made
+ * — that attribution survived seven flagged escalations and ten merged issues before it was
+ * corrected, which is how a label becomes a fact.
  *
  * WHEN A REFUSAL LANDS IS PART OF THE CONTRACT (issues #167/#159/#160/#161/#164, 2026-08-14).
  * Every path-level check used to run LAZILY — `plan.destFor` from inside the install and
@@ -116,6 +128,10 @@
  *   UNINSTALL NEVER REFUSES. Its job is removal, and an ancillary file — or one unreadable
  *   payload file — must not hold the payload hostage. Every failure there is a warning and the
  *   removal continues.
+ *   Record retention (#176) also applies to selective driver removal (#226): keep the WHOLE
+ *   record while the other driver remains, including hashes for paths just removed. Consumers
+ *   check file presence before using those hashes. Rewriting the retained record would add a
+ *   failure-prone write to uninstall solely to prune entries every consumer already tolerates.
  * The dividing principle for install: REFUSE what can be determined before writing (a symlinked
  * or non-regular destination, unparseable `.mcp.json`); DEGRADE what can only be learnt by
  * writing (EACCES, ENOSPC, a race). An `accessSync`-style "can this write succeed?" predicate is
@@ -200,7 +216,7 @@ export function packageVersion(packageRoot: string = PACKAGE_ROOT): string {
  * behaviour is `/guild:consult`, verified live. Check the live skill list before trusting a
  * doc claim about command naming.
  */
-const COMMAND_DOCS = [
+export const COMMAND_DOCS = [
   "consult",
   "panel",
   "research",
@@ -221,10 +237,27 @@ export interface PayloadEntry {
   dest: string;
 }
 
-export function payloadFiles(): PayloadEntry[] {
+export type Driver = "claude" | "codex" | "both";
+
+export function parseDriver(value: string | undefined): Driver {
+  if (value === "claude" || value === "codex" || value === "both") return value;
+  throw new Error("--driver must be claude, codex, or both");
+}
+
+export function payloadFiles(driver: Driver = "claude"): PayloadEntry[] {
   const out: PayloadEntry[] = [];
-  for (const c of COMMAND_DOCS) {
-    const rel = `.claude/commands/guild/${c}.md`;
+  if (driver !== "codex") {
+    for (const c of COMMAND_DOCS) {
+      const rel = `.claude/commands/guild/${c}.md`;
+      out.push({ src: rel, dest: rel });
+    }
+  }
+  if (driver !== "claude") {
+    for (const c of COMMAND_DOCS) {
+      const rel = `.agents/skills/guild-${c}/SKILL.md`;
+      out.push({ src: rel, dest: rel });
+    }
+    const rel = ".agents/skills/modelguild-common.md";
     out.push({ src: rel, dest: rel });
   }
   for (const a of AGENT_DEFS) {
@@ -240,17 +273,21 @@ export function payloadFiles(): PayloadEntry[] {
 
 /** The command docs, for the shadow warning (a same-named non-ours command is silent). */
 const COMMAND_DEST_RELS = new Set(
-  COMMAND_DOCS.map((c) => `.claude/commands/guild/${c}.md`),
+  [...COMMAND_DOCS.map((c) => `.claude/commands/guild/${c}.md`),
+    ...COMMAND_DOCS.map((c) => `.agents/skills/guild-${c}/SKILL.md`)],
 );
 
 /** The PAYLOAD destinations alone. `InitResult.blocked` also carries the ancillary `.mcp.json`
  * and `.gitignore`, and uninstall's record-retention rule (issue #176) turns only on a payload
  * file being left behind — an ancillary write that failed leaves nothing needing proof of
  * ownership. Derived from `payloadFiles()` so it cannot drift from it. */
-const PAYLOAD_DESTS = new Set(payloadFiles().map((f) => f.dest));
+const PAYLOAD_DESTS = new Set(payloadFiles("both").map((f) => f.dest));
 
 /** Deepest-first, pruned on uninstall only when empty (a user file keeps its dir). */
 const PRUNE_DIRS = [
+  ...COMMAND_DOCS.map((c) => `.agents/skills/guild-${c}`),
+  ".agents/skills",
+  ".agents",
   ".claude/commands/guild",
   ".claude/commands",
   ".claude",
@@ -309,7 +346,7 @@ export function payloadDest(
   if (!opts.global) return { base: opts.targetDir, rel: destRel };
   const g = opts.global_dirs;
   if (!g) throw new Error("payloadDest: global mode requires resolved global dirs");
-  if (destRel.startsWith(".claude/commands/guild/")) {
+  if (destRel.startsWith(".claude/commands/guild/") || destRel.startsWith(".agents/skills/")) {
     return { base: g.homeDir, rel: destRel }; // <home>/.claude/commands/guild/<name>.md
   }
   if (destRel.startsWith(".opencode/agent/")) {
@@ -374,7 +411,7 @@ function planFor(opts: InitOptions): InstallPlan {
     // ownership record. Install only — see `checkGlobalDirChain` for why running it on
     // `--uninstall` is the regression this shape must not carry.
     if (!opts.uninstall) {
-      for (const { dest } of [...payloadFiles(), { dest: RECORD_REL }]) {
+      for (const { dest } of [...payloadFiles(opts.driver), { dest: RECORD_REL }]) {
         const { base, rel } = payloadDest(dest, destOpts);
         checkGlobalDirChain(base, rel, dest === RECORD_REL ? "the ownership record" : dest);
       }
@@ -396,6 +433,8 @@ function planFor(opts: InitOptions): InstallPlan {
         return p;
       })(),
       pruneDirs: [
+        ...COMMAND_DOCS.map((c) => path.join(g.homeDir, ".agents", "skills", `guild-${c}`)),
+        path.join(g.homeDir, ".agents", "skills"),
         path.join(g.homeDir, ".claude", "commands", "guild"),
         path.join(g.homeDir, ".claude", "commands"),
         path.join(g.xdgConfigHome, "opencode", "agent"),
@@ -435,7 +474,7 @@ function planFor(opts: InitOptions): InstallPlan {
     // Payload destinations FIRST — the eager pass. `safeJoin` is unchanged in what it refuses
     // (project mode keeps refuse-any-directory-component); running it here is what makes the
     // refusal cost nothing (issue #167).
-    for (const { dest } of payloadFiles()) safeJoin(opts.targetDir, dest);
+    for (const { dest } of payloadFiles(opts.driver)) safeJoin(opts.targetDir, dest);
     recordPath = safeJoin(opts.targetDir, RECORD_REL);
     // `safeJoin` refuses a symlinked component; it says nothing about a FIFO, which the record
     // write blocks on forever (issue #162, C78). Install-only, as in global mode.
@@ -518,6 +557,8 @@ export interface ServerLaunch {
 }
 
 export interface InitOptions {
+  /** Workflow payload to install/remove; shared backend/config assets have one owner. */
+  driver?: Driver;
   /** Absolute path to the target project the payload lands in. Ignored when `global`. */
   targetDir: string;
   /** Absolute path to the package root the payload is read from. */
@@ -825,6 +866,10 @@ function checkGlobalDirChain(base: string, rel: string, what: string): void {
  * True when a path has an entry of its own — a DANGLING symlink included, which `existsSync`
  * (it follows) reports as absent. The install loop gates its never-clobber check on this so a
  * dangling leaf link reaches the not-a-regular-file branch instead of being written THROUGH.
+ * It holds in both modes, and that is **two** behaviour changes in project mode from one root
+ * cause: a dangling leaf was written *through* (payload bytes outside the target), and where the
+ * link's target directory did not exist that write was a mid-loop `ENOENT` crash. Both are now a
+ * clean skip.
  */
 function entryExists(p: string): boolean {
   try {
@@ -1209,7 +1254,7 @@ export interface PayloadScanResult {
  * install consults nothing.
  */
 export function scanPayload(packageRoot: string, entries: PayloadScanEntry[]): PayloadScanResult {
-  const srcFor = new Map(payloadFiles().map((p) => [p.dest, p.src]));
+  const srcFor = new Map(payloadFiles("both").map((p) => [p.dest, p.src]));
   const recordCache = new Map<string, Records>();
   const missingRecords = new Set<string>();
   const drifted: PayloadFileState[] = [];
@@ -1310,7 +1355,7 @@ export function locatePayload(destRel: string, opts: PayloadLocateOptions): Payl
  * presence check's business, not skew's). */
 export function payloadScanEntries(opts: PayloadLocateOptions): PayloadScanEntry[] {
   const out: PayloadScanEntry[] = [];
-  for (const { dest } of payloadFiles()) {
+  for (const { dest } of payloadFiles("both")) {
     const where = locatePayload(dest, opts);
     if (where === "none") continue;
     const destOpts = {
@@ -1697,6 +1742,10 @@ function pruneEmptyDirs(dirs: string[]): void {
 }
 
 export function init(opts: InitOptions): InitResult {
+  const driver = parseDriver(opts.driver ?? "claude");
+  if (opts.writeMcp && driver === "codex") {
+    throw new Error("--write-mcp writes Claude's .mcp.json only; register Codex using the printed config.toml instructions.");
+  }
   const result: InitResult = {
     installed: [],
     skipped: [],
@@ -1712,13 +1761,21 @@ export function init(opts: InitOptions): InitResult {
   const records = readRecords(plan.recordPath);
   const ownedMcp = readMcpRecord(plan.recordPath);
 
+  // Installing a second driver must not discard the first driver's ownership hashes.
+  // On selective removal retain shared assets and the record while the other driver exists.
+  const otherPrefix = driver === "codex" ? ".claude/commands/guild/" : ".agents/skills/";
+  const otherInstalled = driver !== "both" && Object.keys(records).some((dest) => {
+    if (!dest.startsWith(otherPrefix)) return false;
+    try { return isRegularFile(plan.destFor(dest)); } catch { return true; }
+  });
   if (opts.uninstall) {
     // NOTHING IN THIS BLOCK MAY THROW (issue #161, and the uninstall half of #167). Every step
     // below used to be able to abort a removal that had already deleted files, which is the
     // worst of the three possible outcomes: the payload half-gone, the record gone or claiming
     // files that are not there, and every re-run failing the same way. Uninstall's job is
     // removal, so the failing step is what gives way.
-    for (const { dest } of payloadFiles()) {
+    for (const { dest } of payloadFiles(driver)) {
+      if (otherInstalled && !dest.startsWith(".claude/commands/") && !dest.startsWith(".agents/skills/")) continue;
       let abs = "";
       try {
         abs = plan.destFor(dest);
@@ -1765,7 +1822,7 @@ export function init(opts: InitOptions): InitResult {
       }
     }
     // No project .mcp.json in global mode; the global payload never wrote one.
-    if (opts.global) {
+    if (opts.global || driver === "codex") {
       result.mcpAction = "unchanged";
     } else {
       const { action, warning, blocked } = removeMcpKey(opts.targetDir, ownedMcp);
@@ -1798,8 +1855,11 @@ export function init(opts: InitOptions): InitResult {
     // REJECTED: it puts a WRITE on a path whose whole contract is that it never refuses and never
     // throws (C79), to buy tidiness in a record every consumer already tolerates. The other cost
     // is that a user who wanted the record gone now has it; the warning names the path.
+    // Selective driver uninstall uses this same whole-record choice; see the module header.
     const blockedPayload = result.blocked.filter((d) => PAYLOAD_DESTS.has(d));
-    if (blockedPayload.length > 0 && entryExists(plan.recordPath)) {
+    if (otherInstalled) {
+      result.warnings.push("Keeping shared backend/config files and the ownership record for the other installed driver.");
+    } else if (blockedPayload.length > 0 && entryExists(plan.recordPath)) {
       // THE RETAINED CASE HAS TO SAY WHAT HAPPENED TO A SYMLINKED RECORD PATH TOO, and this is
       // not an optional courtesy — without it this branch makes an EXISTING message false.
       // `planFor`'s plan-time disclosure promises "the link itself is removed at the end, its
@@ -1900,7 +1960,7 @@ export function init(opts: InitOptions): InitResult {
         result.blocked.push(RECORD_REL);
       }
     }
-    if (plan.gitignoreDir) {
+    if (plan.gitignoreDir && !otherInstalled) {
       const gi = stripGitignoreOnly(plan.gitignoreDir);
       if (gi.warning) result.warnings.push(gi.warning);
       if (gi.blocked) result.blocked.push(".gitignore");
@@ -1914,8 +1974,8 @@ export function init(opts: InitOptions): InitResult {
   // filesystem saying no — EACCES, ENOSPC, a race — and a throw here would leave a partial
   // payload with no ownership record and no in-tool way back. The loop always finishes, and the
   // record always accounts for what it managed to place.
-  const newRecords: Records = {};
-  for (const { src, dest } of payloadFiles()) {
+  const newRecords: Records = { ...records };
+  for (const { src, dest } of payloadFiles(driver)) {
     const srcAbs = path.join(opts.packageRoot, src);
     if (!existsSync(srcAbs)) {
       result.warnings.push(`payload source missing in package: ${src} (skipped).`);

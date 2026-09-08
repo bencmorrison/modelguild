@@ -42,7 +42,7 @@ GUILD_APPROVE_TIMEOUT_MS=120000
 - **If the bridge loses opencode's event stream, it rejects what's open and goes looking for the rest when the stream comes back.** Open requests are rejected on the spot and the result is marked `degraded`. A request the model raises while the bridge is blind can't arrive on the stream at all — there's no replay — so on reconnect the bridge asks opencode what's still waiting and puts it to you then, with its clock starting there. What that fixes is the pause: a stall of seconds rather than the turn's own 15-minute timeout. What it doesn't do is promise nothing was missed — opencode only lists what's still *open*, so a request that got answered another way while the bridge was blind leaves no trace, and `blindWindows` on the result is there to tell you a window happened even after `degraded` clears. Nothing runs in the meantime either way: a blind bridge is a long pause, never something slipping past the prompt. A `degraded` run showing no requests means the gate stopped seeing, not that the model stopped asking.
 - **If your "yes" doesn't get through, the result says so.** opencode refuses a reply to a request it has already settled — which is what a healthy race looks like when your terminal and your MCP client both answer, and also what a *broken* approval path would look like. So whenever opencode refuses a reply — whatever the status, not just a 404 — the bridge asks a second question: is that request still open? Still open means nobody's decision landed, and it shows up as `unsettled` on the result with a plain-language reason, instead of as a stall you have to guess at. (`unsettled` also covers the rarer case where opencode *accepted* the reply and it still did not take effect; a reply merely still in flight is never counted as one.) Refused with nothing left open is `contested` if it was a 404 (the race) and `refused` otherwise — reported, not diagnosed; only a reply that never reached opencode at all is `undelivered`. Each request lands in exactly one of those four. (The endpoint that delivers an *approval* is the one opencode has marked deprecated; when it goes, approvals will fail while rejections keep working, and that is the failure this exists to name — it need not present as a 404, which is why the check is not keyed on one.) It will not quietly convert your approval into a rejection to get the turn moving again.
 - **Claude cannot approve on your behalf.** There is no tool argument that grants approval — the decision only ever comes from your terminal or your MCP client's own prompt.
-- **Web egress on the read paths** can be gated separately with `GUILD_APPROVE_EGRESS=ask` (also off by default), which puts `webfetch`/`websearch` behind the same prompt for `/guild:consult`, `/guild:panel`, `/guild:research` and friends. It exists because reads on those paths leave your machine for a third-party model — the one asymmetry between them and a Claude subagent that this project treats as real.
+- **Web egress** on every path whose def allows the web tools (all three, since 2026-09-03) can be gated separately with `GUILD_APPROVE_EGRESS=ask` (also off by default), which puts `webfetch`/`websearch` behind the same prompt for `/guild:consult`, `/guild:panel`, `/guild:research` and friends. It exists because reads on those paths leave your machine for a third-party model — the one asymmetry between them and a Claude subagent that this project treats as real.
 - A session's ruleset is fixed when the session is created, so turning the knob on mid-conversation doesn't retro-gate an existing session: continuing one that wasn't created gated is **refused** (`approval-not-applied`), not silently run ungated.
 
 ## The record it keeps
@@ -81,3 +81,31 @@ A refused or stalled call names its failure. Search for the name you were given:
 | `agent-mismatch` | opencode served the turn with a different agent than the one asked for. | [SECURITY.md](../SECURITY.md#other-guardrails) |
 | `approval-config` / `approval-channel-missing` | `GUILD_APPROVE` has an unrecognised value, or the bridge is armed with no way to ask you. Refused up front rather than hanging the turn. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
 | `unsettled` / `contested` / `refused` / `undelivered` | How an approval reply that didn't land is reported. `unsettled` means nobody's decision took effect and the request is still open — that is the one that explains a hung call. | [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default) |
+
+## Codex compatibility
+
+Codex uses the same ModelGuild tools and evidence log as Claude Code. The Codex installer
+prints a 60-second startup deadline and 2,100-second tool deadline; see
+[Codex setup](setup.md#codex-cli-and-ide-extension). Calling a worker uses opencode's
+credentials, independently of the Codex driver's login.
+
+`npm run test:codex` is an opt-in compatibility probe requiring Codex on PATH. It builds
+the package and uses real Codex App Server and ModelGuild processes with a scripted
+opencode fixture. It makes no model calls and uses an isolated Codex home. This checks
+skill discovery, MCP results/errors, continuation, panel results, approval accept/decline/
+cancel, the watch approval fallback, worktree diff capture, a 65-second call, and shutdown
+while a worker is running. The fixture does not establish model reasoning quality or
+provider entitlement. The client version and observed results belong in #226 / its PR.
+
+App Server's direct tool-call interface on the tested Codex 0.153.4 did not expose MCP
+progress notifications to the probe. Completed results retained their activity summary;
+use `modelguild watch` for live activity. Protocol-level elicitation replies were tested;
+interactive CLI and IDE approval-button rendering still require a manual check. App
+Server itself is experimental; this does not add it as a production dependency of
+ModelGuild, which continues to expose standard stdio MCP.
+
+Closing the Codex client closes its MCP transport and triggers ModelGuild's existing
+backend teardown. Merely cancelling a tool wait is a different operation: ModelGuild
+does not currently propagate the MCP request's cancellation signal to the opencode turn.
+Do not assume a cancelled wait stops the worker or rolls back edits while its MCP
+transport stays open. Inspect the worktree and receipts before retrying a write task.
