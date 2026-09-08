@@ -128,6 +128,10 @@
  *   UNINSTALL NEVER REFUSES. Its job is removal, and an ancillary file — or one unreadable
  *   payload file — must not hold the payload hostage. Every failure there is a warning and the
  *   removal continues.
+ *   Record retention (#176) also applies to selective driver removal (#226): keep the WHOLE
+ *   record while the other driver remains, including hashes for paths just removed. Consumers
+ *   check file presence before using those hashes. Rewriting the retained record would add a
+ *   failure-prone write to uninstall solely to prune entries every consumer already tolerates.
  * The dividing principle for install: REFUSE what can be determined before writing (a symlinked
  * or non-regular destination, unparseable `.mcp.json`); DEGRADE what can only be learnt by
  * writing (EACCES, ENOSPC, a race). An `accessSync`-style "can this write succeed?" predicate is
@@ -1739,7 +1743,7 @@ function pruneEmptyDirs(dirs: string[]): void {
 
 export function init(opts: InitOptions): InitResult {
   const driver = parseDriver(opts.driver ?? "claude");
-  if (opts.writeMcp && driver !== "claude") {
+  if (opts.writeMcp && driver === "codex") {
     throw new Error("--write-mcp writes Claude's .mcp.json only; register Codex using the printed config.toml instructions.");
   }
   const result: InitResult = {
@@ -1851,6 +1855,7 @@ export function init(opts: InitOptions): InitResult {
     // REJECTED: it puts a WRITE on a path whose whole contract is that it never refuses and never
     // throws (C79), to buy tidiness in a record every consumer already tolerates. The other cost
     // is that a user who wanted the record gone now has it; the warning names the path.
+    // Selective driver uninstall uses this same whole-record choice; see the module header.
     const blockedPayload = result.blocked.filter((d) => PAYLOAD_DESTS.has(d));
     if (otherInstalled) {
       result.warnings.push("Keeping shared backend/config files and the ownership record for the other installed driver.");

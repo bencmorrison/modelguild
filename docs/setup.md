@@ -48,8 +48,11 @@ They cover all eight Claude workflows with Codex-native invocation and model-cho
 
 `init --driver both` installs both workflow sets. `init` without a driver retains its
 Claude default. `doctor` detects installed workflow sets, or accepts `--driver claude`,
-`--driver codex`, or `--driver both` explicitly. Missing/disabled Codex registration fails
-its check; an unusually short tool timeout produces a warning. Registration is inspected
+`--driver codex`, or `--driver both` explicitly. These files may be committed by the repo;
+detection is an inventory, not a claim about your preferred client. An absent Codex CLI
+produces a warning because registration cannot be checked, matching the Claude path.
+When Codex answers, missing/disabled registration fails its check; an unusually short
+tool timeout produces a warning. Registration is inspected
 with `codex mcp get modelguild --json` in the checked directory.
 
 For all projects, use `init --driver codex --global`. Skills go into `~/.agents/skills`;
@@ -68,8 +71,9 @@ Upgrade by rerunning the same `init --driver ...` command. Remove a workflow set
 Shared backend/config assets and ownership survive while the other driver is installed.
 Use `--driver both --uninstall` to remove both sets. Codex registration remains user-owned:
 remove its table from the TOML file you used, or use `codex mcp remove modelguild` for a
-user-level registration. `--write-mcp` remains a Claude-only `.mcp.json` option and cannot
-be combined with `--driver codex` or `--driver both`.
+user-level registration. `--driver both --write-mcp` writes the Claude `.mcp.json` entry
+and prints Codex TOML registration instructions. `--driver codex --write-mcp` is refused
+because a Codex-only install has no Claude registration to write.
 
 The 2,100-second outer tool timeout allows two default 15-minute model turns plus overhead
 for a panel member that retries once. Increase it when raising ModelGuild's turn timeout;

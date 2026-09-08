@@ -27,7 +27,7 @@ ModelGuild lets **Claude Code and Codex** collaborate with **other LLMs** (OpenA
 
 ## Architecture
 
-- **Codex driver (#226):** install eight `$guild-*` skills with `modelguild init --driver codex` (`both` includes Claude commands; omitted remains `claude`). `doctor --driver codex|claude|both` checks the selected client; omission detects installed workflows. Codex registration is user-owned TOML, printed by init with startup/tool deadlines of 60/2100 seconds. Both clients share project `modelguild/` and global `~/.claude/modelguild/` configuration and ownership. Global Codex skills live under `~/.agents/skills`. Selective uninstall retains shared assets while the other driver is installed. Keep installed skill references and dual-driver ownership valid: `test/driver.test.ts`.
+- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
 
 Claude Code cannot run a non-Anthropic model itself, so it calls a **local MCP server** — `modelguild`, a TypeScript stdio server the user registers with Claude Code (per-project or global; `init` no longer writes `.mcp.json` by default) — which fronts `opencode serve` over its HTTP API:
 

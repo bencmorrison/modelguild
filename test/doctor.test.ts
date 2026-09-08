@@ -157,7 +157,7 @@ function shellOnlyDir(): string {
 
 /**
  * Run `fn` with PATH replaced by `dir` plus the bash-only dir — `null` means the bash-only dir
- * alone, i.e. no `opencode` on PATH at all. `claude` is absent either way, which puts the MCP
+ * alone, i.e. no `opencode` on PATH at all. `claude` and `codex` are absent either way, which puts the MCP
  * check on its documented warning branch; that is what lets these cases assert ABSOLUTE exit
  * codes where the rest of this suite has to compare against `base`.
  */
@@ -212,7 +212,7 @@ async function captureDoctor(
  *     cases (a)-(r) would fail there for a reason those cases are not about.
  *   - A dev box HAS opencode and may or may not be logged in, so the verdict would differ
  *     between machines.
- *   - `claude` is off PATH here too, which puts the MCP-registration check on its documented
+ *   - `claude` and `codex` are off PATH here too, which puts the MCP-registration check on its documented
  *     warning branch — the same state CI has always had.
  *
  * Cases (s)-(z) nest their own `withPath` inside this one to vary the opencode state.
@@ -224,6 +224,29 @@ export async function run(): Promise<number> {
 async function runCases(): Promise<number> {
   const c = new Checker();
   console.log("== doctor.test ==");
+
+  // #226: source repos can commit both workflow sets without either client being installed.
+  const bothProject = tempDir();
+  const bothInject = {homeDir: tempDir(), xdgConfigHome: tempDir()};
+  init({targetDir: bothProject, packageRoot: repoRoot, serverLaunch: LAUNCH, driver: "both"});
+  rmSync(path.join(bothProject, "modelguild/.modelguild-install.json"));
+  const both = await captureDoctor(["--dir", bothProject], bothInject);
+  c.check(both.code === 0 && both.out.includes("doctor: OK"), "both payloads without client CLIs do not fail plain doctor");
+  c.check(both.out.includes("✓ Driver: both") && both.out.includes("override with --driver"), "driver inventory has a glyph and an explicit override");
+  c.check(both.out.includes("! Cannot inspect Codex MCP registration") && !both.out.includes("✗"), "absent Codex warns just like absent Claude");
+  const explicitCodex = await captureDoctor(["--dir", bothProject, "--driver", "codex"], bothInject);
+  c.check(explicitCodex.code === 0, "explicit Codex selection still reports missing CLI as inconclusive");
+  const explicitClaude = await captureDoctor(["--dir", bothProject, "--driver", "claude"], bothInject);
+  c.check(explicitClaude.code === 0 && !explicitClaude.out.includes("Codex MCP"), "explicit Claude selection skips Codex registration");
+  for (const dest of [".claude/commands/guild/panel.md", ".agents/skills/guild-panel/SKILL.md", ".agents/skills/modelguild-common.md"]) {
+    rmSync(path.join(bothProject, dest));
+  }
+  const missing = await captureDoctor(["--dir", bothProject], bothInject);
+  const missingLine = missing.out.split("\n").find(line => line.includes("— missing:")) ?? "";
+  c.check(missing.code === 1 && missingLine.includes(".claude/commands/guild/panel.md") &&
+    missingLine.includes(".agents/skills/guild-panel/SKILL.md") && missingLine.includes(".agents/skills/modelguild-common.md (project)") &&
+    !missingLine.includes(bothProject), "missing workflow diagnostics consistently use install-relative paths");
+  c.check((missingLine.match(/modelguild-common\.md/g) ?? []).length === 1, "missing shared guidance is listed once, not once per reference plus its payload entry");
 
   // ---- (a) GLOBAL-only install: plain `doctor` (no --global) must PASS -----
   // Payload lands ONLY in the injected global dirs; the project dir is empty.
@@ -276,7 +299,7 @@ async function runCases(): Promise<number> {
   const f = await captureDoctor(["--dir", projMissing], { homeDir: tempDir(), xdgConfigHome: tempDir() });
   c.check(f.code === 1, `(f) one doc missing: plain doctor FAILS (exit ${f.code})`);
   c.check(f.out.includes("7/8 command docs"), "(f) reports 7/8 docs with one removed");
-  c.check(f.out.includes("missing: consult"), "(f) names the missing doc (consult)");
+  c.check(f.out.includes("missing: .claude/commands/guild/consult.md"), "(f) names the missing doc (consult)");
   c.check(f.out.includes("✗"), "(f) prints a ✗ line for the missing doc");
 
   // ---- (f2) A DIRECTORY at a def path must FAIL, agreeing with C16 (issue #175) ----

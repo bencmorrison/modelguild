@@ -196,8 +196,8 @@ function runInit(argv: string[]): number {
     );
   }
   if (res.drifted.length > 0) printDriftNote(res.drifted, "  ", driver, global);
-  if (!uninstall && !writeMcp) {
-    if (driver !== "codex") printRegisterInstructions(targetDir, launch, global);
+  if (!uninstall) {
+    if (!writeMcp && driver !== "codex") printRegisterInstructions(targetDir, launch, global);
     if (driver !== "claude") {
       console.log("Register Codex: merge this table into " + (global
         ? "$CODEX_HOME/config.toml (default ~/.codex/config.toml):"
@@ -212,7 +212,9 @@ function runInit(argv: string[]): number {
     console.log("Next steps:");
     console.log("  1. Authenticate opencode:  opencode auth login");
     if (writeMcp) {
-      console.log("  2. (Done — --write-mcp wrote the project .mcp.json for you.)");
+      console.log(driver === "both"
+        ? "  2. Claude registration written to .mcp.json; register Codex using the TOML above."
+        : "  2. (Done — --write-mcp wrote the project .mcp.json for you.)");
     } else if (global && driver === "claude") {
       console.log("  2. Register the MCP server globally, once (see above): `claude mcp add modelguild -s user -- …`.");
     } else {
@@ -398,7 +400,7 @@ export async function runDoctor(
   targetDir = path.resolve(targetDir);
   const gdirs = resolveGlobalDirs({ homeDir: inject?.homeDir, xdgConfigHome: inject?.xdgConfigHome });
   const driver = driverArg ?? installedDriver(targetDir, gdirs, global);
-  console.log(`Driver: ${driver}`);
+  console.log(`✓ Driver: ${driver}${driverArg ? "" : " (from available workflows; override with --driver)"}`);
   // THE ONE INPUT `doctor` RESOLVES DIFFERENTLY FROM THE IN-SERVER SURFACES, SURFACED RATHER
   // THAN HIDDEN (review finding L7). `guild_status` and the start-up notice scan
   // `resolveProjectDir` = `$GUILD_PROJECT_DIR` else cwd (what `.mcp.json` sets, and what the
@@ -468,7 +470,8 @@ export async function runDoctor(
   }
   if (driver !== "claude") {
     const registration = codexRegistration(targetDir);
-    line(registration.ok, registration.messages[0]);
+    if (registration.ok === null) console.warn(`! ${registration.messages[0]}`);
+    else line(registration.ok, registration.messages[0]);
     for (const message of registration.messages.slice(1)) console.warn(message);
   }
 
@@ -493,7 +496,7 @@ export async function runDoctor(
 
   // Expected counts are derived from `payloadFiles()` (the same list `init` installs), so
   // adding a command or agent def can never silently desync doctor's threshold — nothing is
-  // hardcoded here. A missing piece is a HARD fail, named by basename (not a bare count).
+  // hardcoded here. Missing workflows use install-relative paths; agent defs use basenames.
   let docsPresent = 0;
   let docsTotal = 0;
   let agentsPresent = 0;
@@ -506,14 +509,16 @@ export async function runDoctor(
     if (isDoc) docsTotal++;
     const where = locate(dest);
     if (where === "none") {
-      if (isDoc) missingDocs.push(dest.startsWith(".claude/") ? path.basename(dest, ".md") : dest);
+      // A skill reference may already have named this shared file with its actual scope.
+      if (isDoc && !missingDocs.some(item => item === dest || item.startsWith(`${dest} (`))) missingDocs.push(dest);
       else if (dest.startsWith(".opencode/agent/")) missingAgents.push(path.basename(dest, ".md"));
       continue;
     }
     if (dest.endsWith("/SKILL.md")) {
       const { base, rel } = payloadDest(dest, { targetDir, global: where === "global", global_dirs: gdirs });
       const shared = path.resolve(path.dirname(path.join(base, rel)), "../modelguild-common.md");
-      if (!isRegularFile(shared) && !missingDocs.includes(shared)) missingDocs.push(shared);
+      const missingShared = `.agents/skills/modelguild-common.md (${where})`;
+      if (!isRegularFile(shared) && !missingDocs.includes(missingShared)) missingDocs.push(missingShared);
     }
     if (isDoc) { docsPresent++; docsWhere.add(where); }
     else if (dest.startsWith(".opencode/agent/")) { agentsPresent++; agentsWhere.add(where); }
