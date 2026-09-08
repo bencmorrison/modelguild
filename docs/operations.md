@@ -97,11 +97,18 @@ cancel, the watch approval fallback, worktree diff capture, a 65-second call, an
 while a worker is running. The fixture does not establish model reasoning quality or
 provider entitlement. The client version and observed results belong in #226 / its PR.
 
+`npm run test:codex:models` separately exercises actual Codex reasoning through the
+installed skills and real opencode workers. It requires explicit worker IDs and existing
+logins, sends synthetic test inputs to the selected services, and retains transcripts,
+receipts and the delegated patch for inspection. See [live testing](testing.md).
+
 App Server's direct tool-call interface on the tested Codex 0.153.4 did not expose MCP
 progress notifications to the probe. Completed results retained their activity summary;
 use `modelguild watch` for live activity. Protocol-level elicitation replies were tested;
-interactive CLI and IDE approval-button rendering still require a manual check. App
-Server itself is experimental; this does not add it as a production dependency of
+the interactive CLI also displayed all eight skill choices, the running tool call,
+and both the MCP-call and ModelGuild webfetch approval prompts; accepting the latter
+released the real worker. IDE rendering and interactive decline/cancel still require
+a manual check. App Server itself is experimental; this does not add it as a production dependency of
 ModelGuild, which continues to expose standard stdio MCP.
 
 Closing the Codex client closes its MCP transport and triggers ModelGuild's existing

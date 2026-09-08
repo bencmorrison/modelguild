@@ -27,7 +27,7 @@ ModelGuild lets **Claude Code and Codex** collaborate with **other LLMs** (OpenA
 
 ## Architecture
 
-- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
+- **Codex driver (#226):** workflows live in `.agents/skills/guild-*/SKILL.md`, guarded by `test/driver.test.ts`; opt-in real-model smoke: `npm run test:codex:models` (see [testing](docs/testing.md)). See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for installation and client configuration.
 
 Claude Code cannot run a non-Anthropic model itself, so it calls a **local MCP server** — `modelguild`, a TypeScript stdio server the user registers with Claude Code (per-project or global; `init` no longer writes `.mcp.json` by default) — which fronts `opencode serve` over its HTTP API:
 
