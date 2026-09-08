@@ -102,4 +102,4 @@ What helps most in a bug report:
 
 ## Working on ModelGuild itself
 
-Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code and opencode in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)** and **[AGENTS.md](https://github.com/bencmorrison/modelguild/blob/main/AGENTS.md)**.
+Contributing to ModelGuild (not just using it)? The repo ships a dev container that runs Claude Code, opencode and Codex CLI in-container with persistent auth, plus the full TypeScript test suite (`npm test`) and the shell lint/verify scripts. See **[CONTRIBUTING.md](https://github.com/bencmorrison/modelguild/blob/main/CONTRIBUTING.md)** and **[AGENTS.md](https://github.com/bencmorrison/modelguild/blob/main/AGENTS.md)**.
