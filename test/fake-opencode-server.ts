@@ -1025,6 +1025,12 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
     };
 
     try {
+      // Readiness endpoint for fixture executables supervised like opencode serve.
+      if (method === "GET" && url === "/doc") {
+        send(200, {});
+        return;
+      }
+
       // GET /event — the SSE stream the activity layer subscribes to.
       if (method === "GET" && (url === "/event" || url.startsWith("/event?"))) {
         recorded.eventSubscribes += 1;

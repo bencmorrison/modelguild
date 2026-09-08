@@ -1,7 +1,12 @@
 import { mkdtempSync, realpathSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Checker, repoRoot } from "./harness.js";
+import { spawn } from "node:child_process";
+import { createServer, request } from "node:http";
+import { once } from "node:events";
+import { createInterface } from "node:readline";
+import type { AddressInfo } from "node:net";
+import { Checker, repoRoot, withTimeout } from "./harness.js";
 import { init, payloadFiles, resolveGlobalDirs, payloadDest, scanInstalledPayload } from "../src/init.js";
 import { codexConfig, installedDriver, codexRegistration } from "../src/driver.js";
 import { formatSkewNote } from "../src/notice.js";
@@ -14,6 +19,44 @@ export async function run(): Promise<number> {
   const install = (targetDir: string, driver: "claude" | "codex" | "both", uninstall = false) =>
     init({ targetDir, packageRoot: repoRoot, serverLaunch: launch, driver, uninstall });
   try {
+    // Exercise the executable used by the real-Codex probe. Absolute and network-path
+    // targets previously made its proxy contact a different server (PR #231, CodeQL).
+    let unexpectedRequests = 0;
+    const trap = createServer((_req, res) => { unexpectedRequests++; res.end("unexpected destination"); });
+    trap.listen(0, "127.0.0.1");
+    await once(trap, "listening");
+    const trapPort = (trap.address() as AddressInfo).port;
+    const control = path.join(temp, "control.json");
+    writeFileSync(control, "{}");
+    const fixture = spawn(process.execPath, [
+      "--import", path.join(repoRoot, "node_modules/tsx/dist/loader.mjs"),
+      path.join(repoRoot, "test/codex-opencode-fixture.ts"), "serve", "--port", "0",
+    ], {cwd: temp, env: {...process.env, GUILD_CODEX_FIXTURE_CONTROL: control}, stdio: ["ignore", "pipe", "pipe"]});
+    const lines = createInterface({input: fixture.stdout});
+    fixture.stderr.resume();
+    const exited = once(fixture, "exit");
+    try {
+      const [address] = await withTimeout(once(lines, "line"), 10000, "Codex fixture readiness");
+      const fixtureUrl = new URL(address);
+      const get = (target: string) => withTimeout(new Promise<number>((resolve, reject) => {
+        const req = request({hostname: "127.0.0.1", port: fixtureUrl.port, path: target}, res => {
+          res.resume(); res.on("end", () => resolve(res.statusCode!));
+        });
+        req.setTimeout(3000, () => req.destroy(new Error("fixture request timed out")));
+        req.on("error", reject); req.end();
+      }), 5000, "Codex fixture request");
+      c.check(await get("/doc") === 200, "fixture serves readiness directly");
+      c.check(await get("/agent") === 200, "fixture serves backend routes directly");
+      for (const target of [`http://127.0.0.1:${trapPort}/probe`, `//127.0.0.1:${trapPort}/probe`]) {
+        c.check(await get(target) === 404, "fixture rejects an outbound-style request target");
+      }
+      c.check(unexpectedRequests === 0, "request targets cannot redirect the fixture to another server");
+    } finally {
+      lines.close(); fixture.kill("SIGTERM");
+      await withTimeout(exited, 5000, "Codex fixture shutdown");
+      await new Promise<void>((resolve, reject) => trap.close(err => err ? reject(err) : resolve()));
+    }
+
     // Add a driver, upgrade it, then remove either side without losing shared assets or
     // ownership. Run both orders: the original Claude install must not be privileged.
     for (const first of ["claude", "codex"] as const) {
