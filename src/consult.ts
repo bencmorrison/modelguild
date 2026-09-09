@@ -47,7 +47,7 @@ import {
   type TurnDiagnostics,
   type TurnPart,
 } from "./client.js";
-import { resolveReadPaths, resolveWorktreeTarget, type GitRunner } from "./worktree.js";
+import { resolveReadPaths, readPathPattern, resolveWorktreeTarget, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
@@ -404,6 +404,13 @@ export interface ConsultFail {
   /** See `ConsultOk.agentUnverified` — carried on a failure too, because "the call failed AND
    * we could not confirm the agent was hardened" is exactly when it matters most. */
   agentUnverified?: string;
+  /** The read root and the dependency directories this call created its session with
+   * (issues #96, #221) — carried on a FAILURE too (PR #223 re-review), because an
+   * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
+   * what it read to its provider. Present whenever the lifecycle ran, matching the receipt's
+   * `read_root`/`read_paths`; absent on a pre-flight refusal, where nothing was granted. */
+  worktree?: string;
+  readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
    * of a failed call is exactly what makes the failure diagnosable. */
   activity?: ActivitySummary;
@@ -1203,7 +1210,7 @@ export async function runAgentLifecycle(
     if (d.preTurnCheck !== undefined) askOpts.preTurnCheck = d.preTurnCheck;
     const readPathRules = (p.readPaths ?? []).map((path) => ({
       permission: "external_directory",
-      pattern: `${path}/*`,
+      pattern: readPathPattern(path),
       action: "allow" as const,
     }));
     if (readPathRules.length > 0 || (d.approval !== undefined && approver !== undefined)) {
@@ -1670,6 +1677,8 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
+  if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+  if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
   return fail;
 }
 
@@ -1736,8 +1745,10 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
+  if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths) structured.readPaths = r.readPaths;
   return {
-    content: [{ type: "text", text: r.error.message }],
+    content: [{ type: "text", text: r.error.message }, ...readRootBlocks(r.worktree), ...readPathBlocks(r.readPaths)],
     structuredContent: structured,
     isError: true,
   };

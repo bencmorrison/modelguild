@@ -26,6 +26,7 @@
  */
 
 import type { ServeHandle } from "./lifecycle.js";
+import { readPathPattern } from "./worktree.js";
 
 // --- HTTP timeout defaults (ms) --------------------------------------------
 /** Session create/list/delete/history: fast control-plane calls. */
@@ -322,10 +323,10 @@ export function assertAskOnlyRuleset(
   allowedTools?: readonly string[],
   readPathRoots?: readonly string[],
 ): void {
-  const roots = new Set(readPathRoots ?? []);
+  const generated = new Set((readPathRoots ?? []).map(readPathPattern));
   for (const r of rules) {
     if (r.action === "allow" && r.permission === "external_directory") {
-      if (r.pattern?.endsWith("/*") && roots.has(r.pattern.slice(0, -2))) continue;
+      if (r.pattern !== undefined && generated.has(r.pattern)) continue;
       throw new SessionPermissionError(
         "refusing to POST an external-directory allow not generated from validated readPaths",
       );

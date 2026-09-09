@@ -82,7 +82,11 @@ export type WorktreeResolution =
  * external review finding on PR #223, confirmed against the matcher. Cost, stated: such a
  * directory cannot be named at all and must be provided under a plain name. Not a parity
  * fence on the model — a Claude subagent reads it fine — but the transport's matcher cannot
- * say the path literally, and a grant that exceeds its receipt is worse than a refusal. */
+ * say the path literally, and a grant that exceeds its receipt is worse than a refusal.
+ * `\\` is left out of the check on win32, where it is the separator and opencode normalizes
+ * it to `/` on both sides before matching — ModelGuild has no Windows target (CI is ubuntu
+ * and macOS, every script is bash), so this keeps the rule a true statement rather than a
+ * POSIX assumption stated as a universal one (PR #223 re-review). */
 export function resolveReadPaths(
   paths: readonly string[] | undefined,
   baseDir: string,
@@ -107,11 +111,12 @@ export function resolveReadPaths(
     } catch {
       return { ok: false, message: `readPaths entry '${raw}' could not be inspected.` };
     }
-    if (/[*?\\]/.test(canonical)) {
+    const unsayable = process.platform === "win32" ? "'*' or '?'" : "'*', '?' or '\\'";
+    if ((process.platform === "win32" ? /[*?]/ : /[*?\\]/).test(canonical)) {
       return {
         ok: false,
         message:
-          `readPaths entry '${raw}' resolves to '${canonical}', whose name contains '*', '?' or '\\'. ` +
+          `readPaths entry '${raw}' resolves to '${canonical}', whose name contains ${unsayable}. ` +
           `opencode's permission matcher treats those as wildcards and has no escape, so the ` +
           `grant would also match sibling paths. Provide the directory under a name without them.`,
       };
@@ -122,6 +127,14 @@ export function resolveReadPaths(
     }
   }
   return { ok: true, paths: resolved };
+}
+
+/** The session rule pattern for one canonical read path: `<path>/*`. Trailing slashes are
+ * stripped first, so the filesystem root becomes `/*` rather than `//*` — opencode's anchored
+ * matcher satisfies `//*` for nothing under `/`, a grant of nothing (PR #223 re-review). ONE
+ * definition: the lifecycle emits the rule with it and the wire check recognizes it with it. */
+export function readPathPattern(canonical: string): string {
+  return `${canonical.replace(/\/+$/, "")}/*`;
 }
 
 /**

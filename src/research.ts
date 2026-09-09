@@ -186,6 +186,13 @@ export interface ResearchFail {
   rootConflict?: string;
   /** See `ResearchOk.agentUnverified`. */
   agentUnverified?: string;
+  /** The read root and the dependency directories this call created its session with
+   * (issues #96, #221; see `ConsultFail`) — carried on a FAILURE too (PR #223 re-review), because an
+   * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
+   * what it read to its provider. Present whenever the lifecycle ran, matching the receipt's
+   * `read_root`/`read_paths`; absent on a pre-flight refusal, where nothing was granted. */
+  worktree?: string;
+  readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch). */
   activity?: ActivitySummary;
   /** Present when the bridge was armed and the turn ran. */
@@ -437,6 +444,8 @@ export async function research(
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
+  if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+  if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
   return fail;
 }
 
@@ -468,8 +477,10 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
+  if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths) structured.readPaths = r.readPaths;
   return {
-    content: [{ type: "text", text: r.error.message }],
+    content: [{ type: "text", text: r.error.message }, ...readRootBlocks(r.worktree), ...readPathBlocks(r.readPaths)],
     structuredContent: structured,
     isError: true,
   };
