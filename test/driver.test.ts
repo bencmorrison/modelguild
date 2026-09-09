@@ -111,8 +111,17 @@ export async function run(): Promise<number> {
       const ref = /\]\(([^)]+)\)/.exec(skill)?.[1];
       c.check(Boolean(ref && existsSync(path.resolve(path.dirname(skillPath), ref))), "installed skill's shared reference resolves");
     }
-    // All client payloads participate in the same skew scan.
+    // PR #223 review (issue #221): the Codex workflows carry the readPaths guidance the Claude
+    // commands carry, so the two drivers do not diverge on the feature.
     const common = path.join(home, ".agents/skills/modelguild-common.md");
+    const commonText = readFileSync(common, "utf8");
+    c.check(commonText.includes("readPaths") && commonText.includes("structuredContent.readPaths"),
+      "shared Codex guidance explains readPaths and says to report the granted paths");
+    for (const name of ["guild-review", "guild-consult"]) {
+      c.check(readFileSync(path.join(home, `.agents/skills/${name}/SKILL.md`), "utf8").includes("readPaths"),
+        `${name} skill names readPaths for dependency source outside the repository`);
+    }
+    // All client payloads participate in the same skew scan.
     writeFileSync(common, readFileSync(common, "utf8") + "\nEdit\n");
     c.check(scanInstalledPayload({targetDir: temp, global_dirs: g, packageRoot: repoRoot}).unknown.length === 0, "Codex files have recognized ownership in scans");
     init({...opts, uninstall: true});

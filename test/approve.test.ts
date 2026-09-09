@@ -416,6 +416,24 @@ export async function run(): Promise<number> {
       ).ok,
       "verify: a non-ask rule for a tool the def ALREADY allows is not a widening",
     );
+    // PR #223 review (issue #221): a stored `{external_directory, *, allow}` is a directory
+    // grant, accepted ONLY as an exact match of one THIS call generated from `readPaths`. A
+    // continuation never carries this call's read paths, so on it any such rule is a widening.
+    const grant = { permission: "external_directory", pattern: "/deps/*", action: "allow" as const };
+    const stray = { permission: "external_directory", pattern: "/etc/*", action: "allow" as const };
+    c.check(
+      !checkStoredRuleset([required[0], stray], required, buildSet).ok,
+      "verify: a stored external-directory allow the call did not generate is REFUSED as a widening",
+    );
+    c.check(
+      checkStoredRuleset([required[0], grant], required, buildSet, [grant]).ok,
+      "verify: the call's own generated read-path grant is accepted",
+    );
+    const widenedDir = checkStoredRuleset([required[0], grant, stray], required, buildSet, [grant]);
+    c.check(
+      !widenedDir.ok && widenedDir.reason.includes("WIDENED"),
+      "verify: an extra directory grant beside the generated one is still REFUSED, as widened",
+    );
     c.check(
       ApprovalRulesetError.name === "ApprovalRulesetError",
       "never-allow: the construction-time error type is distinct",

@@ -645,6 +645,11 @@ function renderPanelText(r: PanelOk): string {
   const lines: string[] = [];
   lines.push(`Panel of ${r.results.length} model(s) — run ${r.runId || "(logging off)"}.`);
   if (r.worktree) lines.push(`Read root: ${r.worktree}`);
+  // Issue #221: the granted dependency directories reach a text-only reader too (PR #223
+  // review — `panel()` carried them and this translation dropped them).
+  if (r.readPaths !== undefined && r.readPaths.length > 0) {
+    lines.push(`Additional read paths: ${r.readPaths.join(", ")}`);
+  }
   if (r.rootConflict) lines.push(`Root: ${r.rootConflict}`);
   if (r.warnings.length > 0) {
     lines.push("");
@@ -693,5 +698,6 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths !== undefined && r.readPaths.length > 0) structured.readPaths = r.readPaths;
   return { content: [{ type: "text", text: renderPanelText(r) }], structuredContent: structured };
 }

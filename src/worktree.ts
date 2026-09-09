@@ -71,7 +71,18 @@ export type WorktreeResolution =
 /** Resolve caller-named dependency directories for a read-only turn. These are deliberately
  * not constrained to git worktrees: package caches and vendored dependencies are outside the
  * repository. The caller opts in path by path, and the canonical paths become the only
- * session-scoped `external_directory` grants we emit. */
+ * session-scoped `external_directory` grants we emit.
+ *
+ * ONE REFUSAL ON TOP OF EXISTS-AND-IS-A-DIRECTORY: a canonical path containing `*`, `?` or
+ * `\`. opencode evaluates a rule's pattern with its `Wildcard` matcher — `*` → `.*`, `?` →
+ * `.`, `\` normalized to `/` first, `[` escaped so there is no escape syntax (verified against
+ * `packages/opencode/src/util/wildcard.ts` and `permission/index.ts`'s `evaluate` at
+ * v1.18.29). So `/tmp/dep?/*` would also admit `/tmp/depx/...`: a grant WIDER than the path
+ * the receipt records as `read_paths`. Refused rather than silently widened. Provenance: an
+ * external review finding on PR #223, confirmed against the matcher. Cost, stated: such a
+ * directory cannot be named at all and must be provided under a plain name. Not a parity
+ * fence on the model — a Claude subagent reads it fine — but the transport's matcher cannot
+ * say the path literally, and a grant that exceeds its receipt is worse than a refusal. */
 export function resolveReadPaths(
   paths: readonly string[] | undefined,
   baseDir: string,
@@ -95,6 +106,15 @@ export function resolveReadPaths(
       }
     } catch {
       return { ok: false, message: `readPaths entry '${raw}' could not be inspected.` };
+    }
+    if (/[*?\\]/.test(canonical)) {
+      return {
+        ok: false,
+        message:
+          `readPaths entry '${raw}' resolves to '${canonical}', whose name contains '*', '?' or '\\'. ` +
+          `opencode's permission matcher treats those as wildcards and has no escape, so the ` +
+          `grant would also match sibling paths. Provide the directory under a name without them.`,
+      };
     }
     if (!seen.has(canonical)) {
       seen.add(canonical);

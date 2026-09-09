@@ -596,6 +596,15 @@ export function buildApprovalRuleset(opts: {
  * the old subset check and ran on a widened session while reporting itself "armed". So any
  * stored rule whose action is not `ask` for a tool outside the def's allow-set is a refusal.
  *
+ * A THIRD thing since issue #221: the read lifecycle generates `{external_directory,
+ * <path>/*, allow}` rules from `readPaths`, and a stored one is accepted ONLY as an exact
+ * match of a rule THIS call generated (`expectedAllow`). The first cut accepted every such
+ * rule on the grounds that its path had been canonicalized — but a stored session's rules
+ * were canonicalized by whoever created that session, not by this call, so a continuation
+ * carrying `/etc/*` passed as "armed" (PR #223 review, reproduced). A read-path call never
+ * continues a session, so on a continuation `expectedAllow` is empty and any directory grant
+ * is exactly the widening it looks like.
+ *
  * What it does NOT claim: it cannot see rules opencode applied from anywhere other than the
  * session record, and it is a check on the ruleset, not on opencode's resolved behaviour
  * (that is `verify-guild-*.sh`'s job, against a live serve).
@@ -604,6 +613,7 @@ export function checkStoredRuleset(
   stored: unknown,
   required: readonly SessionPermissionRule[],
   allowSet: ReadonlySet<string>,
+  expectedAllow: readonly { permission: string; pattern: string; action: string }[] = [],
 ): { ok: true } | { ok: false; reason: string } {
   if (required.length === 0) return { ok: true };
   if (!Array.isArray(stored)) {
@@ -626,10 +636,23 @@ export function checkStoredRuleset(
     const action = typeof s.action === "string" ? s.action : "";
     const permission = typeof s.permission === "string" ? s.permission : "";
     if (action === "ask") continue;
-    // `readPaths` is the one non-approval rule the read lifecycle generates. Its paths were
-    // canonicalized before this session was created; it extends only opencode's directory
-    // fence, never the agent's tool allow-set.
-    if (action === "allow" && permission === "external_directory") continue;
+    // `readPaths` is the one non-approval rule the read lifecycle generates — accepted only
+    // as an exact match of a rule this call generated (see the header: a stored grant this
+    // call did not make is a widening of the read root, whoever canonicalized it).
+    if (action === "allow" && permission === "external_directory") {
+      const pattern = typeof s.pattern === "string" ? s.pattern : "";
+      const generated = expectedAllow.some(
+        (e) => e.permission === permission && e.pattern === pattern && e.action === action,
+      );
+      if (generated) continue;
+      return {
+        ok: false,
+        reason:
+          `the session's ruleset carries {external_directory, ${pattern}, allow}, a directory ` +
+          `grant this call did not generate — that session has been WIDENED past the read ` +
+          `root, so running in it would not be the gated call you asked for`,
+      };
+    }
     // A non-`ask` rule is only acceptable for a tool the def ALREADY allows — anything else
     // is the session having been widened past the agent's own permission map.
     if (!allowSet.has(permission)) {
@@ -2351,8 +2374,12 @@ export interface ApprovalArming {
   elicitation?: ElicitationRequester;
   /** THE predicate for "is the session opencode will run in genuinely gated?" — passed into
    * `askViaAgent` so `src/client.ts` needs no import from this module and there is exactly
-   * one implementation, shipped and tested (review finding M10). */
-  checkStored(stored: unknown): { ok: true } | { ok: false; reason: string };
+   * one implementation, shipped and tested (review finding M10). `expectedAllow` is the
+   * call's own generated read-path grants (issue #221); anything else of that shape refuses. */
+  checkStored(
+    stored: unknown,
+    expectedAllow?: readonly { permission: string; pattern: string; action: string }[],
+  ): { ok: true } | { ok: false; reason: string };
   /** Build this call's bridge. */
   bridge(ctx: ApprovalContext): ApprovalBridge;
 }
@@ -2464,8 +2491,11 @@ export function armApproval(opts: {
       agentDefFile: resolved.set.file,
       channels,
       ...(opts.elicitation !== undefined ? { elicitation: opts.elicitation } : {}),
-      checkStored(stored: unknown) {
-        return checkStoredRuleset(stored, ruleset, allowSet);
+      checkStored(
+        stored: unknown,
+        expectedAllow?: readonly { permission: string; pattern: string; action: string }[],
+      ) {
+        return checkStoredRuleset(stored, ruleset, allowSet, expectedAllow);
       },
       bridge(ctx: ApprovalContext): ApprovalBridge {
         const bridgeOpts: ConstructorParameters<typeof ApprovalBridge>[0] = {

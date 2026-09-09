@@ -1222,8 +1222,10 @@ export async function runAgentLifecycle(
             (candidate as Record<string, unknown>).action === rule.action,
           )) return { ok: false, reason: `the session's ruleset does not carry the required rule {${rule.permission}, ${rule.pattern}, ${rule.action}}` };
         }
+        // The bridge's widening check accepts a directory grant only as one of THIS call's
+        // generated rules (PR #223 review) — never on the strength of it being canonical.
         return d.approval !== undefined && approver !== undefined
-          ? d.approval.arming.checkStored(stored)
+          ? d.approval.arming.checkStored(stored, readPathRules)
           : { ok: true };
       };
     }

@@ -40,8 +40,8 @@ import path from "node:path";
 import { realpathSync } from "node:fs";
 import { resolveReadPaths, resolveWorktreeTarget } from "../src/worktree.js";
 import { consult, consultToToolResult } from "../src/consult.js";
-import { panel } from "../src/panel.js";
-import { research } from "../src/research.js";
+import { panel, panelToToolResult } from "../src/panel.js";
+import { research, researchToToolResult } from "../src/research.js";
 import { ServePool } from "../src/servepool.js";
 import { OpencodeLifecycle, type ServeHandle } from "../src/lifecycle.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
@@ -166,6 +166,15 @@ export async function run(): Promise<number> {
     const relative = resolveReadPaths([path.relative(repo, dependency)], repo);
     c.check(relative.ok && relative.paths[0] === dependency,
       "readPaths: a relative path is anchored to the effective read root");
+    // PR #223 review: opencode's matcher reads `*` and `?` as wildcards and `\` as `/`, with
+    // no escape — a directory named with one of them would be granted WIDER than itself.
+    for (const name of ["dep?", "dep*", "dep\\x"]) {
+      const odd = path.join(tmp("m221-odd-"), name);
+      mkdirSync(odd);
+      const r = resolveReadPaths([odd], repo);
+      c.check(!r.ok && r.message.includes("wildcards"),
+        `readPaths: a directory named '${name}' is refused, since the grant would match siblings`);
+    }
   }
   {
     const r = resolveWorktreeTarget(repo, { projectDir: repo });
@@ -262,6 +271,13 @@ export async function run(): Promise<number> {
       );
       c.check(r.ok && r.attribution.readPaths?.[0] === dependency,
         "consult: reports the explicit dependency directory it granted");
+      // The MCP translation, not just the internal result (PR #223 review): the granted
+      // paths must reach `structuredContent.readPaths` AND the text a bare client sees.
+      const echoes = (wire: { content: Array<{ text: string }>; structuredContent?: Record<string, unknown> }) =>
+        (wire.structuredContent?.readPaths as string[] | undefined)?.[0] === dependency &&
+        wire.content.some((b) => b.text.includes(`Additional read paths: ${dependency}`));
+      c.check(r.ok && echoes(consultToToolResult(r)),
+        "consult: the MCP result echoes the granted path in structuredContent and text");
       c.check(
         JSON.stringify(fake.recorded.createBodies[0]?.permission) === JSON.stringify([
           { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
@@ -291,6 +307,8 @@ export async function run(): Promise<number> {
       );
       c.check(oneShotPanel.ok && oneShotPanel.readPaths?.[0] === dependency,
         "panel: reports its shared explicit dependency directory");
+      c.check(oneShotPanel.ok && echoes(panelToToolResult(oneShotPanel)),
+        "panel: the MCP result echoes the granted path in structuredContent and the digest");
       c.check(
         fake.recorded.createBodies.slice(-2).every((body) =>
           JSON.stringify(body.permission) === JSON.stringify([
@@ -305,6 +323,8 @@ export async function run(): Promise<number> {
       );
       c.check(researched.ok && researched.attribution.readPaths?.[0] === dependency,
         "research: reports the explicit dependency directory it granted");
+      c.check(researched.ok && echoes(researchToToolResult(researched)),
+        "research: the MCP result echoes the granted path in structuredContent and text");
       c.check(
         JSON.stringify(fake.recorded.createBodies.at(-1)?.permission) === JSON.stringify([
           { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
