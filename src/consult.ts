@@ -407,8 +407,12 @@ export interface ConsultFail {
   /** The read root and the dependency directories this call created its session with
    * (issues #96, #221) — carried on a FAILURE too (PR #223 re-review), because an
    * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
-   * what it read to its provider. Present whenever the lifecycle ran, matching the receipt's
-   * `read_root`/`read_paths`; absent on a pre-flight refusal, where nothing was granted. */
+   * what it read to its provider. Present only when the session was created with its ruleset
+   * verified (`LifecycleOutcome.permissionApplied`); absent on a pre-flight refusal, the
+   * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+   * granted nothing — naming the paths there would say the model could have read them. The
+   * receipt's `read_root`/`read_paths` on `started` still record what the call set out to
+   * grant, which is a different claim. */
   worktree?: string;
   readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
@@ -1056,6 +1060,11 @@ export type LifecycleOutcome =
        * action trace matters most. */
       activity?: ActivitySummary;
       approval?: ApprovalSummary;
+      /** True once the session was created with its ruleset verified — the read root and
+       * any `readPaths` were in force and the model could have read from them. False for the
+       * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+       * granted nothing (PR #223 re-review); the tools disclose the paths only when true. */
+      permissionApplied: boolean;
     };
 
 /**
@@ -1178,6 +1187,8 @@ export async function runAgentLifecycle(
   // turn must not run, because it would run ungated. It is constructed before the try so a
   // construction failure surfaces as a normal thrown call rather than a silent downgrade.
   let approver: ApprovalBridge | undefined;
+  /** Set by `askViaAgent` at the moment the grant became real; see `LifecycleOutcome`. */
+  let permissionApplied = false;
   const ctx = {
     runId: p.runId,
     callId,
@@ -1204,6 +1215,9 @@ export async function runAgentLifecycle(
       expectedAgent: p.agent,
       // Issue #117: only the read paths ask for this; see `LifecycleParams.requireAnswer`.
       requireAnswer: p.requireAnswer === true,
+      onPermissionApplied: () => {
+        permissionApplied = true;
+      },
     };
     if (recorder !== undefined) askOpts.activity = recorder;
     // A3: re-verify the floor on the child that will actually serve this turn.
@@ -1361,6 +1375,7 @@ export async function runAgentLifecycle(
             : empty
               ? "empty-answer"
               : "call-failed",
+      permissionApplied,
     };
     // Issue #168: the diagnostics ride out on the refusal, structurally as well as in the
     // message text, so a caller can tell "read five files then said nothing" from "said
@@ -1677,8 +1692,10 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
-  if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
-  if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  if (outcome.permissionApplied) {
+    if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+    if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  }
   return fail;
 }
 

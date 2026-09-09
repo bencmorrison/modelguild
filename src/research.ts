@@ -189,8 +189,12 @@ export interface ResearchFail {
   /** The read root and the dependency directories this call created its session with
    * (issues #96, #221; see `ConsultFail`) — carried on a FAILURE too (PR #223 re-review), because an
    * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
-   * what it read to its provider. Present whenever the lifecycle ran, matching the receipt's
-   * `read_root`/`read_paths`; absent on a pre-flight refusal, where nothing was granted. */
+   * what it read to its provider. Present only when the session was created with its ruleset
+   * verified (`LifecycleOutcome.permissionApplied`); absent on a pre-flight refusal, the
+   * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+   * granted nothing — naming the paths there would say the model could have read them. The
+   * receipt's `read_root`/`read_paths` on `started` still record what the call set out to
+   * grant, which is a different claim. */
   worktree?: string;
   readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch). */
@@ -444,8 +448,10 @@ export async function research(
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
-  if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
-  if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  if (outcome.permissionApplied) {
+    if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+    if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  }
   return fail;
 }
 

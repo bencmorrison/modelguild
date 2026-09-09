@@ -390,6 +390,44 @@ export async function run(): Promise<number> {
   }
 
   {
+    // PR #223 re-review, the other direction: a failure BEFORE the grant was real must not name
+    // the paths as granted. A serve that ignores the `permission` field never verifies the
+    // ruleset, so the gate refuses before any turn — nothing was granted, and the result says
+    // nothing about the paths. Same for the panel, whose every member fails that way.
+    const logDir = tmp("m221-ungranted-logs-");
+    const dependency = tmp("m221-ungranted-dependency-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const deaf = await startFakeOpencode({ historyText: "MUST NOT BE REACHED", ignoreSessionPermission: true });
+    const names = (wire: { content: Array<{ text: string }>; structuredContent?: Record<string, unknown> }) =>
+      wire.structuredContent?.readPaths !== undefined || wire.content.some((b) => b.text.includes("Additional read paths"));
+    try {
+      const ungranted = await consult(
+        { question: "never", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(!ungranted.ok && ungranted.readPaths === undefined && !names(consultToToolResult(ungranted)),
+        `consult: a failure before the grant was verified names NO read paths (kind ${ungranted.ok ? "ok" : ungranted.error.kind})`);
+      const ungrantedResearch = await research(
+        { question: "never", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(!ungrantedResearch.ok && ungrantedResearch.readPaths === undefined && !names(researchToToolResult(ungrantedResearch)),
+        "research: a failure before the grant was verified names NO read paths");
+      const ungrantedPanel = await panel(
+        { question: "never", models: ["openai/m", "openai/n"], readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(
+        ungrantedPanel.ok && ungrantedPanel.results.every((m) => m.error !== undefined) &&
+          ungrantedPanel.readPaths === undefined && !names(panelToToolResult(ungrantedPanel)),
+        "panel: every member failing before the grant was verified names NO read paths",
+      );
+    } finally {
+      await deaf.close();
+    }
+  }
+
+  {
     // (b) A path not in `git worktree list` is refused BY NAME, and nothing is logged
     //     (gap parity: a refusal before `expect` writes no run).
     const logDir = tmp("m96-logs-");

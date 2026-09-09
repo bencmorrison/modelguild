@@ -249,8 +249,11 @@ export interface PanelOk {
    * PROCEEDED and this is the "never silently" half of that decision (C73). Panel-WIDE, like
    * the def check itself — every member runs the same agent on the same serve child. */
   agentUnverified?: string;
-  /** The read root every member ran against; present only when one was targeted (#96). */
+  /** The read root every member ran against; present only when one was targeted (#96) AND
+   * at least one member's session was created with its ruleset verified — a panel whose every
+   * member failed before that ran against nothing (PR #223 re-review). */
   worktree?: string;
+  /** The dependency directories granted to the members' sessions (#221); same condition. */
   readPaths?: string[];
 }
 
@@ -477,6 +480,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // ISSUE #187: resolved ONCE for the whole panel, beside every other loop-invariant knob.
   const { retryEmpty } = resolvePanelRetrySettings({ env, confContents });
 
+  /** True once ANY member's session was created with its ruleset verified: the point at which
+   * the panel's read root and read paths became something a model could read from. */
+  let grantApplied = false;
   // 5. Members run CONCURRENTLY; each is gated + logged independently. One member's
   //    refusal or failure never touches another's result (order preserved by Promise.all).
   const results = await Promise.all(
@@ -567,6 +573,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
               },
         ];
       }
+      if (outcome.ok || outcome.permissionApplied) grantApplied = true;
       if (outcome.ok) {
         const member: PanelMemberResult = {
           model: outcome.actualModel,
@@ -630,8 +637,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     warnings: panelRes.warnings,
     rootConflict,
     ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
-    ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
-    ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
+    ...(grantApplied && worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+    ...(grantApplied && resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
   };
 }
 

@@ -1869,6 +1869,14 @@ export interface AskViaAgentOpts {
    */
   permissionCheck?: (stored: unknown) => { ok: true } | { ok: false; reason: string };
   approval?: ApprovalAttachable;
+  /**
+   * Fired ONCE, when the session exists AND its stored ruleset — read-path grants included —
+   * has been verified on it: the first moment the model could read what those rules allow.
+   * Anything thrown before it fired (the in-lease floor refusal, session creation, the gate
+   * verification itself) granted nothing, and a result that named the paths as granted would
+   * be saying the model could have read them when it could not (PR #223 re-review).
+   */
+  onPermissionApplied?: () => void;
 }
 
 export interface AskResult {
@@ -2041,6 +2049,9 @@ export async function askViaAgent(serve: ServeProvider, opts: AskViaAgentOpts): 
           );
         }
       }
+
+      // The session exists and its ruleset is verified: from here the grant is real.
+      opts.onPermissionApplied?.();
 
       // Attach the activity stream BEFORE the turn (issue #20). A failure here is swallowed:
       // the call runs unwatched rather than failing over a visibility feature.
