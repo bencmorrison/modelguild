@@ -915,6 +915,8 @@ export class EvidenceLog {
      * field existed, so no existing run, fixture or `verify()` branch changes shape.
      */
     readRoot?: string;
+    /** Explicit external dependency directories granted to this read session (issue #221). */
+    readPaths?: string[];
     /**
      * THE WRITE ROOT the turn actually EDITED (issue #107) — the tree `guild_delegate`'s
      * snapshot, both trees, the recorded patch and the recovery hint are all anchored at,
@@ -979,6 +981,9 @@ export class EvidenceLog {
         // Absent unless a non-default read root was actually used — see `readRoot` above.
         ...(args.readRoot !== undefined && args.readRoot.length > 0
           ? { read_root: args.readRoot }
+          : {}),
+        ...(args.readPaths !== undefined && args.readPaths.length > 0
+          ? { read_paths: args.readPaths }
           : {}),
         // Absent unless a non-default WRITE root was actually used — see `writeRoot` above.
         ...(args.writeRoot !== undefined && args.writeRoot.length > 0

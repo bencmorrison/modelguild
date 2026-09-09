@@ -47,7 +47,7 @@ import {
   type TurnDiagnostics,
   type TurnPart,
 } from "./client.js";
-import { resolveWorktreeTarget, type GitRunner } from "./worktree.js";
+import { resolveReadPaths, readPathPattern, resolveWorktreeTarget, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
@@ -298,6 +298,7 @@ export type ConsultErrorKind =
   // The review target named a directory that is not a worktree of this repository
   // (issue #96). Refused before any log write, like every other pre-call refusal.
   | "worktree-invalid"
+  | "read-path-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -328,6 +329,8 @@ export interface ConsultAttribution {
    * worktree (issue #96). Reported so a review can state which tree it read — a review of
    * the wrong tree is the failure the target exists to prevent. */
   worktree?: string;
+  /** Explicit dependency directories the caller granted this read-only session. */
+  readPaths?: string[];
 }
 
 export interface ConsultError {
@@ -401,6 +404,17 @@ export interface ConsultFail {
   /** See `ConsultOk.agentUnverified` — carried on a failure too, because "the call failed AND
    * we could not confirm the agent was hardened" is exactly when it matters most. */
   agentUnverified?: string;
+  /** The read root and the dependency directories this call created its session with
+   * (issues #96, #221) — carried on a FAILURE too (PR #223 re-review), because an
+   * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
+   * what it read to its provider. Present only when the session was created with its ruleset
+   * verified (`LifecycleOutcome.permissionApplied`); absent on a pre-flight refusal, the
+   * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+   * granted nothing — naming the paths there would say the model could have read them. The
+   * receipt's `read_root`/`read_paths` on `started` still record what the call set out to
+   * grant, which is a different claim. */
+  worktree?: string;
+  readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch): the action trace
    * of a failed call is exactly what makes the failure diagnosable. */
   activity?: ActivitySummary;
@@ -432,6 +446,8 @@ export interface ConsultParams {
    * project root. Omit for the project the server was launched in.
    */
   worktree?: string;
+  /** Explicit external dependency directories this fresh read-only session may inspect. */
+  readPaths?: string[];
   /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`): a positive number capped at `TIMER_MAX_MS`, or the ceiling
@@ -918,6 +934,8 @@ export interface LifecycleParams {
   /** The non-default read root this turn ran against (issue #96), recorded on the `started`
    * evidence entry so the receipts say WHICH TREE the answer describes. Absent otherwise. */
   readRoot?: string;
+  /** Canonical dependency directories granted through session `external_directory` rules. */
+  readPaths?: string[];
   /** The non-default WRITE root this turn edited (issue #107) — the write-path counterpart,
    * deliberately its own field rather than a reuse of `readRoot`; see `log.started`. */
   writeRoot?: string;
@@ -1042,6 +1060,11 @@ export type LifecycleOutcome =
        * action trace matters most. */
       activity?: ActivitySummary;
       approval?: ApprovalSummary;
+      /** True once the session was created with its ruleset verified — the read root and
+       * any `readPaths` were in force and the model could have read from them. False for the
+       * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+       * granted nothing (PR #223 re-review); the tools disclose the paths only when true. */
+      permissionApplied: boolean;
     };
 
 /**
@@ -1149,6 +1172,7 @@ export async function runAgentLifecycle(
     session: p.sessionId,
     prompt: p.question,
     ...(p.readRoot !== undefined ? { readRoot: p.readRoot } : {}),
+    ...(p.readPaths !== undefined ? { readPaths: p.readPaths } : {}),
     ...(p.writeRoot !== undefined ? { writeRoot: p.writeRoot } : {}),
     ...(p.retryOf !== undefined ? { retryOf: p.retryOf } : {}),
   });
@@ -1163,6 +1187,8 @@ export async function runAgentLifecycle(
   // turn must not run, because it would run ungated. It is constructed before the try so a
   // construction failure surfaces as a normal thrown call rather than a silent downgrade.
   let approver: ApprovalBridge | undefined;
+  /** Set by `askViaAgent` at the moment the grant became real; see `LifecycleOutcome`. */
+  let permissionApplied = false;
   const ctx = {
     runId: p.runId,
     callId,
@@ -1189,17 +1215,46 @@ export async function runAgentLifecycle(
       expectedAgent: p.agent,
       // Issue #117: only the read paths ask for this; see `LifecycleParams.requireAnswer`.
       requireAnswer: p.requireAnswer === true,
+      onPermissionApplied: () => {
+        permissionApplied = true;
+      },
     };
     if (recorder !== undefined) askOpts.activity = recorder;
     // A3: re-verify the floor on the child that will actually serve this turn.
     if (d.preTurnCheck !== undefined) askOpts.preTurnCheck = d.preTurnCheck;
+    const readPathRules = (p.readPaths ?? []).map((path) => ({
+      permission: "external_directory",
+      pattern: readPathPattern(path),
+      action: "allow" as const,
+    }));
+    if (readPathRules.length > 0 || (d.approval !== undefined && approver !== undefined)) {
+      askOpts.permission = [
+        ...readPathRules,
+        ...(d.approval !== undefined && approver !== undefined ? d.approval.arming.ruleset : []),
+      ];
+      if (readPathRules.length > 0) askOpts.readPathRoots = p.readPaths;
+      askOpts.permissionCheck = (stored) => {
+        if (!Array.isArray(stored)) return { ok: false, reason: "the session carries no permission ruleset at all" };
+        for (const rule of askOpts.permission ?? []) {
+          if (!stored.some((candidate) =>
+            candidate !== null && typeof candidate === "object" &&
+            (candidate as Record<string, unknown>).permission === rule.permission &&
+            (candidate as Record<string, unknown>).pattern === rule.pattern &&
+            (candidate as Record<string, unknown>).action === rule.action,
+          )) return { ok: false, reason: `the session's ruleset does not carry the required rule {${rule.permission}, ${rule.pattern}, ${rule.action}}` };
+        }
+        // The bridge's widening check accepts a directory grant only as one of THIS call's
+        // generated rules (PR #223 review) — never on the strength of it being canonical.
+        return d.approval !== undefined && approver !== undefined
+          ? d.approval.arming.checkStored(stored, readPathRules)
+          : { ok: true };
+      };
+    }
     if (d.approval !== undefined && approver !== undefined) {
-      askOpts.permission = d.approval.arming.ruleset;
-      // Invariant 2 at the WIRE (review finding M4) and the ONE stored-ruleset predicate
+      // Invariant 2 at the WIRE (review finding M4) and the stored-ruleset predicate
       // (M10) both travel with the ruleset, so `client.ts` enforces the same rules this
       // module does without importing it.
       askOpts.allowedTools = [...d.approval.arming.allowSet];
-      askOpts.permissionCheck = (stored) => d.approval!.arming.checkStored(stored);
       askOpts.approval = approver;
     }
     const result = await askViaAgent(d.serve, askOpts);
@@ -1320,6 +1375,7 @@ export async function runAgentLifecycle(
             : empty
               ? "empty-answer"
               : "call-failed",
+      permissionApplied,
     };
     // Issue #168: the diagnostics ride out on the refusal, structurally as well as in the
     // message text, so a caller can tell "read five files then said nothing" from "said
@@ -1390,6 +1446,21 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
+  if (!resolvedReadPaths.ok) {
+    return {
+      ok: false,
+      rootConflict,
+      error: { kind: "read-path-invalid", model: "", exitAnalogue: null, message: resolvedReadPaths.message },
+    };
+  }
+  if ((params.sessionId !== undefined || params.keepSession === true) && resolvedReadPaths.paths.length > 0) {
+    return {
+      ok: false,
+      rootConflict,
+      error: { kind: "read-path-invalid", model: "", exitAnalogue: null, message: "readPaths can only be used on a one-shot fresh session: opencode fixes session permissions when it creates the session." },
+    };
+  }
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, mirroring guild_research/guild_delegate).
   //    If the hardened guild-read def is not present in the resolved agent-def dir(s), REFUSE
@@ -1547,6 +1618,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       // A read path with no text produced nothing at all (issue #117, C74).
       requireAnswer: true,
       ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+      ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
     },
     {
       serve,
@@ -1571,6 +1643,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+        ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
       },
     };
     // Only expose the session id when the caller asked to keep it — otherwise the
@@ -1619,6 +1692,10 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
+  if (outcome.permissionApplied) {
+    if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+    if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  }
   return fail;
 }
 
@@ -1637,6 +1714,12 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
 export function readRootBlocks(worktree: string | undefined): Array<{ type: "text"; text: string }> {
   if (worktree === undefined || worktree.length === 0) return [];
   return [{ type: "text", text: `Read root: ${worktree}` }];
+}
+
+export function readPathBlocks(paths: string[] | undefined): Array<{ type: "text"; text: string }> {
+  return paths !== undefined && paths.length > 0
+    ? [{ type: "text", text: `Additional read paths: ${paths.join(", ")}` }]
+    : [];
 }
 
 /** The MCP CallToolResult wire shape this tool emits. The index signature lets this
@@ -1668,7 +1751,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
     if (r.activity) structured.activity = r.activity;
     if (r.approval) structured.approval = r.approval;
     return {
-      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree)],
+      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree), ...readPathBlocks(r.attribution.readPaths)],
       structuredContent: structured,
     };
   }
@@ -1679,8 +1762,10 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
+  if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths) structured.readPaths = r.readPaths;
   return {
-    content: [{ type: "text", text: r.error.message }],
+    content: [{ type: "text", text: r.error.message }, ...readRootBlocks(r.worktree), ...readPathBlocks(r.readPaths)],
     structuredContent: structured,
     isError: true,
   };

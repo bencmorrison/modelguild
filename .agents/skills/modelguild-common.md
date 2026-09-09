@@ -39,9 +39,14 @@ and model; do not start a new conversation while claiming it remembers the old o
 The session owns its worktree root; do not supply a contradictory worktree on follow-up.
 
 When the relevant code is in a sibling git worktree, pass its directory as worktree.
-Confirm the returned root is the intended tree. Other read-root restrictions and
-permission changes are tracked separately in #221/#228; report a denial rather than
-inventing evidence about an inaccessible file.
+Confirm the returned root is the intended tree. For dependency source outside the
+repository (package checkouts, node_modules, vendored SDKs), pass the existing
+directories as readPaths on guild_consult, guild_panel, or guild_research. Each is
+canonicalized and granted to that one-shot call only: it cannot be combined with
+sessionId, keepSession, or keepSessions, and guild_delegate does not accept it. Report
+the returned structuredContent.readPaths; every named directory may be read and sent to
+the external provider. Other permission changes are tracked in #228; report a denial
+rather than inventing evidence about an inaccessible file.
 
 ## Approval and long calls
 

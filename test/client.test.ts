@@ -26,6 +26,8 @@ import {
   splitModel,
   OpencodeHttpError,
   AgentMismatchError,
+  SessionPermissionError,
+  assertAskOnlyRuleset,
   type ServeProvider,
   type SessionHistory,
 } from "../src/client.js";
@@ -71,6 +73,35 @@ export async function run(): Promise<number> {
   }
 
   // 1. createSession sends the {id, providerID} shape + agent threading --------
+  {
+    const root = "/tmp/modelguild-read-path";
+    const rule = { permission: "external_directory", pattern: `${root}/*`, action: "allow" as const };
+    try {
+      assertAskOnlyRuleset([rule], undefined, [root]);
+      c.check(true, "readPaths wire: accepts only a generated external-directory allow rule");
+    } catch {
+      c.check(false, "readPaths wire: accepts only a generated external-directory allow rule");
+    }
+    for (const bad of [
+      { permission: "external_directory", pattern: `${root}/*`, action: "allow" as const, roots: [] },
+      { permission: "external_directory", pattern: root, action: "allow" as const, roots: [root] },
+      { permission: "bash", pattern: "*", action: "allow" as const, roots: [root] },
+    ]) {
+      try {
+        assertAskOnlyRuleset([bad], undefined, bad.roots);
+        c.check(false, "readPaths wire: rejects a non-generated allow rule");
+      } catch (err) {
+        c.check(err instanceof SessionPermissionError, "readPaths wire: rejects a non-generated allow rule");
+      }
+    }
+    try {
+      assertAskOnlyRuleset([{ permission: "bash", pattern: "*", action: "ask" }], ["bash"]);
+      c.check(true, "approval wire: continues to accept an allowed ask rule");
+    } catch {
+      c.check(false, "approval wire: continues to accept an allowed ask rule");
+    }
+  }
+
   {
     const fake = await startFakeOpencode({ historyText: "x" });
     try {

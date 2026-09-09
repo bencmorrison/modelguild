@@ -33,19 +33,32 @@ import {
   existsSync,
   rmSync,
   readdirSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
-import { resolveWorktreeTarget } from "../src/worktree.js";
+import { readPathPattern, resolveReadPaths, resolveWorktreeTarget } from "../src/worktree.js";
 import { consult, consultToToolResult } from "../src/consult.js";
-import { panel } from "../src/panel.js";
-import { research } from "../src/research.js";
+import { panel, panelToToolResult } from "../src/panel.js";
+import { research, researchToToolResult } from "../src/research.js";
 import { ServePool } from "../src/servepool.js";
 import { OpencodeLifecycle, type ServeHandle } from "../src/lifecycle.js";
 import { startFakeOpencode, type FakeOpencode } from "./fake-opencode-server.js";
 import type { ServeProvider, ServeRouter } from "../src/client.js";
 import { Checker, fakeServeHandle } from "./harness.js";
+
+/** The MCP wire result echoes a granted read path in BOTH `structuredContent.readPaths` and a
+ * text block (PR #223 review) — asserted on the translated result, not the internal one. */
+function echoesReadPath(
+  wire: { content: Array<{ text: string }>; structuredContent?: Record<string, unknown> },
+  dependency: string,
+): boolean {
+  return (
+    (wire.structuredContent?.readPaths as string[] | undefined)?.[0] === dependency &&
+    wire.content.some((b) => b.text.includes(`Additional read paths: ${dependency}`))
+  );
+}
 
 const tmpDirs: string[] = [];
 function tmp(prefix = "m96-"): string {
@@ -148,6 +161,38 @@ export async function run(): Promise<number> {
     c.check(r.ok && r.isDefault === false, "a sibling worktree is not the default root");
   }
   {
+    const dependency = tmp("m221-dependency-");
+    const alias = path.join(tmp("m221-alias-"), "dependency");
+    symlinkSync(dependency, alias);
+    const r = resolveReadPaths([dependency, alias], repo);
+    c.check(
+      r.ok && r.paths.length === 1 && r.paths[0] === dependency,
+      "readPaths: canonicalizes and de-duplicates explicit dependency directories",
+    );
+    const file = path.join(dependency, "source.swift");
+    writeFileSync(file, "x");
+    const notDir = resolveReadPaths([file], repo);
+    c.check(!notDir.ok && notDir.message.includes("not a directory"), "readPaths: a file is refused");
+    const missing = resolveReadPaths([path.join(dependency, "missing")], repo);
+    c.check(!missing.ok && missing.message.includes("does not exist"), "readPaths: a missing directory is refused");
+    const relative = resolveReadPaths([path.relative(repo, dependency)], repo);
+    c.check(relative.ok && relative.paths[0] === dependency,
+      "readPaths: a relative path is anchored to the effective read root");
+    c.check(
+      readPathPattern("/") === "/*" && readPathPattern("/deps/") === "/deps/*" && readPathPattern("/deps") === "/deps/*",
+      "readPaths: the rule pattern strips trailing slashes, so '/' is '/*' and never '//*'",
+    );
+    // PR #223 review: opencode's matcher reads `*` and `?` as wildcards and `\` as `/`, with
+    // no escape — a directory named with one of them would be granted WIDER than itself.
+    for (const name of ["dep?", "dep*", "dep\\x"]) {
+      const odd = path.join(tmp("m221-odd-"), name);
+      mkdirSync(odd);
+      const r = resolveReadPaths([odd], repo);
+      c.check(!r.ok && r.message.includes("wildcards"),
+        `readPaths: a directory named '${name}' is refused, since the grant would match siblings`);
+    }
+  }
+  {
     const r = resolveWorktreeTarget(repo, { projectDir: repo });
     c.check(r.ok && r.isDefault === true, "the main checkout is accepted AND flagged default");
   }
@@ -227,6 +272,158 @@ export async function run(): Promise<number> {
         "consult: the result reports the read root it actually used");
     } finally {
       await fake.close();
+    }
+  }
+
+  {
+    const logDir = tmp("m221-logs-");
+    const dependency = tmp("m221-dependency-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const fake = await startFakeOpencode({ historyText: "dependency reviewed" });
+    try {
+      const r = await consult(
+        { question: "review dependency", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(r.ok && r.attribution.readPaths?.[0] === dependency,
+        "consult: reports the explicit dependency directory it granted");
+      c.check(r.ok && echoesReadPath(consultToToolResult(r), dependency),
+        "consult: the MCP result echoes the granted path in structuredContent and text");
+      c.check(
+        JSON.stringify(fake.recorded.createBodies[0]?.permission) === JSON.stringify([
+          { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+        ]),
+        "consult: creates only the generated external-directory allow rule",
+      );
+      if (r.ok) {
+        const run = readdirSync(logDir).find((name) => name !== "latest");
+        const entries = readFileSync(path.join(logDir, run ?? "", "calls.jsonl"), "utf8");
+        c.check(entries.includes('"read_paths"'), "consult: records granted paths in the receipt");
+      }
+      const continued = await consult(
+        { question: "retry", model: "openai/m", readPaths: [dependency], keepSession: true },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(!continued.ok && continued.error.kind === "read-path-invalid",
+        "consult: a read-path grant cannot be retained in a kept session");
+      const keptPanel = await panel(
+        { question: "panel dependency", models: ["openai/m", "openai/n"], readPaths: [dependency], keepSessions: true },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(!keptPanel.ok && keptPanel.error.kind === "read-path-invalid",
+        "panel: a read-path grant cannot be retained in kept member sessions");
+      const oneShotPanel = await panel(
+        { question: "panel dependency", models: ["openai/m", "openai/n"], readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(oneShotPanel.ok && oneShotPanel.readPaths?.[0] === dependency,
+        "panel: reports its shared explicit dependency directory");
+      c.check(oneShotPanel.ok && echoesReadPath(panelToToolResult(oneShotPanel), dependency),
+        "panel: the MCP result echoes the granted path in structuredContent and the digest");
+      c.check(
+        fake.recorded.createBodies.slice(-2).every((body) =>
+          JSON.stringify(body.permission) === JSON.stringify([
+            { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+          ]),
+        ),
+        "panel: grants the same generated external-directory rule to every member",
+      );
+      const researched = await research(
+        { question: "research dependency", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(researched.ok && researched.attribution.readPaths?.[0] === dependency,
+        "research: reports the explicit dependency directory it granted");
+      c.check(researched.ok && echoesReadPath(researchToToolResult(researched), dependency),
+        "research: the MCP result echoes the granted path in structuredContent and text");
+      c.check(
+        JSON.stringify(fake.recorded.createBodies.at(-1)?.permission) === JSON.stringify([
+          { permission: "external_directory", pattern: `${dependency}/*`, action: "allow" },
+        ]),
+        "research: creates only the generated external-directory allow rule",
+      );
+      // PR #223 re-review: `/` used to become `//*`, which opencode's anchored matcher satisfies
+      // for nothing — a grant of nothing. The pattern strips trailing slashes.
+      const rootGrant = await consult(
+        { question: "root", model: "openai/m", readPaths: ["/"] },
+        { serve: fakeServe(fake), env, cwd: repo },
+      );
+      c.check(
+        rootGrant.ok &&
+          JSON.stringify(fake.recorded.createBodies.at(-1)?.permission) ===
+            JSON.stringify([{ permission: "external_directory", pattern: "/*", action: "allow" }]),
+        "readPaths: the filesystem root is granted as '/*', a rule the matcher can satisfy",
+      );
+    } finally {
+      await fake.close();
+    }
+  }
+
+  {
+    // PR #223 re-review: a failure that arrives AFTER the session was created with the grant
+    // still discloses it — the model may have read from the directory and sent what it read
+    // before the empty answer. Asserted on the translated MCP result, where the driver looks.
+    const logDir = tmp("m221-fail-logs-");
+    const dependency = tmp("m221-fail-dependency-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const silent = await startFakeOpencode({ historyText: "" });
+    try {
+      const failed = await consult(
+        { question: "silent", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(silent), env, cwd: repo },
+      );
+      c.check(!failed.ok && failed.error.kind === "empty-answer" && failed.readPaths?.[0] === dependency,
+        "consult: a post-session empty-answer still reports the granted dependency directory");
+      c.check(!failed.ok && echoesReadPath(consultToToolResult(failed), dependency),
+        "consult: and the failed MCP result echoes it in structuredContent and text");
+      const failedResearch = await research(
+        { question: "silent", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(silent), env, cwd: repo },
+      );
+      c.check(!failedResearch.ok && failedResearch.error.kind === "empty-answer" && failedResearch.readPaths?.[0] === dependency,
+        "research: a post-session empty-answer still reports the granted dependency directory");
+      c.check(!failedResearch.ok && echoesReadPath(researchToToolResult(failedResearch), dependency),
+        "research: and the failed MCP result echoes it in structuredContent and text");
+    } finally {
+      await silent.close();
+    }
+  }
+
+  {
+    // PR #223 re-review, the other direction: a failure BEFORE the grant was real must not name
+    // the paths as granted. A serve that ignores the `permission` field never verifies the
+    // ruleset, so the gate refuses before any turn — nothing was granted, and the result says
+    // nothing about the paths. Same for the panel, whose every member fails that way.
+    const logDir = tmp("m221-ungranted-logs-");
+    const dependency = tmp("m221-ungranted-dependency-");
+    const env = envWith({ GUILD_ROOT: guildRoot, GUILD_LOG_DIR: logDir, GUILD_PROJECT_DIR: repo });
+    const deaf = await startFakeOpencode({ historyText: "MUST NOT BE REACHED", ignoreSessionPermission: true });
+    const names = (wire: { content: Array<{ text: string }>; structuredContent?: Record<string, unknown> }) =>
+      wire.structuredContent?.readPaths !== undefined || wire.content.some((b) => b.text.includes("Additional read paths"));
+    try {
+      const ungranted = await consult(
+        { question: "never", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(!ungranted.ok && ungranted.readPaths === undefined && !names(consultToToolResult(ungranted)),
+        `consult: a failure before the grant was verified names NO read paths (kind ${ungranted.ok ? "ok" : ungranted.error.kind})`);
+      const ungrantedResearch = await research(
+        { question: "never", model: "openai/m", readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(!ungrantedResearch.ok && ungrantedResearch.readPaths === undefined && !names(researchToToolResult(ungrantedResearch)),
+        "research: a failure before the grant was verified names NO read paths");
+      const ungrantedPanel = await panel(
+        { question: "never", models: ["openai/m", "openai/n"], readPaths: [dependency] },
+        { serve: fakeServe(deaf), env, cwd: repo },
+      );
+      c.check(
+        ungrantedPanel.ok && ungrantedPanel.results.every((m) => m.error !== undefined) &&
+          ungrantedPanel.readPaths === undefined && !names(panelToToolResult(ungrantedPanel)),
+        "panel: every member failing before the grant was verified names NO read paths",
+      );
+    } finally {
+      await deaf.close();
     }
   }
 

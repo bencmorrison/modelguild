@@ -32,7 +32,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 /** `git worktree list` output is small; this is a sanity bound, not a tuning knob. */
@@ -67,6 +67,75 @@ export type WorktreeResolution =
       isDefault: boolean;
     }
   | { ok: false; message: string };
+
+/** Resolve caller-named dependency directories for a read-only turn. These are deliberately
+ * not constrained to git worktrees: package caches and vendored dependencies are outside the
+ * repository. The caller opts in path by path, and the canonical paths become the only
+ * session-scoped `external_directory` grants we emit.
+ *
+ * ONE REFUSAL ON TOP OF EXISTS-AND-IS-A-DIRECTORY: a canonical path containing `*`, `?` or
+ * `\`. opencode evaluates a rule's pattern with its `Wildcard` matcher — `*` → `.*`, `?` →
+ * `.`, `\` normalized to `/` first, `[` escaped so there is no escape syntax (verified against
+ * `packages/opencode/src/util/wildcard.ts` and `permission/index.ts`'s `evaluate` at
+ * v1.18.29). So `/tmp/dep?/*` would also admit `/tmp/depx/...`: a grant WIDER than the path
+ * the receipt records as `read_paths`. Refused rather than silently widened. Provenance: an
+ * external review finding on PR #223, confirmed against the matcher. Cost, stated: such a
+ * directory cannot be named at all and must be provided under a plain name. Not a parity
+ * fence on the model — a Claude subagent reads it fine — but the transport's matcher cannot
+ * say the path literally, and a grant that exceeds its receipt is worse than a refusal.
+ * `\\` is left out of the check on win32, where it is the separator and opencode normalizes
+ * it to `/` on both sides before matching — ModelGuild has no Windows target (CI is ubuntu
+ * and macOS, every script is bash), so this keeps the rule a true statement rather than a
+ * POSIX assumption stated as a universal one (PR #223 re-review). */
+export function resolveReadPaths(
+  paths: readonly string[] | undefined,
+  baseDir: string,
+): { ok: true; paths: string[] } | { ok: false; message: string } {
+  if (paths === undefined || paths.length === 0) return { ok: true, paths: [] };
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+      return { ok: false, message: "readPaths entries must be non-empty directory paths." };
+    }
+    let canonical: string;
+    try {
+      canonical = realpathSync(path.resolve(baseDir, raw));
+    } catch {
+      return { ok: false, message: `readPaths entry '${raw}' does not exist.` };
+    }
+    try {
+      if (!statSync(canonical).isDirectory()) {
+        return { ok: false, message: `readPaths entry '${raw}' resolves to '${canonical}', which is not a directory.` };
+      }
+    } catch {
+      return { ok: false, message: `readPaths entry '${raw}' could not be inspected.` };
+    }
+    const unsayable = process.platform === "win32" ? "'*' or '?'" : "'*', '?' or '\\'";
+    if ((process.platform === "win32" ? /[*?]/ : /[*?\\]/).test(canonical)) {
+      return {
+        ok: false,
+        message:
+          `readPaths entry '${raw}' resolves to '${canonical}', whose name contains ${unsayable}. ` +
+          `opencode's permission matcher treats those as wildcards and has no escape, so the ` +
+          `grant would also match sibling paths. Provide the directory under a name without them.`,
+      };
+    }
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      resolved.push(canonical);
+    }
+  }
+  return { ok: true, paths: resolved };
+}
+
+/** The session rule pattern for one canonical read path: `<path>/*`. Trailing slashes are
+ * stripped first, so the filesystem root becomes `/*` rather than `//*` — opencode's anchored
+ * matcher satisfies `//*` for nothing under `/`, a grant of nothing (PR #223 re-review). ONE
+ * definition: the lifecycle emits the rule with it and the wire check recognizes it with it. */
+export function readPathPattern(canonical: string): string {
+  return `${canonical.replace(/\/+$/, "")}/*`;
+}
 
 /**
  * Every worktree of the repository containing `projectDir`, realpath-resolved.

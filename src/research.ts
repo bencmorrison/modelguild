@@ -40,11 +40,13 @@ import {
   resolveReadRoot,
   gateAgentFloor,
   readRootBlocks,
+  readPathBlocks,
   APPROVAL_EXIT_ANALOGUE,
   type McpToolResult,
 } from "./consult.js";
 import { type ActivityEvent, type ActivitySummary } from "./activity.js";
 import { type ApprovalSummary, type ElicitationRequester } from "./approve.js";
+import { resolveReadPaths } from "./worktree.js";
 import {
   readLayeredConfContents,
   resolveModel,
@@ -70,6 +72,7 @@ export interface ResearchParams {
    * local reads at. Validated against `git worktree list`; anything else is refused by name.
    */
   worktree?: string;
+  readPaths?: string[];
   /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Precedence over `GUILD_MESSAGE_TIMEOUT_MS` env/conf/default;
@@ -115,6 +118,7 @@ export type ResearchErrorKind =
   | "agent-unhardened"
   /** The named read root is not a worktree of this repository (issue #96). */
   | "worktree-invalid"
+  | "read-path-invalid"
   | "model-id"
   | "policy-deny"
   | "policy-ask"
@@ -141,6 +145,7 @@ export interface ResearchAttribution {
   callId: string;
   /** The read root this call ran against; present only when a worktree was targeted (#96). */
   worktree?: string;
+  readPaths?: string[];
 }
 
 export interface ResearchError {
@@ -181,6 +186,17 @@ export interface ResearchFail {
   rootConflict?: string;
   /** See `ResearchOk.agentUnverified`. */
   agentUnverified?: string;
+  /** The read root and the dependency directories this call created its session with
+   * (issues #96, #221; see `ConsultFail`) — carried on a FAILURE too (PR #223 re-review), because an
+   * `empty-answer` or a mismatch arrives AFTER the model may have read from them and sent
+   * what it read to its provider. Present only when the session was created with its ruleset
+   * verified (`LifecycleOutcome.permissionApplied`); absent on a pre-flight refusal, the
+   * in-lease floor refusal, a session-creation failure and `approval-not-applied`, which
+   * granted nothing — naming the paths there would say the model could have read them. The
+   * receipt's `read_root`/`read_paths` on `started` still record what the call set out to
+   * grant, which is a different claim. */
+  worktree?: string;
+  readPaths?: string[];
   /** Present when the call actually RAN (call-failed / agent-mismatch). */
   activity?: ActivitySummary;
   /** Present when the bridge was armed and the turn ran. */
@@ -233,6 +249,10 @@ export async function research(
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
+  if (!resolvedReadPaths.ok) {
+    return { ok: false, rootConflict, error: { kind: "read-path-invalid", model: "", exitAnalogue: null, message: resolvedReadPaths.message } };
+  }
 
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
@@ -362,6 +382,7 @@ export async function research(
       // A read path with no text produced nothing at all (issue #117, C74).
       requireAnswer: true,
       ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+      ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
     },
     {
       serve,
@@ -386,6 +407,7 @@ export async function research(
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+        ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
       },
     };
     if (outcome.activity !== undefined) ok.activity = outcome.activity;
@@ -426,6 +448,10 @@ export async function research(
   if (outcome.activity !== undefined) fail.activity = outcome.activity;
   if (outcome.approval !== undefined) fail.approval = outcome.approval;
   if (floorNote.note !== undefined) fail.agentUnverified = floorNote.note;
+  if (outcome.permissionApplied) {
+    if (worktreeRoot !== undefined) fail.worktree = worktreeRoot;
+    if (resolvedReadPaths.paths.length > 0) fail.readPaths = resolvedReadPaths.paths;
+  }
   return fail;
 }
 
@@ -446,7 +472,7 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
     // The read-root note rides as a SECOND text block, never a prefix — `content[0]` must
     // stay the byte-exact answer (issue #96, review finding L7; see `readRootBlocks`).
     return {
-      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree)],
+      content: [{ type: "text", text: r.answer }, ...readRootBlocks(r.attribution.worktree), ...readPathBlocks(r.attribution.readPaths)],
       structuredContent: structured,
     };
   }
@@ -457,8 +483,10 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.activity) structured.activity = r.activity;
   if (r.approval) structured.approval = r.approval;
+  if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths) structured.readPaths = r.readPaths;
   return {
-    content: [{ type: "text", text: r.error.message }],
+    content: [{ type: "text", text: r.error.message }, ...readRootBlocks(r.worktree), ...readPathBlocks(r.readPaths)],
     structuredContent: structured,
     isError: true,
   };

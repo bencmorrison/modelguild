@@ -47,7 +47,7 @@
 
 import os from "node:os";
 import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
-import { type GitRunner } from "./worktree.js";
+import { resolveReadPaths, type GitRunner } from "./worktree.js";
 import { defaultAgentFloorChecker, type AgentFloorChecker } from "./agentfloor.js";
 import { EvidenceLog } from "./log.js";
 import {
@@ -107,6 +107,7 @@ export interface PanelParams {
    * would make their answers incomparable while looking as if they disagreed.
    */
   worktree?: string;
+  readPaths?: string[];
   /**
    * Per-call model-turn HTTP timeout (ms), ALREADY validated/resolved by the server layer
    * (`parsePerCallTimeoutMs`). Applies to EVERY member of this panel. Precedence: over
@@ -248,8 +249,12 @@ export interface PanelOk {
    * PROCEEDED and this is the "never silently" half of that decision (C73). Panel-WIDE, like
    * the def check itself — every member runs the same agent on the same serve child. */
   agentUnverified?: string;
-  /** The read root every member ran against; present only when one was targeted (#96). */
+  /** The read root every member ran against; present only when one was targeted (#96) AND
+   * at least one member's session was created with its ruleset verified — a panel whose every
+   * member failed before that ran against nothing (PR #223 re-review). */
   worktree?: string;
+  /** The dependency directories granted to the members' sessions (#221); same condition. */
+  readPaths?: string[];
 }
 
 export interface PanelFail {
@@ -267,6 +272,7 @@ export interface PanelFail {
     // The named read root is not a worktree of this repository (issue #96). Panel-wide,
     // like the def check, and refused before any member runs.
     | { kind: "worktree-invalid"; message: string; exitAnalogue: null }
+    | { kind: "read-path-invalid"; message: string; exitAnalogue: null }
     // Panel-wide, like the def check: every member runs the same agent, so a bad approval
     // knob or a missing answering channel refuses the WHOLE panel up front — before any log
     // write, and before a single member is dispatched.
@@ -331,6 +337,22 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
+  if (!resolvedReadPaths.ok) {
+    return { ok: false, warnings: [], rootConflict, error: { kind: "read-path-invalid", message: resolvedReadPaths.message, exitAnalogue: null } };
+  }
+  if (params.keepSessions === true && resolvedReadPaths.paths.length > 0) {
+    return {
+      ok: false,
+      warnings: [],
+      rootConflict,
+      error: {
+        kind: "read-path-invalid",
+        message: "readPaths can only be used on a one-shot panel: opencode fixes session permissions when it creates the session.",
+        exitAnalogue: null,
+      },
+    };
+  }
 
   if (!hardenedDefPresentIn(PANEL_AGENT, agentDefDirs).present) {
     return {
@@ -458,6 +480,9 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // ISSUE #187: resolved ONCE for the whole panel, beside every other loop-invariant knob.
   const { retryEmpty } = resolvePanelRetrySettings({ env, confContents });
 
+  /** True once ANY member's session was created with its ruleset verified: the point at which
+   * the panel's read root and read paths became something a model could read from. */
+  let grantApplied = false;
   // 5. Members run CONCURRENTLY; each is gated + logged independently. One member's
   //    refusal or failure never touches another's result (order preserved by Promise.all).
   const results = await Promise.all(
@@ -499,6 +524,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
             // `text` rendered as a blank line and the synthesis proceeded a voice short.
             requireAnswer: true,
             ...(worktreeRoot !== undefined ? { readRoot: worktreeRoot } : {}),
+            ...(resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
             ...(retryOf !== undefined ? { retryOf } : {}),
           },
           {
@@ -547,6 +573,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
               },
         ];
       }
+      if (outcome.ok || outcome.permissionApplied) grantApplied = true;
       if (outcome.ok) {
         const member: PanelMemberResult = {
           model: outcome.actualModel,
@@ -610,7 +637,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     warnings: panelRes.warnings,
     rootConflict,
     ...(floorNote.note !== undefined ? { agentUnverified: floorNote.note } : {}),
-    ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+    ...(grantApplied && worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
+    ...(grantApplied && resolvedReadPaths.paths.length > 0 ? { readPaths: resolvedReadPaths.paths } : {}),
   };
 }
 
@@ -624,6 +652,11 @@ function renderPanelText(r: PanelOk): string {
   const lines: string[] = [];
   lines.push(`Panel of ${r.results.length} model(s) — run ${r.runId || "(logging off)"}.`);
   if (r.worktree) lines.push(`Read root: ${r.worktree}`);
+  // Issue #221: the granted dependency directories reach a text-only reader too (PR #223
+  // review — `panel()` carried them and this translation dropped them).
+  if (r.readPaths !== undefined && r.readPaths.length > 0) {
+    lines.push(`Additional read paths: ${r.readPaths.join(", ")}`);
+  }
   if (r.rootConflict) lines.push(`Root: ${r.rootConflict}`);
   if (r.warnings.length > 0) {
     lines.push("");
@@ -672,5 +705,6 @@ export function panelToToolResult(r: PanelResult): McpToolResult {
   if (r.rootConflict) structured.rootConflict = r.rootConflict;
   if (r.agentUnverified) structured.agentUnverified = r.agentUnverified;
   if (r.worktree) structured.worktree = r.worktree;
+  if (r.readPaths !== undefined && r.readPaths.length > 0) structured.readPaths = r.readPaths;
   return { content: [{ type: "text", text: renderPanelText(r) }], structuredContent: structured };
 }
