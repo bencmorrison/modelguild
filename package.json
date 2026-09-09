@@ -55,7 +55,8 @@
     "test:offline": "tsx test/run.ts --offline",
     "test:live": "tsx test/client.live.ts && tsx test/consult.live.ts && tsx test/panel.live.ts && tsx test/research.live.ts && tsx test/delegate.live.ts && tsx test/session.live.ts",
     "prepublishOnly": "npm run build && npm test",
-    "test:codex": "npm run build && tsx test/codex-client.live.ts"
+    "test:codex": "npm run build && tsx test/codex-client.live.ts",
+    "test:codex:models": "npm run build && tsx test/codex-driver.live.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
