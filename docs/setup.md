@@ -96,7 +96,9 @@ or Codex can drive these workers. Install/register ModelGuild for that frontend 
 above, then run `npx modelguild doctor --backend codex --driver claude` (use
 `--driver codex` for a Codex frontend). `--backend both` checks both worker runtimes;
 the default remains `opencode`. Selected missing worker binaries fail doctor;
-unavailable auth diagnostics warn. These checks call no model.
+unavailable auth diagnostics warn. With `--backend both`, an enabled opencode
+approval bridge stays ARMED and a warning explains that native calls refuse it;
+`--backend codex` reports that incompatibility as a failure. These checks call no model.
 
 Ask `guild_models` for `backend: "codex"` to list native IDs, or `backend: "both"`
 for a combined listing. Choose an exact `codex/<native-model>` ID for a consult,
@@ -106,7 +108,8 @@ uses opencode. A panel may combine both routes.
 Native workers inherit Codex's normal user/project configuration, including its
 sandbox and approval policy; ModelGuild does not install opencode's agent floor
 on them. See [native worker configuration](configuration.md#native-codex-workers)
-and [runtime and receipt limits](operations.md#native-codex-workers).
+and [runtime and receipt limits](operations.md#native-codex-workers). For automation
+without approval prompts, use the [unattended native-worker configuration](operations.md#unattended-native-workers).
 
 ## The seven steps
 

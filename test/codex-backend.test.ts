@@ -13,7 +13,7 @@ export async function run(): Promise<number> {
   function backend(mode = "normal") {
     const value = new CodexBackend({ cwd: root, command: process.execPath,
       args: ["--import", path.join(repoRoot, "node_modules/tsx/dist/loader.mjs"), path.join(repoRoot, "test/codex-backend-fixture.ts")],
-      env: { ...process.env, GUILD_CODEX_FIXTURE_DIR: root, GUILD_CODEX_FIXTURE_MODE: mode }, requestTimeoutMs: 2000, interruptTimeoutMs: 100 });
+      env: { ...process.env, GUILD_CODEX_FIXTURE_DIR: root, GUILD_CODEX_FIXTURE_MODE: mode }, requestTimeoutMs: 2000, interruptTimeoutMs: 100, shutdownGraceMs: 100 });
     backends.push(value); return value;
   }
   const turn = (value: CodexBackend, extra = {}) => value.turn({ cwd: root, model: "native-model", prompt: "synthetic", ...extra });
@@ -26,12 +26,35 @@ export async function run(): Promise<number> {
     await rejects(() => missing.models(), "Cannot start Codex", "missing executable names the native backend");
     const api = backend();
     const models = await api.models();
+    const flushes = () => existsSync(path.join(root, "graceful-flush.jsonl"))
+      ? readFileSync(path.join(root, "graceful-flush.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+    c.check(flushes().some(entry => entry.kind === "control"), "control connection flushes after EOF before returning");
+    const hungCloseAt = Date.now();
+    const hungModels = await backend("ignore-eof").models();
+    c.check(hungModels.length === 2 && Date.now() - hungCloseAt < 1500, "control ignoring EOF is forcibly reaped within the shutdown deadline");
+    const heldPipeAt = Date.now();
+    const heldModels = await backend("pipe-holder").models();
+    c.check(heldModels.length === 2 && Date.now() - heldPipeAt < 1500, "control EOF remains bounded when a reparented helper retains stdio");
+    // This control helper reparented before any inventory and is outside the
+    // adapter's stated descendant guarantee; the test owns and cleans it up.
+    for (const pid of readFileSync(path.join(root, "pipe-holder-pids"), "utf8").trim().split("\n").map(Number)) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* Already exited. */ }
+    }
     c.check(models.map(m => m.id).join() === "a,b" && models[0].isDefault, "catalog paginates and preserves default marker");
     const account = await api.account();
     c.check(account.authenticated === true && !JSON.stringify(account).includes("email"), "auth status does not expose account details");
     const events: Array<Record<string, unknown>> = [];
     const first = await turn(api, { onEvent: (_method: string, params: Record<string, unknown>) => events.push(params) });
     c.check(events.length > 0 && events.every(event => event.turnId !== "a-prior-turn"), "activity sink receives only exact current-turn events including early buffered events");
+    c.check(flushes().some(entry => entry.kind === "turn"), "successful turn flushes after EOF before returning");
+    const completedWithChild = await turn(backend("completed-descendant"));
+    const normalExits = readFileSync(path.join(root, "exit-codes.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    c.check(completedWithChild.status === "completed" && normalExits.some(entry => entry.mode === "completed-descendant" && entry.code === 0), "completed turn permits graceful parent exit with a background child");
+    const remaining = readFileSync(path.join(root, "descendant-pids"), "utf8").trim().split("\n").map(Number);
+    c.check(remaining.every(pid => {
+      const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+      return !state || state.startsWith("Z");
+    }) && !existsSync(path.join(root, "late-write")), "background tools retained before EOF cannot edit after successful turn returns");
     c.check(first.text === 'answer\n"quoted" café\n', "answer preserves exact transcript bytes");
     c.check(first.toolCallCount === 1 && first.byTool.commandExecution === 1, "tool census dedupes observed notifications when history omits tools");
     c.check(first.runtime.approvalPolicy === "on-request", "resolved native permission facts returned without invented floor");

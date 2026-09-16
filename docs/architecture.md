@@ -30,7 +30,7 @@ transcript readback. Release archives history rather than deleting it. Model/pro
 identity is labelled configuration. Exact-turn saved history supplies answer bytes;
 native item notifications supply tool details and the shared activity recorder.
 Codex 0.153.4 omits tool items from saved history, so tool capture has no post-turn
-replay; results report that limitation explicitly. See C84 and [backend requirements](backend-requirements.md).
+replay; results report that limitation explicitly. See C84–C84e and [backend requirements](backend-requirements.md).
 
 ## `src/lifecycle.ts` — the `opencode serve` supervisor
 

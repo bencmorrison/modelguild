@@ -849,6 +849,27 @@ async function runCases(): Promise<number> {
     const opencode = await native(stub(), "opencode");
     c.check(opencode.code === 1 && !opencode.out.includes("Codex login confirmed"),
       "opencode-only backend selection does not probe native Codex auth");
+    // Both runtimes are healthy: an opencode gate remains usable even though
+    // native calls cannot honor that requested bridge.
+    const dualProject = tempDir();
+    init({ targetDir: dualProject, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    const dualPath = `${stub()}:${opencodeStub({ authList: AUTH_LIST.authed })}`;
+    for (const conf of ["GUILD_APPROVE=write", "GUILD_APPROVE_EGRESS=ask"]) {
+      writeFileSync(path.join(dualProject, "modelguild", "modelguild.conf.local"), conf + "\n");
+      for (const selected of ["both", "codex", "opencode"]) {
+        const checked = await withPath(dualPath, () => captureDoctor(
+          ["--dir", dualProject, "--driver", "claude", "--backend", selected], isolated));
+        if (selected === "codex") {
+          c.check(checked.code === 1 && checked.out.includes("✗ Codex backend cannot arm") &&
+            !checked.out.includes("✓ approval bridge: ARMED"), `${conf}: native-only gate is a failure, never advertised as armed`);
+        } else {
+          c.check(checked.code === 0 && checked.out.includes("✓ approval bridge: ARMED"),
+            `${conf}: ${selected} retains the healthy opencode bridge`);
+          c.check(checked.out.includes("! Native Codex workers refuse") === (selected === "both"),
+            `${conf}: only both reports native incompatibility as a warning`);
+        }
+      }
+    }
     for (const args of [["--backend"], ["--backend=other"]]) {
       let message = "";
       try { await captureDoctor(args, isolated); } catch (error) { message = String(error); }

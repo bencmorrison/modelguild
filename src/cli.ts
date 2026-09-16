@@ -626,7 +626,7 @@ export async function runDoctor(
     });
     if (info.error !== null) {
       line(false, `approval bridge: GUILD_APPROVE/GUILD_APPROVE_EGRESS is invalid — ${info.error}`);
-    } else if (backend !== "opencode" && info.requested) {
+    } else if (backend === "codex" && info.requested) {
       line(false, "Codex backend cannot arm the opencode GUILD_APPROVE/GUILD_APPROVE_EGRESS bridge; " +
         "native Codex approval policy is separate. Requested gates are not silently disabled.");
     } else if (!info.requested) {
@@ -639,6 +639,10 @@ export async function runDoctor(
         `✓ approval bridge: ARMED (GUILD_APPROVE=${info.tier}, GUILD_APPROVE_EGRESS=${info.egress}, ` +
           `timeout ${info.timeoutMs}ms)`,
       );
+      if (backend === "both") {
+        console.warn("! Native Codex workers refuse the requested GUILD_APPROVE/GUILD_APPROVE_EGRESS bridge; " +
+          "the opencode bridge remains armed. Native Codex approval policy is separate.");
+      }
       if (info.watchers > 0) {
         console.log(`  • ${info.watchers} live \`watch --approve\` terminal(s) in ${info.watcherDir}`);
       } else {

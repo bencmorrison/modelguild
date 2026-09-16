@@ -4,12 +4,17 @@
  * Each turn owns a child: an unconfirmed interrupt can kill its process group
  * without taking a concurrent panel member down. Codex creates separate process
  * groups for its code-mode host and shell commands (observed 0.153.4), so POSIX
- * teardown freezes the app-server group, inventories its descendants with ps,
+ * forced teardown freezes the app-server group, inventories its descendants with ps,
  * freezes those, and kills the tree before the parent. A process that deliberately
  * daemonizes/reparents before this inventory, a crash before inventory, or a
  * missing/failing ps remains outside the descendant-cleanup guarantee.
- * Catalog/read operations use a
- * separate short-lived child too; there is no daemon or port to orphan.
+ * Successful turns and control calls first close stdin and allow one second to
+ * flush and exit on POSIX. Completed turns retain descendant birth identities
+ * before EOF and stop surviving tools before returning. Windows completed turns
+ * keep forced taskkill /T cleanup while their root is alive, because descendant
+ * retention is POSIX-only; token-free controls can still use EOF. Controls have not run a model and
+ * skip that scan on graceful exit. Hung exits fall back to forced teardown.
+ * Catalog/read operations use a separate short-lived child too; no daemon or port.
  *
  * Receipts come from thread/read(includeTurns), selecting the exact turn/start
  * id. On 0.153.4 the read reports itemsView:full but OMITS command/tool
@@ -22,7 +27,7 @@
  * permission floor. Unknown approval protocols fail visibly rather than grant.
  */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { isBlank } from "./client.js";
 
 type ObjectValue = Record<string, any>;
@@ -33,6 +38,7 @@ export interface CodexOptions {
   env?: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
   interruptTimeoutMs?: number;
+  shutdownGraceMs?: number;
 }
 export interface CodexModel { id: string; name: string; description: string; isDefault: boolean }
 export interface CodexSession { id: string; cwd: string; model?: string }
@@ -118,7 +124,27 @@ export function extractCodexTurn(thread: unknown, turnId: string): {
   return { text, items, toolCallCount: seen.size, byTool, turn: data.turns.indexOf(matches[0]) + 1, status: string(turn.status, "turn status") };
 }
 
-/** One JSONL transport. All shutdown paths synchronously signal the process group. */
+interface ProcessEntry { pid: number; parent: number; born: string }
+function processTable(): ProcessEntry[] {
+  const listing = spawnSync("ps", ["-axo", "pid=,ppid=,lstart="], { encoding: "utf8", timeout: 1000, maxBuffer: 4 * 1024 * 1024 });
+  return (listing.stdout ?? "").split("\n").flatMap(line => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+    return match ? [{ pid: Number(match[1]), parent: Number(match[2]), born: match[3] }] : [];
+  });
+}
+function processIdentity(entry: ProcessEntry, verifyParent = false): string | undefined {
+  if (process.platform !== "linux") return entry.born;
+  try {
+    const stat = readFileSync(`/proc/${entry.pid}/stat`, "utf8");
+    // Field 22 is starttime; the comm field may itself contain parentheses.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    // During retention, do not pair an old ps parent row with a reused PID's
+    // new birth identity. Later cleanup deliberately permits EOF reparenting.
+    if (verifyParent && Number(fields[1]) !== entry.parent) return undefined;
+    return fields[19];
+  } catch { return undefined; }
+}
+/** One JSONL transport. Forced shutdown is synchronous; ordinary EOF gets a grace period. */
 class Connection {
   readonly child: ChildProcessWithoutNullStreams;
   readonly exited: Promise<void>;
@@ -131,6 +157,8 @@ class Connection {
   private failure?: Error;
   private closed = false;
   private killed = false;
+  private rootExited = false;
+  private readonly retainedDescendants = new Map<number, string>();
   constructor(readonly options: CodexOptions, cwd = options.cwd) {
     this.child = spawn(options.command ?? "codex", options.args ?? ["app-server"], {
       cwd, env: options.env ?? process.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32",
@@ -138,6 +166,7 @@ class Connection {
     this.exited = new Promise(resolve => this.child.once("close", () => {
       this.fail(new Error(`Codex app-server closed${this.stderr ? `: ${this.stderr}` : ""}`)); resolve();
     }));
+    this.child.once("exit", () => { this.rootExited = true; });
     this.child.on("error", error => this.fail(new Error(`Cannot start Codex app-server: ${error.message}`)));
     this.child.stdin.on("error", error => this.fail(error));
     this.child.stdout.setEncoding("utf8");
@@ -200,48 +229,98 @@ class Connection {
     await this.request("initialize", { clientInfo: { name: "modelguild", version: "1" }, capabilities: { experimentalApi: true } });
     this.send({ method: "initialized", params: {} });
   }
-  kill(signal: NodeJS.Signals = "SIGKILL"): void {
-    this.closed = true;
-    if (this.killed) return;
-    this.killed = true;
-    if (!this.child.pid) return;
-    if (process.platform === "win32") {
-      // taskkill owns descendant discovery on Windows; no shell interpolation.
-      spawnSync("taskkill", ["/pid", String(this.child.pid), "/T", "/F"], { timeout: 2000, windowsHide: true, stdio: "ignore" });
-      try { this.child.kill(signal); } catch { /* Already gone. */ }
-      return;
-    }
-    const safeKill = (pid: number, how: NodeJS.Signals) => { try { process.kill(pid, how); } catch { /* Already gone. */ } };
-    safeKill(-this.child.pid, "SIGSTOP");
-    // Killing only the app-server group leaves Codex's independent command
-    // groups alive. Freeze discovered descendants before killing any parent so
-    // a shell cannot resume after its sleep child dies and perform a late edit.
-    const descendants = new Set<number>([this.child.pid]);
-    for (let pass = 0; pass < 2; pass++) {
-      const listing = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8", timeout: 1000, maxBuffer: 4 * 1024 * 1024 });
-      const rows = (listing.stdout ?? "").trim().split("\n").map(line => line.trim().split(/\s+/).map(Number));
-      let added = true;
-      while (added) {
-        added = false;
-        for (const [pid, parent] of rows) {
-          if (pid > 0 && descendants.has(parent) && !descendants.has(pid)) {
-            descendants.add(pid); safeKill(pid, "SIGSTOP"); added = true;
-          }
+  private retainDescendants(): void {
+    if (!this.child.pid || this.rootExited || process.platform === "win32") return;
+    const descendants = new Set([this.child.pid]);
+    const rows = processTable();
+    let added = true;
+    while (added) {
+      added = false;
+      for (const row of rows) {
+        if (descendants.has(row.parent) && !descendants.has(row.pid)) {
+          const identity = processIdentity(row, true);
+          if (!identity) continue;
+          descendants.add(row.pid); added = true;
+          this.retainedDescendants.set(row.pid, identity);
         }
       }
     }
-    for (const pid of [...descendants].reverse()) if (pid !== this.child.pid) safeKill(pid, "SIGKILL");
-    // SIGTERM is ineffective while stopped; the child and descendants must be
-    // gone before a delegation's after-snapshot can be taken.
-    safeKill(-this.child.pid, "SIGKILL");
-    safeKill(this.child.pid, "SIGKILL");
   }
-  async close(): Promise<void> {
+  kill(): void {
     this.closed = true;
+    if (this.killed) return;
+    this.killed = true;
+    try {
+      if (!this.child.pid) return;
+      if (process.platform === "win32") {
+        // taskkill owns descendant discovery on Windows; no shell interpolation.
+        spawnSync("taskkill", ["/pid", String(this.child.pid), "/T", "/F"], { timeout: 2000, windowsHide: true, stdio: "ignore" });
+        try { this.child.kill("SIGKILL"); } catch { /* Already gone. */ }
+        return;
+      }
+      const safeKill = (pid: number, how: NodeJS.Signals) => { try { process.kill(pid, how); } catch { /* Already gone. */ } };
+      if (!this.rootExited) safeKill(-this.child.pid, "SIGSTOP");
+      // Killing only the app-server group leaves Codex's independent command
+      // groups alive. Freeze discovered descendants before killing any parent so
+      // a shell cannot resume after its sleep child dies and perform a late edit.
+      const descendants = new Set<number>(this.rootExited ? [] : [this.child.pid]);
+      for (let pass = 0; pass < 2; pass++) {
+        const rows = processTable();
+        // EOF may have reparented a command before app-server close. Its captured
+        // birth identity guards against PID reuse. Non-Linux lstart is only
+        // second-resolution, so that check is best-effort on those systems.
+        for (const row of rows) {
+          const identity = this.retainedDescendants.get(row.pid);
+          if (identity && identity === processIdentity(row)) {
+            descendants.add(row.pid); safeKill(row.pid, "SIGSTOP");
+          }
+        }
+        let added = true;
+        while (added) {
+          added = false;
+          for (const { pid, parent } of rows) {
+            if (pid > 0 && descendants.has(parent) && !descendants.has(pid)) {
+              descendants.add(pid); safeKill(pid, "SIGSTOP"); added = true;
+            }
+          }
+        }
+      }
+      for (const pid of [...descendants].reverse()) if (pid !== this.child.pid) safeKill(pid, "SIGKILL");
+      // SIGTERM is ineffective while stopped; the child and descendants must be
+      // gone before a delegation's after-snapshot can be taken.
+      if (!this.rootExited) {
+        safeKill(-this.child.pid, "SIGKILL");
+        safeKill(this.child.pid, "SIGKILL");
+      }
+    } finally {
+      // Close pipes AFTER freezing/stopping the tree: exposing EOF first could
+      // reparent active tools before discovery. Also bound child.close when an
+      // already-reparented helper retains inherited transport handles.
+      this.child.stdin.destroy();
+      this.child.stdout.destroy();
+      this.child.stderr.destroy();
+    }
+  }
+  async close(mode: "force" | "control" | "completed" = "force"): Promise<void> {
+    this.closed = true;
+    // Windows has no retained descendant identities here: keep its root alive
+    // until taskkill /T owns the completed turn's whole process tree.
+    if (mode === "force" || this.killed || (mode === "completed" && process.platform === "win32")) {
+      this.kill();
+      await this.exited;
+      return;
+    }
+    // A successful turn can leave background tools. Inventory BEFORE EOF so
+    // cleanup still owns them if graceful shutdown reparents them. Control RPCs
+    // have never started a model turn and can skip this process-table scan.
+    if (mode === "completed") this.retainDescendants();
     this.child.stdin.end();
-    this.kill("SIGTERM");
-    const timer = setTimeout(() => this.kill(), 1000);
-    try { await this.exited; } finally { this.kill(); clearTimeout(timer); }
+    const timer = setTimeout(() => this.kill(), this.options.shutdownGraceMs ?? 1000);
+    try { await this.exited; }
+    finally {
+      clearTimeout(timer);
+      if (this.retainedDescendants.size) this.kill();
+    }
   }
 }
 
@@ -259,7 +338,7 @@ export class CodexBackend {
   }
   private async control<T>(run: (connection: Connection) => Promise<T>): Promise<T> {
     const connection = await this.connect();
-    try { return await run(connection); } finally { await connection.close(); }
+    try { return await run(connection); } finally { await connection.close("control"); }
   }
   async start(): Promise<void> { await this.control(async () => {}); }
   async models(): Promise<CodexModel[]> {
@@ -305,6 +384,7 @@ export class CodexBackend {
     if (options.sessionId && this.busy.has(options.sessionId)) throw new Error("Codex session already has an active turn");
     if (options.sessionId) this.busy.add(options.sessionId);
     let connection: Connection | undefined;
+    let succeeded = false;
     let sessionId = options.sessionId;
     let turnId: string | undefined;
     let timeout: NodeJS.Timeout | undefined;
@@ -368,7 +448,7 @@ export class CodexBackend {
         if (params.threadId !== sessionId) throw new Error("Codex request belongs to an unexpected thread");
         if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
           if (!options.approve) {
-            approvalError = "Codex requested an approval but no approval channel is available";
+            approvalError = "Codex requested an approval but no approval channel is available. Use an elicitation-capable MCP client, or configure Codex's native approval_policy and sandbox for unattended use (see docs/operations.md).";
             return { decision: "decline" };
           }
           try {
@@ -415,6 +495,7 @@ export class CodexBackend {
           answerTranscriptSource: "thread/read exact turn",
           toolTranscriptSource: "turn-scoped app-server item notifications; no post-turn replay" } };
       if (interrupted || approvalError || ending.status !== "completed") throw new CodexTurnError(interrupted ?? approvalError ?? `Codex turn ${ending.status}: ${ending.error?.message ?? "no error detail"}`, result, sessionId);
+      succeeded = true;
       return result;
     } catch (error) {
       if (error instanceof CodexTurnError) throw error;
@@ -425,7 +506,7 @@ export class CodexBackend {
       if (interruptTimer) clearTimeout(interruptTimer);
       options.signal?.removeEventListener("abort", abort);
       // Also ends a turn whose start RPC failed after the server accepted it.
-      if (connection) await connection.close();
+      if (connection) await connection.close(succeeded ? "completed" : "force");
       if (options.sessionId) this.busy.delete(options.sessionId);
     }
   }

@@ -5,7 +5,19 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 const dir = process.env.GUILD_CODEX_FIXTURE_DIR!;
 const mode = process.env.GUILD_CODEX_FIXTURE_MODE ?? "normal";
+process.stdin.once("end", () => {
+  if (mode === "ignore-eof") { setInterval(() => {}, 1000); return; }
+  if (mode === "pipe-holder") {
+    const helper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+    appendFileSync(`${dir}/pipe-holder-pids`, `${helper.pid}\n`);
+    helper.unref();
+    setTimeout(() => process.exit(0), 25);
+  }
+  // Delayed flush is lost by immediate SIGKILL, even if stdin.end was called.
+  setTimeout(() => appendFileSync(`${dir}/graceful-flush.jsonl`, JSON.stringify({ pid: process.pid, kind: activeTurn ? "turn" : "control" }) + "\n"), 25);
+});
 appendFileSync(`${dir}/pids`, `${process.pid}\n`);
+process.once("exit", code => appendFileSync(`${dir}/exit-codes.jsonl`, JSON.stringify({ pid: process.pid, mode, code }) + "\n"));
 let initialized = false;
 let thread: any;
 let activeTurn: any;
@@ -45,7 +57,7 @@ createInterface({ input: process.stdin }).on("line", line => {
       thread.turns.push(activeTurn); save();
       if (mode === "crash") process.exit(9);
       if (mode === "lost-start") return;
-      if (mode === "descendant") {
+      if (mode === "descendant" || mode === "completed-descendant") {
         // Keep the fixture path as argv data, never interpolated JavaScript.
         const child = spawn(process.execPath, [
           "-e",
@@ -53,11 +65,12 @@ createInterface({ input: process.stdin }).on("line", line => {
           `${dir}/late-write`,
         ], { detached: true, stdio: "ignore" });
         appendFileSync(`${dir}/descendant-pids`, `${child.pid}\n`);
+        child.unref();
       }
       notify("item/completed", { threadId: thread.id, turnId: "a-prior-turn", item: { type: "commandExecution", id: "foreign-tool" } });
       if (mode === "malformed") { process.stdout.write("not-json\n"); return; }
       // Completion deliberately precedes the start RPC response.
-      if (mode === "normal" || mode === "empty") {
+      if (mode === "normal" || mode === "empty" || mode === "completed-descendant") {
         const item = { type: "commandExecution", id: "tool", command: "cat note", aggregatedOutput: "token" };
         notify("item/started", { threadId: thread.id, turnId: activeTurn.id, item });
         notify("item/completed", { threadId: thread.id, turnId: activeTurn.id, item });
