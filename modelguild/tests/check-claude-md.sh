@@ -62,7 +62,7 @@ CEILING=60
 #                                                     hyphenated pointer form is fine
 #   - "Every script starts with"                      the shebang convention
 #   - "would I impose this on an Anthropic subagent"  the PARITY forcing question
-#   - "Two transports for two vendors"                the two-transport architecture rule
+#   - "Opencode and Claude subagent voices"                the opencode/Claude voice routing rule
 #   - "Record provenance."                            the PARITY provenance rule (the
 #                                                     imperative sentence, NOT CLAUDE.md's
 #                                                     "provenance recorded" pointer noun)
@@ -77,7 +77,7 @@ markers=(
   "vendor is not a threat model"
   "Every script starts with"
   "would I impose this on an Anthropic subagent"
-  "Two transports for two vendors"
+  "Opencode and Claude subagent voices"
   "Record provenance."
   "State the capability cost."
 )
