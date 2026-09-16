@@ -46,7 +46,12 @@ createInterface({ input: process.stdin }).on("line", line => {
       if (mode === "crash") process.exit(9);
       if (mode === "lost-start") return;
       if (mode === "descendant") {
-        const child = spawn(process.execPath, ["-e", `process.on('SIGTERM', () => {}); setTimeout(() => require('fs').writeFileSync(${JSON.stringify(dir + "/late-write")}, 'late'), 1000); setInterval(() => {}, 1000);`], { detached: true, stdio: "ignore" });
+        // Keep the fixture path as argv data, never interpolated JavaScript.
+        const child = spawn(process.execPath, [
+          "-e",
+          "process.on('SIGTERM', () => {}); setTimeout(() => require('fs').writeFileSync(process.argv[1], 'late'), 1000); setInterval(() => {}, 1000);",
+          `${dir}/late-write`,
+        ], { detached: true, stdio: "ignore" });
         appendFileSync(`${dir}/descendant-pids`, `${child.pid}\n`);
       }
       notify("item/completed", { threadId: thread.id, turnId: "a-prior-turn", item: { type: "commandExecution", id: "foreign-tool" } });
