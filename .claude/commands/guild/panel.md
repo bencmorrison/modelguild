@@ -3,6 +3,15 @@ description: Convene a panel — ask two or more different LLMs the same questio
 argument-hint: [question]
 allowed-tools: mcp__modelguild__guild_panel, mcp__modelguild__guild_models, Task
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Convene a panel of models for multiple independent perspectives on:
 
 $ARGUMENTS

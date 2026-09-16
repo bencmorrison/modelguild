@@ -11,6 +11,7 @@
  * transport — the pair that actually fire under Claude Code teardown (see lifecycle.ts).
  */
 
+import { CodexBackend } from "./codex.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -129,6 +130,17 @@ const lifecycle = new OpencodeLifecycle();
  * orphan proof rests on takes the extra children with it.
  */
 const servePool = new ServePool(lifecycle);
+const codex = new CodexBackend({ cwd: process.env.GUILD_PROJECT_DIR || process.cwd() });
+// shutdown synchronously kills every native child group before its first await.
+lifecycle.onShutdown(() => { void codex.shutdown(); });
+process.once("exit", () => { void codex.shutdown(); });
+const BACKEND_PROP = { type: "string", enum: ["opencode", "codex", "both"], description: "Backend to inspect. Default opencode; codex needs no opencode installation; both reports each independently." };
+function backendArg(raw: unknown): "opencode" | "codex" | "both" {
+  if (raw === undefined || raw === "opencode") return "opencode";
+  if (raw === "codex" || raw === "both") return raw;
+  throw new Error("backend must be opencode, codex, or both");
+}
+
 
 // ---------------------------------------------------------------------------
 // guild_status — diagnostics + the M4 doctor-seed checks.
@@ -206,8 +218,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "cannot tell those apart. Say the files are out of sync with what the server ships, " +
         "and give the version-pinned fix `npx modelguild@<payload.serverVersion> init`, which " +
         "converges either way (plain `npx modelguild init` installs the LATEST payload and " +
-        "does not converge on a pinned older server). Takes no arguments.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        "does not converge on a pinned older server). backend selects opencode (default), codex or both.",
+      inputSchema: { type: "object", properties: { backend: BACKEND_PROP }, additionalProperties: false },
     },
     {
       name: MODELS_TOOL,
@@ -217,7 +229,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "enumeration: NO policy check, NO model call, no cost. Use it to pick a model/panel " +
         "for guild_consult, guild_panel, guild_research, or guild_delegate. Returns " +
         "structuredContent.models (flat sorted ids), .providers (grouped, with each " +
-        "provider's default), and .defaults. Takes no arguments. TWO THINGS IT DOES NOT " +
+        "provider's default), and .defaults. backend selects opencode (default), codex or both. TWO THINGS IT DOES NOT " +
         "TELL YOU. It does NOT report policy tiers — a listed model may still be deny/ask " +
         "under the model policy; the per-call tool enforces that. And the config is " +
         "PER-PROVIDER, not per-model entitlement: a listed id can still be REJECTED by the " +
@@ -231,11 +243,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "counts, cost) where it recorded any. RELAY THOSE — 'read five files then said nothing' " +
         "and 'said nothing at all' are different failures. If an id fails either way, pick " +
         "another and say so.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: { type: "object", properties: { backend: BACKEND_PROP }, additionalProperties: false },
     },
     {
       name: CONSULT_TOOL,
       description:
+        "Native route: model ids codex/<native-model> use Codex with its configured tools, sandbox and approvals; the opencode agent guarantees below apply only to other model ids. Native runtime and backend are reported explicitly. " +
         "Get a second opinion from another LLM (via opencode's read-only guild-read " +
         "agent) on a question, plan, or approach. Read-only ROLE (review-subagent parity): " +
         "the consulted model can read any repo file, grep/glob, and fetch/search the web, " +
@@ -317,6 +330,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: PANEL_TOOL,
       description:
+        "Native route: model ids codex/<native-model> use Codex with its configured tools, sandbox and approvals; the opencode agent guarantees below apply only to other model ids. Native runtime and backend are reported explicitly. " +
         "Convene a PANEL: ask the SAME question to two or more different LLMs (via " +
         "opencode's read-only guild-read agent), concurrently, and get every model's " +
         "answer back with exact-id attribution. This is a TRANSPORT, not a synthesizer — " +
@@ -398,6 +412,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: RESEARCH_TOOL,
       description:
+        "Native route: model ids codex/<native-model> use Codex with its configured tools, sandbox and approvals; the opencode agent guarantees below apply only to other model ids. Native runtime and backend are reported explicitly. " +
         "Source-backed investigation by a WEB-CAPABLE LLM (via opencode's read-only " +
         "guild-research agent: it can read any repo file, grep/glob, and reach the web, but " +
         "cannot edit files or run commands). NOT a confidentiality boundary — it can read " +
@@ -466,6 +481,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: DELEGATE_TOOL,
       description:
+        "Native route: model ids codex/<native-model> use Codex with its configured tools, sandbox and approvals; the opencode agent guarantees below apply only to other model ids. Native runtime and backend are reported explicitly. " +
         "Delegate a coding TASK to another LLM that can EDIT FILES and run commands (via " +
         "opencode's hardened guild-build agent: edit/write/patch/bash/read allowed; task/" +
         "web/search/grep/glob denied at the tool layer — it CAN read any repo file, " +
@@ -605,7 +621,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const progressExtra = extra as unknown as ProgressCapableExtra;
 
   if (name === STATUS_TOOL) {
-    const status = await guildStatus();
+    const selected = backendArg((args as Record<string, unknown> | undefined)?.backend);
+    let status: unknown;
+    if (selected === "opencode") status = await guildStatus();
+    else {
+      const nativeStatus = await codex.account().then(account => ({ backend: "codex", ok: true, account }), error => ({ backend: "codex", ok: false, error: String(error) }));
+      const openStatus = selected === "both" ? await guildStatus().then(value => ({ backend: "opencode", ok: true, ...value }), error => ({ backend: "opencode", ok: false, error: String(error) })) : undefined;
+      status = { ...guildDoctorSeed(), backend: selected, backends: { codex: nativeStatus, ...(openStatus ? { opencode: openStatus } : {}) } };
+    }
     // `structuredContent` AS WELL AS the text blob (issue #94). The tool description names
     // `structuredContent.payload`, but the data only ever rode in `content[0].text` as JSON —
     // so a caller following the description read a field that did not exist. Every other tool
@@ -623,7 +646,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 
   if (name === MODELS_TOOL) {
-    const result = await models({ serve: lifecycle });
+    const result = await models({ serve: lifecycle, codex, backend: backendArg((args as Record<string, unknown> | undefined)?.backend) });
     return modelsToToolResult(result);
   }
 
@@ -663,7 +686,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, router: servePool, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, codex, signal: extra.signal, onActivity, elicitation },
       ),
     );
     return consultToToolResult(result);
@@ -716,7 +739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, router: servePool, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, codex, signal: extra.signal, onActivity, elicitation },
       ),
     );
     return panelToToolResult(result);
@@ -756,7 +779,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           readPaths: readPaths.value,
           timeoutMs: tmo.value,
         },
-        { serve: lifecycle, router: servePool, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, codex, signal: extra.signal, onActivity, elicitation },
       ),
     );
     return researchToToolResult(result);
@@ -796,7 +819,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         // The pool is the SAME one the read tools use (issue #96), reused unchanged: a
         // delegation into a worktree gets a supervised child rooted there, and the capture
         // is rooted at the identical directory (issue #107).
-        { serve: lifecycle, router: servePool, onActivity, elicitation },
+        { serve: lifecycle, router: servePool, codex, signal: extra.signal, onActivity, elicitation },
       ),
     );
     return delegateToToolResult(result);

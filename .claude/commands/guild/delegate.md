@@ -3,7 +3,16 @@ description: Delegate a coding task to another LLM agent (opencode) that can edi
 argument-hint: [coding task]
 allowed-tools: mcp__modelguild__guild_delegate, Bash(git diff:*), Bash(git status:*), Bash(git grep:*), Read, Grep, Glob, Edit
 ---
-Delegate this coding task to another LLM via opencode, then review the result. The delegated model runs in this repo and CAN edit files.
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
+Delegate this coding task to another LLM via ModelGuild, then review the result. The delegated model runs in this repo and CAN edit files.
 
 Task:
 $ARGUMENTS

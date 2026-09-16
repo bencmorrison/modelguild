@@ -2,7 +2,7 @@
   "name": "modelguild",
   "version": "0.7.2",
   "type": "module",
-  "description": "An MCP server fronting `opencode serve`, letting Claude Code and Codex collaborate with other LLMs (consult, panel, research, review, delegate). Ships Claude slash commands, Codex skills, and opencode agents; `npx modelguild init` wires it into a project. The bash layer in modelguild/ was retired at 0.5.0 (M12); this is the sole path now.",
+  "description": "An MCP server fronting opencode and native Codex workers, letting Claude Code and Codex collaborate with other LLMs (consult, panel, research, review, delegate). Ships Claude slash commands, Codex skills, and opencode agents; `npx modelguild init` wires it into a project. The bash layer in modelguild/ was retired at 0.5.0 (M12); this is the sole path now.",
   "license": "MIT",
   "author": "Benjamin Beno Morrison <ai@bcm.co>",
   "repository": {
@@ -56,7 +56,8 @@
     "test:live": "tsx test/client.live.ts && tsx test/consult.live.ts && tsx test/panel.live.ts && tsx test/research.live.ts && tsx test/delegate.live.ts && tsx test/session.live.ts",
     "prepublishOnly": "npm run build && npm test",
     "test:codex": "npm run build && tsx test/codex-client.live.ts",
-    "test:codex:models": "npm run build && tsx test/codex-driver.live.ts"
+    "test:codex:models": "npm run build && tsx test/codex-driver.live.ts",
+    "test:codex:workers": "tsx test/codex-worker.live.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

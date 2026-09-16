@@ -3,6 +3,7 @@
 Exactly what you do, start to finish, plus every variant off the happy path. Back to [README.md](../README.md).
 
 - [Codex CLI and IDE extension](#codex-cli-and-ide-extension)
+- [Native Codex workers](#native-codex-workers)
 - [The seven steps](#the-seven-steps)
 - [Installation variants](#installation-variants) — from source, `--global`, registering by hand
 - [Global vs project config](#global-vs-project-config)
@@ -11,9 +12,10 @@ Exactly what you do, start to finish, plus every variant off the happy path. Bac
 
 ## Codex CLI and IDE extension
 
-Needs Node.js 20+, Codex, and authenticated opencode on PATH in the environment that
-starts the MCP server. The backend remains opencode; Codex login authenticates the
-driver, and `opencode auth login` authenticates its workers. Claude Code is not required.
+Needs Node.js 20+, Codex, and the selected worker runtime on PATH in the environment that
+starts the MCP server. Use `opencode auth login` for opencode workers or `codex login`
+for native Codex workers. Claude Code is not required. Driver and worker runtime are
+independent choices; `--driver` installs the frontend workflows.
 
 ```bash
 cd /path/to/your/project
@@ -86,6 +88,25 @@ a heartbeat does not guarantee that Codex resets this deadline. See
 Client validation and limits are recorded under [Codex compatibility](operations.md#codex-compatibility).
 Official references: [MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 and [skill discovery](https://learn.chatgpt.com/docs/build-skills).
+
+## Native Codex workers
+
+Install Codex on the MCP server's PATH and run `codex login` there. Either Claude Code
+or Codex can drive these workers. Install/register ModelGuild for that frontend as
+above, then run `npx modelguild doctor --backend codex --driver claude` (use
+`--driver codex` for a Codex frontend). `--backend both` checks both worker runtimes;
+the default remains `opencode`. Selected missing worker binaries fail doctor;
+unavailable auth diagnostics warn. These checks call no model.
+
+Ask `guild_models` for `backend: "codex"` to list native IDs, or `backend: "both"`
+for a combined listing. Choose an exact `codex/<native-model>` ID for a consult,
+research call, delegation, or panel member. An ordinary `openai/<model>` ID still
+uses opencode. A panel may combine both routes.
+
+Native workers inherit Codex's normal user/project configuration, including its
+sandbox and approval policy; ModelGuild does not install opencode's agent floor
+on them. See [native worker configuration](configuration.md#native-codex-workers)
+and [runtime and receipt limits](operations.md#native-codex-workers).
 
 ## The seven steps
 

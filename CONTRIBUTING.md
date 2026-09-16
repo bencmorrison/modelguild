@@ -1,6 +1,6 @@
 # Contributing to ModelGuild
 
-Thanks for helping out. This is a small, security-sensitive tool — a local MCP server (`modelguild`, TypeScript) that lets Claude Code and Codex delegate to other models via [opencode](https://opencode.ai). The bar is "correct and honest," not "fast."
+Thanks for helping out. This is a small, security-sensitive tool — a local MCP server (`modelguild`, TypeScript) that lets Claude Code and Codex delegate to other models via [opencode](https://opencode.ai) or native Codex App Server. The bar is "correct and honest," not "fast."
 
 ## Read first
 

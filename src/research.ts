@@ -26,6 +26,7 @@
  * completed lifecycle spine (src/consult.ts `runAgentLifecycle`), reused not forked.
  */
 
+import { isCodexModel, nativeApprovalFor, resolveNativeSelection, type NativeBackendDeps, type NativeRuntime } from "./backend.js";
 import os from "node:os";
 import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
 import { type GitRunner } from "./worktree.js";
@@ -81,7 +82,7 @@ export interface ResearchParams {
   timeoutMs?: number;
 }
 
-export interface ResearchDeps {
+export interface ResearchDeps extends NativeBackendDeps {
   serve: ServeProvider;
   /** Serve providers keyed by read root (issue #96); wired to the `ServePool` in production. */
   router?: ServeRouter;
@@ -135,6 +136,8 @@ export type ResearchErrorKind =
   | "agent-mismatch";
 
 export interface ResearchAttribution {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   /** The EXACT model id used: the resolved id, or the id opencode actually ran when the
    * caller left it to opencode's default. */
   model: string;
@@ -177,6 +180,8 @@ export interface ResearchOk {
   approval?: ApprovalSummary;
 }
 export interface ResearchFail {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   ok: false;
   error: ResearchError;
   /** WHERE THE RECEIPT IS (issue #117 review) — see `ConsultFail.runId`/`callId`. Present only
@@ -222,9 +227,14 @@ export async function research(
   const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
+  const selection = await resolveNativeSelection(resolveModel({ flag: params.model, env, confContents }), params.model, undefined, deps);
+  if (!selection.ok) return { ok: false, rootConflict, error: { kind: "model-id", model: params.model ?? "", exitAnalogue: 2, message: selection.message } };
+  const requestedModel = selection.model;
+  const native = isCodexModel(requestedModel);
 
   // 1b. READ ROOT (issue #96) — see `resolveReadRoot`. A no-op without `worktree`.
   const readRoot = await resolveReadRoot({
+    ...(native ? { native: true, nativeSessionDirectory: selection.directory } : {}),
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     env,
     cwd,
@@ -249,6 +259,7 @@ export async function research(
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  if (native && (params.readPaths?.length ?? 0) > 0) return { ok: false, rootConflict, error: { kind: "read-path-invalid", model: requestedModel, exitAnalogue: null, message: "Native Codex uses its configured sandbox; ModelGuild cannot currently attach or verify scoped readPaths grants. Configure the native sandbox or omit readPaths." } };
   const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
   if (!resolvedReadPaths.ok) {
     return { ok: false, rootConflict, error: { kind: "read-path-invalid", model: "", exitAnalogue: null, message: resolvedReadPaths.message } };
@@ -257,7 +268,7 @@ export async function research(
   // 2. NO-FALLBACK def gate (deviation from bash C16, task-directed). If the hardened
   //    guild-research def is not present in the resolved agent-def dir, REFUSE loudly —
   //    never silently degrade to a weaker agent. Refused before any log write (gap parity).
-  if (!hardenedDefPresentIn(RESEARCH_AGENT, agentDefDirs).present) {
+  if (!native && !hardenedDefPresentIn(RESEARCH_AGENT, agentDefDirs).present) {
     return {
       ok: false,
       rootConflict,
@@ -276,8 +287,7 @@ export async function research(
     };
   }
 
-  // 3. Resolve the model (param > GUILD_MODEL env > conf > opencode default).
-  const requestedModel = resolveModel({ flag: params.model, env, confContents });
+  // Model resolution above also selects the backend before its session/root lookup.
 
   // 4. Gate: leading-dash refusal (C12) THEN policy tier (C1–C7), all BEFORE any log write.
   const gate = gateModel(requestedModel, params.confirmed === true, { guildDirs, env });
@@ -303,7 +313,7 @@ export async function research(
    * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
    * child warns again, and the next call starts fresh (review B1). */
   const announced = new Set<string>();
-  const floor = await gateAgentFloor({
+  const floor = native ? { ok: true as const, unverified: undefined } : await gateAgentFloor({
     serve,
     agent: RESEARCH_AGENT,
     agentDefDirs,
@@ -326,7 +336,7 @@ export async function research(
   if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
-  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+  const preTurnCheck = native ? undefined : (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     RESEARCH_AGENT,
     agentDefDirs,
     {
@@ -344,7 +354,7 @@ export async function research(
   // 4c. APPROVAL BRIDGE pre-flight (issue #20 slice 4). On the read paths this only arms
   //     under the separate, opt-in `GUILD_APPROVE_EGRESS=ask`; `GUILD_APPROVE` alone gates
   //     nothing here, because guild-research holds none of edit/write/patch/bash.
-  const armed = approvalFor({
+  const armed = native ? nativeApprovalFor(env, confContents) : approvalFor({
     agent: RESEARCH_AGENT,
     env,
     confContents,
@@ -388,6 +398,7 @@ export async function research(
       serve,
       log,
       preTurnCheck,
+      ...(native ? { codex: deps.codex, nativeRoot: readRoot.value.root, signal: deps.signal, elicitation: deps.elicitation } : {}),
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
@@ -401,9 +412,10 @@ export async function research(
       answer: outcome.text,
       rootConflict,
       attribution: {
+        ...(outcome.runtime !== undefined ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
         model: outcome.actualModel,
         requestedModel,
-        agent: RESEARCH_AGENT,
+        agent: native ? "codex" : RESEARCH_AGENT,
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
@@ -434,6 +446,7 @@ export async function research(
         : `The research call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ResearchFail = {
     ok: false,
+    ...(native ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
     rootConflict,
     error: {
       kind: outcome.kind,
@@ -476,7 +489,7 @@ export function researchToToolResult(r: ResearchResult): McpToolResult {
       structuredContent: structured,
     };
   }
-  const structured: Record<string, unknown> = { error: r.error };
+  const structured: Record<string, unknown> = { error: r.error, ...(r.backend ? { backend: r.backend, runtime: r.runtime } : {}) };
   if (r.runId) structured.runId = r.runId;
   if (r.callId) structured.callId = r.callId;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;

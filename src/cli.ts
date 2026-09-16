@@ -4,8 +4,8 @@
  * The published npm package's `bin`. Subcommands:
  *   serve   (default) — start the MCP stdio server (what `.mcp.json` launches).
  *   init              — place the MCP-era payload into a project (see init.ts).
- *   doctor            — a token-free health check (opencode present AND authenticated, MCP
- *                       registration, command docs + agent defs present, config/policy roots).
+ *   doctor            — token-free driver registration, selected worker-backend binary/auth,
+ *                       workflow payload and config/policy checks. Opencode defs apply only to opencode.
  *   watch             — tail the live activity of guild model calls (issue #20): the
  *                       external model's reads/greps/fetches/edits/commands as they happen.
  *   logs clean        — apply log retention by hand (issue #23): delete run dirs older
@@ -389,9 +389,17 @@ export async function runDoctor(
   let targetDir = process.cwd();
   let global = false;
   let driverArg: Driver | undefined;
+  let backend: "opencode" | "codex" | "both" = "opencode";
+  const selectBackend = (value: string | undefined) => {
+    if (value !== "opencode" && value !== "codex" && value !== "both")
+      throw new Error("doctor --backend requires opencode, codex, or both");
+    return value;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--driver") driverArg = parseDriver(argv[++i]);
+    if (a === "--backend") backend = selectBackend(argv[++i]);
+    else if (a.startsWith("--backend=")) backend = selectBackend(a.slice(10));
+    else if (a === "--driver") driverArg = parseDriver(argv[++i]);
     else if (a.startsWith("--driver=")) driverArg = parseDriver(a.slice(9));
     else if (a === "--dir") targetDir = argv[++i] ?? targetDir;
     else if (a.startsWith("--dir=")) targetDir = a.slice("--dir=".length);
@@ -401,6 +409,7 @@ export async function runDoctor(
   const gdirs = resolveGlobalDirs({ homeDir: inject?.homeDir, xdgConfigHome: inject?.xdgConfigHome });
   const driver = driverArg ?? installedDriver(targetDir, gdirs, global);
   console.log(`✓ Driver: ${driver}${driverArg ? "" : " (from available workflows; override with --driver)"}`);
+  console.log(`✓ Worker backend: ${backend} (select with --backend; independent of --driver)`);
   // THE ONE INPUT `doctor` RESOLVES DIFFERENTLY FROM THE IN-SERVER SURFACES, SURFACED RATHER
   // THAN HIDDEN (review finding L7). `guild_status` and the start-up notice scan
   // `resolveProjectDir` = `$GUILD_PROJECT_DIR` else cwd (what `.mcp.json` sets, and what the
@@ -558,7 +567,8 @@ export async function runDoctor(
     missingAgents.length === 0
       ? `${agentsPresent}/3 hardened agent defs present in ${agentsLoc}${whereSuffix(agentsWhere)}`
       : `${agentsPresent}/3 hardened agent defs present in ${agentsLoc} — missing: ${missingAgents.join(", ")}`;
-  line(missingAgents.length === 0, agentsMsg);
+  if (backend !== "codex") line(missingAgents.length === 0, agentsMsg);
+  else console.log("✓ opencode agent definitions are not required by the Codex backend");
 
   // Policy / config template present — project `modelguild/models.policy` OR global.
   const globalPolicy = payloadDest("modelguild/models.policy", globalOpts);
@@ -616,10 +626,13 @@ export async function runDoctor(
     });
     if (info.error !== null) {
       line(false, `approval bridge: GUILD_APPROVE/GUILD_APPROVE_EGRESS is invalid — ${info.error}`);
+    } else if (backend !== "opencode" && info.requested) {
+      line(false, "Codex backend cannot arm the opencode GUILD_APPROVE/GUILD_APPROVE_EGRESS bridge; " +
+        "native Codex approval policy is separate. Requested gates are not silently disabled.");
     } else if (!info.requested) {
       console.log(
         "✓ approval bridge: OFF (default) — GUILD_APPROVE=off, GUILD_APPROVE_EGRESS=off; " +
-          "no tool call is gated",
+          "no opencode tool call is gated; native Codex keeps its own approval policy",
       );
     } else {
       console.log(
@@ -704,76 +717,97 @@ export async function runDoctor(
     );
   }
 
-  // opencode binary — a HARD FAIL since issue #151. It used to be a `!` warning under
-  // `doctor: OK`, which inverted the severity ordering: a merely-unregistered MCP server failed
-  // (exit 1) while the one condition that guarantees NO model can ever answer passed. There is
-  // nothing degraded about this state — every `guild_*` tool spawns `opencode serve` — so it is
-  // a ✗, and unlike the auth check below it has no blind spot to soften the claim: no opencode,
-  // no `opencode serve`, no call. NOTE the scope: C72's "skew and drift never change the exit
-  // code" is untouched, and deliberately so. That rule is about the state of the installed
-  // PAYLOAD (behind a release is not broken); this is about the binary the system runs on.
-  const oc = spawnSync("opencode", ["--version"], { encoding: "utf8" });
-  const opencodePresent = oc.status === 0;
-  if (opencodePresent) {
-    console.log(`✓ opencode present (${(oc.stdout || "").trim()})`);
-  } else if (oc.error) {
-    // A spawn error is NOT synonymous with "not on PATH" — EACCES (present, not executable) and
-    // EPERM reach here too, and telling that user to install opencode sends them at the wrong
-    // problem. Only ENOENT earns the not-found wording; every other errno is named as itself.
-    const code = (oc.error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      line(false, "opencode not found on PATH — install it (https://opencode.ai) and run `opencode auth login`");
+  if (backend !== "codex") {
+    // opencode binary — a HARD FAIL since issue #151. It used to be a `!` warning under
+    // `doctor: OK`, which inverted the severity ordering: a merely-unregistered MCP server failed
+    // (exit 1) while the one condition that guarantees NO model can ever answer passed. There is
+    // nothing degraded about this state — a selected opencode worker needs `opencode serve` — so it is
+    // a ✗, and unlike the auth check below it has no blind spot to soften the claim: no opencode,
+    // no `opencode serve`, no call. NOTE the scope: C72's "skew and drift never change the exit
+    // code" is untouched, and deliberately so. That rule is about the state of the installed
+    // PAYLOAD (behind a release is not broken); this is about the binary the system runs on.
+    const oc = spawnSync("opencode", ["--version"], { encoding: "utf8" });
+    const opencodePresent = oc.status === 0;
+    if (opencodePresent) {
+      console.log(`✓ opencode present (${(oc.stdout || "").trim()})`);
+    } else if (oc.error) {
+      // A spawn error is NOT synonymous with "not on PATH" — EACCES (present, not executable) and
+      // EPERM reach here too, and telling that user to install opencode sends them at the wrong
+      // problem. Only ENOENT earns the not-found wording; every other errno is named as itself.
+      const code = (oc.error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        line(false, "opencode not found on PATH — install it (https://opencode.ai) and run `opencode auth login`");
+      } else {
+        line(
+          false,
+          `could not execute opencode (${code ?? oc.error.message}) — it is on PATH but would not ` +
+            "run; check its permissions and reinstall if needed, then run `opencode auth login`",
+        );
+      }
     } else {
       line(
         false,
-        `could not execute opencode (${code ?? oc.error.message}) — it is on PATH but would not ` +
-          "run; check its permissions and reinstall if needed, then run `opencode auth login`",
+        `opencode is on PATH but \`opencode --version\` failed (exit ${oc.status ?? "?"}) — ` +
+          "reinstall it, then run `opencode auth login`",
       );
     }
-  } else {
-    line(
-      false,
-      `opencode is on PATH but \`opencode --version\` failed (exit ${oc.status ?? "?"}) — ` +
-        "reinstall it, then run `opencode auth login`",
-    );
+
+    // AUTH PRESENCE (issue #151). `--version` proves the binary exists and nothing more; a user
+    // who never ran `opencode auth login` passed every documented verification step and met the
+    // failure at their first `/guild:consult`, inside Claude Code. Skipped whenever the binary
+    // CHECK failed — not-found and on-PATH-but-broken alike — because in both cases the line
+    // above already named the cause and `auth list` could tell us nothing anyway.
+    //
+    // A WARNING, NOT A FAILURE (maintainer decision, 2026-08-03, after two independent reviews
+    // reached the same position). The probe cannot see every way this state could be fine — see
+    // the blind spots on `opencodeAuthState` — so a zero is evidence, not proof. That is the rule
+    // this file already follows elsewhere: the MCP-registration check downgrades to a warning
+    // when `claude` is absent rather than call a working global setup broken, and C72 keeps
+    // payload skew/drift report-only. The binary checks stay hard failures because they have no
+    // such blind spot: no opencode, no `opencode serve`, no call.
+    if (opencodePresent) {
+      const auth = opencodeAuthState(spawnSync);
+      if (auth.kind === "authed") {
+        console.log(
+          `✓ opencode authenticated (${auth.credentials} stored credential(s), ` +
+            `${auth.envVars} provider env var(s))`,
+        );
+      } else if (auth.kind === "none") {
+        console.warn(
+          "! opencode has NO credentials and no provider API-key env vars — run `opencode auth " +
+            "login`. Until you do, every guild tool call reaches a provider that will refuse it. " +
+            "(If your provider is configured directly in opencode.json — an apiKey, or a local " +
+            "endpoint needing no credential — `opencode auth list` cannot see it and this line is " +
+            "a false alarm.)",
+        );
+      } else {
+        // FAIL-OPEN on an unreadable probe: "could not determine" must never be reported as
+        // "unauthenticated". A future opencode that reformats `auth list` lands here, and a
+        // warning is the honest verdict — doctor did not learn anything either way.
+        console.warn(
+          `! could not determine whether opencode is authenticated — ${auth.why}. ` +
+            "Check by hand with `opencode auth list`.",
+        );
+      }
+    }
   }
 
-  // AUTH PRESENCE (issue #151). `--version` proves the binary exists and nothing more; a user
-  // who never ran `opencode auth login` passed every documented verification step and met the
-  // failure at their first `/guild:consult`, inside Claude Code. Skipped whenever the binary
-  // CHECK failed — not-found and on-PATH-but-broken alike — because in both cases the line
-  // above already named the cause and `auth list` could tell us nothing anyway.
-  //
-  // A WARNING, NOT A FAILURE (maintainer decision, 2026-08-03, after two independent reviews
-  // reached the same position). The probe cannot see every way this state could be fine — see
-  // the blind spots on `opencodeAuthState` — so a zero is evidence, not proof. That is the rule
-  // this file already follows elsewhere: the MCP-registration check downgrades to a warning
-  // when `claude` is absent rather than call a working global setup broken, and C72 keeps
-  // payload skew/drift report-only. The binary checks stay hard failures because they have no
-  // such blind spot: no opencode, no `opencode serve`, no call.
-  if (opencodePresent) {
-    const auth = opencodeAuthState(spawnSync);
-    if (auth.kind === "authed") {
-      console.log(
-        `✓ opencode authenticated (${auth.credentials} stored credential(s), ` +
-          `${auth.envVars} provider env var(s))`,
-      );
-    } else if (auth.kind === "none") {
-      console.warn(
-        "! opencode has NO credentials and no provider API-key env vars — run `opencode auth " +
-          "login`. Until you do, every guild tool call reaches a provider that will refuse it. " +
-          "(If your provider is configured directly in opencode.json — an apiKey, or a local " +
-          "endpoint needing no credential — `opencode auth list` cannot see it and this line is " +
-          "a false alarm.)",
-      );
+  if (backend !== "opencode") {
+    const binary = spawnSync("codex", ["--version"], { encoding: "utf8", timeout: 15000, cwd: targetDir });
+    if (binary.error) {
+      const errno = (binary.error as NodeJS.ErrnoException).code;
+      line(false, errno === "ENOENT" ? "codex not found on PATH — install Codex CLI for native workers" :
+        `could not execute codex (${errno ?? "unknown error"}) — check the executable and permissions`);
+    } else if (binary.status !== 0) {
+      line(false, `codex --version failed (exit ${binary.status ?? "signal"}) — check the Codex installation`);
     } else {
-      // FAIL-OPEN on an unreadable probe: "could not determine" must never be reported as
-      // "unauthenticated". A future opencode that reformats `auth list` lands here, and a
-      // warning is the honest verdict — doctor did not learn anything either way.
-      console.warn(
-        `! could not determine whether opencode is authenticated — ${auth.why}. ` +
-          "Check by hand with `opencode auth list`.",
-      );
+      line(true, `codex worker present (${binary.stdout.trim()})`);
+      // Login status is evidence about the configured CLI, not per-model entitlement.
+      // Never print its raw output: API-key login diagnostics may include key details.
+      const login = spawnSync("codex", ["login", "status"], { encoding: "utf8", timeout: 15000, cwd: targetDir });
+      if (!login.error && login.status === 0) console.log("✓ Codex login confirmed (not a per-model entitlement check)");
+      else console.warn("! Codex login could not be confirmed — check `codex login status`; " +
+        "use `codex login` if your configured provider requires it");
     }
   }
 
@@ -1560,7 +1594,7 @@ async function main(): Promise<number> {
     console.log("       [--abs]     Pin an absolute path to this interpreter+entry (offline/no-registry).");
     console.log("       [--server-command \"cmd args\"]  Override the launch command verbatim.");
     console.log("       [--driver claude|codex|both] Workflow payload (init defaults to claude). Codex registration is printed as TOML.");
-    console.log("  doctor [--driver claude|codex|both] [--dir D] Token-free health check ([--global] checks the global locations).");
+    console.log("  doctor [--driver claude|codex|both] [--backend opencode|codex|both] [--dir D] Token-free health check (backend defaults to opencode; --global checks global locations).");
     console.log("  watch            Tail LIVE what an external model is doing (reads, greps,");
     console.log("                   fetches, edits, shell commands) while a guild call runs.");
     console.log("       [--run ID]   watch one run instead of following the newest.");

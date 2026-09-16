@@ -45,6 +45,7 @@
  * distinct-turn integrity; the panel test pins it again at this level).
  */
 
+import { isCodexModel, nativeApprovalFor, resolveNativeSelection, type NativeBackendDeps, type NativeRuntime } from "./backend.js";
 import os from "node:os";
 import { type ServeProvider, type ServeRouter, type TurnDiagnostics } from "./client.js";
 import { resolveReadPaths, type GitRunner } from "./worktree.js";
@@ -116,7 +117,7 @@ export interface PanelParams {
   timeoutMs?: number;
 }
 
-export interface PanelDeps {
+export interface PanelDeps extends NativeBackendDeps {
   serve: ServeProvider;
   /** Serve providers keyed by read root (issue #96); wired to the `ServePool` in production. */
   router?: ServeRouter;
@@ -211,6 +212,8 @@ export interface PanelAttempt {
  * EXACT id (area-F command surface, panel.md): the resolved/actual id on success, the
  * requested id on a refusal. */
 export interface PanelMemberResult {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   model: string;
   text?: string;
   error?: PanelMemberError;
@@ -307,6 +310,10 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
+  const panelRes = resolvePanelModels({ args: params.models, env, confContents });
+  const hasNative = panelRes.models.some(isCodexModel);
+  const allNative = panelRes.models.length > 0 && panelRes.models.every(isCodexModel);
+
 
   // 2. NO-FALLBACK def gate for the WHOLE panel (deviation from bash C16, mirroring
   //    guild_research/guild_delegate). Every member runs through the SAME hardened guild-read
@@ -317,6 +324,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //     `worktree`; with it, every member is routed to a serve child rooted there and the
   //     agent-def dirs move with it. Refused before the model set is even resolved.
   const readRoot = await resolveReadRoot({
+    native: allNative,
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     env,
     cwd,
@@ -337,6 +345,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  if (hasNative && (params.readPaths?.length ?? 0) > 0) return { ok: false, warnings: panelRes.warnings, rootConflict, error: { kind: "read-path-invalid", exitAnalogue: null, message: "Native Codex cannot currently attach or verify scoped readPaths grants. Configure its native sandbox or omit readPaths." } };
   const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
   if (!resolvedReadPaths.ok) {
     return { ok: false, warnings: [], rootConflict, error: { kind: "read-path-invalid", message: resolvedReadPaths.message, exitAnalogue: null } };
@@ -354,7 +363,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
     };
   }
 
-  if (!hardenedDefPresentIn(PANEL_AGENT, agentDefDirs).present) {
+  if (!allNative && !hardenedDefPresentIn(PANEL_AGENT, agentDefDirs).present) {
     return {
       ok: false,
       warnings: [],
@@ -375,7 +384,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
 
   // 3. Resolve the panel's model set (args > $GUILD_MODELS > conf), WIRING C13/C14's
   //    resolvePanelModels — dedup, order, and the diversity/shape warnings intact.
-  const panelRes = resolvePanelModels({ args: params.models, env, confContents });
+
   if (panelRes.error !== undefined || panelRes.models.length === 0) {
     return {
       ok: false,
@@ -401,7 +410,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
    * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
    * child warns again, and the next call starts fresh (review B1). */
   const announced = new Set<string>();
-  const floor = await gateAgentFloor({
+  const floor = allNative ? { ok: true as const, unverified: undefined } : await gateAgentFloor({
     serve,
     agent: PANEL_AGENT,
     agentDefDirs,
@@ -426,7 +435,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   /** A3: re-asked inside each member's own turn lease. Built ONCE from the same checker, so on
    * the shared child every member is a cache hit; under `GUILD_SERVE_PER_CALL=1` each member's
    * lease is a different child, so each gets a real check on the one that serves it. */
-  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+  const preTurnCheck = allNative ? undefined : (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     PANEL_AGENT,
     agentDefDirs,
     {
@@ -445,7 +454,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   // 4b. APPROVAL BRIDGE pre-flight for the WHOLE panel (issue #20 slice 4), before `newRun`
   //     so a refusal writes nothing. One check: every member uses the same guild-read agent,
   //     so what is gated and whether anyone can answer is identical for all of them.
-  const armed = approvalFor({
+  const nativeArmed = hasNative ? nativeApprovalFor(env, confContents) : { ok: true as const };
+  const armed = !nativeArmed.ok ? nativeArmed : allNative ? { ok: true as const, approval: undefined } : approvalFor({
     agent: PANEL_AGENT,
     env,
     confContents,
@@ -487,6 +497,8 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
   //    refusal or failure never touches another's result (order preserved by Promise.all).
   const results = await Promise.all(
     panelRes.models.map(async (model): Promise<PanelMemberResult> => {
+      const selection = await resolveNativeSelection(model, model, undefined, deps);
+      if (!selection.ok) return { model, error: { kind: "model-id", message: selection.message, exitAnalogue: 2 } };
       const gate = gateModel(model, confirmed, { guildDirs, env });
       if (!gate.ok) {
         // A pre-log refusal: no call_id, nothing written for this member (gap parity).
@@ -531,6 +543,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
             serve,
             log,
             preTurnCheck,
+            ...(isCodexModel(model) ? { codex: deps.codex, nativeRoot: readRoot.value.root, signal: deps.signal, elicitation: deps.elicitation } : {}),
             messageTimeoutMs,
             activity,
             ...(armed.approval !== undefined ? { approval: armed.approval } : {}),
@@ -576,6 +589,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
       if (outcome.ok || outcome.permissionApplied) grantApplied = true;
       if (outcome.ok) {
         const member: PanelMemberResult = {
+          ...(outcome.runtime !== undefined ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
           model: outcome.actualModel,
           text: outcome.text,
           callId: outcome.callId,
@@ -612,6 +626,7 @@ export async function panel(params: PanelParams, deps: PanelDeps): Promise<Panel
               }: ${outcome.reason}`
             : `The panel call to '${model}' failed: ${outcome.reason}. No answer was produced.`;
       const failed: PanelMemberResult = {
+        ...(isCodexModel(model) ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
         model,
         callId: outcome.callId,
         error: {

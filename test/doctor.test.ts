@@ -801,6 +801,62 @@ async function runCases(): Promise<number> {
     fifoCase("modelguild/models.policy", "modelguild/models.policy"); // the one that never hung
   }
 
+  // Native backend diagnostics are independent of the selected driver (#227).
+  {
+    const project = tempDir();
+    init({ targetDir: project, packageRoot: repoRoot, serverLaunch: LAUNCH });
+    rmSync(path.join(project, ".opencode"), { recursive: true, force: true });
+    const isolated = { homeDir: tempDir(), xdgConfigHome: tempDir() };
+    const stub = (opts: { authExit?: number; versionExit?: number; executable?: boolean } = {}) => {
+      const dir = tempDir();
+      writeFileSync(path.join(dir, "codex"), [
+        "#!/usr/bin/env bash",
+        'if [ "$1" = "--version" ]; then',
+        `  echo codex-test; exit ${opts.versionExit ?? 0}`,
+        "fi",
+        'if [ "$1" = "login" ] && [ "$2" = "status" ]; then',
+        '  echo "LOGIN_SECRET_CANARY" >&2',
+        `  exit ${opts.authExit ?? 0}`,
+        "fi",
+        "exit 1",
+      ].join("\n") + "\n", { mode: opts.executable === false ? 0o644 : 0o755 });
+      return dir;
+    };
+    const native = (bin: string | null, backend = "codex") => withPath(bin, () =>
+      captureDoctor(["--dir", project, "--driver", "claude", "--backend", backend], isolated));
+    const good = await native(stub());
+    c.check(good.code === 0, "native doctor succeeds without opencode binary or agent definitions");
+    c.check(good.out.includes("Driver: claude") && good.out.includes("Worker backend: codex"),
+      "worker backend selection is independent of the frontend driver");
+    c.check(good.out.includes("Codex login confirmed"), "native doctor reports a confirmed Codex login");
+    c.check(!good.out.includes("LOGIN_SECRET_CANARY"), "native login output is not exposed");
+    const absent = await native(null);
+    c.check(absent.code === 1 && absent.out.includes("codex not found on PATH"),
+      "a missing selected native worker is a hard failure");
+    const broken = await native(stub({ versionExit: 3 }));
+    c.check(broken.code === 1 && broken.out.includes("codex --version failed (exit 3)"),
+      "native doctor distinguishes a broken installed binary");
+    const denied = await native(stub({ executable: false }));
+    c.check(denied.code === 1 && denied.out.includes("could not execute codex (EACCES)"),
+      "native doctor distinguishes permissions from a missing binary");
+    const noLogin = await native(stub({ authExit: 1 }));
+    c.check(noLogin.code === 0 && noLogin.out.includes("! Codex login could not be confirmed"),
+      "unconfirmed native login warns because configured providers may not need it");
+    c.check(!noLogin.out.includes("LOGIN_SECRET_CANARY"), "failed login diagnostics do not expose raw output either");
+    const both = await native(stub(), "both");
+    c.check(both.code === 1 && both.out.includes("opencode not found on PATH"),
+      "explicit both checks the missing opencode worker too");
+    const opencode = await native(stub(), "opencode");
+    c.check(opencode.code === 1 && !opencode.out.includes("Codex login confirmed"),
+      "opencode-only backend selection does not probe native Codex auth");
+    for (const args of [["--backend"], ["--backend=other"]]) {
+      let message = "";
+      try { await captureDoctor(args, isolated); } catch (error) { message = String(error); }
+      c.check(message.includes("--backend requires opencode, codex, or both"),
+        `invalid native backend selector is a named usage error: ${args.join(" ")}`);
+    }
+  }
+
   console.log(`doctor.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;
 }

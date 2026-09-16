@@ -858,6 +858,8 @@ export class EvidenceLog {
    * pre-marker that makes a crash-before-`started` gap visible to verify. */
   async expect(args: {
     callId: string;
+    backend?: string;
+    runtime?: Record<string, unknown>;
     command?: string;
     model?: string;
     agent?: string;
@@ -874,6 +876,8 @@ export class EvidenceLog {
         command: args.command ?? "",
         model: nullIfEmpty(args.model),
         agent: args.agent ?? "",
+        ...(args.backend !== undefined ? { backend: args.backend } : {}),
+        ...(args.runtime !== undefined ? { runtime: JSON.parse(JSON.stringify(args.runtime)) as JsonValue } : {}),
       };
       const r = await this.#appendLocked(path.join(rd, "calls.jsonl"), payload, false);
       return { ok: r.ok };
@@ -888,6 +892,8 @@ export class EvidenceLog {
    * only; off ⇒ neither. */
   async started(args: {
     callId: string;
+    backend?: string;
+    runtime?: Record<string, unknown>;
     command?: string;
     model?: string;
     agent?: string;
@@ -971,6 +977,8 @@ export class EvidenceLog {
         command: args.command ?? "",
         model: nullIfEmpty(args.model),
         agent: args.agent ?? "",
+        ...(args.backend !== undefined ? { backend: args.backend } : {}),
+        ...(args.runtime !== undefined ? { runtime: JSON.parse(JSON.stringify(args.runtime)) as JsonValue } : {}),
         session_id: nullIfEmpty(args.session),
         prompt_mode: mode,
         // full ⇒ the prompt text (empty string if none was supplied, matching log.sh's
@@ -1014,6 +1022,8 @@ export class EvidenceLog {
    */
   async completed(args: {
     callId: string;
+    backend?: string;
+    runtime?: Record<string, unknown>;
     exit?: number;
     turn?: number;
     session?: string;
@@ -1075,6 +1085,8 @@ export class EvidenceLog {
         command: args.command ?? "",
         model: nullIfEmpty(args.model),
         agent: args.agent ?? "",
+        ...(args.backend !== undefined ? { backend: args.backend } : {}),
+        ...(args.runtime !== undefined ? { runtime: JSON.parse(JSON.stringify(args.runtime)) as JsonValue } : {}),
         session_id: nullIfEmpty(args.session),
         turn: args.turn === undefined ? null : args.turn,
         exit_code: args.exit ?? 0,

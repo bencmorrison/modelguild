@@ -967,6 +967,10 @@ export class ActivityRecorder {
     };
   }
 
+  /** Adapter-neutral ingress for a backend with its own event transport. */
+  record(event: ActivityEvent): void { try { this.#handle(event); } catch { this.#markDegraded("activity normalization failed"); } }
+  degrade(reason: string): void { this.#markDegraded(reason); }
+
   // --- internals ----------------------------------------------------------
   #markDegraded(reason: string): void {
     if (this.#closed) return;

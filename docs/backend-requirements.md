@@ -1,10 +1,27 @@
 # Backend requirements — what ModelGuild needs to run a model
 
-What a backend has to provide for ModelGuild's tools and receipts to work as documented, and what each tool does when it cannot. **opencode is the reference backend**: every requirement below is stated in the abstract and then, on one line, as the thing opencode actually does, with the file that reads it. Not all of it is a gate: the permission model (§7) is optional for a substitute, and ModelGuild is a way to reach another model and keep receipts of what it said, not a way to fence one. This is an inventory of requirements, not an evaluation — **no CLI is assessed here**, and nothing below claims a second backend exists. Back to [README.md](../README.md).
+What a backend has to provide for ModelGuild's tools and receipts to work as documented, and what each tool does when it cannot. **opencode is the reference backend**: every requirement below is stated in the abstract and then, on one line, as the thing opencode actually does, with the file that reads it. Not all of it is a gate: the permission model (§7) is optional for a substitute, and ModelGuild is a way to reach another model and keep receipts of what it said, not a way to fence one. Native Codex App Server is the second backend (#227); the table below records how its adapter satisfies or explicitly declines these requirements. Back to [README.md](../README.md).
 
 - [The requirements](#the-requirements) — [lifecycle](#1-process-lifecycle), [the turn](#2-the-model-turn), [transcript](#3-transcript-readback), [events and gating](#4-event-stream-and-gating), [enumeration](#5-model-enumeration), [auth](#6-auth), [permissions, optional](#7-permission-model-with-readback)
 - [When a requirement is missing](#when-a-requirement-is-missing)
 - [Not a backend concern](#not-a-backend-concern)
+
+## Native Codex implementation
+
+| Requirement | Native Codex behavior |
+| --- | --- |
+| Lifecycle | An isolated stdio `codex app-server` child per active turn, rooted at the resolved project/worktree; catalog and thread inspection use separate short-lived children. |
+| Turn and continuation | `thread/start` or `thread/resume`, then `turn/start`; ModelGuild exposes `codex:<thread-id>` session IDs so changed defaults cannot route a continuation through opencode. |
+| Transcript | Authoritative `thread/read` answer text, selected by the exact returned turn ID; answer bytes are preserved. An absent or incomplete matching turn fails. Codex 0.153.4 omits tool items despite `itemsView: full`; tool details use exact-turn item notifications instead. |
+| Identity | Requested `codex/<model>` selects the runtime. Native model/provider and policy are echoed configuration, explicitly labelled rather than claimed as provider execution telemetry. |
+| Activity | Native item events feed the shared activity recorder, watch output and MCP progress. Tool counts deduplicate those events by item ID; no post-turn tool replay is available, explicitly reported as degraded activity and runtime provenance. |
+| Enumeration and auth | `guild_models` selects `backend: "codex"` or `"both"`; native catalog IDs are prefixed `codex/`. Codex owns credentials; `doctor --backend codex` checks the binary and login diagnostic without a model turn. |
+| Permissions and gating | Codex's configured sandbox/approval policy governs the worker. No opencode floor is required or claimed. Unsupported ModelGuild approval gates and nonempty `readPaths` refuse before a turn. |
+| Retention | Threads are durable for transcript readback; release archives rather than deletes. ModelGuild log retention does not erase Codex history. |
+
+The existing opencode implementation and its permission contract remain unchanged.
+A panel can mix runtimes, while policy, receipt hash chains and delegated diff capture
+remain shared. The runtime prefix does not establish independent model/provider voices.
 
 ## The requirements
 
@@ -78,11 +95,11 @@ Three tiers, and the boundaries between them are deliberate.
 
 **Refuse to arm.** `GUILD_APPROVE` or `GUILD_APPROVE_EGRESS` set on a backend that cannot gate (§4) ⇒ refuse the call up front. Never silently un-arm: a user who set the knob believes edits are gated, and a typo in that knob is already an error rather than a quiet `off`.
 
-**What exists today, and what does not.** The tiers exist as *shapes* — refusals and degradations inside the one backend, not a backend-capability branch. `agent-def-missing` (C16, `src/consult.ts:1401` and its three siblings) and `agent-unhardened` (C73, `src/panel.ts:394`) refuse with a named kind before any model turn, any session and any evidence entry, which is the shape a hard refuse takes — but they are opencode's checks over §7, not instances of the tier above, and a backend without a permission model is not refused for lacking them. `activity.degraded` (C61) is the degrade-loudly shape; C67's refusal when no channel can answer, and C65's error on an unrecognized knob value, are the refuse-to-arm shape. **The per-backend rules above are not implemented** — there is one backend, and no capability declaration to branch on. Treat this section as the specification a second backend would have to satisfy, and do not cite it as behaviour.
+**Opencode-specific checks.** Each backend reports the capabilities it actually supplies. `agent-def-missing` (C16, `src/consult.ts:1401` and its three siblings) and `agent-unhardened` (C73, `src/panel.ts:394`) refuse with a named kind before any model turn, any session and any evidence entry, which is the shape a hard refuse takes — but they are opencode's checks over §7, not instances of the tier above, and a backend without a permission model is not refused for lacking them. `activity.degraded` (C61) is the degrade-loudly shape; C67's refusal when no channel can answer, and C65's error on an unrecognized knob value, are the refuse-to-arm shape. Native Codex implements these rules through explicit gate/read-path refusals and degraded live-activity reporting; see the implementation table above.
 
 ## Not a backend concern
 
 - **Model policy** — `src/policy.ts` matches `provider/model` strings. That is a naming convention, not an API.
 - **The evidence log** — `src/log.ts`: the `expected-call` → `started` → `completed` lifecycle, the hash chain, run-id grammar and retention are all backend-independent, and the fields that name a backend concept (`agent`, `session_id`) are already optional.
 - **Progress notifications** — `src/progress.ts` speaks MCP to the client above, never to the backend below.
-- **The installer** — `src/init.ts`'s ownership, never-clobber, uninstall, drift and skew machinery is backend-agnostic. Its **payload** is not: the hardened agent definitions it ships are opencode artifacts, so a second backend brings a second payload, not a second installer.
+- **The installer** — `src/init.ts`'s ownership, never-clobber, uninstall, drift and skew machinery is backend-agnostic. Its **payload** is not: the hardened agent definitions it ships are opencode artifacts, native Codex uses its installed runtime and normal configuration without requiring a second agent-definition payload.

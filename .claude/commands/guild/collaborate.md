@@ -3,6 +3,15 @@ description: Work through a problem WITH another LLM as a peer — a bounded mul
 argument-hint: [question or problem to think through together]
 allowed-tools: mcp__modelguild__guild_consult, mcp__modelguild__guild_models, Task
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Think this through WITH another model as a **peer** — not as a boss collecting an opinion to rubber-stamp or wave away. The point is genuine engagement: your view must be able to change, and the other model's contribution must be *visibly dispositioned*, not nodded at. You are NOT the automatic tie-breaker.
 
 Problem:

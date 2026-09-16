@@ -3,6 +3,15 @@ description: Source-backed investigation by another LLM with web access, with Cl
 argument-hint: [what to research — a question, a technology, a comparison]
 allowed-tools: mcp__modelguild__guild_research, mcp__modelguild__guild_models, Read, Grep, Glob, WebFetch
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Have another LLM investigate a question using the web, then verify its claims against the sources before reporting. You are the **verifier, not a relay** — a claim reaches the user only if a real source backs it.
 
 Research question:

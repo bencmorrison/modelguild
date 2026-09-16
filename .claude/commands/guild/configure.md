@@ -3,6 +3,15 @@ description: Interactively set up your ModelGuild model policy (deny/ask/allow) 
 argument-hint: (interactive — no arguments needed)
 allowed-tools: mcp__modelguild__guild_models, Bash(npx modelguild doctor:*), Bash(modelguild doctor:*), Read, Write, Edit
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Guide the user through configuring ModelGuild's model policy and preferences. This is **interactive** — ASK the user for their choices, don't assume them, and show the result for confirmation before writing anything.
 
 $ARGUMENTS
@@ -39,7 +48,7 @@ $ARGUMENTS
      These take effect immediately (no restart needed) — that's the point of using a file. Do NOT print `export` lines; the file is the durable home now.
    - **Note on the guild root:** resolution is layered — `<cwd>/modelguild/` over `~/.claude/modelguild/`, most-specific first, both binding. `$GUILD_ROOT` overrides that with a **single** root (nothing layered under it). Writes from ModelGuild itself (the evidence log's `logs/`) always go to the most-specific root.
 
-7. **Validate.** Run `npx modelguild doctor` (or `modelguild doctor` if it's on PATH) — a token-free check that the MCP server is registered, the command docs and hardened agent defs are present, the model policy file exists, and — the part that matters here — the **layered config/policy chain**, printed most-specific first with a presence marker per file. Check the file you just wrote appears in that chain. Then confirm intent yourself:
+7. **Validate.** Run `npx modelguild doctor --backend <opencode|codex|both>` for the chosen worker runtime(s) (or `modelguild doctor` if it's on PATH) — a token-free check that the MCP server is registered, the command docs and hardened agent defs are present, the model policy file exists, and — the part that matters here — the **layered config/policy chain**, printed most-specific first with a presence marker per file. Check the file you just wrote appears in that chain. Then confirm intent yourself:
    - The policy is **first-match-wins across the whole chain, default-allow**, and takes effect immediately — re-read the file you wrote AND the other layer's files, then walk the user through which of their models land in `deny` / `ask` / `allow` once both layers are applied. Do not describe the project layer as if it were the only one.
    - If you set a panel, sanity-check that its members come from **different providers** (single-provider sets are "diversity theater"); `guild_panel` will also surface a warning at call time.
    Report what you verified.
