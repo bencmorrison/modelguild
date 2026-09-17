@@ -9,7 +9,9 @@
  * daemonizes/reparents before this inventory, a crash before inventory, or a
  * missing/failing ps remains outside the descendant-cleanup guarantee.
  * Successful turns and control calls first close stdin and allow one second to
- * flush and exit on POSIX. Completed turns retain descendant birth identities
+ * flush and exit on POSIX. This grace is not user-configurable; shutdownGraceMs
+ * is an adapter option with no server/config setting.
+ * Completed turns retain descendant birth identities
  * before EOF and stop surviving tools before returning. Windows completed turns
  * keep forced taskkill /T cleanup while their root is alive, because descendant
  * retention is POSIX-only; token-free controls can still use EOF. Controls have not run a model and
