@@ -18,7 +18,7 @@ const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx");
 export const ALL_SUITES = [
   "lifecycle", "orphan", "mcp-client", "serve-stderr", "client", "activity",
   "approve", "log", "policy", "config", "consult", "panel", "research",
-  "delegate", "models", "init", "doctor", "worktree", "agentfloor", "runner", "driver",
+  "delegate", "models", "init", "doctor", "worktree", "agentfloor", "runner", "driver", "codex-backend", "native-routing",
 ] as const;
 
 export const OFFLINE_EXCLUDED = ["lifecycle", "orphan", "mcp-client"] as const;

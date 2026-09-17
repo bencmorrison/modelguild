@@ -3,6 +3,7 @@
 Everything you can set, and where it lives. Back to [README.md](../README.md).
 
 - [Picking the model](#picking-the-model)
+- [Native Codex workers](#native-codex-workers)
 - [Persistent defaults](#persistent-defaults)
 - [Model policy](#model-policy)
 - [Timeouts](#timeouts)
@@ -12,9 +13,32 @@ Most of what follows lives in two files under your chosen **guild root** — `~/
 
 ## Picking the model
 
-To see the exact provider/model ids your auth offers, ask your driver to run the `guild_models` tool (or run `opencode models` yourself). Pass a specific model to any command; omit it to use your configured default.
+To list model IDs, ask your driver to run `guild_models`: `backend: "opencode"` is the default; `"codex"` lists native Codex models; `"both"` combines them. Listing is configuration/catalog information, not proof that a model call will succeed. `opencode models` lists only the opencode route. Pass a specific model to any command; omit it to use your configured default.
 
 For independent opinions, prefer a different model family from the actual driver when choosing models. Honor explicit model choices and persistent defaults. A hosting provider can serve several families; provider diversity alone does not establish model diversity (issue #225).
+
+## Native Codex workers
+
+The reserved `codex/` prefix selects a runtime: `codex/<native-model>` runs through
+Codex App Server. It is not a provider or model-family claim. All other
+`provider/model` IDs keep the opencode route, and policy rules match the full ID
+including the prefix. Both types can appear in `GUILD_MODEL` and `GUILD_MODELS`.
+A custom opencode provider named `codex` collides with this reserved namespace;
+the catalog omits it with a warning to rename that provider.
+
+Codex inherits its normal user/project configuration and login. ModelGuild sends
+the selected model and caller's task prompt; it does not override the native
+sandbox or approval policy to emulate opencode's hardened agents. A read-only request
+in a workflow or task prompt remains an instruction, not a native permission fence. Results report
+Codex's echoed policy and configured model/provider. Choose native settings in Codex's
+configuration, not in an opencode agent definition.
+
+ModelGuild's `GUILD_APPROVE` and `GUILD_APPROVE_EGRESS` gates currently require
+opencode's verifiable per-session rules. A native Codex call with either gate enabled
+refuses before running; native approval policy does not silently substitute for an
+explicitly requested ModelGuild gate. Nonempty `readPaths` also refuses for Codex:
+the adapter cannot attach and verify those scoped grants. Configure native access
+through Codex instead; omitting `readPaths` is not a claim that external reads are fenced.
 
 ## Persistent defaults
 
@@ -37,7 +61,7 @@ Rules are first-match globs, and resolution is **layered analogously to preferen
 
 ## Timeouts
 
-If a heavy task on a slow reasoning model aborts with *"operation was aborted due to timeout"* — e.g. a whole-repo review or a long planning session — raise the per-turn HTTP timeout (default 15 minutes) in `modelguild.conf.local`:
+If a heavy task on a slow reasoning model aborts with *"operation was aborted due to timeout"* — e.g. a whole-repo review or a long planning session — raise the per-turn timeout (default 15 minutes) in `modelguild.conf.local`:
 
 ```
 GUILD_MESSAGE_TIMEOUT_MS=1800000

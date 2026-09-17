@@ -29,6 +29,8 @@
  * methods already return `{ok}` instead of throwing, and this flow ignores their `ok`.
  */
 
+import { CodexTurnError } from "./codex.js";
+import { isCodexModel, nativeApprovalFor, resolveNativeSelection, nativeTurn, nativeRuntime, NativeEmptyAnswerError, type NativeBackendDeps, type NativeRuntime } from "./backend.js";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import {
@@ -316,6 +318,8 @@ export type ConsultErrorKind =
   | "agent-mismatch";
 
 export interface ConsultAttribution {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   /** The EXACT model id used (consult.md reports the model id used — area-F command
    * surface; NOT C45, which is verify-not-relay): the resolved id, or the id opencode actually ran
    * (from the turn metadata) when the caller left it to opencode's default. */
@@ -388,6 +392,8 @@ export interface ConsultOk {
   approval?: ApprovalSummary;
 }
 export interface ConsultFail {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   ok: false;
   error: ConsultError;
   /**
@@ -457,7 +463,7 @@ export interface ConsultParams {
   timeoutMs?: number;
 }
 
-export interface ConsultDeps {
+export interface ConsultDeps extends NativeBackendDeps {
   /** A ready-serve provider (the M1 lifecycle in production; a fake in tests). */
   serve: ServeProvider;
   /**
@@ -723,6 +729,8 @@ export async function resolveReadRoot(opts: {
    * OWN directory decides the root — see the doc comment.
    */
   sessionId?: string;
+  native?: boolean;
+  nativeSessionDirectory?: string;
   env: NodeJS.ProcessEnv;
   cwd: string;
   confContents: string;
@@ -780,11 +788,11 @@ export async function resolveReadRoot(opts: {
     // what keeps `/guild:collaborate` and `/guild:workshop` — which never touch a worktree
     // — from newly depending on a `GET /session/{id}` succeeding. Where the ambiguity IS
     // real (a root was named, or extra roots exist), a failed lookup is a refusal.
-    const ambiguous = asked !== undefined || (opts.router?.extraRoots.length ?? 0) > 0;
+    const ambiguous = opts.native === true || asked !== undefined || (opts.router?.extraRoots.length ?? 0) > 0;
     let dir: string | undefined;
     let lookupError: string | undefined;
     try {
-      dir = opts.fetchSessionDirectory
+      dir = opts.native ? opts.nativeSessionDirectory : opts.fetchSessionDirectory
         ? await opts.fetchSessionDirectory(sessionId)
         : await defaultSessionDirectory(opts.serve, sessionId);
     } catch (err) {
@@ -857,6 +865,7 @@ export async function resolveReadRoot(opts: {
       },
     };
   }
+  if (opts.native) return { ok: true, value: { serve: opts.serve, agentDefDirs: [], root: effective.root, worktree: effective.root } };
   if (opts.router === undefined) {
     throw new Error(
       `internal: a worktree read root ('${effective.root}') was requested but no ServeRouter ` +
@@ -971,7 +980,9 @@ export interface LifecycleApproval {
   arming: ApprovalArming;
 }
 
-export interface LifecycleDeps {
+export interface LifecycleDeps extends NativeBackendDeps {
+  nativeRoot?: string;
+  elicitation?: ElicitationRequester;
   serve: ServeProvider;
   /**
    * The issue-#111 floor re-check, run INSIDE the turn's own serve lease (review A3). Absent ⇒
@@ -999,6 +1010,7 @@ export interface LifecycleDeps {
 export type LifecycleOutcome =
   | {
       ok: true;
+      runtime?: NativeRuntime;
       text: string;
       callId: string;
       actualModel: string;
@@ -1037,6 +1049,7 @@ export type LifecycleOutcome =
     }
   | {
       ok: false;
+      runtime?: NativeRuntime;
       callId: string;
       reason: string;
       /** `approval-not-applied` is only reachable when the bridge is armed: the session this
@@ -1148,12 +1161,14 @@ export async function runAgentLifecycle(
   p: LifecycleParams,
   d: LifecycleDeps,
 ): Promise<LifecycleOutcome> {
+  const native = d.nativeRoot !== undefined;
   const callId = newCallId();
   const common = {
     callId,
     command: p.command,
     model: p.requestedModel,
-    agent: p.agent,
+    agent: native ? "codex" : p.agent,
+    ...(native ? { backend: "codex" } : {}),
     tier: p.tier,
     confirmed: p.confirmed,
     run: p.runId,
@@ -1162,7 +1177,8 @@ export async function runAgentLifecycle(
     callId,
     command: p.command,
     model: p.requestedModel,
-    agent: p.agent,
+    agent: native ? "codex" : p.agent,
+    ...(native ? { backend: "codex" } : {}),
     run: p.runId,
   });
   // On a continuation the session id is known before the call, so it is stamped on
@@ -1193,7 +1209,7 @@ export async function runAgentLifecycle(
     runId: p.runId,
     callId,
     model: p.requestedModel === "" ? "(opencode default)" : p.requestedModel,
-    agent: p.agent,
+    agent: native ? "codex" : p.agent,
     command: p.command,
   };
   try {
@@ -1257,7 +1273,9 @@ export async function runAgentLifecycle(
       askOpts.allowedTools = [...d.approval.arming.allowSet];
       askOpts.approval = approver;
     }
-    const result = await askViaAgent(d.serve, askOpts);
+    const result = native
+      ? await nativeTurn(askOpts, { ...d, nativeRoot: d.nativeRoot! })
+      : await askViaAgent(d.serve, askOpts);
     // THE WRITE PATH'S REFUSAL CANNOT REACH ITS OWN RECEIPT, SO THE SPINE WRITES IT (issue #188).
     //
     // `guild_delegate` decides `empty-delegation` after this function has returned AND after its
@@ -1294,6 +1312,7 @@ export async function runAgentLifecycle(
       session: result.sessionId,
       captureState: "complete",
       response: result.text,
+      ...("runtime" in result ? { runtime: result.runtime } : {}),
       // Issue #168: absent unless the answer was promoted off a non-text channel, so an
       // ordinary call's entry is byte-identical to a pre-#168 one.
       ...(result.answerChannel !== undefined ? { answerChannel: result.answerChannel } : {}),
@@ -1307,10 +1326,11 @@ export async function runAgentLifecycle(
       text: result.text,
       callId,
       actualModel: actualModel(p.requestedModel, result.metadata.providerID, result.metadata.modelID),
+      ...("runtime" in result ? { runtime: result.runtime } : {}),
       sessionId: result.sessionId,
       toolCallCount: result.toolCallCount,
     };
-    if (recorder !== undefined) ok.activity = recorder.summary();
+    if (recorder !== undefined) ok.activity = "nativeActivity" in result ? result.nativeActivity : recorder.summary();
     if (approver !== undefined) ok.approval = approver.summary();
     if (result.providerError !== undefined) ok.providerError = result.providerError;
     if (result.completion !== undefined) ok.completion = result.completion;
@@ -1341,6 +1361,8 @@ export async function runAgentLifecycle(
     // reason is the sufficient one. `verify()` reads `capture_state`, the hash chain and
     // the response digest — never `exit_code` — so exit 1 + complete verifies clean.
     const empty = err instanceof EmptyAnswerError;
+    const nativeFailure = err instanceof CodexTurnError ? err : undefined;
+    const runtime = err instanceof NativeEmptyAnswerError ? err.runtime : nativeFailure?.result ? nativeRuntime(nativeFailure.result) : undefined;
     const reason = err instanceof Error ? err.message : String(err);
     await d.log.completed({
       ...common,
@@ -1349,8 +1371,8 @@ export async function runAgentLifecycle(
       // Record the session id we know: the served one on a mismatch or an empty answer, else
       // the continued id (item 4 — a failed continuation must still record which session it
       // was; null for a fresh session whose id we never learned before the throw).
-      session: mismatch || empty ? err.sessionId : p.sessionId,
-      ...(empty
+      session: nativeFailure?.sessionId ? `codex:${nativeFailure.sessionId}` : mismatch || empty ? err.sessionId : p.sessionId,
+      ...(nativeFailure?.result ? { captureState: "complete" as const, response: nativeFailure.result.text, runtime: nativeRuntime(nativeFailure.result) } : empty
         ? { captureState: "complete" as const, response: err.text }
         : { captureState: "failed" as const }),
       // ISSUE #188: THE REFUSAL'S EVIDENCE GOES IN THE RECEIPT, NOT ONLY IN THE TOOL RESULT.
@@ -1361,11 +1383,13 @@ export async function runAgentLifecycle(
       // object as `failed.diagnostics` below — deliberately the identical value rather than a
       // second construction, so the two surfaces cannot drift.
       ...(empty && err.diagnostics !== undefined ? { diagnostics: err.diagnostics } : {}),
+      ...(runtime !== undefined ? { runtime } : {}),
     });
     const failed: LifecycleOutcome = {
       ok: false,
       callId,
       reason,
+      ...(runtime !== undefined ? { runtime } : {}),
       kind: mismatch
         ? "agent-mismatch"
         : ungated
@@ -1412,12 +1436,17 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
+  const selection = await resolveNativeSelection(resolveModel({ flag: params.model, env, confContents }), params.model, params.sessionId, deps);
+  if (!selection.ok) return { ok: false, rootConflict, error: { kind: "model-id", model: params.model ?? "", exitAnalogue: 2, message: selection.message } };
+  const requestedModel = selection.model;
+  const native = isCodexModel(requestedModel);
 
   // 1b. READ ROOT (issue #96). Optional: without `worktree` this is exactly the pre-#96
   //     path. With it, the target is validated against `git worktree list` and the call is
   //     routed to a serve child rooted there — and the agent-def dirs move with it, because
   //     opencode resolves agents from the serve's cwd. Refused BEFORE any log write.
   const readRoot = await resolveReadRoot({
+    ...(native ? { native: true, nativeSessionDirectory: selection.directory } : {}),
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     // A continuation inherits its root from the session (review finding M3).
     ...(params.sessionId !== undefined ? { sessionId: params.sessionId } : {}),
@@ -1446,6 +1475,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
   const { serve, agentDefDirs, worktree: worktreeRoot } = readRoot.value;
+  if (native && (params.readPaths?.length ?? 0) > 0) return { ok: false, rootConflict, error: { kind: "read-path-invalid", model: requestedModel, exitAnalogue: null, message: "Native Codex uses its configured sandbox; ModelGuild cannot currently attach or verify scoped readPaths grants. Configure the native sandbox or omit readPaths." } };
   const resolvedReadPaths = resolveReadPaths(params.readPaths, readRoot.value.root);
   if (!resolvedReadPaths.ok) {
     return {
@@ -1469,7 +1499,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   //    guarantee; the pre-flight is version-independent and fail-closed). Refused BEFORE any
   //    log write (gap parity) and BEFORE any session/model work, so a `sessionId` continuation
   //    is governed identically — the def governs the agent regardless of session reuse.
-  if (!hardenedDefPresentIn(CONSULT_AGENT, agentDefDirs).present) {
+  if (!native && !hardenedDefPresentIn(CONSULT_AGENT, agentDefDirs).present) {
     return {
       ok: false,
       rootConflict,
@@ -1488,8 +1518,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
     };
   }
 
-  // 3. Resolve the model (param > GUILD_MODEL env > conf > opencode default).
-  const requestedModel = resolveModel({ flag: params.model, env, confContents });
+  // Model resolution above also selects the backend before its session/root lookup.
 
   // 4. Gate: the leading-dash refusal (C12) THEN the policy tier gate (C1–C7). deny →
   //    exit-3 analogue; ask without confirmed → exit-4 analogue instructing the DRIVER to
@@ -1527,7 +1556,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
    * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
    * child warns again, and the next call starts fresh (review B1). */
   const announced = new Set<string>();
-  const floor = await gateAgentFloor({
+  const floor = native ? { ok: true as const, unverified: undefined } : await gateAgentFloor({
     serve,
     agent: CONSULT_AGENT,
     agentDefDirs,
@@ -1556,7 +1585,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
-  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+  const preTurnCheck = native ? undefined : (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     CONSULT_AGENT,
     agentDefDirs,
     {
@@ -1576,7 +1605,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
   //    and nothing below changes. Armed with no channel that can answer ⇒ REFUSE here,
   //    before any log write: an unanswered `ask` HANGS the turn under `opencode serve`
   //    (probe P3), so arming blind would deadlock rather than fail closed.
-  const armed = approvalFor({
+  const armed = native ? nativeApprovalFor(env, confContents) : approvalFor({
     agent: CONSULT_AGENT,
     env,
     confContents,
@@ -1624,6 +1653,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       serve,
       log,
       preTurnCheck,
+      ...(native ? { codex: deps.codex, nativeRoot: readRoot.value.root, signal: deps.signal, elicitation: deps.elicitation } : {}),
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
@@ -1637,9 +1667,10 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
       answer: outcome.text,
       rootConflict,
       attribution: {
+        ...(outcome.runtime !== undefined ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
         model: outcome.actualModel,
         requestedModel,
-        agent: CONSULT_AGENT,
+        agent: native ? "codex" : CONSULT_AGENT,
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
@@ -1675,6 +1706,7 @@ export async function consult(params: ConsultParams, deps: ConsultDeps): Promise
         : `The consult call to '${modelLabel}' failed: ${outcome.reason}. No answer was produced.`;
   const fail: ConsultFail = {
     ok: false,
+    ...(native ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
     rootConflict,
     error: {
       kind: outcome.kind,
@@ -1755,7 +1787,7 @@ export function consultToToolResult(r: ConsultResult): McpToolResult {
       structuredContent: structured,
     };
   }
-  const structured: Record<string, unknown> = { error: r.error };
+  const structured: Record<string, unknown> = { error: r.error, ...(r.backend ? { backend: r.backend, runtime: r.runtime } : {}) };
   if (r.runId) structured.runId = r.runId;
   if (r.callId) structured.callId = r.callId;
   if (r.rootConflict) structured.rootConflict = r.rootConflict;

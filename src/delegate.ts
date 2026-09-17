@@ -60,6 +60,7 @@
  * lifecycle spine (src/consult.ts runAgentLifecycle), reused not forked.
  */
 
+import { isCodexModel, nativeApprovalFor, resolveNativeSelection, type NativeBackendDeps, type NativeRuntime } from "./backend.js";
 import os from "node:os";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -131,7 +132,7 @@ export interface DelegateParams {
   timeoutMs?: number;
 }
 
-export interface DelegateDeps {
+export interface DelegateDeps extends NativeBackendDeps {
   serve: ServeProvider;
   /**
    * Serve providers keyed by root (issue #96's `ServePool`, reused unchanged by #107). Wired
@@ -254,6 +255,8 @@ export type DelegateErrorKind =
   | "agent-mismatch";
 
 export interface DelegateAttribution {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   /** The EXACT model id used: the resolved id, or the id opencode actually ran. */
   model: string;
   requestedModel: string;
@@ -306,6 +309,8 @@ export interface DelegateOk {
   approval?: ApprovalSummary;
 }
 export interface DelegateFail {
+  backend?: "codex";
+  runtime?: NativeRuntime;
   ok: false;
   error: DelegateError;
   /** Present when the model turn RAN (call-failed / agent-mismatch): whatever it changed
@@ -430,6 +435,10 @@ export async function delegate(
   const guildDir = rootRes.root; // PRIMARY: where the evidence log writes.
   const rootConflict = rootRes.conflict;
   const confContents = readLayeredConfContents(guildDirs, env);
+  const selection = await resolveNativeSelection(resolveModel({ flag: params.model, env, confContents }), params.model, undefined, deps);
+  if (!selection.ok) return { ok: false, rootConflict, error: { kind: "model-id", model: params.model ?? "", exitAnalogue: 2, message: selection.message } };
+  const requestedModel = selection.model;
+  const native = isCodexModel(requestedModel);
 
   // 1b. THE ROOT — RESOLVED ONCE, HERE, AND NOWHERE ELSE (issue #107).
   //
@@ -468,6 +477,7 @@ export async function delegate(
   //     (If a `sessionId` input is ever added here, this comment is the pointer: it must be
   //     routed through `resolveReadRoot`'s `sessionId`, which already implements the rule.)
   const readRoot = await resolveReadRoot({
+    ...(native ? { native: true, nativeSessionDirectory: selection.directory } : {}),
     ...(params.worktree !== undefined ? { worktree: params.worktree } : {}),
     env,
     cwd,
@@ -506,7 +516,7 @@ export async function delegate(
   //    write path's ordering has one step the read paths do not: this refusal lands before
   //    `log.expect()` AND before `snapshotWorktree`, so a refused delegation leaves no run and
   //    takes no snapshot of a tree it was never going to touch.
-  if (!hardenedDefPresentIn(DELEGATE_AGENT, agentDefDirs).present) {
+  if (!native && !hardenedDefPresentIn(DELEGATE_AGENT, agentDefDirs).present) {
     return {
       ok: false,
       rootConflict,
@@ -526,8 +536,7 @@ export async function delegate(
     };
   }
 
-  // 3. Resolve the model (param > GUILD_MODEL env > conf > opencode default).
-  const requestedModel = resolveModel({ flag: params.model, env, confContents });
+  // Model resolution above also selects the backend before its session/root lookup.
 
   // 4. Gate: leading-dash refusal (C12) THEN policy tier (C1–C7), all BEFORE any log write.
   const gate = gateModel(requestedModel, params.confirmed === true, { guildDirs, env });
@@ -578,7 +587,7 @@ export async function delegate(
    * keyed on the child instance WITHIN a call, so the same child warns once, a different serving
    * child warns again, and the next call starts fresh (review B1). */
   const announced = new Set<string>();
-  const floor = await gateAgentFloor({
+  const floor = native ? { ok: true as const, unverified: undefined } : await gateAgentFloor({
     serve,
     agent: DELEGATE_AGENT,
     agentDefDirs,
@@ -602,7 +611,7 @@ export async function delegate(
   if (floor.unverified !== undefined) floorNote.note = floor.unverified;
   /** A3: the same checker, re-asked inside the turn's own lease (a cache hit on the shared
    * child; a real check under `GUILD_SERVE_PER_CALL=1`, where the early lease is already gone). */
-  const preTurnCheck = (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
+  const preTurnCheck = native ? undefined : (deps.agentFloor ?? defaultAgentFloorChecker).preTurnCheck(
     DELEGATE_AGENT,
     agentDefDirs,
     {
@@ -622,7 +631,7 @@ export async function delegate(
   //     refusal leaves nothing behind at all. Arming with no answering channel would
   //     DEADLOCK the turn rather than fail closed (probe P3), which is why this is a
   //     refusal and not a warning.
-  const armed = approvalFor({
+  const armed = native ? nativeApprovalFor(env, confContents) : approvalFor({
     agent: DELEGATE_AGENT,
     env,
     confContents,
@@ -674,6 +683,7 @@ export async function delegate(
       serve,
       log,
       preTurnCheck,
+      ...(native ? { codex: deps.codex, nativeRoot: readRoot.value.root, signal: deps.signal, elicitation: deps.elicitation } : {}),
       messageTimeoutMs:
         deps.messageTimeoutMs ?? params.timeoutMs ?? resolveMessageTimeoutMs({ env, confContents }),
       activity: activityLayerFor({ env, confContents, log, onActivity: deps.onActivity }),
@@ -731,6 +741,7 @@ export async function delegate(
     const delegateDiagnostics: TurnDiagnostics = buildTurnDiagnostics(outcome);
     const fail: DelegateFail = {
       ok: false,
+      ...(native ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
       rootConflict,
       error: {
         kind: "empty-delegation",
@@ -745,7 +756,7 @@ export async function delegate(
           `capture record is attached (structuredContent.capture), including any scaffoldWarning. ` +
           (outcome.providerError !== undefined
             ? `The provider reported: ${outcome.providerError}`
-            : `opencode reported no error for the turn, so the cause is not in the history — ` +
+            : `${native ? "Codex" : "opencode"} reported no error for the turn, so the cause is not in the history — ` +
               `check the model id (guild_models lists the authed provider CONFIGURATION, and a ` +
               `provider can still reject a listed id at call time) and, if the activity layer is ` +
               `on, the call's activity errors.`) +
@@ -771,9 +782,10 @@ export async function delegate(
       report: outcome.text,
       rootConflict,
       attribution: {
+        ...(outcome.runtime !== undefined ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
         model: outcome.actualModel,
         requestedModel,
-        agent: DELEGATE_AGENT,
+        agent: native ? "codex" : DELEGATE_AGENT,
         runId,
         callId: outcome.callId,
         ...(worktreeRoot !== undefined ? { worktree: worktreeRoot } : {}),
@@ -809,6 +821,7 @@ export async function delegate(
     outcome.kind === "empty-answer" ? "call-failed" : outcome.kind;
   const fail: DelegateFail = {
     ok: false,
+    ...(native ? { backend: "codex" as const, runtime: outcome.runtime } : {}),
     rootConflict,
     error: {
       kind,
@@ -1118,7 +1131,7 @@ export function delegateToToolResult(r: DelegateResult): McpToolResult {
       structuredContent: structured,
     };
   }
-  const structured: Record<string, unknown> = { error: r.error };
+  const structured: Record<string, unknown> = { error: r.error, ...(r.backend ? { backend: r.backend, runtime: r.runtime } : {}) };
   if (r.capture) structured.capture = r.capture;
   // THE TREE TRAVELS ON THE FAILURE PATH TOO (issue #107, review finding M2). Success carries
   // it via `...r.attribution`; failure has no attribution, so the first cut set `DelegateFail

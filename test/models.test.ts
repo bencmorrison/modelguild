@@ -176,6 +176,53 @@ export async function run(): Promise<number> {
   const r2 = await models({ serve: throwing });
   c.check(r2.ok === false && /no serve/.test(r2.error?.message ?? ""), "serve failure surfaces as ok:false with the message");
 
+  const collision = await startFixture({providers:[...FIXTURE.providers,{id:"codex",models:{ambiguous:{}}}],default:{codex:"ambiguous"}});
+  try {
+    const catalog = await models({serve:stubServe(collision.baseUrl)});
+    c.check(catalog.ok && catalog.count === 4 && !catalog.models.includes("codex/ambiguous") && !catalog.defaults.codex,
+      "reserved native namespace cannot advertise an ambiguous opencode model");
+    c.check(/Rename that provider/.test(modelsToToolResult(catalog).content[0].text), "reserved provider collision is visible with recovery advice");
+  } finally { await collision.close(); }
+
+  // Native selection must not start opencode; combined catalogs survive either
+  // runtime being unavailable and say which side failed.
+  let nativeCalls = 0;
+  const native = { models: async () => {
+    nativeCalls++;
+    return [
+      { id: "local-small", name: "Small", description: "", isDefault: true },
+      { id: "local-large", name: "Large", description: "", isDefault: false },
+    ];
+  } };
+  const absentNative = { models: async () => { throw new Error("native unavailable"); } };
+  const only = await models({serve:throwing, backend:"codex", codex:native});
+  c.check(only.ok && only.count === 2, "native catalog succeeds without opencode");
+  c.check(only.models.join(",") === "codex/local-large,codex/local-small", "native ids use runtime namespace and stable sorting");
+  c.check(only.defaults.codex === "codex/local-small" && only.providers[0].backend === "codex", "native default and runtime identity are explicit");
+  const nativeText = modelsToToolResult(only).content[0].text;
+  c.check(/runtime namespace/.test(nativeText) && /does not establish per-model entitlement/.test(nativeText), "native catalog describes namespace and entitlement limits");
+  const nativeFailure = await models({serve:throwing, backend:"codex", codex:absentNative});
+  c.check(!nativeFailure.ok && /native unavailable/.test(nativeFailure.error?.message ?? ""), "native enumeration failure is a named tool error");
+  const partial = await models({serve:throwing, backend:"both", codex:native});
+  c.check(partial.ok && partial.partial === true && partial.count === 2 && partial.warnings?.some(w=>w.includes("no serve")) === true, "both preserves native catalog when opencode fails");
+  c.check(/Partial catalog/.test(modelsToToolResult(partial).content[0].text), "partial failure is visible in text channel");
+  const neither = await models({serve:throwing, backend:"both", codex:absentNative});
+  c.check(!neither.ok && neither.warnings?.length === 2, "both failed catalogs return a combined error");
+  const combinedFixture = await startFixture(FIXTURE);
+  try {
+    const serve = stubServe(combinedFixture.baseUrl);
+    const combined = await models({serve,backend:"both",codex:native});
+    c.check(combined.ok && !combined.partial && combined.count === 6, "both healthy catalogs are combined");
+    c.check(combined.providers.every(p=>p.backend) && combined.defaults.openai === "openai/gpt-5.5", "combined catalog retains runtime identity and provider defaults");
+    const opencodeOnly = await models({serve,backend:"both",codex:absentNative});
+    c.check(opencodeOnly.ok && opencodeOnly.partial === true && opencodeOnly.count === 4, "both preserves opencode catalog when native fails");
+    const before = nativeCalls;
+    await models({serve,codex:native});
+    c.check(nativeCalls === before, "default backend never starts native Codex");
+  } finally {
+    await combinedFixture.close();
+  }
+
   console.log(`models.test: ${c.passes} passed, ${c.failures} failed`);
   return c.failures;
 }

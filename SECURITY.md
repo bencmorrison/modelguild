@@ -1,15 +1,33 @@
 # Security policy
 
-ModelGuild lets Claude Code hand work to other LLMs through [opencode](https://opencode.ai). This document is the honest account of what it does and does **not** protect against. Read it before using `/guild:delegate` on anything you don't fully trust.
+ModelGuild lets Claude Code and Codex hand work to other LLMs through [opencode](https://opencode.ai) or native Codex App Server. This document is the honest account of what it does and does **not** protect against. Read it before using `/guild:delegate` on anything you don't fully trust.
 
 ## Threat model
 
-ModelGuild is built for **trusted repositories and frontier models reached through your own opencode auth**. It is a collaboration tool with real, verifiable guardrails — **not a security sandbox**. It does not contain a hostile model, and it is not designed to run untrusted code safely.
+ModelGuild is built for **trusted repositories and frontier models reached through your selected runtime’s login**. It is a collaboration tool with real, verifiable guardrails — **not a security sandbox**. It does not contain a hostile model, and it is not designed to run untrusted code safely.
 
-- **No API keys are stored or managed by this repo.** Model access and auth live entirely in opencode (OAuth / your provider logins, including free-tier providers). Nothing here reads or writes your credentials.
+- **No API keys are stored or managed by this repo.** Model access and auth live in opencode or Codex (their own logins and provider configuration). Nothing here reads or writes your credentials.
 - **The dev container has no network firewall** (a deliberate choice for trusted repos + frontier models). Egress is limited at the *tool* layer where noted below, not at the network layer.
 
-## What is guaranteed, and how
+## Native Codex workers
+
+A `codex/<native-model>` worker inherits Codex's configured sandbox, approval policy,
+reviewer, tools, and instruction loading. ModelGuild reports the echoed native
+settings; it does not install or claim opencode's default-deny floor. A caller or workflow can ask for read-only work in a consult or research prompt. Whether the worker can mutate files
+or run shell is governed by its native configuration, so the read-role request is
+not a no-write guarantee. Use trusted repositories and review delegated changes.
+
+The adapter does not claim scoped `readPaths` grants or ModelGuild's optional
+`GUILD_APPROVE`/`GUILD_APPROVE_EGRESS` gates on Codex: explicitly requesting these
+unsupported features refuses the call. Native approval requests are a separate
+surface, described in [operations](docs/operations.md#native-codex-workers).
+
+Codex keeps durable local thread history for authoritative transcript readback.
+Releasing a ModelGuild session archives that history; it does not erase it, and
+ModelGuild log retention does not prune Codex's archives. Native model/provider
+metadata is resolved configuration, not independent provider execution telemetry.
+
+## What is guaranteed on opencode, and how
 
 The three agents ModelGuild defines are **default-deny allowlists** at opencode's permission layer: the permission map sets `"*": deny` (overriding opencode's built-in `"*": allow`, which opencode resolves last-match-wins), then re-allows only what each role needs. A denied tool is removed from the model's toolset — this is enforcement, not a prompt asking the model to behave. Because the allowlists leave nothing in an `ask` state, `--auto` cannot approve a `deny` into existence (it is a no-op for these agents).
 
@@ -122,4 +140,4 @@ Include what you found, how to reproduce it, and the impact. Because this is a s
 
 ## Scope notes
 
-In scope: the permission model and its enforcement, the tools' guards (worktree snapshot, policy, injection), any way to make a read-only command (`guild-read`/`guild-research`) **mutate the repo, shell out, or spawn a sub-agent**, and any way to make `guild-build` exceed "edit + bash on a trusted repo you're reviewing". (Reading repo contents **including credentials** and reaching the web from the read paths is the documented, accepted trusted-repo tradeoff of the 2026-07-22 realignment — not a vulnerability; the same applies to a **git worktree of the same repository** named via the `worktree` input, which is the accepted widening of issue #96. Exfiltration of any repo data via read+web agents is likewise accepted. `guild-build` reading a credential file **through its `read` tool** is likewise accepted and not a vulnerability: the carve-outs were removed on 2026-07-29, issue #29, and `bash` bypassed them before that.) Out of scope: opencode itself, the models, your provider auth, and running untrusted code (ModelGuild is not a sandbox).
+In scope: the permission model and its enforcement, the tools' guards (worktree snapshot, policy, injection), any way to make an opencode read-only command (`guild-read`/`guild-research`) **mutate the repo, shell out, or spawn a sub-agent**, and any way to make `guild-build` exceed "edit + bash on a trusted repo you're reviewing". (Reading repo contents **including credentials** and reaching the web from the read paths is the documented, accepted trusted-repo tradeoff of the 2026-07-22 realignment — not a vulnerability; the same applies to a **git worktree of the same repository** named via the `worktree` input, which is the accepted widening of issue #96. Exfiltration of any repo data via read+web agents is likewise accepted. `guild-build` reading a credential file **through its `read` tool** is likewise accepted and not a vulnerability: the carve-outs were removed on 2026-07-29, issue #29, and `bash` bypassed them before that.) Out of scope: opencode itself, the models, your provider auth, and running untrusted code (ModelGuild is not a sandbox).

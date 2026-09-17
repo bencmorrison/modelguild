@@ -3,6 +3,15 @@ description: Run a multi-LLM planning session — independent plans from several
 argument-hint: [the goal or decision to plan — include constraints if you have them]
 allowed-tools: mcp__modelguild__guild_panel, mcp__modelguild__guild_consult, mcp__modelguild__guild_models, Read, Grep, Glob, Write, Task
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Run a **planning session** across several LLMs: independent plans → your synthesis → those same models critique *your synthesis* → you disposition each critique → a plan with provenance. This is `/guild:panel`'s bigger sibling: `/guild:panel` asks a question once, `/guild:workshop` works a plan through rounds and produces an artifact.
 
 Goal to plan:

@@ -3,6 +3,15 @@ description: Findings-first code review by another LLM, with Claude verifying ea
 argument-hint: [what to review — a path, "the diff", "this branch", or a description]
 allowed-tools: mcp__modelguild__guild_consult, mcp__modelguild__guild_panel, mcp__modelguild__guild_models, Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git ls-files:*), Bash(git worktree list:*), Bash(git rev-parse:*), Read, Grep, Glob
 ---
+
+**Worker runtime:** ordinary `provider/model` IDs use opencode; reserved
+`codex/<native-model>` IDs use native Codex. `guild_models` accepts
+`backend: "opencode"` (default), `"codex"`, or `"both"`. The opencode agent-floor,
+read-only enforcement, `readPaths`, and ModelGuild approval-bridge details below apply
+only to opencode. Native Codex uses its configured sandbox/approval policy and reports
+it in runtime metadata; requesting read-only work is not a no-write guarantee.
+Native IDs may join mixed panels; a runtime prefix does not establish model diversity.
+
 Get a findings-first code review from another LLM, then verify every finding yourself before reporting. You are the **verifier, not a relay** — a finding reaches the user only if it holds up against the actual code.
 
 Review target:

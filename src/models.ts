@@ -1,5 +1,8 @@
 /**
- * `guild_models` — enumerate the running serve's AUTHED PROVIDER CONFIGURATION.
+ * `guild_models` — enumerate configured models from the selected worker runtime.
+ * Native Codex uses model/list; opencode uses AUTHED PROVIDER CONFIGURATION.
+ * codex/ is reserved for native routing, so a colliding custom opencode provider
+ * is omitted with a warning rather than advertised under an ambiguous identifier.
  *
  * IT IS NOT A REACHABILITY LIST, AND THIS FILE USED TO SAY IT WAS (issue #117, maintainer
  * report 2026-07-30). The set is per-PROVIDER, not per-model entitlement: a GitHub Copilot
@@ -50,6 +53,8 @@
 
 import type { ServeHandle } from "./lifecycle.js";
 import type { McpToolResult } from "./consult.js";
+import type { CodexBackend } from "./codex.js";
+import { nativeBackend } from "./backend.js";
 
 /** The minimal serve dependency: run `fn` against a ready serve (the lifecycle). */
 export interface ServeRunner {
@@ -58,7 +63,11 @@ export interface ServeRunner {
 
 const HTTP_MS = 10_000;
 
+export type ModelBackend = "opencode" | "codex" | "both";
+
 export interface ProviderInfo {
+  /** Runtime identity; codex is a routing namespace, not a provider/family claim. */
+  backend?: "opencode" | "codex";
   /** Provider id, e.g. "openai". */
   id: string;
   /** Human-readable provider name, e.g. "OpenAI" (omitted if the endpoint has none). */
@@ -70,6 +79,9 @@ export interface ProviderInfo {
 }
 
 export interface ModelsResult {
+  backend?: ModelBackend;
+  partial?: boolean;
+  warnings?: string[];
   ok: boolean;
   /** Every authed model as a `provider/model` id, sorted. */
   models: string[];
@@ -156,12 +168,19 @@ export function parseProviders(raw: unknown): Omit<ModelsResult, "ok" | "error">
  * A serve/HTTP failure is returned as `ok:false` with the error message (the tool
  * surfaces it as `isError`) rather than thrown, matching the other tools' shape.
  */
-export async function models(deps: { serve: ServeRunner }): Promise<ModelsResult> {
+async function opencodeModels(deps: { serve: ServeRunner }): Promise<ModelsResult> {
   try {
     const parsed = await deps.serve.withServe(async (h) => {
       const raw = await fetchJson(`${h.baseUrl}/config/providers`);
       return parseProviders(raw);
     });
+    if (parsed.providers.some(provider => provider.id === "codex")) {
+      const providers = parsed.providers.filter(provider => provider.id !== "codex");
+      const ids = providers.flatMap(provider => provider.models).sort();
+      const { codex: _reserved, ...defaults } = parsed.defaults;
+      return { ok: true, providers, models: ids, defaults, count: ids.length,
+        warnings: ["The custom opencode provider 'codex' is omitted: codex/ is reserved for native Codex routing. Rename that provider to expose its models."] };
+    }
     return { ok: true, ...parsed };
   } catch (err) {
     return {
@@ -175,6 +194,51 @@ export async function models(deps: { serve: ServeRunner }): Promise<ModelsResult
   }
 }
 
+/** Native and mixed catalogs do not depend on the other runtime being installed.
+ * A partial listing preserves the successful backend and explicitly names failures;
+ * neither catalog is a promise that a listed model will answer under current auth.
+ */
+export async function models(deps: {
+  serve: ServeRunner;
+  backend?: ModelBackend;
+  codex?: Pick<CodexBackend, "models">;
+}): Promise<ModelsResult> {
+  const backend = deps.backend ?? "opencode";
+  if (backend === "opencode") return opencodeModels(deps);
+  if (backend !== "codex" && backend !== "both") {
+    return { ok:false, models:[], providers:[], defaults:{}, count:0,
+      error:{message:"backend must be opencode, codex, or both"} };
+  }
+  const native = async (): Promise<ModelsResult> => {
+    try {
+      const catalog = await (deps.codex ?? nativeBackend({})).models();
+      const ids = [...new Set(catalog.map(model=>`codex/${model.id}`))].sort();
+      const preferred = catalog.find(model=>model.isDefault);
+      const defaultId = preferred ? `codex/${preferred.id}` : undefined;
+      return { ok:true, backend:"codex", models:ids, count:ids.length,
+        providers:[{id:"codex",name:"Native Codex runtime",backend:"codex",models:ids,
+          ...(defaultId ? {default:defaultId} : {})}],
+        defaults:defaultId ? {codex:defaultId} : {} };
+    } catch (error) {
+      return { ok:false, backend:"codex", models:[], providers:[], defaults:{}, count:0,
+        error:{message:`Codex model enumeration failed: ${(error as Error).message}`} };
+    }
+  };
+  if (backend === "codex") return native();
+  const [opencode,codex] = await Promise.all([opencodeModels(deps),native()]);
+  const warnings = [...(opencode.warnings ?? []), !opencode.ok ? `opencode: ${opencode.error?.message}` : "",
+    !codex.ok ? `codex: ${codex.error?.message}` : ""].filter(Boolean);
+  const providers = [
+    ...opencode.providers.map(provider=>({...provider,backend:"opencode" as const})),
+    ...codex.providers,
+  ];
+  const ids = providers.flatMap(provider=>provider.models).sort();
+  const ok = opencode.ok || codex.ok;
+  return { ok, backend:"both", models:ids, providers, defaults:{...opencode.defaults,...codex.defaults}, count:ids.length,
+    ...(warnings.length ? {partial:ok && (!opencode.ok || !codex.ok),warnings} : {}),
+    ...(!ok ? {error:{message:warnings.join("; ")}} : {}) };
+}
+
 /**
  * Map a `ModelsResult` to the MCP wire shape. The text block is a human-readable,
  * provider-grouped listing (what the driver reads to pick a model); the full structured
@@ -185,7 +249,7 @@ export function modelsToToolResult(r: ModelsResult): McpToolResult {
     const msg = `guild_models: could not list models — ${r.error?.message ?? "unknown error"}`;
     return {
       content: [{ type: "text", text: msg }],
-      structuredContent: { error: r.error },
+      structuredContent: { error: r.error, ...(r.backend ? { backend:r.backend } : {}), ...(r.warnings ? { warnings:r.warnings } : {}) },
       isError: true,
     };
   }
@@ -195,18 +259,25 @@ export function modelsToToolResult(r: ModelsResult): McpToolResult {
     lines.push(header + (p.default ? `  [default: ${p.default}]` : ""));
     for (const id of p.models) lines.push(`  ${id}`);
   }
-  const text =
-    r.count === 0
-      ? "No models available. Run `opencode auth login` to authenticate a provider."
+  let text = r.backend === "codex" || r.backend === "both"
+    ? `${r.count} configured model(s) from ${r.backend === "codex" ? "native Codex" : "selected worker runtimes"}; ` +
+      "listing does not establish per-model entitlement. codex/ is a runtime namespace.\n" + lines.join("\n") +
+      (r.warnings?.length ? "\n" + (r.partial ? "Partial catalog" : "Catalog warnings") + ":\n" + r.warnings.join("\n") : "")
+    : r.count === 0
+      ? (r.warnings?.length ? "No routable models in the opencode catalog." : "No models available. Run `opencode auth login` to authenticate a provider.")
       : // "configured", not "available": the set is per-provider, so a listed id can still be
         // rejected at call time (issue #117). The text channel is what a human reads, so it
         // carries the caveat rather than leaving it in the tool description alone.
         `${r.count} model(s) in the authed provider config (per-provider, not per-model ` +
         `entitlement — a listed id may still be rejected by the provider at call time):\n` +
         lines.join("\n");
+  if (r.backend !== "codex" && r.backend !== "both" && r.warnings?.length) text += "\nCatalog warnings:\n" + r.warnings.join("\n");
   return {
     content: [{ type: "text", text }],
     structuredContent: {
+      ...(r.backend ? {backend:r.backend} : {}),
+      ...(r.partial !== undefined ? {partial:r.partial} : {}),
+      ...(r.warnings ? {warnings:r.warnings} : {}),
       models: r.models,
       providers: r.providers,
       defaults: r.defaults,

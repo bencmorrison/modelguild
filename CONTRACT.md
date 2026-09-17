@@ -52,7 +52,19 @@ Milestone history is in git history.
 - **C13** — Panel set resolution (`panel-models.sh`): explicit args > `$GUILD_MODELS` env > `modelguild.conf.local` `GUILD_MODELS`; comma- or space-separated; order preserved.
 - **C14** — Panel de-duplicates (first-seen order kept, each dropped dup warned); warns on `<2` distinct models; warns if all models share one provider prefix ("diversity theater"); warns on a token that is not `provider/model`; exit **2** if no models at all. It does **not** consult the policy (that is per-call in `ask.sh`).
 
+### Native backend routing (issue #227)
+
+- **C84** — **Routing and policy.** Reserved `codex/<native-model>` IDs select native Codex App Server; other IDs and an unresolved default retain the opencode route. Model policy matches the qualified ID before a model turn. Panels may mix runtimes.
+- **C84a** — **Continuation and roots.** Native continuations use `codex:<thread-id>` and retain their recorded model and validated worktree root; an explicit incompatible model/root refuses rather than silently starting another conversation. Delegated edits use the same resolved root for the worker and C71's snapshot/capture.
+- **C84b** — **Capture and attribution.** Native answer capture selects the exact returned turn ID from authoritative thread history, preserves its answer bytes and never inherits a previous turn's answer. Tool details/counts use exact-turn item notifications because Codex 0.153.4 omits them from saved history; runtime provenance and degraded activity disclose that no post-turn tool replay is available. Native model/provider metadata is labelled configured identity.
+- **C84c** — **Permissions and explicit grants.** The echoed native sandbox/approval policy is not an opencode agent-floor claim. Opencode's C16/C73 checks apply only to opencode members. Explicit unsupported ModelGuild approval gates or nonempty `readPaths` refuse on Codex.
+- **C84d** — **Retention.** Native release archives durable threads rather than deleting their history.
+- **C84e** — **Diagnostics.** `doctor --backend opencode|codex|both` independently selects worker checks (default opencode), while `--driver` selects frontend checks; a missing selected worker binary fails and inconclusive auth warns. An enabled ModelGuild gate fails a Codex-only check; a combined check reports the opencode bridge as armed and warns that native calls refuse it.
+
 ## C. Agent selection
+
+The opencode agent-definition and permission-floor requirements below apply to the
+opencode route. Native Codex uses the separate runtime contract in C84–C84e.
 *Oracle: `modelguild/ask.sh` (flag parsing, watch block, fallback blocks); `AGENTS.md` agent notes; `run-tests.sh` cases 1, 3, 3b–3h, 4, 14, 14b–14e.*
 
 - **C15** (amended 2026-07-23, issue #36 — `--watch`/`guild-watch` retired at M12) — Default agent is `guild-read`. `--edit` → `guild-build`; `--research` → `guild-research`; `--watch` → `guild-watch` (**retired** with the witness at M12 — no watch agent ships; historical). `-a <agent>` overrides; an unrecognized agent runs as-is with a stderr note.

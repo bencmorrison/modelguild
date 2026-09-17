@@ -2,7 +2,7 @@
 
 Use the registered ModelGuild MCP tools (`guild_models`, `guild_consult`, `guild_panel`,
 `guild_research`, `guild_delegate`, `guild_status`). Codex remains the driver; opencode
-runs the workers. Tool schemas and returned diagnostics describe the capabilities in
+or native Codex runs the workers. Tool schemas and returned diagnostics describe capabilities in
 force. These skills add workflow guidance, not another tool permission policy.
 
 ## Model choice and context
@@ -10,7 +10,8 @@ force. These skills add workflow guidance, not another tool permission policy.
 Honor the user's named model and existing choices. Otherwise use configured defaults;
 when choosing an independent opinion, prefer a different model family from the actual
 driver. Provider names alone do not establish family diversity (issue #225). Consult
-`guild_models` for exact provider/model IDs; its catalog is configuration, not proof a
+`guild_models` for exact model IDs (`backend: "opencode"`, `"codex"`, or `"both"`);
+its catalog is configuration, not proof a
 particular model is entitled or will answer. Do not assume Codex can spawn an Anthropic
 subagent: use an available route, or explain that the requested model is unavailable.
 Native driver subagents may help within the authorized task; distinguish their output
@@ -19,6 +20,12 @@ from ModelGuild's mechanically captured receipts.
 Give each worker enough standalone context to answer the requested question. Keep the
 user's objective and constraints, relevant paths, and the evidence to examine. Do not
 prejudge its conclusions or require agreement with the driver.
+
+The reserved `codex/<native-model>` ID selects native Codex; other provider/model IDs
+use opencode. A runtime prefix is not evidence of model-family diversity. Native
+workers use Codex's configured sandbox/approval policy, reported in result runtime
+metadata; a requested read role is not an opencode no-write guarantee. Native model
+identity is configured identity, not independently observed provider execution.
 
 ## Results, evidence, and continuations
 
@@ -36,16 +43,18 @@ Do not claim a file was read or a command was run without evidence.
 For follow-up consults use keepSession: true, then the returned sessionId. Panel members
 need keepSessions: true. Continue a member with guild_consult using its own sessionId
 and model; do not start a new conversation while claiming it remembers the old one.
+Native session IDs start with codex:; release archives their history rather than deleting it.
 The session owns its worktree root; do not supply a contradictory worktree on follow-up.
 
 When the relevant code is in a sibling git worktree, pass its directory as worktree.
 Confirm the returned root is the intended tree. For dependency source outside the
 repository (package checkouts, node_modules, vendored SDKs), pass the existing
-directories as readPaths on guild_consult, guild_panel, or guild_research. Each is
-canonicalized and granted to that one-shot call only: it cannot be combined with
+directories as readPaths on opencode guild_consult, guild_panel, or guild_research calls.
+Each granted opencode path is canonicalized and granted to that one-shot call only: it cannot be combined with
 sessionId, keepSession, or keepSessions, and guild_delegate does not accept it. Report
 the returned structuredContent.readPaths; every named directory may be read and sent to
-the external provider. Other permission changes are tracked in #228; report a denial
+the external provider. Native Codex cannot attach these scoped grants and refuses
+nonempty readPaths. Other permission changes are tracked in #228; report a denial
 rather than inventing evidence about an inaccessible file.
 
 ## Approval and long calls
@@ -54,10 +63,11 @@ Model policy is enforced by the server. Set confirmed: true only when the user's
 authorization covers the requested model; a policy refusal is not permission to approve
 it yourself. Preserve already-given authorization and ask only for missing decisions.
 
-Per-tool approval gates are controlled by the user's GUILD_APPROVE/GUILD_APPROVE_EGRESS
+For opencode, per-tool approval gates are controlled by the user's GUILD_APPROVE/GUILD_APPROVE_EGRESS
 settings. Use the client's elicitation UI when available; `modelguild watch --approve`
 is the existing alternative. A client without an answer channel cannot run an armed
-call. Do not disable a requested gate to get past that refusal.
+call. Native Codex refuses these ModelGuild gates and uses its own native policy.
+Do not disable a requested gate to get past that refusal.
 
 ModelGuild's default model-turn deadline is 15 minutes. The documented Codex MCP
 configuration uses tool_timeout_sec = 2100 to cover a default panel's possible second

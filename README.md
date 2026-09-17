@@ -1,14 +1,14 @@
 # ModelGuild
 
-Let **Claude Code or Codex** collaborate with **other LLMs** (OpenAI, GitHub Copilot's model stack, Google Gemini, or anything else) for a second opinion, a multi-model panel, code review, or delegated coding — using **[opencode](https://opencode.ai)** as the gateway.
+Let **Claude Code or Codex** collaborate with **other LLMs** (OpenAI, GitHub Copilot's model stack, Google Gemini, or anything else) for a second opinion, a multi-model panel, code review, or delegated coding — using **[opencode](https://opencode.ai)** or a **native Codex worker**.
 
-Your chosen agent stays the driver. You add ModelGuild to **your own project**, and your driver gains collaboration workflows backed by a small local **MCP server**. opencode handles model access and auth, so this works off **whatever providers your opencode auth gives you — paid subscriptions or free tiers — with no API keys stored or managed by this tool**.
+Your chosen agent stays the driver. You add ModelGuild to **your own project**, and your driver gains collaboration workflows backed by a small local **MCP server**. Each worker runtime handles its own model access and login: opencode uses your provider subscriptions or free tiers, and native Codex uses your Codex login. **No API keys are stored or managed by this tool**.
 
-Works in stdio MCP clients. Claude Code has `/guild:*` commands; Codex CLI and the IDE extension have `$guild-*` skills. Both use the same MCP server, opencode backend, preferences, and evidence log. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for registration and verified-client limitations.
+Works in stdio MCP clients. Claude Code has `/guild:*` commands; Codex CLI and the IDE extension have `$guild-*` skills. Both use the same MCP server, worker backends, preferences, and evidence log. See [Codex setup](docs/setup.md#codex-cli-and-ide-extension) for registration and verified-client limitations.
 
 ## Quickstart
 
-Needs [Node.js](https://nodejs.org) 20 or newer, Claude Code or Codex, and [opencode](https://opencode.ai) already on your PATH — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
+Needs [Node.js](https://nodejs.org) 20 or newer, Claude Code or Codex, and your chosen worker runtime on PATH. The quickstart below uses [opencode](https://opencode.ai) — details in [Prerequisites](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md#1-prerequisites).
 
 ```bash
 opencode auth login
@@ -20,7 +20,7 @@ npx modelguild doctor
 
 Restart Claude Code, run `/guild:configure` inside it, then try a first `/guild:consult` — `doctor` warns when opencode has no credentials at all, but it calls no model, so that consult is what proves your opencode auth actually works. What each command does, why installing the payload and registering the server are separate steps, and every variant (from source, `--global`, by hand): **[docs/setup.md](https://github.com/bencmorrison/modelguild/blob/main/docs/setup.md)**.
 
-For Codex, run `npx modelguild init --driver codex` in your project, merge the printed MCP table into `.codex/config.toml`, and restart Codex. Then run `npx modelguild doctor --driver codex` and try `$guild-consult`. Use `--driver both` to install both workflow sets. [Complete Codex setup](docs/setup.md#codex-cli-and-ide-extension).
+For Codex, run `npx modelguild init --driver codex` in your project, merge the printed MCP table into `.codex/config.toml`, and restart Codex. Then run `npx modelguild doctor --driver codex` and try `$guild-consult`. Use `--driver both` to install both workflow sets. To run native Codex workers, choose `codex/<native-model>` and use `doctor --backend codex`; see [native worker setup](docs/setup.md#native-codex-workers). [Complete Codex setup](docs/setup.md#codex-cli-and-ide-extension).
 
 ## Contents
 
@@ -40,12 +40,11 @@ For Codex, run `npx modelguild init --driver codex` in your project, merge the p
 
 ## How it works
 
-Your driver calls a **local MCP server** — `modelguild`, a small TypeScript stdio server you register with Claude Code or Codex (per-project or global, your choice) — which fronts `opencode serve`, model-agnostic, over its HTTP API:
+Your driver calls a **local MCP server** — `modelguild`, a small TypeScript stdio server you register with Claude Code or Codex (per-project or global, your choice) — which routes ordinary `provider/model` IDs to `opencode serve` over HTTP and reserved `codex/<native-model>` IDs to `codex app-server` over stdio:
 
 ```
-Your driver  ──(MCP tool call)──▶  modelguild MCP server  ──▶  opencode serve  ──▶  GPT / Copilot / Gemini / …
-     ▲                                                                                       │
-     └────────────────────  reads the other model's answer, then reasons over it  ───────────┘
+Your driver ──MCP──▶ ModelGuild ──HTTP──▶ opencode serve ──▶ worker model
+                          └──────stdio──▶ Codex App Server ──▶ worker model
 ```
 
 ModelGuild adds to a project:
@@ -65,13 +64,13 @@ Run these inside Claude Code in a project you've installed into. Codex has the s
 
 | Command | What it does |
 |---|---|
-| `/guild:consult <question>` | Second opinion from another LLM on a plan or approach (read-only). Claude weighs it against its own view. |
+| `/guild:consult <question>` | Second opinion from another LLM on a plan or approach (read role). Claude weighs it against its own view. |
 | `/guild:panel <question>` | Ask 2–3 different models the same question; Claude synthesizes and breaks ties. Warns if the panel isn't cross-provider. |
 | `/guild:workshop <goal>` | A **multi-LLM planning session**: 2–3 models write independent plans, Claude synthesizes, then those same models **critique Claude's synthesis** before Claude dispositions each point into a final plan. ~2 calls per model. |
-| `/guild:review <target>` | Findings-first code review by another model, then Claude verifies each finding against the code before reporting. Target a path, the diff, or a branch — including a branch checked out in a sibling git worktree, if you pass that worktree's path (without it, reads of the sibling tree are denied). |
+| `/guild:review <target>` | Findings-first code review by another model, then Claude verifies each finding against the code before reporting. Target a path, the diff, or a branch — including a branch checked out in a sibling git worktree, if you pass that worktree's path (without it, an opencode worker cannot read the sibling tree). |
 | `/guild:research <question>` | Source-backed investigation by a **web-capable** model, then Claude fetches the cited sources and verifies each claim. Fabricated citations get refuted, not repeated. |
 | `/guild:delegate <coding task>` | Hand a coding task to another model (it edits files and can run your tooling), then Claude reviews the diff. It can work in a **sibling git worktree** of the same repo when you pass that worktree's path — the change-capture is rooted there too, so the patch you review is of that tree. |
-| `/guild:collaborate <question>` | Bounded multi-turn peer exchange with another model; Claude dispositions each point (read-only). |
+| `/guild:collaborate <question>` | Bounded multi-turn peer exchange with another model; Claude dispositions each point (read role). |
 | `/guild:configure` | Interactive setup: writes your model policy and preferred-model defaults to git-ignored config files. |
 
 Examples:
@@ -82,17 +81,17 @@ Examples:
 /guild:delegate Add bounds checking to the ring buffer in src/buffer.c and a test
 ```
 
-Pass a specific `provider/model` id to any command, or omit it to use your configured default. `/guild:configure` sets persistent defaults; to see the ids your auth actually offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). When choosing an independent opinion, prefer a different model family from the driver; honor explicitly requested models and configured preferences. Model choice, the policy file, and the per-turn timeout are covered in **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)**.
+Pass a specific `provider/model` id to any command (`codex/<native-model>` selects the native Codex runtime), or omit it to use your configured default. `/guild:configure` sets persistent defaults; to see the ids your auth actually offers, ask Claude to run the `guild_models` tool (or run `opencode models` yourself). When choosing an independent opinion, prefer a different model family from the driver; honor explicitly requested models and configured preferences. Model choice, the policy file, and the per-turn timeout are covered in **[docs/configuration.md](https://github.com/bencmorrison/modelguild/blob/main/docs/configuration.md)**.
 
 While a call runs you can [tail what the other model is doing](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#watch-it-live) (`npx modelguild watch`), optionally make it [ask before it acts](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#answer-before-it-acts-opt-in-off-by-default), and read the [receipts](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#the-record-it-keeps) it leaves in `modelguild/logs/`. A refused or stalled call is [named and explained](https://github.com/bencmorrison/modelguild/blob/main/docs/operations.md#common-failures-by-name) on the same page.
 
 ## Safety
 
-ModelGuild has real, verifiable guardrails — but it is **not a sandbox**. The read paths (`/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`, `/guild:collaborate`, `/guild:research`) run under default-deny allowlist agents that cannot mutate your repo or shell out, but they **can read any file including your secrets and reach the web**, so they are not confidentiality boundaries. `/guild:delegate` can edit files and run shell, so **the trust boundary is you reviewing the diff**. External model output is treated as data, not instructions. **Use it on trusted repositories**, and read **[SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md)** — the full threat model, what each hardened agent may do, and how each guarantee is verified.
+ModelGuild has real, verifiable guardrails — but it is **not a sandbox**. On the opencode backend, the read paths (`/guild:consult`, `/guild:panel`, `/guild:workshop`, `/guild:review`, `/guild:collaborate`, `/guild:research`) run under default-deny allowlist agents that cannot mutate your repo or shell out, but they **can read any file including your secrets and reach the web**, so they are not confidentiality boundaries. `/guild:delegate` can edit files and run shell, so **the trust boundary is you reviewing the diff**. Native Codex workers inherit Codex’s configured sandbox and approval policy; the read role is requested in the prompt and is not an opencode permission guarantee. Their results report the effective native settings. External model output is treated as data, not instructions. **Use it on trusted repositories**, and read **[SECURITY.md](https://github.com/bencmorrison/modelguild/blob/main/SECURITY.md)** — the full threat model, what each hardened agent may do, and how each guarantee is verified.
 
 ## Notes & limits
 
-- **Cost**: calls run against your opencode-authenticated providers; usage counts against those plans (free tiers included). `opencode stats` shows token usage/cost.
+- **Cost**: calls use the selected runtime’s login and count against its model plan. `opencode stats` covers opencode calls, not native Codex usage.
 - **Not just for coding**: `/guild:consult` and `/guild:panel` are great for planning and design reviews, which is often where a second model helps most.
 - **Always review `/guild:delegate` diffs** — that human review is the trust boundary for the write path.
 

@@ -2,10 +2,94 @@
 
 What a guild call looks like while it runs, what it leaves behind, and what to do when one fails. Back to [README.md](../README.md).
 
+- [Native Codex workers](#native-codex-workers)
 - [Watch it live](#watch-it-live)
 - [Answer before it acts](#answer-before-it-acts-opt-in-off-by-default)
 - [The record it keeps](#the-record-it-keeps)
 - [Troubleshooting](#troubleshooting) — including [common failures by name](#common-failures-by-name)
+
+## Native Codex workers
+
+A `codex/<native-model>` choice runs a native worker regardless of which client drives
+ModelGuild. Returned `backend: "codex"` attribution distinguishes it from an opencode
+model. `runtime` reports the configured native model/provider, sandbox, approval
+policy/reviewer, transcript source and turn ID. This is configured identity, not
+independent proof of which provider executed the request.
+
+Consult continuations and kept panel sessions return `codex:<thread-id>` identifiers.
+Reuse the returned ID and model: changing defaults does not move that conversation
+into another runtime. Its stored root remains authoritative, including sibling
+worktrees. Native delegation shares the existing before/after diff capture.
+
+Codex threads are durable so the adapter can read the authoritative completed turn.
+`keepSession: false` releases a thread by archiving it; it does **not** delete native
+history. ModelGuild's log cleanup affects its own records only. Manage native archives
+through Codex's own facilities.
+
+Cancellation interrupts the active native turn; an unconfirmed stop terminates its
+owned process tree before returning. On POSIX, cleanup inventories descendants
+with `ps`, including Codex's separate shell process groups. Deliberately reparented
+processes, a crash before that inventory, or missing/failing `ps` remain outside
+this cleanup guarantee.
+
+Native item events feed `modelguild watch`, the activity JSONL file and MCP progress.
+Codex 0.153.4 omits tool items from saved history, so tool counts and details
+come from exact-turn item notifications with no post-turn replay. This limitation
+is reported through `activity.degraded` and runtime provenance. An empty read answer still fails rather than borrowing a previous answer.
+The opencode approval bridge described below is unavailable on native calls; explicitly
+requesting its gates refuses before a turn. Codex's native approval policy remains in
+force. Command/file-change approval requests use the MCP client's elicitation channel
+when available; acceptance, decline and cancellation are forwarded to Codex.
+`modelguild watch --approve` currently answers opencode bridge requests only.
+
+A client that does not advertise MCP elicitation has no answering channel. This is
+an integration error: the adapter declines the requested action, lets Codex finish,
+then returns a failed guild call even if
+Codex produced an answer after the denial. That answer remains in the receipt.
+This deliberately differs from a human declining through a working channel, which
+can complete normally. The cost is model usage and potentially useful work before
+an error result; there is no up-front rejection of every `on-request` session.
+The [parity audit](parity.md) records this choice. With an advertised channel, the
+shared MCP requester currently maps timeout/transport errors to `cancel`; those
+follow native cancellation handling rather than the missing-channel error path.
+
+### Unattended native workers
+
+For a worker that should never ask a person, configure its Codex user config
+(`~/.codex/config.toml`) or trusted project's `.codex/config.toml`, for example:
+
+```toml
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+```
+
+This permits work inside the sandbox without escalation prompts; it does not grant
+access outside that sandbox. Use `sandbox_mode = "read-only"` for read-only work.
+If using permission profiles, choose the appropriate profile instead of also
+setting `sandbox_mode`; do not combine them. Project trust and managed settings
+can affect which configuration applies. See the official [Codex configuration
+reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+ModelGuild inherits the worker's loaded configuration and reports the resolved
+policy in `runtime`. Flags passed only to the driving Codex process are not
+forwarded to the separately spawned worker. ModelGuild does not change these
+settings for you. Calls with a configured sandbox that cannot do the requested
+work can still encounter ordinary tool denials.
+
+### Driver approval coverage
+
+On Codex 0.153.4, `npm run test:codex` verifies MCP elicitation accept, decline and
+cancel through App Server's direct tool-call interface. The interactive CLI's
+ModelGuild webfetch approval prompt and acceptance were also verified during #226.
+Those observations establish that Codex has an elicitation route; they do not prove
+every client mode exposes it. Interactive CLI rendering of a nested native-worker
+approval, IDE rendering, and unattended `codex exec` approval handling are unverified.
+The native-worker tests separately verify accepted/declined native requests and
+accepted requests through an SDK MCP client; they do not assert Codex UI behavior.
+
+Unsupported native interactive request types also fail visibly. Cancelling a worker
+stops its execution; an already-open MCP approval prompt may remain until its own
+timeout (the shared cancellation follow-up is #232).
 
 ## Watch it live
 
@@ -20,13 +104,13 @@ It tails what the external model is doing **as it happens** — which files it r
 The same trace is written to `modelguild/logs/<run_id>/activity.jsonl` and summarised on each tool result (`structuredContent.activity`: counts by tool, files edited, errors, the first few actions), so Claude can tell you "it ran 14 tool calls, 3 of them shell, and edited 5 files" instead of only handing you a diff.
 
 - **It is visibility, not containment.** Seeing a command scroll past does not gate it — nothing here asks your permission before the model acts. The diff review is still the review point.
-- **It is not the receipts either.** These lines are opencode's report of the model's *actions*, at opencode's fidelity. The model's actual *words* are in `calls.jsonl` (below).
+- **It is not the receipts either.** These lines are the selected runtime's report of the model's *actions*, at that runtime's fidelity. The model's actual *words* are in `calls.jsonl` (below).
 - **If the stream drops, it says so.** `activity.degraded` is set on the result, so a quiet trace is never mistaken for a quiet model.
 - **Knobs:** `GUILD_ACTIVITY=off` turns it off entirely; `GUILD_ACTIVITY_DETAIL=full` records each event's raw payload, which can include file contents the model read — same sensitivity trade-off as `GUILD_LOG_PROMPTS=full`. Both live in `modelguild/modelguild.conf.local`.
 
 ## Answer before it acts (opt-in, off by default)
 
-Watching is not gating. If you want the model to **ask first**, arm the approval bridge — it moves the chosen tools to `ask` for that one session, and each request comes to you before opencode runs it.
+On opencode, watching is not gating. If you want the model to **ask first**, arm the approval bridge — it moves the chosen tools to `ask` for that one session, and each request comes to you before opencode runs it.
 
 ```bash
 # in modelguild/modelguild.conf.local (or as env vars for one session)
@@ -86,8 +170,8 @@ A refused or stalled call names its failure. Search for the name you were given:
 
 Codex uses the same ModelGuild tools and evidence log as Claude Code. The Codex installer
 prints a 60-second startup deadline and 2,100-second tool deadline; see
-[Codex setup](setup.md#codex-cli-and-ide-extension). Calling a worker uses opencode's
-credentials, independently of the Codex driver's login.
+[Codex setup](setup.md#codex-cli-and-ide-extension). Opencode workers use opencode's credentials; native `codex/` workers use the
+Codex installation's own login and configuration.
 
 `npm run test:codex` is an opt-in compatibility probe requiring Codex on PATH. It builds
 the package and uses real Codex App Server and ModelGuild processes with a scripted
@@ -108,8 +192,8 @@ use `modelguild watch` for live activity. Protocol-level elicitation replies wer
 the interactive CLI skill list, running tool call, MCP-call approval prompt and
 ModelGuild webfetch approval prompt are verified on 0.153.4. IDE rendering and
 interactive decline/cancel are not verified. App Server itself is experimental;
-this does not add it as a production dependency of ModelGuild, which continues to
-expose standard stdio MCP.
+ModelGuild continues to expose standard stdio MCP to drivers; selecting a native
+Codex worker uses App Server as that backend's production transport.
 
 Closing the Codex client closes its MCP transport and triggers ModelGuild's existing
 backend teardown. Merely cancelling a tool wait is a different operation: ModelGuild
