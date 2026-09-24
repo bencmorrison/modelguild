@@ -142,7 +142,7 @@ Or the one-liner bootstrap (a thin `install.sh` that runs `npx modelguild init` 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bencmorrison/modelguild/main/install.sh | bash
 ```
-The bootstrap installs into the current directory; pass `-s -- --dir /path/to/project` to target another. Pin a version with `-s -- --ref 0.7.2` (or `MODELGUILD_REF=0.7.2`).
+The bootstrap installs into the current directory; pass `-s -- --dir /path/to/project` to target another. Pin a version with `-s -- --ref 0.8.0` (or `MODELGUILD_REF=0.8.0`).
 
 Building from a checkout instead, or installing once for every project? → [From source](#from-source-contributors-or-to-run-an-unreleased-build), [Global install](#global-install-all-projects).
 
