@@ -440,6 +440,29 @@ export async function run(): Promise<number> {
     }
   }
 
+  // 9b. transport error carries its cause code (issue #237) ---------------------
+  {
+    const fake = await startFakeOpencode({ historyText: "x", dropMessage: true });
+    try {
+      let message = "";
+      try {
+        await sendMessage({
+          baseUrl: fake.baseUrl,
+          sessionId: "ses_fake",
+          agent: "a",
+          model: "openai/gpt-fake",
+          parts: [{ type: "text", text: "q" }],
+        });
+      } catch (err) {
+        c.check(err instanceof OpencodeHttpError, "dropped message surfaces an OpencodeHttpError");
+        message = (err as Error).message;
+      }
+      c.check(/\(UND_ERR_[A-Z_]+\)/.test(message), `transport error carries its cause code (${message})`);
+    } finally {
+      await fake.close();
+    }
+  }
+
   // 10. TURN-SCOPED EXTRACTION (issue #117 review, defect 1) --------------------
   //
   //     Unit-level, on hand-built histories, because the property is about the SHAPE of the

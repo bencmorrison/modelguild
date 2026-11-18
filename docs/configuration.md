@@ -67,7 +67,7 @@ If a heavy task on a slow reasoning model aborts with *"operation was aborted du
 GUILD_MESSAGE_TIMEOUT_MS=1800000
 ```
 
-Only the model-turn call uses it; the fast control-plane calls keep their own short timeout. A value of 0, negative, or non-numeric falls back to the default; the literal `max` uses the longest timeout Node can honour (~24.8 days). This is the default — for a single long-running call, the assistant can also pass a `timeoutMs` (a number of ms, or `"max"`) directly to `guild_consult`/`guild_panel`/`guild_research`/`guild_delegate`, which overrides it for that call.
+Only the model-turn call uses it; the fast control-plane calls keep their own short timeout. Since issue #237 it is the turn's only deadline: Node fetch's 300 s `headersTimeout` no longer cuts a turn off at five minutes. A value of 0, negative, or non-numeric falls back to the default; the literal `max` uses the longest timeout Node can honour (~24.8 days). This is the default — for a single long-running call, the assistant can also pass a `timeoutMs` (a number of ms, or `"max"`) directly to `guild_consult`/`guild_panel`/`guild_research`/`guild_delegate`, which overrides it for that call.
 
 Codex also has an outer MCP deadline. Set `tool_timeout_sec = 2100` in its
 `[mcp_servers.modelguild]` table for default ModelGuild turns and a possible panel retry;
