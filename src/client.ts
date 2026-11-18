@@ -23,8 +23,15 @@
  *      This is M3's evidence-layer input, so a lost trailing newline here is a
  *      contract violation downstream (CONTRACT.md area D, C25). JSON.parse round-trips
  *      string bytes exactly, so the value returned equals what the model produced.
+ *
+ * The message POST alone goes through undici's own `fetch` with `MESSAGE_DISPATCHER`
+ * (issue #237): opencode sends no response headers until the turn ends, and the global
+ * fetch's default 300 s `headersTimeout` killed every turn past five minutes before
+ * `MESSAGE_HTTP_MS` / `GUILD_MESSAGE_TIMEOUT_MS` could apply. The abort signal is that
+ * request's only deadline.
  */
 
+import { Agent, fetch as undiciFetch } from "undici";
 import type { ServeHandle } from "./lifecycle.js";
 import { readPathPattern } from "./worktree.js";
 
@@ -34,6 +41,7 @@ export const SHORT_HTTP_MS = 15_000;
 /** A model turn — generous; a real call can be slow. 15 min default (raised from 3 min
  * for long-running planning/review work); override per-install with GUILD_MESSAGE_TIMEOUT_MS. */
 export const MESSAGE_HTTP_MS = 900_000;
+const MESSAGE_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 // --- Model id -------------------------------------------------------------
 /** The message-send model shape: `{providerID, modelID}` (verified live). */
@@ -101,6 +109,9 @@ interface RequestCtx {
   /** Test seam only (the approval bridge already carries one for its reply path). Production
    * callers omit it and get the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /** Send through undici's `fetch` with this dispatcher instead of the global `fetch`. A
+   * `fetchImpl` still takes precedence. */
+  dispatcher?: Agent;
 }
 
 /** Issue one bounded request, throwing an `OpencodeHttpError` with context on any
@@ -115,7 +126,14 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
 
   let res: Response;
   try {
-    res = await (ctx.fetchImpl ?? fetch)(`${baseUrl}${path}`, init);
+    const url = `${baseUrl}${path}`;
+    if (ctx.fetchImpl) res = await ctx.fetchImpl(url, init);
+    else if (ctx.dispatcher) {
+      res = (await undiciFetch(url, {
+        ...(init as Parameters<typeof undiciFetch>[1]),
+        dispatcher: ctx.dispatcher,
+      })) as unknown as Response;
+    } else res = await fetch(url, init);
   } catch (err) {
     // Timeout aborts and connection failures both land here — annotate the DURATION only
     // when the failure was actually the timeout firing, so a too-small configured value
@@ -125,10 +143,11 @@ async function requestJson(ctx: RequestCtx): Promise<unknown> {
     // is "AbortError", a connection failure a TypeError "fetch failed"); it survives the
     // `AbortSignal.any` wrap in `effectiveSignal`.
     const timedOut = (err as Error)?.name === "TimeoutError";
+    const causeCode = ((err as Error)?.cause as { code?: unknown } | undefined)?.code;
     throw new OpencodeHttpError(
       `${method} ${path} failed${timedOut ? ` after ${timeoutMs}ms (timeout)` : ""}${
         sessionId ? ` (session=${sessionId})` : ""
-      }: ${(err as Error).message}`,
+      }: ${(err as Error).message}${typeof causeCode === "string" ? ` (${causeCode})` : ""}`,
       { method, path, sessionId },
       { cause: err },
     );
@@ -741,6 +760,7 @@ export async function sendMessage(opts: SendMessageOpts): Promise<SendResult> {
     sessionId: opts.sessionId,
     signal: opts.signal,
     body,
+    dispatcher: MESSAGE_DISPATCHER,
   })) as { info?: Record<string, unknown> };
 
   // Read ONLY metadata off the sync envelope; the text/parts are intentionally

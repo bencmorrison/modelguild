@@ -97,6 +97,8 @@ export interface FakeOpencodeOpts {
   messageDelayMs?: number;
   /** Return 500 on the GET history (drive an error path with the session created). */
   failHistory?: boolean;
+  /** Destroy the socket on the POST message, with no response (a transport failure). */
+  dropMessage?: boolean;
   /** Return 500 on the POST message. */
   failMessage?: boolean;
   /** Return 500 on the POST message ONLY when the request body's model id
@@ -1284,6 +1286,10 @@ export function startFakeOpencode(opts: FakeOpencodeOpts): Promise<FakeOpencode>
             text: turnTextFor(opts, turnNo),
           });
           turns.set(msgMatch[1], list);
+        }
+        if (opts.dropMessage) {
+          res.destroy();
+          return;
         }
         // Per-model failure: 500 only for the targeted model (siblings still succeed).
         if (opts.failMessageForModel) {

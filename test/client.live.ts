@@ -16,7 +16,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { OpencodeLifecycle } from "../src/lifecycle.js";
-import { askViaAgent } from "../src/client.js";
+import { askViaAgent, sendMessage } from "../src/client.js";
+import { startFakeOpencode } from "./fake-opencode-server.js";
 import { Checker, repoRoot, withTimeout, waitFor, pidAlive } from "./harness.js";
 
 const FREE_MODEL = "opencode/deepseek-v4-flash-free";
@@ -28,6 +29,30 @@ const MARKER = "PLATYPUS-ORBIT-7731";
 async function main(): Promise<number> {
   const c = new Checker();
   console.log("== client.live ==");
+
+  // Offline against the fake, but ~5 minutes long, so it lives here and not in CI (#237).
+  {
+    const fake = await startFakeOpencode({ historyText: "x", messageDelayMs: 310_000 });
+    try {
+      const started = Date.now();
+      let error = "";
+      try {
+        await sendMessage({
+          baseUrl: fake.baseUrl,
+          sessionId: "ses_fake",
+          agent: "a",
+          model: "openai/gpt-fake",
+          parts: [{ type: "text", text: "q" }],
+        });
+      } catch (err) {
+        error = (err as Error).message;
+      }
+      const secs = Math.round((Date.now() - started) / 1000);
+      c.check(error === "", `message turn survives past undici's 300 s headers default (${secs}s${error ? `: ${error}` : ""})`);
+    } finally {
+      await fake.close();
+    }
+  }
 
   const scratch = await mkdtemp(path.join(tmpdir(), "guild-m2-live-"));
   const lc = new OpencodeLifecycle({ projectDir: scratch, idleMs: 0 });
